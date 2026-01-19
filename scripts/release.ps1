@@ -36,7 +36,7 @@ New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 Write-Host "`n[3/5] Copying files..." -ForegroundColor Yellow
 
 # Copy executable
-Copy-Item "$TargetDir\ferrite_s100.exe" "$ReleaseDir\FerriteS100.exe"
+Copy-Item "$TargetDir\ferrite-s100.exe" "$ReleaseDir\FerriteS100.exe"
 
 # Create empty folders with README
 $folders = @("Catalogues\FC", "Catalogues\PC", "ChartData")
