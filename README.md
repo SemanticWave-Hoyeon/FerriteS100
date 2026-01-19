@@ -202,7 +202,7 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests. If you actually understand the S-100 standard, we *really* need your help.
+This is a personal project and is not accepting contributions at this time. Feel free to fork it if you'd like to experiment on your own!
 
 ## Acknowledgments
 
