@@ -14,6 +14,7 @@
   <a href="#installation">Installation</a> •
   <a href="#usage">Usage</a> •
   <a href="#security">Security</a> •
+  <a href="#sbom-software-bill-of-materials">SBOM</a> •
   <a href="#license">License</a>
 </p>
 
@@ -135,6 +136,46 @@ FerriteS100 implements a **sandboxed Lua environment** via [mlua](https://github
 | **Restricted Search** | Only Portrayal Catalogue directory is searchable |
 
 This design mitigates potential security risks from malicious Portrayal Catalogue scripts (**CWE-829**, **CWE-749**).
+
+## SBOM (Software Bill of Materials)
+
+FerriteS100 supports generating SBOM for supply chain security and compliance.
+
+### Generate SBOM
+
+```bash
+# Install cargo-sbom (SPDX format)
+cargo install cargo-sbom
+
+# Generate SPDX SBOM
+cargo sbom > sbom.spdx.json
+
+# Alternative: CycloneDX format
+cargo install cargo-cyclonedx
+cargo cyclonedx --format json > sbom.cdx.json
+```
+
+### Dependency Audit
+
+```bash
+# Install cargo-audit
+cargo install cargo-audit
+
+# Scan for known vulnerabilities
+cargo audit
+
+# Generate audit report
+cargo audit --json > audit-report.json
+```
+
+### Dependency Tracking
+
+| File | Description |
+|------|-------------|
+| `Cargo.lock` | Exact dependency versions (committed to repo) |
+| `Cargo.toml` | Direct dependency declarations |
+
+All dependencies are sourced from [crates.io](https://crates.io) and audited via [RustSec Advisory Database](https://rustsec.org/).
 
 ## Dependencies
 
