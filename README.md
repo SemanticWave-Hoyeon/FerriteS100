@@ -23,13 +23,16 @@
   <img src="https://img.shields.io/badge/License-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/GPU-Vulkan%20%7C%20DX12%20%7C%20Metal-green" alt="GPU">
+  <img src="https://img.shields.io/badge/Navigation-Please%20Don't-red" alt="Not for Navigation">
 </p>
 
 ---
 
 ## Overview
 
-**FerriteS100** is a high-performance Rust application for parsing and rendering IHO S-100/S-101 standard electronic navigational charts. The project leverages modern GPU rendering via [wgpu](https://wgpu.rs/) and follows the official S-100 portrayal model using Lua scripts.
+**FerriteS100** is a Rust application *trying* to parse and render IHO S-100/S-101 electronic navigational charts. Because apparently reading PDFs of maritime standards wasn't painful enough, we decided to implement them in Rust.
+
+The project leverages modern GPU rendering via [wgpu](https://wgpu.rs/) and *attempts* to follow the S-100 portrayal model using Lua scripts. No ships were harmed in the making of this software (please don't actually navigate with this).
 
 ## Screenshots
 
@@ -119,9 +122,9 @@ FerriteS100/
 
 ## Key Principles
 
-1. **No Hardcoding** — Feature and Portrayal catalogues are loaded dynamically at runtime
-2. **Standard Compliance** — Lua portrayal rules follow IHO international standards
-3. **S-100 Specification** — Implementation strictly follows IHO S-100/S-101 specifications
+1. **No Hardcoding** — Feature and Portrayal catalogues are loaded dynamically at runtime (because we learned the hard way)
+2. **Standard Compliance** — Lua portrayal rules follow IHO international standards (or at least we're trying)
+3. **S-100 Specification** — Implementation strictly follows IHO S-100/S-101 specifications (500+ pages of bedtime reading)
 
 ## Security
 
@@ -199,7 +202,7 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Contributions are welcome! Please feel free to submit issues and pull requests. If you actually understand the S-100 standard, we *really* need your help.
 
 ## Acknowledgments
 
