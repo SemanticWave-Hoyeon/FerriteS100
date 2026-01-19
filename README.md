@@ -124,7 +124,7 @@ FerriteS100/
 
 1. **No Hardcoding** — Feature and Portrayal catalogues are loaded dynamically at runtime (because we learned the hard way)
 2. **Standard Compliance** — Lua portrayal rules follow IHO international standards (or at least we're trying)
-3. **S-100 Specification** — Implementation strictly follows IHO S-100/S-101 specifications (500+ pages of bedtime reading)
+3. **S-100 Specification** — Implementation *inspired by* IHO S-100/S-101 specifications (we read most of the 500+ pages, probably)
 
 ## Security
 
