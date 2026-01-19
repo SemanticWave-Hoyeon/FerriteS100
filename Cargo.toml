@@ -1,0 +1,113 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferrite-iso8211",
+    "crates/ferrite-s100-core",
+    "crates/ferrite-feature-catalog",
+    "crates/ferrite-portrayal-catalog",
+    "crates/ferrite-render",
+    "crates/ferrite-wgpu",
+    "crates/ferrite-lua",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/user/ferrite-s100"
+
+[workspace.dependencies]
+# Parsing
+nom = "8"
+bytes = "1"
+encoding_rs = "0.8"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+
+# Geometry
+geo-types = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+earcutr = "0.4"  # Fast polygon triangulation (mapbox/earcut port)
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# File system
+walkdir = "2"
+
+# Graphics
+wgpu = "24"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+resvg = "0.45"  # SVG rendering library
+
+# GUI
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+rfd = "0.15"  # Native file dialogs
+
+# Scripting
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+
+# Internal crates
+ferrite-iso8211 = { path = "crates/ferrite-iso8211" }
+ferrite-s100-core = { path = "crates/ferrite-s100-core" }
+ferrite-feature-catalog = { path = "crates/ferrite-feature-catalog" }
+ferrite-portrayal-catalog = { path = "crates/ferrite-portrayal-catalog" }
+ferrite-render = { path = "crates/ferrite-render" }
+ferrite-wgpu = { path = "crates/ferrite-wgpu" }
+ferrite-lua = { path = "crates/ferrite-lua" }
+
+[package]
+name = "ferrite-s100"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ferrite-s100"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-iso8211.workspace = true
+ferrite-s100-core.workspace = true
+ferrite-feature-catalog.workspace = true
+ferrite-portrayal-catalog.workspace = true
+ferrite-render.workspace = true
+ferrite-wgpu.workspace = true
+ferrite-lua.workspace = true
+winit.workspace = true
+pollster.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+walkdir.workspace = true
+anyhow.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+rfd.workspace = true
+image.workspace = true
+
+# Release profile: maximum optimizations
+[profile.release]
+opt-level = 3          # Maximum optimization
+lto = "thin"           # Link-time optimization (thin is faster to compile than fat)
+codegen-units = 1      # Single codegen unit for better optimization
+strip = "symbols"      # Strip symbols for smaller binary
+panic = "abort"        # Abort on panic (smaller binary, faster)
+
+# Development profile: faster compile, some optimization for usable performance
+[profile.dev]
+opt-level = 1          # Basic optimization for better debug performance
+
+# Optimize dependencies even in dev builds
+[profile.dev.package."*"]
+opt-level = 2

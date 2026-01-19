@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-feature-catalog"
+version.workspace = true
+edition.workspace = true
+description = "S-100 Feature Catalogue XML parser"
+
+[dependencies]
+quick-xml.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

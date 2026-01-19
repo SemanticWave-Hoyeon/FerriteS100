@@ -1,0 +1,27 @@
+[package]
+name = "ferrite-wgpu"
+version.workspace = true
+edition.workspace = true
+description = "wgpu-based renderer for S-100 charts"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+# Graphics
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+image.workspace = true
+earcutr.workspace = true  # Polygon triangulation
+resvg.workspace = true  # SVG rendering
+
+# GUI
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+
+# Internal crates
+ferrite-render = { workspace = true }
+ferrite-portrayal-catalog = { workspace = true }

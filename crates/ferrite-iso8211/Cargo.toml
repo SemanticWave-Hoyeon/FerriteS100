@@ -1,0 +1,12 @@
+[package]
+name = "ferrite-iso8211"
+version.workspace = true
+edition.workspace = true
+description = "ISO 8211 binary file parser for S-100 ENC data"
+
+[dependencies]
+nom.workspace = true
+bytes.workspace = true
+encoding_rs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
