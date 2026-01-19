@@ -1,0 +1,18 @@
+[package]
+name = "ferrite-lua"
+version.workspace = true
+edition.workspace = true
+description = "Lua integration for S-100 portrayal rules"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+# Lua runtime
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+
+# Internal crates
+ferrite-s100-core = { workspace = true }
+ferrite-feature-catalog = { workspace = true }
+ferrite-portrayal-catalog = { workspace = true }
+ferrite-render = { workspace = true }

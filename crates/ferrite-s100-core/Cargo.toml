@@ -1,0 +1,12 @@
+[package]
+name = "ferrite-s100-core"
+version.workspace = true
+edition.workspace = true
+description = "Core S-100 data structures for feature and spatial records"
+
+[dependencies]
+ferrite-iso8211.workspace = true
+geo-types.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

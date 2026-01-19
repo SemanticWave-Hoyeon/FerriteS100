@@ -1,0 +1,41 @@
+# Rust build output
+/target/
+
+# Catalogue data (FC/PC)
+/ProgramData/
+/Catalogues/
+
+# Chart data
+/ChartData/
+
+# Reference implementations
+/reference/
+/OpenS100/
+
+# Logs
+/logs/
+*.log
+
+# Executables
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code session data
+/.claude/
+/claude.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak

@@ -1,0 +1,16 @@
+[package]
+name = "ferrite-render"
+version.workspace = true
+edition.workspace = true
+description = "S-100 rendering abstractions and drawing instructions"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+# Geometry
+geo-types.workspace = true
+
+# Internal crates
+ferrite-s100-core = { workspace = true }
+ferrite-portrayal-catalog = { workspace = true }
