@@ -193,8 +193,7 @@ All dependencies are sourced from [crates.io](https://crates.io) and audited via
 
 ## References
 
-- [IHO S-100 Standard](https://iho.int/en/s-100-universal-hydrographic-data-model)
-- [IHO S-101 Product Specification](https://iho.int/en/s-101-electronic-navigational-chart)
+- [IHO S-100 / S-101 Standards](https://registry.iho.int/)
 
 ## License
 
