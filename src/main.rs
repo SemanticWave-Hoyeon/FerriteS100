@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::{info, debug, error, warn};
+use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use walkdir::WalkDir;
@@ -23,16 +23,16 @@ use winit::{
 };
 
 use ferrite_feature_catalog::FeatureCatalogue;
-use ferrite_portrayal_catalog::PortrayalCatalogue;
-use ferrite_s100_core::{S101Cell, SpatialPrimitiveType};
-use ferrite_render::{
-    Color, GeoBounds, RenderContext, Viewport,
-    PointInstruction, LineInstruction, AreaInstruction, LineStyle, WorldPoint,
-};
-use ferrite_wgpu::{SelectedFeature, SymbolCache, WgpuRenderer};
 use ferrite_lua::{
     ContextParameters as LuaContextParameters, PortrayalContext, PortrayalEngine, TypeCatalogue,
 };
+use ferrite_portrayal_catalog::PortrayalCatalogue;
+use ferrite_render::{
+    AreaInstruction, Color, GeoBounds, LineInstruction, LineStyle, PointInstruction, RenderContext,
+    Viewport, WorldPoint,
+};
+use ferrite_s100_core::{S101Cell, SpatialPrimitiveType};
+use ferrite_wgpu::{SelectedFeature, SymbolCache, WgpuRenderer};
 
 /// Application configuration
 struct AppConfig {
@@ -148,7 +148,8 @@ impl ChartApp {
         }
 
         // Filter out already loaded files
-        let new_paths: Vec<_> = paths.iter()
+        let new_paths: Vec<_> = paths
+            .iter()
             .filter(|p| {
                 let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
                 !self.loaded_paths.contains(&canonical)
@@ -162,8 +163,11 @@ impl ChartApp {
         }
 
         #[cfg(debug_assertions)]
-        info!("Loading {} new chart file(s) ({} skipped as duplicates)",
-              new_paths.len(), paths.len() - new_paths.len());
+        info!(
+            "Loading {} new chart file(s) ({} skipped as duplicates)",
+            new_paths.len(),
+            paths.len() - new_paths.len()
+        );
 
         let fc_feature_codes = self.fc.feature_type_codes();
         let mut loaded_names = Vec::new();
@@ -186,8 +190,10 @@ impl ChartApp {
             #[cfg(debug_assertions)]
             {
                 let stats = cell.statistics();
-                info!("Loaded: {} features, {} points, {} curves, {} surfaces",
-                      stats.features, stats.points, stats.curves, stats.surfaces);
+                info!(
+                    "Loaded: {} features, {} points, {} curves, {} surfaces",
+                    stats.features, stats.points, stats.curves, stats.surfaces
+                );
                 total_features += stats.features;
             }
 
@@ -227,22 +233,26 @@ impl ChartApp {
         if let Some(renderer) = &mut self.renderer {
             // Show count of loaded charts or single chart name
             let chart_info = if self.cells.len() == 1 {
-                loaded_names.last().cloned().unwrap_or_else(|| "Chart".to_string())
+                loaded_names
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "Chart".to_string())
             } else {
                 format!("{} charts loaded", self.cells.len())
             };
             renderer.ui_state.loaded_chart = Some(chart_info);
 
             // Update total feature count across all cells
-            let total_count: usize = self.cells.iter()
-                .map(|c| c.statistics().features)
-                .sum();
+            let total_count: usize = self.cells.iter().map(|c| c.statistics().features).sum();
             renderer.ui_state.feature_count = total_count;
             renderer.ui_state.chart_count = self.cells.len();
         }
 
         #[cfg(debug_assertions)]
-        info!("Loaded {} new charts ({} total features)", new_paths_count, total_features);
+        info!(
+            "Loaded {} new charts ({} total features)",
+            new_paths_count, total_features
+        );
         Ok(())
     }
 
@@ -262,7 +272,8 @@ impl ChartApp {
         // Clear render context
         if let Some(renderer) = &self.renderer {
             let size = renderer.window().inner_size();
-            self.render_context = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
+            self.render_context =
+                RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         }
 
         // Update UI state
@@ -298,7 +309,8 @@ impl ChartApp {
         self.render_context.set_bounds(self.bounds);
 
         // Try Lua portrayal
-        let lua_result = try_lua_portrayal(&self.cells, &self.fc, &self.pc, &mut self.render_context);
+        let lua_result =
+            try_lua_portrayal(&self.cells, &self.fc, &self.pc, &mut self.render_context);
 
         if let Err(e) = lua_result {
             warn!("Lua portrayal failed: {}. Using default instructions.", e);
@@ -310,7 +322,8 @@ impl ChartApp {
         // Update renderer
         if let Some(renderer) = &mut self.renderer {
             let size = renderer.window().inner_size();
-            self.render_context.set_viewport(size.width as f32, size.height as f32);
+            self.render_context
+                .set_viewport(size.width as f32, size.height as f32);
             self.render_context.zoom_to_fit(self.bounds);
 
             renderer.begin_frame();
@@ -350,13 +363,17 @@ impl ChartApp {
             }
         }
 
-        info!("Built {} rendered symbols for hit testing", self.rendered_symbols.len());
+        info!(
+            "Built {} rendered symbols for hit testing",
+            self.rendered_symbols.len()
+        );
     }
 
     /// Find symbols near the click position
     /// Sorted by priority (highest first = topmost visible), then by distance (closest first)
     fn find_symbols_at(&self, x: f64, y: f64, radius: f32) -> Vec<&RenderedSymbol> {
-        let mut nearby: Vec<_> = self.rendered_symbols
+        let mut nearby: Vec<_> = self
+            .rendered_symbols
             .iter()
             .filter_map(|s| {
                 let dx = s.screen_x - x as f32;
@@ -461,7 +478,8 @@ impl ApplicationHandler for ChartApp {
                         Ok(mut renderer) => {
                             // Update render context viewport
                             let size = window.inner_size();
-                            self.render_context.set_viewport(size.width as f32, size.height as f32);
+                            self.render_context
+                                .set_viewport(size.width as f32, size.height as f32);
 
                             // Initialize UI state
                             renderer.ui_state.zoom_level = self.zoom_level;
@@ -479,7 +497,11 @@ impl ApplicationHandler for ChartApp {
                             }
 
                             let stats = renderer.statistics();
-                            info!("GPU Renderer initialized: {} (symbols cached: {})", stats, self.symbol_cache.len());
+                            info!(
+                                "GPU Renderer initialized: {} (symbols cached: {})",
+                                stats,
+                                self.symbol_cache.len()
+                            );
 
                             self.renderer = Some(renderer);
                         }
@@ -519,10 +541,8 @@ impl ApplicationHandler for ChartApp {
                     renderer.resize(physical_size);
 
                     // Update render context and re-add instructions
-                    self.render_context.set_viewport(
-                        physical_size.width as f32,
-                        physical_size.height as f32,
-                    );
+                    self.render_context
+                        .set_viewport(physical_size.width as f32, physical_size.height as f32);
 
                     if self.chart_loaded {
                         self.render_context.zoom_to_fit(self.bounds);
@@ -542,7 +562,8 @@ impl ApplicationHandler for ChartApp {
                 self.last_frame_time = now;
 
                 // Apply pan velocity (inertia)
-                let velocity_magnitude = (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
+                let velocity_magnitude =
+                    (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
                 if velocity_magnitude > 0.0001 && self.chart_loaded && !self.is_dragging {
                     // Apply velocity to pan offset
                     self.pan_offset.0 += self.pan_velocity.0 * dt;
@@ -554,11 +575,13 @@ impl ApplicationHandler for ChartApp {
                     self.pan_velocity.1 *= friction;
 
                     // Calculate screen-space velocity for GPU pan offset
-                    let screen_vx = -self.pan_velocity.0 * self.render_context.scaler.scale_x() as f64 * dt;
-                    let screen_vy = self.pan_velocity.1 * self.render_context.scaler.scale_y() as f64 * dt;
+                    let screen_vx =
+                        -self.pan_velocity.0 * self.render_context.scaler.scale_x() * dt;
+                    let screen_vy = self.pan_velocity.1 * self.render_context.scaler.scale_y() * dt;
 
                     // Check if velocity is now very small (stopping)
-                    let new_magnitude = (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
+                    let new_magnitude =
+                        (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
                     if new_magnitude < 0.00001 {
                         self.pan_velocity = (0.0, 0.0);
                         // Motion stopped - reset pan offset and full rebuild
@@ -676,7 +699,8 @@ impl ApplicationHandler for ChartApp {
 
                 // Update UI state with cursor position
                 if let Some(renderer) = &mut self.renderer {
-                    let screen_pt = ferrite_render::ScreenPoint::new(new_pos.0 as f32, new_pos.1 as f32);
+                    let screen_pt =
+                        ferrite_render::ScreenPoint::new(new_pos.0 as f32, new_pos.1 as f32);
                     let world = self.render_context.scaler.screen_to_world(screen_pt);
                     renderer.set_cursor_world(world.x, world.y);
                     renderer.set_cursor_screen(new_pos.0 as f32, new_pos.1 as f32);
@@ -688,14 +712,15 @@ impl ApplicationHandler for ChartApp {
                     let dy = new_pos.1 - self.mouse_pos.1;
 
                     // Track world-space pan offset for final calculation
-                    let world_dx = -dx / self.render_context.scaler.scale_x() as f64;
-                    let world_dy = dy / self.render_context.scaler.scale_y() as f64;
+                    let world_dx = -dx / self.render_context.scaler.scale_x();
+                    let world_dy = dy / self.render_context.scaler.scale_y();
                     self.pan_offset.0 += world_dx;
                     self.pan_offset.1 += world_dy;
 
                     // Track recent positions for velocity calculation (keep last 100ms worth)
                     self.recent_positions.push((new_pos, now));
-                    self.recent_positions.retain(|(_, t)| now.duration_since(*t).as_millis() < 100);
+                    self.recent_positions
+                        .retain(|(_, t)| now.duration_since(*t).as_millis() < 100);
 
                     // Stop any existing inertia when actively dragging
                     self.pan_velocity = (0.0, 0.0);
@@ -721,7 +746,10 @@ impl ApplicationHandler for ChartApp {
                 }
 
                 let zoom_factor = 1.0 + scroll_amount * 0.1;
-                let screen_pt = ferrite_render::ScreenPoint::new(self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
+                let screen_pt = ferrite_render::ScreenPoint::new(
+                    self.mouse_pos.0 as f32,
+                    self.mouse_pos.1 as f32,
+                );
                 let world_before = self.render_context.scaler.screen_to_world(screen_pt);
 
                 let new_zoom = (self.zoom_level * zoom_factor).clamp(0.1, 50.0);
@@ -735,7 +763,11 @@ impl ApplicationHandler for ChartApp {
 
                 self.update_view();
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } if !egui_consumed => {
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } if !egui_consumed => {
                 match state {
                     ElementState::Pressed => {
                         self.is_dragging = true;
@@ -749,22 +781,25 @@ impl ApplicationHandler for ChartApp {
                         self.is_dragging = false;
 
                         let drag_dist = ((self.mouse_pos.0 - self.drag_start.0).powi(2)
-                                       + (self.mouse_pos.1 - self.drag_start.1).powi(2)).sqrt();
+                            + (self.mouse_pos.1 - self.drag_start.1).powi(2))
+                        .sqrt();
 
                         // Calculate velocity for inertia from recent positions
                         let mut inertia_applied = false;
                         if was_dragging && drag_dist >= 5.0 && self.recent_positions.len() >= 2 {
                             // Use positions from recent history to calculate velocity
-                            if let (Some(first), Some(last)) = (self.recent_positions.first(), self.recent_positions.last()) {
+                            if let (Some(first), Some(last)) =
+                                (self.recent_positions.first(), self.recent_positions.last())
+                            {
                                 let dt = last.1.duration_since(first.1).as_secs_f64();
                                 if dt > 0.001 {
                                     // Screen-space velocity
-                                    let vx = (last.0.0 - first.0.0) / dt;
-                                    let vy = (last.0.1 - first.0.1) / dt;
+                                    let vx = (last.0 .0 - first.0 .0) / dt;
+                                    let vy = (last.0 .1 - first.0 .1) / dt;
 
                                     // Convert to world-space velocity
-                                    let world_vx = -vx / self.render_context.scaler.scale_x() as f64;
-                                    let world_vy = vy / self.render_context.scaler.scale_y() as f64;
+                                    let world_vx = -vx / self.render_context.scaler.scale_x();
+                                    let world_vy = vy / self.render_context.scaler.scale_y();
 
                                     // Apply velocity with damping factor for natural feel
                                     self.pan_velocity = (world_vx * 0.5, world_vy * 0.5);
@@ -797,19 +832,25 @@ impl ApplicationHandler for ChartApp {
                                 // but different feature types
                                 let feature = if let Some(cell_idx) = sym.cell_index {
                                     // Look up in the specific cell the symbol came from
-                                    self.cells.get(cell_idx)
+                                    self.cells
+                                        .get(cell_idx)
                                         .and_then(|cell| cell.features.get(&sym.feature_id))
                                 } else {
                                     // Fallback: search all cells (old behavior)
-                                    self.cells.iter()
+                                    self.cells
+                                        .iter()
                                         .find_map(|cell| cell.features.get(&sym.feature_id))
                                 };
 
                                 let (feature_code, definition) = feature
                                     .map(|f| {
-                                        let code = f.feature_code.as_deref().unwrap_or(&sym.symbol_ref);
+                                        let code =
+                                            f.feature_code.as_deref().unwrap_or(&sym.symbol_ref);
                                         // Look up definition from FC
-                                        let def = self.fc.feature_types.get(code)
+                                        let def = self
+                                            .fc
+                                            .feature_types
+                                            .get(code)
                                             .and_then(|ft| ft.definition.clone());
                                         (code.to_string(), def)
                                     })
@@ -833,12 +874,19 @@ impl ApplicationHandler for ChartApp {
                                 renderer.ui_state.selected_feature = selected;
                             }
 
-                            info!("Click at ({:.4}, {:.4}): {} symbols found", world.x, world.y, nearby_count);
+                            info!(
+                                "Click at ({:.4}, {:.4}): {} symbols found",
+                                world.x, world.y, nearby_count
+                            );
                         }
                     }
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } if !egui_consumed => {
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if !egui_consumed => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.reset_pan_offset();
                 }
@@ -897,31 +945,34 @@ fn main() -> Result<()> {
     info!("Symbol cache initialized: {}", symbols_path.display());
 
     // Get default color profile from PC
-    let color_profile = pc.color_profiles.default_profile.as_ref()
+    let color_profile = pc
+        .color_profiles
+        .default_profile
+        .as_ref()
         .and_then(|name| pc.color_profiles.profiles.get(name))
         .or_else(|| pc.color_profiles.profiles.values().next())
         .cloned()
         .unwrap_or_else(|| {
             #[cfg(debug_assertions)]
             warn!("No color profile found in PC, using empty profile");
-            ferrite_portrayal_catalog::ColorProfile::new("default".to_string(), "Default".to_string())
+            ferrite_portrayal_catalog::ColorProfile::new(
+                "default".to_string(),
+                "Default".to_string(),
+            )
         });
     #[cfg(debug_assertions)]
-    info!("Using color profile: {} ({} colors)", color_profile.name, color_profile.colors.len());
-
-    let event_loop = EventLoop::new()
-        .context("Failed to create event loop")?;
-    event_loop.set_control_flow(ControlFlow::Poll); // Use Poll for smooth UI updates
-
-    let mut app = ChartApp::new(
-        symbol_cache,
-        color_profile,
-        fc,
-        pc,
+    info!(
+        "Using color profile: {} ({} colors)",
+        color_profile.name,
+        color_profile.colors.len()
     );
 
-    event_loop.run_app(&mut app)
-        .context("Event loop error")?;
+    let event_loop = EventLoop::new().context("Failed to create event loop")?;
+    event_loop.set_control_flow(ControlFlow::Poll); // Use Poll for smooth UI updates
+
+    let mut app = ChartApp::new(symbol_cache, color_profile, fc, pc);
+
+    event_loop.run_app(&mut app).context("Event loop error")?;
 
     Ok(())
 }
@@ -938,36 +989,50 @@ fn try_lua_portrayal(
     let rules_path = pc.root_path.join("Rules");
 
     if !rules_path.exists() {
-        return Err(anyhow::anyhow!("Rules directory not found: {}", rules_path.display()));
+        return Err(anyhow::anyhow!(
+            "Rules directory not found: {}",
+            rules_path.display()
+        ));
     }
 
     info!("Initializing Lua portrayal engine...");
 
     // Create portrayal engine
-    let mut engine = PortrayalEngine::new(&rules_path)
-        .context("Failed to create portrayal engine")?;
+    let mut engine =
+        PortrayalEngine::new(&rules_path).context("Failed to create portrayal engine")?;
 
     // Set type catalogue from FC
     let type_catalogue = TypeCatalogue::from_feature_catalogue(fc);
     engine.set_type_catalogue(type_catalogue);
-    info!("  Type catalogue loaded: {} feature types, {} attributes",
-          fc.feature_types.len(), fc.simple_attributes.len());
+    info!(
+        "  Type catalogue loaded: {} feature types, {} attributes",
+        fc.feature_types.len(),
+        fc.simple_attributes.len()
+    );
 
     // Initialize engine (load main.lua)
-    engine.initialize()
+    engine
+        .initialize()
         .context("Failed to initialize portrayal engine")?;
     info!("  Lua engine initialized");
 
     // Load context parameters from PC XML (dynamically, no hardcoding)
     let pc_context_params = pc.get_context_parameters();
     let context = LuaContextParameters::from_pc_context(pc_context_params);
-    info!("  Context parameters loaded from PC XML: {} parameters", pc_context_params.len());
+    info!(
+        "  Context parameters loaded from PC XML: {} parameters",
+        pc_context_params.len()
+    );
 
     let mut total_results = 0;
 
     // Process each cell separately to avoid feature ID collisions
     for (cell_index, cell) in cells.iter().enumerate() {
-        debug!("Processing cell {}: {}", cell_index, cell.file_path.display());
+        debug!(
+            "Processing cell {}: {}",
+            cell_index,
+            cell.file_path.display()
+        );
 
         // Create portrayal context for this cell
         let portrayal_context = PortrayalContext::from_cell(cell, context.clone());
@@ -977,7 +1042,11 @@ fn try_lua_portrayal(
         // Process cell through Lua
         match engine.process_cell(&cell_data_guard, context.clone()) {
             Ok(results) => {
-                debug!("  Cell {} produced {} portrayal results", cell_index, results.len());
+                debug!(
+                    "  Cell {} produced {} portrayal results",
+                    cell_index,
+                    results.len()
+                );
                 total_results += results.len();
 
                 // Convert THIS cell's Lua results using ONLY this cell's data
@@ -1006,9 +1075,7 @@ fn convert_lua_results_for_cell(
     use ferrite_lua::DrawingCommand;
 
     // Helper to lookup color from token (from PC colorProfile.xml)
-    let lookup_color = |token: &str| -> Color {
-        lookup_pc_color(pc, token)
-    };
+    let lookup_color = |token: &str| -> Color { lookup_pc_color(pc, token) };
 
     let mut area_count = 0;
     let mut area_rendered = 0;
@@ -1016,24 +1083,33 @@ fn convert_lua_results_for_cell(
     let mut point_count = 0;
 
     // Count total LandArea features in cell (before Lua processing)
-    let total_land_area_in_cell: usize = cell.features.values()
+    let total_land_area_in_cell: usize = cell
+        .features
+        .values()
         .filter(|f| f.feature_code.as_deref() == Some("LandArea"))
         .count();
-    let total_land_area_surface_in_cell: usize = cell.features.values()
-        .filter(|f| f.feature_code.as_deref() == Some("LandArea")
-                && f.primitive_type == SpatialPrimitiveType::Surface)
+    let total_land_area_surface_in_cell: usize = cell
+        .features
+        .values()
+        .filter(|f| {
+            f.feature_code.as_deref() == Some("LandArea")
+                && f.primitive_type == SpatialPrimitiveType::Surface
+        })
         .count();
 
     // Count all Surface-type features by feature code
-    let mut surface_feature_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut surface_feature_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for f in cell.features.values() {
         if f.primitive_type == SpatialPrimitiveType::Surface {
             let code = f.feature_code.as_deref().unwrap_or("UNKNOWN").to_string();
             *surface_feature_counts.entry(code).or_insert(0) += 1;
         }
     }
-    info!("Cell total: {} LandArea features ({} with Surface primitive)",
-          total_land_area_in_cell, total_land_area_surface_in_cell);
+    info!(
+        "Cell total: {} LandArea features ({} with Surface primitive)",
+        total_land_area_in_cell, total_land_area_surface_in_cell
+    );
     info!("All Surface features by type: {:?}", surface_feature_counts);
 
     // Log LandArea results from Lua (feature_id is numeric, lookup feature code)
@@ -1041,7 +1117,7 @@ fn convert_lua_results_for_cell(
     let mut land_area_surface_count = 0;
     let mut land_area_curve_count = 0;
     for r in results.iter() {
-        if let Some(fid) = r.feature_id.parse::<i64>().ok() {
+        if let Ok(fid) = r.feature_id.parse::<i64>() {
             if let Some(feature) = cell.features.get(&fid) {
                 if feature.feature_code.as_deref() == Some("LandArea") {
                     land_area_count += 1;
@@ -1049,17 +1125,27 @@ fn convert_lua_results_for_cell(
                     // Count by primitive type
                     match feature.primitive_type {
                         SpatialPrimitiveType::Surface => land_area_surface_count += 1,
-                        SpatialPrimitiveType::Curve | SpatialPrimitiveType::CompositeCurve => land_area_curve_count += 1,
+                        SpatialPrimitiveType::Curve | SpatialPrimitiveType::CompositeCurve => {
+                            land_area_curve_count += 1
+                        }
                         _ => {}
                     }
 
                     if land_area_count <= 5 {
                         // Log feature PrimitiveType and spatial associations
-                        let spas_types: Vec<_> = feature.spatial_associations.iter()
+                        let spas_types: Vec<_> = feature
+                            .spatial_associations
+                            .iter()
                             .map(|sa| format!("RCNM{}", sa.spatial_id.rcnm))
                             .collect();
-                        info!("LandArea[{}] id={} primitive={:?} spas={:?}: {} instructions",
-                              land_area_count, fid, feature.primitive_type, spas_types, r.instructions.len());
+                        info!(
+                            "LandArea[{}] id={} primitive={:?} spas={:?}: {} instructions",
+                            land_area_count,
+                            fid,
+                            feature.primitive_type,
+                            spas_types,
+                            r.instructions.len()
+                        );
                         for inst in &r.instructions {
                             for cmd in &inst.commands {
                                 info!("    cmd: {:?}", cmd);
@@ -1071,15 +1157,18 @@ fn convert_lua_results_for_cell(
         }
     }
     if land_area_count > 0 {
-        info!("Cell has {} LandArea results from Lua total ({} Surface, {} Curve)",
-              land_area_count, land_area_surface_count, land_area_curve_count);
+        info!(
+            "Cell has {} LandArea results from Lua total ({} Surface, {} Curve)",
+            land_area_count, land_area_surface_count, land_area_curve_count
+        );
     }
 
     for result in results {
         // Parse feature ID from the result (format: "type|id")
-        let feature_id: Option<i64> = result.feature_id
+        let feature_id: Option<i64> = result
+            .feature_id
             .split('|')
-            .last()
+            .next_back()
             .and_then(|s| s.parse().ok());
 
         // Get feature from THIS cell only (no collision with other cells)
@@ -1088,7 +1177,12 @@ fn convert_lua_results_for_cell(
         for instruction in &result.instructions {
             for cmd in &instruction.commands {
                 match cmd {
-                    DrawingCommand::PointInstruction { symbol_ref, rotation, scale, position } => {
+                    DrawingCommand::PointInstruction {
+                        symbol_ref,
+                        rotation,
+                        scale,
+                        position,
+                    } => {
                         point_count += 1;
 
                         // If explicit position is available (from AugmentedPoint), use it
@@ -1099,11 +1193,14 @@ fn convert_lua_results_for_cell(
                             let depth = feature.and_then(|f| {
                                 // Find the MultiPoint spatial association
                                 for spas in &f.spatial_associations {
-                                    if let Some(mp) = cell.multi_points.get(&spas.spatial_id.key()) {
+                                    if let Some(mp) = cell.multi_points.get(&spas.spatial_id.key())
+                                    {
                                         // Find the position with matching coordinates
                                         for coord in &mp.positions {
                                             // Use small epsilon for floating point comparison
-                                            if (coord.x - x).abs() < 1e-9 && (coord.y - y).abs() < 1e-9 {
+                                            if (coord.x - x).abs() < 1e-9
+                                                && (coord.y - y).abs() < 1e-9
+                                            {
                                                 return coord.z;
                                             }
                                         }
@@ -1112,24 +1209,22 @@ fn convert_lua_results_for_cell(
                                 None
                             });
 
-                            let mut point_inst = PointInstruction::new(
-                                symbol_ref.clone(),
-                                WorldPoint::new(*x, *y),
-                            )
-                            .with_rotation(*rotation)
-                            .with_scale(*scale)
-                            .with_priority(instruction.drawing_priority as i32)
-                            .with_feature_id(feature_id.unwrap_or(0))
-                            .with_cell_index(cell_index);
+                            let mut point_inst =
+                                PointInstruction::new(symbol_ref.clone(), WorldPoint::new(*x, *y))
+                                    .with_rotation(*rotation)
+                                    .with_scale(*scale)
+                                    .with_priority(instruction.drawing_priority)
+                                    .with_feature_id(feature_id.unwrap_or(0))
+                                    .with_cell_index(cell_index);
 
                             // Add depth for sounding decluttering (shallowest wins for safety)
                             if let Some(d) = depth {
                                 point_inst = point_inst.with_depth(d);
                             }
 
-                            context.add_instruction(
-                                ferrite_render::DrawingInstruction::Point(point_inst),
-                            );
+                            context.add_instruction(ferrite_render::DrawingInstruction::Point(
+                                point_inst,
+                            ));
                         } else if let Some(feature) = feature {
                             // Get coordinates from feature's spatial associations
                             for spas in &feature.spatial_associations {
@@ -1140,7 +1235,7 @@ fn convert_lua_results_for_cell(
                                     )
                                     .with_rotation(*rotation)
                                     .with_scale(*scale)
-                                    .with_priority(instruction.drawing_priority as i32)
+                                    .with_priority(instruction.drawing_priority)
                                     .with_feature_id(feature_id.unwrap_or(0))
                                     .with_cell_index(cell_index);
 
@@ -1154,7 +1249,10 @@ fn convert_lua_results_for_cell(
                     DrawingCommand::AugmentedPoint { .. } => {
                         // AugmentedPoint is handled during parsing, position is passed to PointInstruction
                     }
-                    DrawingCommand::LineInstruction { style_ref, simple_style } => {
+                    DrawingCommand::LineInstruction {
+                        style_ref,
+                        simple_style,
+                    } => {
                         line_count += 1;
                         // Determine line color and width from PC (no hardcoding)
                         let (color, width) = if let Some((w, token)) = simple_style {
@@ -1201,7 +1299,7 @@ fn convert_lua_results_for_cell(
                                     if points.len() >= 2 {
                                         let line_inst = LineInstruction::new(points)
                                             .with_style(LineStyle::solid(color, width))
-                                            .with_priority(instruction.drawing_priority as i32)
+                                            .with_priority(instruction.drawing_priority)
                                             .with_feature_id(feature_id.unwrap_or(0));
 
                                         context.add_instruction(
@@ -1212,7 +1310,10 @@ fn convert_lua_results_for_cell(
                             }
                         }
                     }
-                    DrawingCommand::AreaInstruction { fill_ref, color_fill } => {
+                    DrawingCommand::AreaInstruction {
+                        fill_ref,
+                        color_fill,
+                    } => {
                         area_count += 1;
 
                         // Log area assignments by feature type
@@ -1221,17 +1322,23 @@ fn convert_lua_results_for_cell(
                             .and_then(|f| f.feature_code.as_deref())
                             .unwrap_or("unknown");
                         if feature_code_str == "LandArea" {
-                            static LAND_LOG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                            static LAND_LOG: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
                             if LAND_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                                info!("LandArea area: color_fill={:?} fill_ref={:?} priority={}",
-                                      color_fill, fill_ref, instruction.drawing_priority);
+                                info!(
+                                    "LandArea area: color_fill={:?} fill_ref={:?} priority={}",
+                                    color_fill, fill_ref, instruction.drawing_priority
+                                );
                             }
                         }
                         if feature_code_str == "DepthArea" {
-                            static DEPTH_LOG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                            static DEPTH_LOG: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
                             if DEPTH_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                                info!("DepthArea area: color_fill={:?} fill_ref={:?} priority={}",
-                                      color_fill, fill_ref, instruction.drawing_priority);
+                                info!(
+                                    "DepthArea area: color_fill={:?} fill_ref={:?} priority={}",
+                                    color_fill, fill_ref, instruction.drawing_priority
+                                );
                             }
                         }
 
@@ -1245,9 +1352,9 @@ fn convert_lua_results_for_cell(
                                     ferrite_portrayal_catalog::AreaFillType::Color(c) => {
                                         lookup_color(&c.color_token)
                                     }
-                                    ferrite_portrayal_catalog::AreaFillType::Symbol(_) |
-                                    ferrite_portrayal_catalog::AreaFillType::Pattern(_) |
-                                    ferrite_portrayal_catalog::AreaFillType::Pixmap(_) => {
+                                    ferrite_portrayal_catalog::AreaFillType::Symbol(_)
+                                    | ferrite_portrayal_catalog::AreaFillType::Pattern(_)
+                                    | ferrite_portrayal_catalog::AreaFillType::Pixmap(_) => {
                                         lookup_color("DEPVS")
                                     }
                                     ferrite_portrayal_catalog::AreaFillType::Hatch(h) => {
@@ -1265,11 +1372,21 @@ fn convert_lua_results_for_cell(
                         if let Some(feature) = feature {
                             // Debug: track LandArea surface processing
                             let is_land_area = feature.feature_code.as_deref() == Some("LandArea");
-                            static LAND_DEBUG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                            let land_debug_idx = if is_land_area { LAND_DEBUG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) } else { 999 };
+                            static LAND_DEBUG: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            let land_debug_idx = if is_land_area {
+                                LAND_DEBUG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            } else {
+                                999
+                            };
 
                             if is_land_area && land_debug_idx < 5 {
-                                debug!("LandArea[{}] fid={:?} spas_count={}", land_debug_idx, feature_id, feature.spatial_associations.len());
+                                debug!(
+                                    "LandArea[{}] fid={:?} spas_count={}",
+                                    land_debug_idx,
+                                    feature_id,
+                                    feature.spatial_associations.len()
+                                );
                             }
 
                             for spas in &feature.spatial_associations {
@@ -1280,10 +1397,15 @@ fn convert_lua_results_for_cell(
 
                                 let surface_key = spas.spatial_id.key();
                                 if is_land_area && land_debug_idx < 5 {
-                                    debug!("  LandArea[{}] looking for surface key={}", land_debug_idx, surface_key);
-                                    debug!("  cell.surfaces has {} entries, keys sample: {:?}",
+                                    debug!(
+                                        "  LandArea[{}] looking for surface key={}",
+                                        land_debug_idx, surface_key
+                                    );
+                                    debug!(
+                                        "  cell.surfaces has {} entries, keys sample: {:?}",
                                         cell.surfaces.len(),
-                                        cell.surfaces.keys().take(5).collect::<Vec<_>>());
+                                        cell.surfaces.keys().take(5).collect::<Vec<_>>()
+                                    );
                                 }
 
                                 if let Some(surface) = cell.surfaces.get(&surface_key) {
@@ -1300,26 +1422,35 @@ fn convert_lua_results_for_cell(
                                             let positions = curve.all_positions();
                                             if oriented_curve.orientation {
                                                 for pos in positions {
-                                                    exterior_points.push(WorldPoint::new(pos.x, pos.y));
+                                                    exterior_points
+                                                        .push(WorldPoint::new(pos.x, pos.y));
                                                 }
                                             } else {
                                                 for pos in positions.into_iter().rev() {
-                                                    exterior_points.push(WorldPoint::new(pos.x, pos.y));
+                                                    exterior_points
+                                                        .push(WorldPoint::new(pos.x, pos.y));
                                                 }
                                             }
-                                        } else if let Some(composite) = cell.composite_curves.get(&curve_key) {
+                                        } else if let Some(composite) =
+                                            cell.composite_curves.get(&curve_key)
+                                        {
                                             for sub_curve in &composite.curves {
                                                 let sub_key = sub_curve.curve_id.key();
                                                 if let Some(curve) = cell.curves.get(&sub_key) {
                                                     let positions = curve.all_positions();
-                                                    let forward = oriented_curve.orientation == sub_curve.orientation;
+                                                    let forward = oriented_curve.orientation
+                                                        == sub_curve.orientation;
                                                     if forward {
                                                         for pos in positions {
-                                                            exterior_points.push(WorldPoint::new(pos.x, pos.y));
+                                                            exterior_points.push(WorldPoint::new(
+                                                                pos.x, pos.y,
+                                                            ));
                                                         }
                                                     } else {
                                                         for pos in positions.into_iter().rev() {
-                                                            exterior_points.push(WorldPoint::new(pos.x, pos.y));
+                                                            exterior_points.push(WorldPoint::new(
+                                                                pos.x, pos.y,
+                                                            ));
                                                         }
                                                     }
                                                 }
@@ -1329,7 +1460,8 @@ fn convert_lua_results_for_cell(
 
                                     // Remove duplicate consecutive points (curves share endpoints)
                                     // This prevents triangulation issues
-                                    let mut cleaned_points = Vec::with_capacity(exterior_points.len());
+                                    let mut cleaned_points =
+                                        Vec::with_capacity(exterior_points.len());
                                     for point in exterior_points {
                                         if cleaned_points.is_empty() {
                                             cleaned_points.push(point);
@@ -1361,9 +1493,10 @@ fn convert_lua_results_for_cell(
                                         // Adjust priority: LandArea should be on top of DepthArea
                                         // S-52 standard: land is always above water
                                         let adjusted_priority = if feature_code_str == "LandArea" {
-                                            (instruction.drawing_priority as i32).max(4) // Ensure land is above depth (priority 3)
+                                            instruction.drawing_priority.max(4)
+                                        // Ensure land is above depth (priority 3)
                                         } else {
-                                            instruction.drawing_priority as i32
+                                            instruction.drawing_priority
                                         };
                                         let area_inst = AreaInstruction::new(cleaned_points)
                                             .with_solid_fill(color)
@@ -1378,7 +1511,11 @@ fn convert_lua_results_for_cell(
                             }
                         }
                     }
-                    DrawingCommand::TextInstruction { text, font_size: _, color_token } => {
+                    DrawingCommand::TextInstruction {
+                        text,
+                        font_size: _,
+                        color_token,
+                    } => {
                         let _color = lookup_color(color_token);
                         debug!("Text instruction (not rendered yet): {}", text);
                     }
@@ -1411,18 +1548,16 @@ fn load_window_icon() -> Option<Icon> {
             // Parse ICO file to get RGBA data
             // ICO files have a directory structure, we need to extract the image
             match parse_ico_to_rgba(&data) {
-                Some((rgba, width, height)) => {
-                    match Icon::from_rgba(rgba, width, height) {
-                        Ok(icon) => {
-                            info!("Window icon loaded: {}x{}", width, height);
-                            Some(icon)
-                        }
-                        Err(e) => {
-                            warn!("Failed to create icon: {}", e);
-                            None
-                        }
+                Some((rgba, width, height)) => match Icon::from_rgba(rgba, width, height) {
+                    Ok(icon) => {
+                        info!("Window icon loaded: {}x{}", width, height);
+                        Some(icon)
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to create icon: {}", e);
+                        None
+                    }
+                },
                 None => {
                     warn!("Failed to parse ICO file");
                     None
@@ -1466,8 +1601,16 @@ fn parse_ico_to_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         }
 
         // Width and height (0 means 256)
-        let width = if data[entry_offset] == 0 { 256u32 } else { data[entry_offset] as u32 };
-        let height = if data[entry_offset + 1] == 0 { 256u32 } else { data[entry_offset + 1] as u32 };
+        let width = if data[entry_offset] == 0 {
+            256u32
+        } else {
+            data[entry_offset] as u32
+        };
+        let height = if data[entry_offset + 1] == 0 {
+            256u32
+        } else {
+            data[entry_offset + 1] as u32
+        };
         let size = u32::from_le_bytes([
             data[entry_offset + 8],
             data[entry_offset + 9],
@@ -1520,22 +1663,21 @@ fn parse_ico_to_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
             return None;
         }
 
-        let header_size = u32::from_le_bytes([
-            image_data[0], image_data[1], image_data[2], image_data[3]
-        ]);
+        let header_size =
+            u32::from_le_bytes([image_data[0], image_data[1], image_data[2], image_data[3]]);
 
         if header_size < 40 {
             return None;
         }
 
-        let dib_width = i32::from_le_bytes([
-            image_data[4], image_data[5], image_data[6], image_data[7]
-        ]) as u32;
+        let dib_width =
+            i32::from_le_bytes([image_data[4], image_data[5], image_data[6], image_data[7]]) as u32;
 
         // Height in DIB is doubled (includes mask)
-        let dib_height = i32::from_le_bytes([
-            image_data[8], image_data[9], image_data[10], image_data[11]
-        ]).unsigned_abs() / 2;
+        let dib_height =
+            i32::from_le_bytes([image_data[8], image_data[9], image_data[10], image_data[11]])
+                .unsigned_abs()
+                / 2;
 
         let bpp = u16::from_le_bytes([image_data[14], image_data[15]]);
 
@@ -1566,9 +1708,9 @@ fn parse_ico_to_rgba(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 
                 if src_px + 4 <= image_data.len() {
                     // BGRA -> RGBA
-                    rgba[dst_px] = image_data[src_px + 2];     // R
+                    rgba[dst_px] = image_data[src_px + 2]; // R
                     rgba[dst_px + 1] = image_data[src_px + 1]; // G
-                    rgba[dst_px + 2] = image_data[src_px];     // B
+                    rgba[dst_px + 2] = image_data[src_px]; // B
                     rgba[dst_px + 3] = image_data[src_px + 3]; // A
                 }
             }
@@ -1586,16 +1728,10 @@ fn init_logging(log_path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to create log directory: {}", log_path.display()))?;
 
     // File appender
-    let file_appender = RollingFileAppender::new(
-        Rotation::NEVER,
-        log_path,
-        "ferrite_debug.log",
-    );
+    let file_appender = RollingFileAppender::new(Rotation::NEVER, log_path, "ferrite_debug.log");
 
     // Console layer
-    let console_layer = fmt::layer()
-        .with_target(false)
-        .with_level(true);
+    let console_layer = fmt::layer().with_target(false).with_level(true);
 
     // File layer
     let file_layer = fmt::layer()
@@ -1615,7 +1751,10 @@ fn init_logging(log_path: &Path) -> Result<()> {
         .with(file_layer)
         .init();
 
-    info!("Logging initialized: {}/ferrite_debug.log", log_path.display());
+    info!(
+        "Logging initialized: {}/ferrite_debug.log",
+        log_path.display()
+    );
 
     Ok(())
 }
@@ -1722,9 +1861,9 @@ fn load_chart_data(path: &Path) -> Result<Vec<S101Cell>> {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().extension().map_or(false, |ext| ext == "000")
+            e.path().extension().is_some_and(|ext| ext == "000")
                 // Filter to specific file for testing
-                && e.path().file_name().map_or(false, |name| name == "101GB00GB302045.000")
+                && e.path().file_name().is_some_and(|name| name == "101GB00GB302045.000")
         })
         .map(|e| e.path().to_path_buf())
         .collect();
@@ -1781,9 +1920,9 @@ fn generate_default_instructions(
                         .with_priority(priority)
                         .with_feature_id(*key);
 
-                        context.add_instruction(
-                            ferrite_render::DrawingInstruction::Point(instruction),
-                        );
+                        context.add_instruction(ferrite_render::DrawingInstruction::Point(
+                            instruction,
+                        ));
                     }
                 }
             }
@@ -1803,9 +1942,9 @@ fn generate_default_instructions(
                                 .with_priority(priority)
                                 .with_feature_id(*key);
 
-                            context.add_instruction(
-                                ferrite_render::DrawingInstruction::Line(instruction),
-                            );
+                            context.add_instruction(ferrite_render::DrawingInstruction::Line(
+                                instruction,
+                            ));
                         }
                     }
                 }
@@ -1839,9 +1978,11 @@ fn generate_default_instructions(
                             // Also check composite curves
                             else if let Some(composite) = cell.composite_curves.get(&curve_key) {
                                 for sub_curve in &composite.curves {
-                                    if let Some(curve) = cell.curves.get(&sub_curve.curve_id.key()) {
+                                    if let Some(curve) = cell.curves.get(&sub_curve.curve_id.key())
+                                    {
                                         let positions = curve.all_positions();
-                                        let forward = oriented_curve.orientation == sub_curve.orientation;
+                                        let forward =
+                                            oriented_curve.orientation == sub_curve.orientation;
                                         if forward {
                                             for pos in positions {
                                                 exterior_points.push(WorldPoint::new(pos.x, pos.y));
@@ -1890,9 +2031,9 @@ fn generate_default_instructions(
                                 .with_priority(priority)
                                 .with_feature_id(*key);
 
-                            context.add_instruction(
-                                ferrite_render::DrawingInstruction::Area(instruction),
-                            );
+                            context.add_instruction(ferrite_render::DrawingInstruction::Area(
+                                instruction,
+                            ));
                         }
                     }
                 }
@@ -1911,9 +2052,9 @@ fn get_feature_color_token(feature_code: &str) -> (&'static str, i32) {
         "BuiltUpArea" => ("CHBRN", 2),
 
         // Depth features - use PC tokens
-        "DepthArea" => ("DEPVS", 1),        // Very shallow water
-        "DepthContour" => ("DEPCN", 10),    // Depth contour
-        "DredgedArea" => ("DEPMD", 3),      // Medium depth
+        "DepthArea" => ("DEPVS", 1),     // Very shallow water
+        "DepthContour" => ("DEPCN", 10), // Depth contour
+        "DredgedArea" => ("DEPMD", 3),   // Medium depth
 
         // Coastline
         "Coastline" => ("CSTLN", 15),
@@ -1942,7 +2083,10 @@ fn get_feature_color_token(feature_code: &str) -> (&'static str, i32) {
 
 /// Look up color from PC color profile by token
 fn lookup_pc_color(pc: &PortrayalCatalogue, token: &str) -> Color {
-    let profile = pc.color_profiles.default_profile.as_ref()
+    let profile = pc
+        .color_profiles
+        .default_profile
+        .as_ref()
         .and_then(|name| pc.color_profiles.profiles.get(name))
         .or_else(|| pc.color_profiles.profiles.values().next());
 

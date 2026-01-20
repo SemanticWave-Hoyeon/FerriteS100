@@ -53,15 +53,11 @@ impl Leader {
         let application_indicator = data[9] as char;
         let field_control_length = parse_numeric(&data[10..12])? as u8;
         let base_address = parse_numeric(&data[12..17])?;
-        let extended_charset = [
-            data[17] as char,
-            data[18] as char,
-            data[19] as char,
-        ];
-        let size_field_length = (data[20] - b'0') as u8;
-        let size_field_position = (data[21] - b'0') as u8;
+        let extended_charset = [data[17] as char, data[18] as char, data[19] as char];
+        let size_field_length = data[20] - b'0';
+        let size_field_position = data[21] - b'0';
         let reserved = data[22] as char;
-        let size_field_tag = (data[23] - b'0') as u8;
+        let size_field_tag = data[23] - b'0';
 
         Ok(Leader {
             record_length,

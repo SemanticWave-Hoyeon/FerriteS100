@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    Color, DrawingInstruction, FeatureInstructions, GeoBounds, Scaler, Viewport, ViewingGroup,
+    Color, DrawingInstruction, FeatureInstructions, GeoBounds, Scaler, ViewingGroup, Viewport,
 };
 
 /// Display settings
@@ -163,7 +163,7 @@ impl RenderContext {
         if let Some(feature_id) = instruction.feature_id() {
             self.feature_instructions
                 .entry(feature_id)
-                .or_insert_with(FeatureInstructions::new)
+                .or_default()
                 .instructions
                 .push(instruction.clone());
         }

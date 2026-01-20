@@ -83,13 +83,7 @@ impl EguiIntegration {
             None,
         );
 
-        let renderer = egui_wgpu::Renderer::new(
-            device,
-            output_format,
-            None,
-            msaa_samples,
-            false,
-        );
+        let renderer = egui_wgpu::Renderer::new(device, output_format, None, msaa_samples, false);
 
         EguiIntegration {
             ctx,
@@ -113,7 +107,8 @@ impl EguiIntegration {
     /// End egui frame and get render output
     pub fn end_frame(&mut self, window: &Window) -> egui::FullOutput {
         let output = self.ctx.end_pass();
-        self.state.handle_platform_output(window, output.platform_output.clone());
+        self.state
+            .handle_platform_output(window, output.platform_output.clone());
         output
     }
 
@@ -138,7 +133,9 @@ impl EguiIntegration {
         }
 
         // Tessellate shapes
-        let clipped_primitives = self.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let clipped_primitives = self
+            .ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
 
         // Update buffers
         self.renderer.update_buffers(
@@ -175,11 +172,11 @@ impl EguiIntegration {
             // 1. The render pass is used immediately and dropped at the end of this scope
             // 2. The encoder (which render_pass borrows from) outlives this scope
             // 3. No references to the render pass escape this block
-            let mut render_pass: wgpu::RenderPass<'static> = unsafe {
-                std::mem::transmute(render_pass)
-            };
+            let mut render_pass: wgpu::RenderPass<'static> =
+                unsafe { std::mem::transmute(render_pass) };
 
-            self.renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+            self.renderer
+                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
 
             // render_pass is dropped here, before encoder is used again
         }
@@ -201,11 +198,9 @@ impl EguiIntegration {
                         ui.close_menu();
                     }
                     // Only show Clear All if charts are loaded
-                    if ui_state.chart_count > 0 {
-                        if ui.button("Clear All Charts").clicked() {
-                            ui_state.clear_charts_requested = true;
-                            ui.close_menu();
-                        }
+                    if ui_state.chart_count > 0 && ui.button("Clear All Charts").clicked() {
+                        ui_state.clear_charts_requested = true;
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("Save Screenshot...").clicked() {
@@ -244,16 +239,27 @@ impl EguiIntegration {
         // Toolbar
         egui::TopBottomPanel::top("toolbar").show(&self.ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open").on_hover_text("Open Chart(s) - Can select multiple files").clicked() {
+                if ui
+                    .button("Open")
+                    .on_hover_text("Open Chart(s) - Can select multiple files")
+                    .clicked()
+                {
                     ui_state.open_file_requested = true;
                 }
                 // Only show Clear button if charts are loaded
-                if ui_state.chart_count > 0 {
-                    if ui.button("Clear").on_hover_text("Clear All Charts").clicked() {
-                        ui_state.clear_charts_requested = true;
-                    }
+                if ui_state.chart_count > 0
+                    && ui
+                        .button("Clear")
+                        .on_hover_text("Clear All Charts")
+                        .clicked()
+                {
+                    ui_state.clear_charts_requested = true;
                 }
-                if ui.button("Screenshot").on_hover_text("Save Screenshot (Ctrl+S)").clicked() {
+                if ui
+                    .button("Screenshot")
+                    .on_hover_text("Save Screenshot (Ctrl+S)")
+                    .clicked()
+                {
                     ui_state.screenshot_requested = true;
                 }
                 ui.separator();
@@ -278,7 +284,10 @@ impl EguiIntegration {
                 let lon_dir = if lon >= 0.0 { "E" } else { "W" };
                 ui.label(format!(
                     "LAT: {:.6}{} | LON: {:.6}{}",
-                    lat.abs(), lat_dir, lon.abs(), lon_dir
+                    lat.abs(),
+                    lat_dir,
+                    lon.abs(),
+                    lon_dir
                 ));
 
                 ui.separator();
@@ -290,7 +299,10 @@ impl EguiIntegration {
 
                 // Feature count and chart info
                 if ui_state.chart_count > 0 {
-                    ui.label(format!("Charts: {} | Features: {}", ui_state.chart_count, ui_state.feature_count));
+                    ui.label(format!(
+                        "Charts: {} | Features: {}",
+                        ui_state.chart_count, ui_state.feature_count
+                    ));
 
                     // Loaded chart name(s)
                     if let Some(ref chart) = ui_state.loaded_chart {
@@ -318,14 +330,22 @@ impl EguiIntegration {
                     // Feature type - prominent display
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Type:").size(14.0).strong());
-                        ui.label(egui::RichText::new(&feature.feature_type).size(14.0).color(egui::Color32::from_rgb(100, 149, 237)));
+                        ui.label(
+                            egui::RichText::new(&feature.feature_type)
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(100, 149, 237)),
+                        );
                     });
 
                     // Symbol name (if available)
                     if let Some(ref symbol) = feature.symbol_name {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Symbol:").size(13.0).strong());
-                            ui.label(egui::RichText::new(symbol).size(13.0).color(egui::Color32::from_rgb(144, 238, 144)));
+                            ui.label(
+                                egui::RichText::new(symbol)
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(144, 238, 144)),
+                            );
                         });
                     }
 
@@ -337,9 +357,11 @@ impl EguiIntegration {
                             .corner_radius(4.0)
                             .inner_margin(egui::Margin::symmetric(8, 6))
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(definition)
-                                    .size(12.5)
-                                    .color(egui::Color32::from_rgb(200, 210, 225)));
+                                ui.label(
+                                    egui::RichText::new(definition)
+                                        .size(12.5)
+                                        .color(egui::Color32::from_rgb(200, 210, 225)),
+                                );
                             });
                     }
 
@@ -365,8 +387,14 @@ impl EguiIntegration {
                         let (lon, lat) = feature.world_pos;
                         let lat_dir = if lat >= 0.0 { "N" } else { "S" };
                         let lon_dir = if lon >= 0.0 { "E" } else { "W" };
-                        ui.label(egui::RichText::new(format!("  LAT: {:.6}° {}", lat.abs(), lat_dir)).size(12.0));
-                        ui.label(egui::RichText::new(format!("  LON: {:.6}° {}", lon.abs(), lon_dir)).size(12.0));
+                        ui.label(
+                            egui::RichText::new(format!("  LAT: {:.6}° {}", lat.abs(), lat_dir))
+                                .size(12.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("  LON: {:.6}° {}", lon.abs(), lon_dir))
+                                .size(12.0),
+                        );
                     });
 
                     ui.add_space(8.0);
@@ -377,14 +405,22 @@ impl EguiIntegration {
                     ui.label(egui::RichText::new("Attributes").size(14.0).strong());
 
                     if feature.attributes.is_empty() {
-                        ui.label(egui::RichText::new("  (No attributes)").size(12.0).italics());
+                        ui.label(
+                            egui::RichText::new("  (No attributes)")
+                                .size(12.0)
+                                .italics(),
+                        );
                     } else {
                         egui::ScrollArea::vertical()
                             .max_height(300.0)
                             .show(ui, |ui| {
                                 for (key, value) in &feature.attributes {
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new(format!("{}:", key)).size(12.0).strong());
+                                        ui.label(
+                                            egui::RichText::new(format!("{}:", key))
+                                                .size(12.0)
+                                                .strong(),
+                                        );
                                         ui.label(egui::RichText::new(value).size(12.0));
                                     });
                                 }
@@ -394,7 +430,11 @@ impl EguiIntegration {
                     // No feature selected - show help
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
-                        ui.label(egui::RichText::new("Click on a feature to see details").size(13.0).italics());
+                        ui.label(
+                            egui::RichText::new("Click on a feature to see details")
+                                .size(13.0)
+                                .italics(),
+                        );
                     });
 
                     ui.add_space(30.0);

@@ -1,7 +1,7 @@
 //! Color profile definitions
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// sRGB color value
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -111,6 +111,8 @@ impl ColorProfiles {
 
     /// Get color from any profile
     pub fn get_color(&self, profile_id: &str, token: &str) -> Option<&ColorDefinition> {
-        self.profiles.get(profile_id).and_then(|p| p.get_color(token))
+        self.profiles
+            .get(profile_id)
+            .and_then(|p| p.get_color(token))
     }
 }

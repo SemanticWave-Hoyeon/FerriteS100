@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::{DDR, DR, Leader, Iso8211Error, Result};
+use crate::{Iso8211Error, Leader, Result, DDR, DR};
 
 /// ISO 8211 file parser
 pub struct Iso8211Parser {

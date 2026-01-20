@@ -1,7 +1,7 @@
 //! Information type definitions
 
-use serde::{Deserialize, Serialize};
 use crate::{AttributeBinding, Multiplicity, RoleType};
+use serde::{Deserialize, Serialize};
 
 /// Information type definition
 #[derive(Debug, Clone, Serialize, Deserialize)]

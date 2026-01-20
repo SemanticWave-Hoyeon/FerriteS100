@@ -35,14 +35,14 @@
 //!
 //! - **Output/debug**: HostPortrayalEmit, HostDebuggerEntry, HostGetContextParameter
 
+mod context;
 mod error;
-mod session;
 mod host;
 mod instruction;
-mod context;
+mod session;
 
+pub use context::*;
 pub use error::*;
-pub use session::*;
 pub use host::*;
 pub use instruction::*;
-pub use context::*;
+pub use session::*;

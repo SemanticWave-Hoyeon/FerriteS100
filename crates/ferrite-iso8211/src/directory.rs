@@ -3,7 +3,7 @@
 //! The directory follows the leader and contains entries
 //! describing each field in the record.
 
-use crate::{Leader, Iso8211Error, Result};
+use crate::{Iso8211Error, Leader, Result};
 
 /// Directory entry for a single field
 #[derive(Debug, Clone)]
@@ -35,7 +35,11 @@ impl DirectoryEntry {
         let length = parse_numeric(&data[tag_size..tag_size + len_size])?;
         let position = parse_numeric(&data[tag_size + len_size..total_size])?;
 
-        Ok(DirectoryEntry { tag, length, position })
+        Ok(DirectoryEntry {
+            tag,
+            length,
+            position,
+        })
     }
 }
 

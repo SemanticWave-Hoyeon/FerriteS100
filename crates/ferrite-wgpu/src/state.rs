@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use winit::window::Window;
 
-use crate::{Result, WgpuError, ViewUniforms};
+use crate::{Result, ViewUniforms, WgpuError};
 
 /// MSAA sample count for antialiasing
 pub const MSAA_SAMPLE_COUNT: u32 = 4;
@@ -103,7 +103,10 @@ impl GpuState {
     }
 
     /// Create MSAA texture and view
-    fn create_msaa_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> (wgpu::Texture, wgpu::TextureView) {
+    fn create_msaa_texture(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("msaa-texture"),
             size: wgpu::Extent3d {
@@ -147,36 +150,44 @@ impl GpuState {
     /// Create a uniform buffer
     pub fn create_uniform_buffer<T: bytemuck::Pod>(&self, data: &T, label: &str) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(&[*data]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[*data]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
     }
 
     /// Create a vertex buffer
-    pub fn create_vertex_buffer<T: bytemuck::Pod>(&self, vertices: &[T], label: &str) -> wgpu::Buffer {
+    pub fn create_vertex_buffer<T: bytemuck::Pod>(
+        &self,
+        vertices: &[T],
+        label: &str,
+    ) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
     }
 
     /// Create an index buffer
     pub fn create_index_buffer(&self, indices: &[u32], label: &str) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            })
     }
 
     /// Update view uniforms
     pub fn update_view_uniforms(&self, buffer: &wgpu::Buffer, uniforms: &ViewUniforms) {
-        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[*uniforms]));
+        self.queue
+            .write_buffer(buffer, 0, bytemuck::cast_slice(&[*uniforms]));
     }
 
     /// Get surface format

@@ -10,8 +10,8 @@
 //! </af:symbolFill>
 //! ```
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// 2D Vector point
 #[derive(Debug, Clone, Default)]
@@ -32,8 +32,8 @@ pub struct ColorFill {
 pub struct SymbolFill {
     pub area_crs: String,
     pub symbol_ref: String,
-    pub v1: VectorPoint,  // First vector for tiling
-    pub v2: VectorPoint,  // Second vector for tiling
+    pub v1: VectorPoint, // First vector for tiling
+    pub v2: VectorPoint, // Second vector for tiling
     pub clip_symbols: bool,
 }
 
@@ -94,7 +94,13 @@ impl AreaFill {
     }
 
     /// Create a symbol fill from XML data
-    pub fn symbol(id: String, symbol_ref: String, area_crs: String, v1: VectorPoint, v2: VectorPoint) -> Self {
+    pub fn symbol(
+        id: String,
+        symbol_ref: String,
+        area_crs: String,
+        v1: VectorPoint,
+        v2: VectorPoint,
+    ) -> Self {
         AreaFill {
             id,
             fill_type: AreaFillType::Symbol(SymbolFill {
