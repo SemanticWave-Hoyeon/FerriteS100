@@ -533,19 +533,23 @@ impl FeatureInstructions {
     }
 
     pub fn add_point(&mut self, instruction: PointInstruction) {
-        self.instructions.push(DrawingInstruction::Point(instruction));
+        self.instructions
+            .push(DrawingInstruction::Point(instruction));
     }
 
     pub fn add_line(&mut self, instruction: LineInstruction) {
-        self.instructions.push(DrawingInstruction::Line(instruction));
+        self.instructions
+            .push(DrawingInstruction::Line(instruction));
     }
 
     pub fn add_area(&mut self, instruction: AreaInstruction) {
-        self.instructions.push(DrawingInstruction::Area(instruction));
+        self.instructions
+            .push(DrawingInstruction::Area(instruction));
     }
 
     pub fn add_text(&mut self, instruction: TextInstruction) {
-        self.instructions.push(DrawingInstruction::Text(instruction));
+        self.instructions
+            .push(DrawingInstruction::Text(instruction));
     }
 
     pub fn is_empty(&self) -> bool {

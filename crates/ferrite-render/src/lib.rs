@@ -7,14 +7,14 @@
 //!
 //! Based on S-100 standard rendering architecture, adapted for Rust/wgpu.
 
-mod error;
 mod color;
+mod context;
+mod error;
 mod instruction;
 mod scaler;
-mod context;
 
-pub use error::*;
 pub use color::*;
+pub use context::*;
+pub use error::*;
 pub use instruction::*;
 pub use scaler::*;
-pub use context::*;

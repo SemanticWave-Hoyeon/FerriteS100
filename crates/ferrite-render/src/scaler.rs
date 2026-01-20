@@ -20,7 +20,12 @@ pub struct GeoBounds {
 impl GeoBounds {
     #[inline]
     pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
-        GeoBounds { min_x, min_y, max_x, max_y }
+        GeoBounds {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
     }
 
     #[inline]
@@ -90,12 +95,22 @@ pub struct Viewport {
 impl Viewport {
     #[inline]
     pub fn new(width: f32, height: f32) -> Self {
-        Viewport { x: 0.0, y: 0.0, width, height }
+        Viewport {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        }
     }
 
     #[inline]
     pub fn with_origin(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Viewport { x, y, width, height }
+        Viewport {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     #[inline]
@@ -144,7 +159,7 @@ impl Scaler {
             offset_x: 0.0,
             offset_y: 0.0,
             display_scale: 1.0,
-            min_scale: 100.0,        // 1:100 (very zoomed in)
+            min_scale: 100.0,         // 1:100 (very zoomed in)
             max_scale: 100_000_000.0, // 1:100M (very zoomed out)
         };
         scaler.update_transform();
@@ -228,8 +243,10 @@ impl Scaler {
         let rendered_width = geo_width * scale;
         let rendered_height = geo_height * scale;
 
-        self.offset_x = (self.viewport.width as f64 - rendered_width) / 2.0 + self.viewport.x as f64;
-        self.offset_y = (self.viewport.height as f64 - rendered_height) / 2.0 + self.viewport.y as f64;
+        self.offset_x =
+            (self.viewport.width as f64 - rendered_width) / 2.0 + self.viewport.x as f64;
+        self.offset_y =
+            (self.viewport.height as f64 - rendered_height) / 2.0 + self.viewport.y as f64;
 
         // Calculate display scale (approximate)
         // At equator: 1 degree ≈ 111 km

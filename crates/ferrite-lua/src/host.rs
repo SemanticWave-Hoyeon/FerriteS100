@@ -167,7 +167,7 @@ pub struct AttributeBinding {
 pub struct SimpleAttributeInfo {
     pub code: String,
     pub alias: Option<String>,
-    pub value_type: String,        // "text", "enumeration", "real", "integer", "boolean"
+    pub value_type: String, // "text", "enumeration", "real", "integer", "boolean"
     pub listed_values: Vec<(i32, String, String)>, // (value, label, definition)
 }
 
@@ -252,7 +252,13 @@ impl TypeCatalogue {
             let listed_values: Vec<(i32, String, String)> = sa
                 .listed_values
                 .iter()
-                .map(|lv| (lv.code as i32, lv.label.clone(), lv.definition.clone().unwrap_or_default()))
+                .map(|lv| {
+                    (
+                        lv.code as i32,
+                        lv.label.clone(),
+                        lv.definition.clone().unwrap_or_default(),
+                    )
+                })
                 .collect();
 
             catalogue.simple_attribute_info.insert(
@@ -281,10 +287,7 @@ impl TypeCatalogue {
             for binding in &ca.sub_attributes {
                 let lower = binding.multiplicity.lower;
                 let upper = binding.multiplicity.upper;
-                sub_attribute_bindings.insert(
-                    binding.attribute_code.clone(),
-                    (lower, upper),
-                );
+                sub_attribute_bindings.insert(binding.attribute_code.clone(), (lower, upper));
             }
 
             catalogue.complex_attribute_info.insert(
@@ -305,18 +308,30 @@ impl TypeCatalogue {
         catalogue.complex_attribute_codes.sort();
 
         // Debug: verify featureName is in complex attributes
-        if catalogue.complex_attribute_codes.contains(&"featureName".to_string()) {
+        if catalogue
+            .complex_attribute_codes
+            .contains(&"featureName".to_string())
+        {
             tracing::debug!("TypeCatalogue: featureName is in complex_attribute_codes");
-        } else if catalogue.simple_attribute_codes.contains(&"featureName".to_string()) {
+        } else if catalogue
+            .simple_attribute_codes
+            .contains(&"featureName".to_string())
+        {
             tracing::warn!("TypeCatalogue: featureName is INCORRECTLY in simple_attribute_codes!");
         } else {
             tracing::warn!("TypeCatalogue: featureName is NOT in any attribute codes!");
         }
 
         // Debug: verify colour is in simple attributes (used by LightSectored)
-        if catalogue.simple_attribute_codes.contains(&"colour".to_string()) {
+        if catalogue
+            .simple_attribute_codes
+            .contains(&"colour".to_string())
+        {
             tracing::warn!("TypeCatalogue: colour is in simple_attribute_codes (correct)");
-        } else if catalogue.complex_attribute_codes.contains(&"colour".to_string()) {
+        } else if catalogue
+            .complex_attribute_codes
+            .contains(&"colour".to_string())
+        {
             tracing::error!("TypeCatalogue: colour is INCORRECTLY in complex_attribute_codes!");
         } else {
             tracing::error!("TypeCatalogue: colour is NOT in any attribute codes!");
@@ -328,17 +343,27 @@ impl TypeCatalogue {
                 "TypeCatalogue: lightSector has sub_attributes: {:?}",
                 light_sector_info.sub_attributes
             );
-            if light_sector_info.sub_attributes.contains(&"colour".to_string()) {
-                tracing::warn!("TypeCatalogue: lightSector contains colour as sub-attribute (correct)");
+            if light_sector_info
+                .sub_attributes
+                .contains(&"colour".to_string())
+            {
+                tracing::warn!(
+                    "TypeCatalogue: lightSector contains colour as sub-attribute (correct)"
+                );
             } else {
-                tracing::error!("TypeCatalogue: lightSector does NOT contain colour as sub-attribute!");
+                tracing::error!(
+                    "TypeCatalogue: lightSector does NOT contain colour as sub-attribute!"
+                );
             }
         } else {
             tracing::error!("TypeCatalogue: lightSector not found in complex_attribute_info!");
         }
 
         // Debug: check sectorLimit is in complex attributes
-        if catalogue.complex_attribute_codes.contains(&"sectorLimit".to_string()) {
+        if catalogue
+            .complex_attribute_codes
+            .contains(&"sectorLimit".to_string())
+        {
             tracing::warn!("TypeCatalogue: sectorLimit is in complex_attribute_codes (correct)");
             if let Some(sector_limit_info) = catalogue.complex_attribute_info.get("sectorLimit") {
                 tracing::warn!(
@@ -363,8 +388,10 @@ pub struct HostFunctions {
     /// Spatial data cache
     spatials: Arc<RwLock<HashMap<i64, SpatialInfo>>>,
     /// Feature associations (feature_id → [(target_id, assoc_code, role_code)])
+    #[allow(clippy::type_complexity)]
     feature_associations: Arc<RwLock<HashMap<i64, Vec<(i64, String, String)>>>>,
     /// Information associations (feature_id → [(info_id, assoc_code, role_code)])
+    #[allow(clippy::type_complexity)]
     information_associations: Arc<RwLock<HashMap<i64, Vec<(i64, String, String)>>>>,
     /// Spatial to features reverse mapping
     spatial_to_features: Arc<RwLock<HashMap<i64, Vec<i64>>>>,
@@ -470,7 +497,13 @@ impl HostFunctions {
                     (
                         *k,
                         v.iter()
-                            .map(|fa| (fa.target_id, fa.association_code.clone(), fa.role_code.clone()))
+                            .map(|fa| {
+                                (
+                                    fa.target_id,
+                                    fa.association_code.clone(),
+                                    fa.role_code.clone(),
+                                )
+                            })
                             .collect(),
                     )
                 })
@@ -485,7 +518,13 @@ impl HostFunctions {
                     (
                         *k,
                         v.iter()
-                            .map(|ia| (ia.info_id, ia.association_code.clone(), ia.role_code.clone()))
+                            .map(|ia| {
+                                (
+                                    ia.info_id,
+                                    ia.association_code.clone(),
+                                    ia.role_code.clone(),
+                                )
+                            })
                             .collect(),
                     )
                 })
@@ -698,7 +737,11 @@ impl HostFunctions {
                         .and_then(|f| {
                             f.get(&feature_id).map(|fi| {
                                 // Navigate to the target complex attribute using path
-                                navigate_and_count_complex(&fi.complex_attributes, &path_str, &attr_code)
+                                navigate_and_count_complex(
+                                    &fi.complex_attributes,
+                                    &path_str,
+                                    &attr_code,
+                                )
                             })
                         })
                         .unwrap_or(0);
@@ -742,7 +785,9 @@ impl HostFunctions {
                     if attr_code.contains("sector") || attr_code.contains("Sector") {
                         tracing::error!(
                             "RUST HostGetSimpleAttribute: attr='{}', container={}, path='{}'",
-                            attr_code, container_id, path_str
+                            attr_code,
+                            container_id,
+                            path_str
                         );
                     }
 
@@ -752,7 +797,8 @@ impl HostFunctions {
                             let feature_exists = features_guard.get(&container_id).is_some();
                             tracing::error!(
                                 "RUST HostGetSimpleAttribute: feature {} exists={}",
-                                container_id, feature_exists
+                                container_id,
+                                feature_exists
                             );
                         }
                         if let Some(fi) = features_guard.get(&container_id) {
@@ -878,7 +924,9 @@ impl HostFunctions {
                     if let Some(feature) = features.get(&feature_id) {
                         // Filter out invalid spatial refs (RCNM=0 -> None type)
                         // These cause Lua errors because SpatialType["None"] doesn't exist
-                        let valid_refs: Vec<_> = feature.spatial_refs.iter()
+                        let valid_refs: Vec<_> = feature
+                            .spatial_refs
+                            .iter()
                             .filter(|r| !matches!(r.spatial_type, PrimitiveType::None))
                             .collect();
 
@@ -917,10 +965,12 @@ impl HostFunctions {
                             };
 
                             // Create spatial ID in "Type|RCID" format like S-100 standard
-                            let spatial_id_str = format!("{}|{}", spatial_type_name, spatial_ref.spatial_id);
+                            let spatial_id_str =
+                                format!("{}|{}", spatial_type_name, spatial_ref.spatial_id);
 
                             // Call Lua's CreateSpatialAssociation function
-                            let create_fn: mlua::Function = lua.globals().get("CreateSpatialAssociation")?;
+                            let create_fn: mlua::Function =
+                                lua.globals().get("CreateSpatialAssociation")?;
                             let sa: Value = create_fn.call((
                                 spatial_type_name,
                                 spatial_id_str,
@@ -959,10 +1009,8 @@ impl HostFunctions {
                         if let Some(feature_assocs) = assocs.get(&feature_id) {
                             let mut idx = 1;
                             for (target_id, ac, rc) in feature_assocs {
-                                let matches = assoc_filter
-                                    .as_ref()
-                                    .map_or(true, |f| f == ac)
-                                    && role_filter.as_ref().map_or(true, |f| f == rc);
+                                let matches = assoc_filter.as_ref().is_none_or(|f| f == ac)
+                                    && role_filter.as_ref().is_none_or(|f| f == rc);
 
                                 if matches {
                                     table.set(idx, *target_id)?;
@@ -998,10 +1046,8 @@ impl HostFunctions {
                         if let Some(info_assocs) = assocs.get(&feature_id) {
                             let mut idx = 1;
                             for (info_id, ac, rc) in info_assocs {
-                                let matches = assoc_filter
-                                    .as_ref()
-                                    .map_or(true, |f| f == ac)
-                                    && role_filter.as_ref().map_or(true, |f| f == rc);
+                                let matches = assoc_filter.as_ref().is_none_or(|f| f == ac)
+                                    && role_filter.as_ref().is_none_or(|f| f == rc);
 
                                 if matches {
                                     table.set(idx, *info_id)?;
@@ -1116,8 +1162,9 @@ impl HostFunctions {
                         .read()
                         .ok()
                         .and_then(|i| {
-                            i.get(&info_id)
-                                .and_then(|ii| ii.complex_attributes.get(&attr_code).map(|v| v.len()))
+                            i.get(&info_id).and_then(|ii| {
+                                ii.complex_attributes.get(&attr_code).map(|v| v.len())
+                            })
                         })
                         .unwrap_or(0);
                     Ok(count as i64)
@@ -1154,7 +1201,8 @@ impl HostFunctions {
                             "Point" => {
                                 // CreatePoint(x, y, z) - parameters as strings
                                 if let Some((x, y)) = spatial.coordinates.first() {
-                                    let create_fn: mlua::Function = lua.globals().get("CreatePoint")?;
+                                    let create_fn: mlua::Function =
+                                        lua.globals().get("CreatePoint")?;
                                     let point: Value = create_fn.call((
                                         format!("{:.7}", x),
                                         format!("{:.7}", y),
@@ -1166,15 +1214,19 @@ impl HostFunctions {
                             "MultiPoint" => {
                                 // CreateMultiPoint(points) - array of Point objects with Z for soundings
                                 // Reference: S-100 standard Sounding uses ScaledZ for depth values
-                                let create_point_fn: mlua::Function = lua.globals().get("CreatePoint")?;
-                                let create_fn: mlua::Function = lua.globals().get("CreateMultiPoint")?;
+                                let create_point_fn: mlua::Function =
+                                    lua.globals().get("CreatePoint")?;
+                                let create_fn: mlua::Function =
+                                    lua.globals().get("CreateMultiPoint")?;
 
                                 let points = lua.create_table()?;
                                 for (i, (x, y)) in spatial.coordinates.iter().enumerate() {
                                     // Get Z coordinate (depth) if available
                                     let z_value: Value = if i < spatial.z_coordinates.len() {
                                         match spatial.z_coordinates[i] {
-                                            Some(z) => Value::String(lua.create_string(&format!("{:.7}", z))?),
+                                            Some(z) => Value::String(
+                                                lua.create_string(format!("{:.7}", z))?,
+                                            ),
                                             None => Value::Nil,
                                         }
                                     } else {
@@ -1198,7 +1250,8 @@ impl HostFunctions {
                                 // Full implementation would need curve structure with start/end points
 
                                 // Create control points for the curve segment
-                                let create_point_fn: mlua::Function = lua.globals().get("CreatePoint")?;
+                                let create_point_fn: mlua::Function =
+                                    lua.globals().get("CreatePoint")?;
                                 let control_points = lua.create_table()?;
 
                                 for (i, (x, y)) in spatial.coordinates.iter().enumerate() {
@@ -1211,19 +1264,28 @@ impl HostFunctions {
                                 }
 
                                 // Create curve segment
-                                let create_segment_fn: mlua::Function = lua.globals().get("CreateCurveSegment")?;
-                                let segment: Value = create_segment_fn.call((control_points, "Loxodromic"))?;
+                                let create_segment_fn: mlua::Function =
+                                    lua.globals().get("CreateCurveSegment")?;
+                                let segment: Value =
+                                    create_segment_fn.call((control_points, "Loxodromic"))?;
 
                                 let segments = lua.create_table()?;
                                 segments.set(1, segment)?;
 
                                 // Create start and end point spatial associations
-                                let create_sa_fn: mlua::Function = lua.globals().get("CreateSpatialAssociation")?;
+                                let create_sa_fn: mlua::Function =
+                                    lua.globals().get("CreateSpatialAssociation")?;
 
                                 // Start point (first coordinate)
-                                let start_point: Value = if spatial.coordinates.first().is_some() {
+                                let start_point: Value = if !spatial.coordinates.is_empty() {
                                     let point_id = format!("Point|start_{}", id);
-                                    create_sa_fn.call(("Point", point_id, "Forward", Value::Nil, Value::Nil))?
+                                    create_sa_fn.call((
+                                        "Point",
+                                        point_id,
+                                        "Forward",
+                                        Value::Nil,
+                                        Value::Nil,
+                                    ))?
                                 } else {
                                     Value::Nil
                                 };
@@ -1231,13 +1293,21 @@ impl HostFunctions {
                                 // End point (last coordinate)
                                 let end_point: Value = if spatial.coordinates.last().is_some() {
                                     let point_id = format!("Point|end_{}", id);
-                                    create_sa_fn.call(("Point", point_id, "Forward", Value::Nil, Value::Nil))?
+                                    create_sa_fn.call((
+                                        "Point",
+                                        point_id,
+                                        "Forward",
+                                        Value::Nil,
+                                        Value::Nil,
+                                    ))?
                                 } else {
                                     Value::Nil
                                 };
 
-                                let create_curve_fn: mlua::Function = lua.globals().get("CreateCurve")?;
-                                let curve: Value = create_curve_fn.call((start_point, end_point, segments))?;
+                                let create_curve_fn: mlua::Function =
+                                    lua.globals().get("CreateCurve")?;
+                                let curve: Value =
+                                    create_curve_fn.call((start_point, end_point, segments))?;
                                 return Ok(curve);
                             }
                             "CompositeCurve" => {
@@ -1245,7 +1315,8 @@ impl HostFunctions {
                                 // Reference: S-100 standard/GISLibrary/host_data.cpp - hd_get_composite_curve()
                                 // Each curve association has spatial_type, spatial_id, and orientation
                                 let curve_associations = lua.create_table()?;
-                                let create_sa_fn: mlua::Function = lua.globals().get("CreateSpatialAssociation")?;
+                                let create_sa_fn: mlua::Function =
+                                    lua.globals().get("CreateSpatialAssociation")?;
 
                                 for (i, assoc) in spatial.curve_associations.iter().enumerate() {
                                     // Determine spatial type from RCNM
@@ -1257,10 +1328,15 @@ impl HostFunctions {
                                     };
 
                                     // Orientation: true = Forward, false = Reverse
-                                    let orientation = if assoc.orientation { "Forward" } else { "Reverse" };
+                                    let orientation = if assoc.orientation {
+                                        "Forward"
+                                    } else {
+                                        "Reverse"
+                                    };
 
                                     // Create spatial ID in "Type|ID" format
-                                    let assoc_spatial_id = format!("{}|{}", assoc_spatial_type, assoc.curve_id);
+                                    let assoc_spatial_id =
+                                        format!("{}|{}", assoc_spatial_type, assoc.curve_id);
 
                                     // CreateSpatialAssociation(type, id, orientation, scaleMin, scaleMax)
                                     let sa: Value = create_sa_fn.call((
@@ -1273,14 +1349,16 @@ impl HostFunctions {
                                     curve_associations.set(i + 1, sa)?;
                                 }
 
-                                let create_fn: mlua::Function = lua.globals().get("CreateCompositeCurve")?;
+                                let create_fn: mlua::Function =
+                                    lua.globals().get("CreateCompositeCurve")?;
                                 let composite: Value = create_fn.call((curve_associations,))?;
                                 return Ok(composite);
                             }
                             "Surface" => {
                                 // Surface has exterior ring and optional interior rings
                                 // For now, create with empty exterior ring
-                                let create_sa_fn: mlua::Function = lua.globals().get("CreateSpatialAssociation")?;
+                                let create_sa_fn: mlua::Function =
+                                    lua.globals().get("CreateSpatialAssociation")?;
                                 let exterior_ring: Value = create_sa_fn.call((
                                     "Curve",
                                     format!("Curve|exterior_{}", id),
@@ -1289,7 +1367,8 @@ impl HostFunctions {
                                     Value::Nil,
                                 ))?;
 
-                                let create_fn: mlua::Function = lua.globals().get("CreateSurface")?;
+                                let create_fn: mlua::Function =
+                                    lua.globals().get("CreateSurface")?;
                                 let surface: Value = create_fn.call((exterior_ring, Value::Nil))?;
                                 return Ok(surface);
                             }
@@ -1335,11 +1414,13 @@ impl HostFunctions {
         // Spatial ID is in "Type|ID" format
         globals.set(
             "HostSpatialGetAssociatedInformationIDs",
-            lua.create_function(move |lua, (_spatial_id, _assoc_code, _role_code): (String, Value, Value)| {
-                // Spatials don't typically have direct information associations
-                let table = lua.create_table()?;
-                Ok(table)
-            })?,
+            lua.create_function(
+                move |lua, (_spatial_id, _assoc_code, _role_code): (String, Value, Value)| {
+                    // Spatials don't typically have direct information associations
+                    let table = lua.create_table()?;
+                    Ok(table)
+                },
+            )?,
         )?;
 
         // ========================================
@@ -1384,11 +1465,15 @@ impl HostFunctions {
                 let table = lua.create_table()?;
                 if let Ok(cat) = type_cat.read() {
                     // DEBUG: Verify sectorBearing IS in simple attributes
-                    let has_sector_bearing = cat.simple_attribute_codes.contains(&"sectorBearing".to_string());
+                    let has_sector_bearing = cat
+                        .simple_attribute_codes
+                        .contains(&"sectorBearing".to_string());
                     if !has_sector_bearing {
                         tracing::error!("BUG: sectorBearing is NOT in simple_attribute_codes!");
                     } else {
-                        tracing::warn!("HostGetSimpleAttributeTypeCodes: sectorBearing IS in list (correct)");
+                        tracing::warn!(
+                            "HostGetSimpleAttributeTypeCodes: sectorBearing IS in list (correct)"
+                        );
                     }
                     tracing::info!(
                         "HostGetSimpleAttributeTypeCodes: {} codes",
@@ -1410,11 +1495,15 @@ impl HostFunctions {
                 let table = lua.create_table()?;
                 if let Ok(cat) = type_cat.read() {
                     // DEBUG: Verify sectorLimitOne IS in complex attributes
-                    let has_sector_limit_one = cat.complex_attribute_codes.contains(&"sectorLimitOne".to_string());
+                    let has_sector_limit_one = cat
+                        .complex_attribute_codes
+                        .contains(&"sectorLimitOne".to_string());
                     if !has_sector_limit_one {
                         tracing::error!("BUG: sectorLimitOne is NOT in complex_attribute_codes!");
                     } else {
-                        tracing::warn!("HostGetComplexAttributeTypeCodes: sectorLimitOne IS in list (correct)");
+                        tracing::warn!(
+                            "HostGetComplexAttributeTypeCodes: sectorLimitOne IS in list (correct)"
+                        );
                     }
                     tracing::info!(
                         "HostGetComplexAttributeTypeCodes: {} codes",
@@ -1482,10 +1571,15 @@ impl HostFunctions {
                     if let Some(info) = cat.feature_type_info.get(&code) {
                         // Debug: log bindings for LightSectored
                         if code == "LightSectored" {
-                            let binding_codes: Vec<_> = info.bindings.iter().map(|b| b.attribute_code.as_str()).collect();
+                            let binding_codes: Vec<_> = info
+                                .bindings
+                                .iter()
+                                .map(|b| b.attribute_code.as_str())
+                                .collect();
                             tracing::warn!(
                                 "HostGetFeatureTypeInfo: code={} bindings={:?}",
-                                code, binding_codes
+                                code,
+                                binding_codes
                             );
                         }
 
@@ -1640,15 +1734,13 @@ impl HostFunctions {
                         // Debug: for sector-related, print all keys in bindings table
                         if code.contains("sector") || code.contains("Sector") {
                             let mut keys = Vec::new();
-                            for pair in bindings.pairs::<Value, Value>() {
-                                if let Ok((k, _)) = pair {
-                                    let key_str = match k {
-                                        Value::String(s) => format!("str:{}", s.to_str().map(|s| s.to_string()).unwrap_or_else(|_| "?".to_string())),
-                                        Value::Integer(i) => format!("int:{}", i),
-                                        _ => "other".to_string(),
-                                    };
-                                    keys.push(key_str);
-                                }
+                            for (k, _) in bindings.pairs::<Value, Value>().flatten() {
+                                let key_str = match k {
+                                    Value::String(s) => format!("str:{}", s.to_str().map(|s| s.to_string()).unwrap_or_else(|_| "?".to_string())),
+                                    Value::Integer(i) => format!("int:{}", i),
+                                    _ => "other".to_string(),
+                                };
+                                keys.push(key_str);
                             }
                             tracing::error!(
                                 "DEBUG {} bindings keys: {:?}",

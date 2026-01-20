@@ -39,11 +39,7 @@ pub enum DrawingCommand {
         position: Option<(f64, f64)>,
     },
     /// AugmentedPoint sets explicit coordinates for subsequent PointInstructions
-    AugmentedPoint {
-        crs: String,
-        x: f64,
-        y: f64,
-    },
+    AugmentedPoint { crs: String, x: f64, y: f64 },
     /// Line style
     LineInstruction {
         style_ref: Option<String>,
@@ -63,15 +59,9 @@ pub enum DrawingCommand {
         color_token: String,
     },
     /// Dash pattern for lines
-    Dash {
-        start: f32,
-        length: f32,
-    },
+    Dash { start: f32, length: f32 },
     /// Spatial reference (geometry)
-    SpatialReference {
-        spatial_id: String,
-        forward: bool,
-    },
+    SpatialReference { spatial_id: String, forward: bool },
 }
 
 impl ParsedInstruction {
@@ -111,7 +101,13 @@ pub fn parse_instruction_string(
 
         // Split command:value(s)
         if let Some((cmd, value)) = part.split_once(':') {
-            parse_command(&mut result, cmd.trim(), value.trim(), &mut current_augmented_point, &mut current_rotation)?;
+            parse_command(
+                &mut result,
+                cmd.trim(),
+                value.trim(),
+                &mut current_augmented_point,
+                &mut current_rotation,
+            )?;
         }
     }
 
@@ -171,7 +167,9 @@ fn parse_command(
                 let x = parts[1].parse::<f64>().unwrap_or(0.0);
                 let y = parts[2].parse::<f64>().unwrap_or(0.0);
                 *current_augmented_point = Some((x, y));
-                result.commands.push(DrawingCommand::AugmentedPoint { crs, x, y });
+                result
+                    .commands
+                    .push(DrawingCommand::AugmentedPoint { crs, x, y });
             }
         }
         "PointInstruction" => {
@@ -179,7 +177,8 @@ fn parse_command(
             let parts: Vec<&str> = value.split(',').collect();
             let symbol_ref = parts.first().unwrap_or(&"").to_string();
             // Use inline rotation if specified, otherwise use current_rotation from Rotation command
-            let rotation = parts.get(1)
+            let rotation = parts
+                .get(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(*current_rotation);
             let scale = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
@@ -253,10 +252,11 @@ fn parse_command(
             // Format: spatial_id or spatial_id,false (for reverse)
             let parts: Vec<&str> = value.split(',').collect();
             let spatial_id = parts.first().unwrap_or(&"").to_string();
-            let forward = parts.get(1).map_or(true, |s| *s != "false");
-            result
-                .commands
-                .push(DrawingCommand::SpatialReference { spatial_id, forward });
+            let forward = parts.get(1).is_none_or(|s| *s != "false");
+            result.commands.push(DrawingCommand::SpatialReference {
+                spatial_id,
+                forward,
+            });
         }
         "ClearGeometry" => {
             // Clears current augmented point - used after processing a sounding set

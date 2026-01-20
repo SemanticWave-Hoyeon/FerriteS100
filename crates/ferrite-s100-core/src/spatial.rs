@@ -38,8 +38,8 @@ impl RecordId {
 /// Coordinate with optional depth
 #[derive(Debug, Clone, Copy)]
 pub struct Coordinate {
-    pub x: f64, // Longitude
-    pub y: f64, // Latitude
+    pub x: f64,         // Longitude
+    pub y: f64,         // Latitude
     pub z: Option<f64>, // Depth/height
 }
 
@@ -114,11 +114,7 @@ impl CurveRecord {
 
     /// Convert to geo-types LineString
     pub fn to_linestring(&self) -> LineString<f64> {
-        let coords: Vec<Coord<f64>> = self
-            .all_positions()
-            .into_iter()
-            .map(|c| c.into())
-            .collect();
+        let coords: Vec<Coord<f64>> = self.all_positions().into_iter().map(|c| c.into()).collect();
         LineString::new(coords)
     }
 }
