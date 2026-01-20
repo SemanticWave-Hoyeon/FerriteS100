@@ -1,7 +1,7 @@
 //! Feature type definitions
 
-use serde::{Deserialize, Serialize};
 use crate::{AttributeBinding, Multiplicity, RoleType, SpatialPrimitive};
+use serde::{Deserialize, Serialize};
 
 /// Feature type definition
 #[derive(Debug, Clone, Serialize, Deserialize)]

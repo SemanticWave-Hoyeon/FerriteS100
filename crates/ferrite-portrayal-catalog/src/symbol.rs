@@ -1,8 +1,8 @@
 //! Symbol definitions
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 /// Symbol placement on line
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +87,8 @@ impl Symbols {
 
     /// Get full path to symbol SVG
     pub fn get_svg_path(&self, id: &str) -> Option<PathBuf> {
-        self.symbols.get(id).map(|s| self.base_path.join(&s.svg_reference))
+        self.symbols
+            .get(id)
+            .map(|s| self.base_path.join(&s.svg_reference))
     }
 }

@@ -3,16 +3,16 @@
 //! This crate parses S-100 Feature Catalogue XML files dynamically,
 //! supporting different product specifications (S-101, S-102, etc.).
 
-mod error;
-mod types;
 mod attribute;
+mod catalogue;
+mod error;
 mod feature_type;
 mod information_type;
-mod catalogue;
+mod types;
 
-pub use error::*;
-pub use types::*;
 pub use attribute::*;
+pub use catalogue::*;
+pub use error::*;
 pub use feature_type::*;
 pub use information_type::*;
-pub use catalogue::*;
+pub use types::*;

@@ -186,7 +186,14 @@ impl ViewUniforms {
     }
 
     /// Create orthographic projection matrix
-    fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+    fn orthographic(
+        left: f32,
+        right: f32,
+        bottom: f32,
+        top: f32,
+        near: f32,
+        far: f32,
+    ) -> [[f32; 4]; 4] {
         let width = right - left;
         let height = top - bottom;
         let depth = far - near;

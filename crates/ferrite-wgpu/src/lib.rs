@@ -14,21 +14,21 @@
 //!                      Area Renderer
 //! ```
 
+mod egui_integration;
 mod error;
-mod state;
-mod vertex;
 mod pipeline;
 mod renderer;
+mod state;
 mod symbol_cache;
-mod egui_integration;
+mod vertex;
 
+pub use egui_integration::*;
 pub use error::*;
-pub use state::*;
-pub use vertex::*;
 pub use pipeline::*;
 pub use renderer::*;
+pub use state::*;
 pub use symbol_cache::*;
-pub use egui_integration::*;
+pub use vertex::*;
 
 /// Initialize wgpu for the given window
 pub async fn create_renderer(

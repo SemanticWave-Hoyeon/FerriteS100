@@ -1,7 +1,7 @@
 //! Viewing groups and display modes
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Display plane
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -96,8 +96,6 @@ impl DisplayModes {
 
     /// Get default mode
     pub fn get_default(&self) -> Option<&DisplayMode> {
-        self.default_mode
-            .as_ref()
-            .and_then(|id| self.modes.get(id))
+        self.default_mode.as_ref().and_then(|id| self.modes.get(id))
     }
 }

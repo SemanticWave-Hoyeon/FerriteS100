@@ -77,7 +77,9 @@ impl RawField {
     /// Get data without terminator
     pub fn data_trimmed(&self) -> &[u8] {
         let mut end = self.data.len();
-        while end > 0 && (self.data[end - 1] == FIELD_TERMINATOR || self.data[end - 1] == UNIT_TERMINATOR) {
+        while end > 0
+            && (self.data[end - 1] == FIELD_TERMINATOR || self.data[end - 1] == UNIT_TERMINATOR)
+        {
             end -= 1;
         }
         &self.data[..end]
@@ -87,7 +89,11 @@ impl RawField {
 /// Extract null/unit-terminated string from buffer
 pub fn read_string(data: &[u8]) -> Result<(String, usize)> {
     let mut end = 0;
-    while end < data.len() && data[end] != UNIT_TERMINATOR && data[end] != FIELD_TERMINATOR && data[end] != 0 {
+    while end < data.len()
+        && data[end] != UNIT_TERMINATOR
+        && data[end] != FIELD_TERMINATOR
+        && data[end] != 0
+    {
         end += 1;
     }
 
@@ -104,8 +110,8 @@ pub fn read_uint(data: &[u8], size: usize) -> Result<u64> {
     }
 
     let mut value: u64 = 0;
-    for i in 0..size {
-        value |= (data[i] as u64) << (i * 8);
+    for (i, &byte) in data.iter().enumerate().take(size) {
+        value |= (byte as u64) << (i * 8);
     }
 
     Ok(value)

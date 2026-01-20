@@ -3,13 +3,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Attribute value type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AttributeValueType {
     Boolean,
     Enumeration,
     Integer,
     Real,
+    #[default]
     Text,
     Date,
     Time,
@@ -25,12 +26,6 @@ pub enum AttributeValueType {
     S100CodeList,
     #[serde(rename = "S100_TruncatedDate")]
     S100TruncatedDate,
-}
-
-impl Default for AttributeValueType {
-    fn default() -> Self {
-        AttributeValueType::Text
-    }
 }
 
 /// Spatial primitive type for features
@@ -55,21 +50,33 @@ pub struct Multiplicity {
 
 impl Default for Multiplicity {
     fn default() -> Self {
-        Multiplicity { lower: 1, upper: Some(1) }
+        Multiplicity {
+            lower: 1,
+            upper: Some(1),
+        }
     }
 }
 
 impl Multiplicity {
     pub fn optional() -> Self {
-        Multiplicity { lower: 0, upper: Some(1) }
+        Multiplicity {
+            lower: 0,
+            upper: Some(1),
+        }
     }
 
     pub fn required() -> Self {
-        Multiplicity { lower: 1, upper: Some(1) }
+        Multiplicity {
+            lower: 1,
+            upper: Some(1),
+        }
     }
 
     pub fn unbounded() -> Self {
-        Multiplicity { lower: 0, upper: None }
+        Multiplicity {
+            lower: 0,
+            upper: None,
+        }
     }
 
     pub fn is_required(&self) -> bool {
@@ -98,16 +105,11 @@ pub struct Alias {
 }
 
 /// Role type in associations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RoleType {
+    #[default]
     Association,
     Aggregation,
     Composition,
-}
-
-impl Default for RoleType {
-    fn default() -> Self {
-        RoleType::Association
-    }
 }

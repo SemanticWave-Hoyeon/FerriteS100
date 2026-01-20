@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use ferrite_portrayal_catalog::{ContextParamType, ContextParameter};
 use ferrite_s100_core::S101Cell;
-use ferrite_portrayal_catalog::{ContextParameter, ContextParamType};
 
 /// Context parameters for portrayal (mariner settings, display options)
 #[derive(Debug, Clone)]
@@ -167,24 +167,136 @@ impl ContextParameters {
     pub fn to_lua_params(&self) -> Vec<(String, String, String)> {
         let mut params = Vec::new();
 
-        params.push(("SafetyDepth".to_string(), "real".to_string(), format!("{}", self.safety_depth)));
-        params.push(("SafetyContour".to_string(), "real".to_string(), format!("{}", self.safety_contour)));
-        params.push(("ShallowContour".to_string(), "real".to_string(), format!("{}", self.shallow_contour)));
-        params.push(("DeepContour".to_string(), "real".to_string(), format!("{}", self.deep_contour)));
-        params.push(("TwoShades".to_string(), "boolean".to_string(), if self.two_shades { "true" } else { "false" }.to_string()));
-        params.push(("FourShades".to_string(), "boolean".to_string(), if !self.two_shades { "true" } else { "false" }.to_string()));
-        params.push(("RadarOverlay".to_string(), "boolean".to_string(), if self.radar_overlay { "true" } else { "false" }.to_string()));
-        params.push(("IgnoreScamin".to_string(), "boolean".to_string(), if self.ignore_scamin { "true" } else { "false" }.to_string()));
-        params.push(("IgnoreScaleMinimum".to_string(), "boolean".to_string(), if self.ignore_scale_minimum { "true" } else { "false" }.to_string()));
-        params.push(("FullSectors".to_string(), "boolean".to_string(), if self.full_sectors { "true" } else { "false" }.to_string()));
-        params.push(("SymbolizedBoundaries".to_string(), "boolean".to_string(), if self.symbolized_boundaries { "true" } else { "false" }.to_string()));
-        params.push(("PlainBoundaries".to_string(), "boolean".to_string(), if !self.symbolized_boundaries { "true" } else { "false" }.to_string()));
-        params.push(("IsolatedDangers".to_string(), "boolean".to_string(), if self.isolated_dangers { "true" } else { "false" }.to_string()));
-        params.push(("SimplifiedSymbols".to_string(), "boolean".to_string(), if self.simplified_symbols { "true" } else { "false" }.to_string()));
-        params.push(("PaperChart".to_string(), "boolean".to_string(), if !self.simplified_symbols { "true" } else { "false" }.to_string()));
-        params.push(("ShallowWaterDangers".to_string(), "boolean".to_string(), if self.shallow_water_dangers { "true" } else { "false" }.to_string()));
-        params.push(("FullLightLines".to_string(), "boolean".to_string(), if self.full_light_lines { "true" } else { "false" }.to_string()));
-        params.push(("NationalLanguage".to_string(), "text".to_string(), self.national_language.clone()));
+        params.push((
+            "SafetyDepth".to_string(),
+            "real".to_string(),
+            format!("{}", self.safety_depth),
+        ));
+        params.push((
+            "SafetyContour".to_string(),
+            "real".to_string(),
+            format!("{}", self.safety_contour),
+        ));
+        params.push((
+            "ShallowContour".to_string(),
+            "real".to_string(),
+            format!("{}", self.shallow_contour),
+        ));
+        params.push((
+            "DeepContour".to_string(),
+            "real".to_string(),
+            format!("{}", self.deep_contour),
+        ));
+        params.push((
+            "TwoShades".to_string(),
+            "boolean".to_string(),
+            if self.two_shades { "true" } else { "false" }.to_string(),
+        ));
+        params.push((
+            "FourShades".to_string(),
+            "boolean".to_string(),
+            if !self.two_shades { "true" } else { "false" }.to_string(),
+        ));
+        params.push((
+            "RadarOverlay".to_string(),
+            "boolean".to_string(),
+            if self.radar_overlay { "true" } else { "false" }.to_string(),
+        ));
+        params.push((
+            "IgnoreScamin".to_string(),
+            "boolean".to_string(),
+            if self.ignore_scamin { "true" } else { "false" }.to_string(),
+        ));
+        params.push((
+            "IgnoreScaleMinimum".to_string(),
+            "boolean".to_string(),
+            if self.ignore_scale_minimum {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "FullSectors".to_string(),
+            "boolean".to_string(),
+            if self.full_sectors { "true" } else { "false" }.to_string(),
+        ));
+        params.push((
+            "SymbolizedBoundaries".to_string(),
+            "boolean".to_string(),
+            if self.symbolized_boundaries {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "PlainBoundaries".to_string(),
+            "boolean".to_string(),
+            if !self.symbolized_boundaries {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "IsolatedDangers".to_string(),
+            "boolean".to_string(),
+            if self.isolated_dangers {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "SimplifiedSymbols".to_string(),
+            "boolean".to_string(),
+            if self.simplified_symbols {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "PaperChart".to_string(),
+            "boolean".to_string(),
+            if !self.simplified_symbols {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "ShallowWaterDangers".to_string(),
+            "boolean".to_string(),
+            if self.shallow_water_dangers {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "FullLightLines".to_string(),
+            "boolean".to_string(),
+            if self.full_light_lines {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ));
+        params.push((
+            "NationalLanguage".to_string(),
+            "text".to_string(),
+            self.national_language.clone(),
+        ));
 
         // Add custom parameters
         for (key, value) in &self.custom {
@@ -251,7 +363,9 @@ impl From<ferrite_s100_core::SpatialPrimitiveType> for PrimitiveType {
             ferrite_s100_core::SpatialPrimitiveType::Point => PrimitiveType::Point,
             ferrite_s100_core::SpatialPrimitiveType::MultiPoint => PrimitiveType::MultiPoint,
             ferrite_s100_core::SpatialPrimitiveType::Curve => PrimitiveType::Curve,
-            ferrite_s100_core::SpatialPrimitiveType::CompositeCurve => PrimitiveType::CompositeCurve,
+            ferrite_s100_core::SpatialPrimitiveType::CompositeCurve => {
+                PrimitiveType::CompositeCurve
+            }
             ferrite_s100_core::SpatialPrimitiveType::Surface => PrimitiveType::Surface,
             ferrite_s100_core::SpatialPrimitiveType::NoGeometry => PrimitiveType::None,
         }
@@ -412,7 +526,7 @@ pub struct InformationAssociation {
 #[derive(Debug, Clone)]
 pub struct CurveAssociation {
     pub curve_id: i64,
-    pub rcnm: u8,  // 120=Curve, 125=CompositeCurve
+    pub rcnm: u8,          // 120=Curve, 125=CompositeCurve
     pub orientation: bool, // true=Forward, false=Reverse
 }
 
@@ -485,14 +599,16 @@ fn extract_attributes(
                 if children_by_position.contains_key(child_pos) {
                     // Nested complex attribute
                     let nested = build_complex_attribute(child, *child_pos, children_by_position);
-                    complex.complex_attrs
+                    complex
+                        .complex_attrs
                         .entry(child_code)
                         .or_default()
                         .push(nested);
                 } else {
                     // Simple sub-attribute - use push to collect multiple values
                     // S-101 allows multiple values for same attribute (e.g., colour = [1, 3])
-                    complex.simple_attrs
+                    complex
+                        .simple_attrs
                         .entry(child_code)
                         .or_default()
                         .push(AttributeValue::Text(child.atvl.clone()));
@@ -519,10 +635,7 @@ fn extract_attributes(
         if children_by_position.contains_key(&position) {
             // Complex attribute - build the full tree recursively
             let complex = build_complex_attribute(attr, position, &children_by_position);
-            complex_attrs
-                .entry(code.clone())
-                .or_default()
-                .push(complex);
+            complex_attrs.entry(code.clone()).or_default().push(complex);
         } else {
             // Simple attribute - no children
             simple_attrs.insert(code.clone(), AttributeValue::Text(attr.atvl.clone()));
@@ -556,40 +669,84 @@ impl PortrayalContext {
 
             // Extract attributes - handle both simple and complex attributes
             // Complex attributes have child attributes (paix points to parent's atix)
-            let (attributes, complex_attributes) = extract_attributes(&feature.attributes, Some(&feature_code));
+            let (attributes, complex_attributes) =
+                extract_attributes(&feature.attributes, Some(&feature_code));
 
             // Debug: trace LightSectored attribute structure
             if feature_code == "LightSectored" && *key == 429496838244 {
-                tracing::warn!("LightSectored ID={}: {} simple attrs, {} complex attrs",
-                    key, attributes.len(), complex_attributes.len());
+                tracing::warn!(
+                    "LightSectored ID={}: {} simple attrs, {} complex attrs",
+                    key,
+                    attributes.len(),
+                    complex_attributes.len()
+                );
                 for (code, instances) in &complex_attributes {
                     tracing::warn!("  complex attr '{}': {} instances", code, instances.len());
                     for (i, inst) in instances.iter().enumerate() {
-                        tracing::warn!("    [{}] {} simple sub-attrs: {:?}", i, inst.simple_attrs.len(), inst.simple_attrs.keys().collect::<Vec<_>>());
-                        tracing::warn!("    [{}] {} complex sub-attrs: {:?}", i, inst.complex_attrs.len(), inst.complex_attrs.keys().collect::<Vec<_>>());
+                        tracing::warn!(
+                            "    [{}] {} simple sub-attrs: {:?}",
+                            i,
+                            inst.simple_attrs.len(),
+                            inst.simple_attrs.keys().collect::<Vec<_>>()
+                        );
+                        tracing::warn!(
+                            "    [{}] {} complex sub-attrs: {:?}",
+                            i,
+                            inst.complex_attrs.len(),
+                            inst.complex_attrs.keys().collect::<Vec<_>>()
+                        );
                         // Show lightSector details
                         if let Some(light_sectors) = inst.complex_attrs.get("lightSector") {
                             for (j, ls) in light_sectors.iter().enumerate() {
-                                tracing::warn!("      lightSector[{}]: {} simple, {} complex", j, ls.simple_attrs.len(), ls.complex_attrs.len());
-                                tracing::warn!("        simple attrs: {:?}", ls.simple_attrs.keys().collect::<Vec<_>>());
-                                tracing::warn!("        complex attrs: {:?}", ls.complex_attrs.keys().collect::<Vec<_>>());
+                                tracing::warn!(
+                                    "      lightSector[{}]: {} simple, {} complex",
+                                    j,
+                                    ls.simple_attrs.len(),
+                                    ls.complex_attrs.len()
+                                );
+                                tracing::warn!(
+                                    "        simple attrs: {:?}",
+                                    ls.simple_attrs.keys().collect::<Vec<_>>()
+                                );
+                                tracing::warn!(
+                                    "        complex attrs: {:?}",
+                                    ls.complex_attrs.keys().collect::<Vec<_>>()
+                                );
                                 // Check for sectorLimit
                                 if let Some(sector_limits) = ls.complex_attrs.get("sectorLimit") {
                                     for (k, sl) in sector_limits.iter().enumerate() {
-                                        tracing::warn!("          sectorLimit[{}]: {} simple, {} complex", k, sl.simple_attrs.len(), sl.complex_attrs.len());
-                                        tracing::warn!("            simple: {:?}, complex: {:?}", sl.simple_attrs.keys().collect::<Vec<_>>(), sl.complex_attrs.keys().collect::<Vec<_>>());
+                                        tracing::warn!(
+                                            "          sectorLimit[{}]: {} simple, {} complex",
+                                            k,
+                                            sl.simple_attrs.len(),
+                                            sl.complex_attrs.len()
+                                        );
+                                        tracing::warn!(
+                                            "            simple: {:?}, complex: {:?}",
+                                            sl.simple_attrs.keys().collect::<Vec<_>>(),
+                                            sl.complex_attrs.keys().collect::<Vec<_>>()
+                                        );
                                         // Check inside sectorLimitOne
-                                        if let Some(sector_limit_ones) = sl.complex_attrs.get("sectorLimitOne") {
+                                        if let Some(sector_limit_ones) =
+                                            sl.complex_attrs.get("sectorLimitOne")
+                                        {
                                             for (l, slo) in sector_limit_ones.iter().enumerate() {
                                                 tracing::warn!("              sectorLimitOne[{}]: {} simple, {} complex", l, slo.simple_attrs.len(), slo.complex_attrs.len());
-                                                tracing::warn!("                simple: {:?}", slo.simple_attrs.keys().collect::<Vec<_>>());
+                                                tracing::warn!(
+                                                    "                simple: {:?}",
+                                                    slo.simple_attrs.keys().collect::<Vec<_>>()
+                                                );
                                             }
                                         } else {
-                                            tracing::warn!("              NO sectorLimitOne in sectorLimit");
+                                            tracing::warn!(
+                                                "              NO sectorLimitOne in sectorLimit"
+                                            );
                                         }
                                     }
                                 } else {
-                                    tracing::warn!("          NO sectorLimit found in lightSector!");
+                                    tracing::warn!(
+                                        "          NO sectorLimit found in lightSector!"
+                                    );
                                 }
                             }
                         }
@@ -686,7 +843,8 @@ impl PortrayalContext {
                 .clone()
                 .unwrap_or_else(|| format!("UNKNOWN_{}", info.irid.nitc));
 
-            let (attributes, complex_attributes) = extract_attributes(&info.attributes, Some(&info_code));
+            let (attributes, complex_attributes) =
+                extract_attributes(&info.attributes, Some(&info_code));
 
             cell_data.information_types.insert(
                 *key,
@@ -716,16 +874,9 @@ impl PortrayalContext {
         // Extract multi-point spatials (for Sounding features)
         // Reference: S-100 standard uses multiPoint for Sounding with multiple depth values
         for (key, multi_point) in &cell.multi_points {
-            let coords: Vec<(f64, f64)> = multi_point
-                .positions
-                .iter()
-                .map(|c| (c.x, c.y))
-                .collect();
-            let z_coords: Vec<Option<f64>> = multi_point
-                .positions
-                .iter()
-                .map(|c| c.z)
-                .collect();
+            let coords: Vec<(f64, f64)> =
+                multi_point.positions.iter().map(|c| (c.x, c.y)).collect();
+            let z_coords: Vec<Option<f64>> = multi_point.positions.iter().map(|c| c.z).collect();
             cell_data.spatials.insert(
                 *key,
                 SpatialInfo {
@@ -740,11 +891,8 @@ impl PortrayalContext {
 
         // Extract curve spatials
         for (key, curve) in &cell.curves {
-            let coords: Vec<(f64, f64)> = curve
-                .all_positions()
-                .iter()
-                .map(|c| (c.x, c.y))
-                .collect();
+            let coords: Vec<(f64, f64)> =
+                curve.all_positions().iter().map(|c| (c.x, c.y)).collect();
             cell_data.spatials.insert(
                 *key,
                 SpatialInfo {
@@ -784,7 +932,7 @@ impl PortrayalContext {
         }
 
         // Extract surface spatials (for Surface primitive type)
-        for (key, _surface) in &cell.surfaces {
+        for key in cell.surfaces.keys() {
             // Surface coordinates are derived from curves, just register the ID
             cell_data.spatials.insert(
                 *key,
@@ -845,8 +993,8 @@ impl PortrayalContext {
                     assocs
                         .iter()
                         .filter(|a| {
-                            association_code.map_or(true, |c| a.association_code == c)
-                                && role_code.map_or(true, |r| a.role_code == r)
+                            association_code.is_none_or(|c| a.association_code == c)
+                                && role_code.is_none_or(|r| a.role_code == r)
                         })
                         .map(|a| a.target_id)
                         .collect()
@@ -866,16 +1014,18 @@ impl PortrayalContext {
             .read()
             .ok()
             .and_then(|data| {
-                data.information_associations.get(&feature_id).map(|assocs| {
-                    assocs
-                        .iter()
-                        .filter(|a| {
-                            association_code.map_or(true, |c| a.association_code == c)
-                                && role_code.map_or(true, |r| a.role_code == r)
-                        })
-                        .map(|a| a.info_id)
-                        .collect()
-                })
+                data.information_associations
+                    .get(&feature_id)
+                    .map(|assocs| {
+                        assocs
+                            .iter()
+                            .filter(|a| {
+                                association_code.is_none_or(|c| a.association_code == c)
+                                    && role_code.is_none_or(|r| a.role_code == r)
+                            })
+                            .map(|a| a.info_id)
+                            .collect()
+                    })
             })
             .unwrap_or_default()
     }

@@ -1,7 +1,7 @@
 //! Attribute definitions
 
+use crate::{AttributeValueType, ListedValue, Multiplicity};
 use serde::{Deserialize, Serialize};
-use crate::{AttributeValueType, Multiplicity, ListedValue};
 
 /// Simple attribute definition
 #[derive(Debug, Clone, Serialize, Deserialize)]

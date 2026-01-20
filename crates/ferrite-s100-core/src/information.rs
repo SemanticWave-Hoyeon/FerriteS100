@@ -1,6 +1,6 @@
 //! Information record types for S-100
 
-use crate::{RecordId, Attribute, InformationAssociation};
+use crate::{Attribute, InformationAssociation, RecordId};
 
 /// Information Record Identifier (IRID)
 #[derive(Debug, Clone)]

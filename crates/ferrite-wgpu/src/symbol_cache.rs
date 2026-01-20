@@ -81,7 +81,11 @@ impl SymbolCache {
             return self.symbols.get(symbol_id);
         }
 
-        tracing::debug!("Loading symbol: '{}' from {}", symbol_id, self.symbols_path.display());
+        tracing::debug!(
+            "Loading symbol: '{}' from {}",
+            symbol_id,
+            self.symbols_path.display()
+        );
 
         // Try to load from file
         let svg_path = self.symbols_path.join(format!("{}.svg", symbol_id));
@@ -94,7 +98,9 @@ impl SymbolCache {
             Ok(geometry) => {
                 tracing::debug!(
                     "Rendered symbol '{}': {}x{} pixels",
-                    symbol_id, geometry.width, geometry.height
+                    symbol_id,
+                    geometry.width,
+                    geometry.height
                 );
                 self.symbols.insert(symbol_id.to_string(), geometry);
                 self.symbols.get(symbol_id)
@@ -114,8 +120,8 @@ impl SymbolCache {
         color_profile: &ColorProfile,
     ) -> Result<SymbolGeometry, String> {
         // Read SVG file
-        let svg_content = std::fs::read_to_string(svg_path)
-            .map_err(|e| format!("Failed to read SVG: {}", e))?;
+        let svg_content =
+            std::fs::read_to_string(svg_path).map_err(|e| format!("Failed to read SVG: {}", e))?;
 
         // Extract viewBox from original SVG (minX, minY, width, height)
         let view_box = self.extract_viewbox(&svg_content);
@@ -152,10 +158,8 @@ impl SymbolCache {
             .ok_or("Failed to create pixmap")?;
 
         // Render SVG
-        let transform = resvg::tiny_skia::Transform::from_scale(
-            self.render_scale,
-            self.render_scale,
-        );
+        let transform =
+            resvg::tiny_skia::Transform::from_scale(self.render_scale, self.render_scale);
         resvg::render(&tree, transform, &mut pixmap.as_mut());
 
         // Extract pivot point from SVG (look for circle with class "pivotPoint")
@@ -199,8 +203,8 @@ impl SymbolCache {
 
         // Also add common classes
         css_rules.push_str(".f0 { fill: none; }\n");
-        css_rules.push_str(".sl { fill: none; }\n");  // stroke-line
-        css_rules.push_str(".layout { display: none; }\n");  // hide layout elements
+        css_rules.push_str(".sl { fill: none; }\n"); // stroke-line
+        css_rules.push_str(".layout { display: none; }\n"); // hide layout elements
 
         // Inject CSS into SVG
         if svg_content.contains("<defs>") {
@@ -211,7 +215,10 @@ impl SymbolCache {
             if let Some(svg_end) = after_svg.find('>') {
                 let insert_pos = svg_start + svg_end + 1;
                 let (before, after) = svg_content.split_at(insert_pos);
-                format!("{}<defs><style>{}</style></defs>{}", before, css_rules, after)
+                format!(
+                    "{}<defs><style>{}</style></defs>{}",
+                    before, css_rules, after
+                )
             } else {
                 svg_content.to_string()
             }
@@ -234,10 +241,13 @@ impl SymbolCache {
                     if class.len() > 1 {
                         let prefix = &class[..1];
                         let token = &class[1..];
-                        if (prefix == "s" || prefix == "f") && !token.is_empty() && token != "0" && token != "l" {
-                            if !tokens.contains(&token.to_string()) {
-                                tokens.push(token.to_string());
-                            }
+                        if (prefix == "s" || prefix == "f")
+                            && !token.is_empty()
+                            && token != "0"
+                            && token != "l"
+                            && !tokens.contains(&token.to_string())
+                        {
+                            tokens.push(token.to_string());
                         }
                     }
                 }
@@ -269,7 +279,12 @@ impl SymbolCache {
     }
 
     /// Extract pivot point from SVG content
-    fn extract_pivot_point(&self, svg_content: &str, _vb_width: f32, _vb_height: f32) -> (f32, f32) {
+    fn extract_pivot_point(
+        &self,
+        svg_content: &str,
+        _vb_width: f32,
+        _vb_height: f32,
+    ) -> (f32, f32) {
         // Look for circle with class="pivotPoint"
         // Example: <circle class="pivotPoint layout" cx="0" cy="0" r="1"/>
 

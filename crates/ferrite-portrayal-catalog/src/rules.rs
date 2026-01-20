@@ -1,20 +1,15 @@
 //! Portrayal rules definitions
 
-use std::path::PathBuf;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Rule type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RuleType {
+    #[default]
     Lua,
     Xslt,
-}
-
-impl Default for RuleType {
-    fn default() -> Self {
-        RuleType::Lua
-    }
 }
 
 /// Rule file reference
@@ -83,7 +78,9 @@ impl PortrayalRules {
 
     /// Get full path to rule file
     pub fn get_rule_path(&self, id: &str) -> Option<PathBuf> {
-        self.rule_files.get(id).map(|r| self.base_path.join(&r.file_path))
+        self.rule_files
+            .get(id)
+            .map(|r| self.base_path.join(&r.file_path))
     }
 
     /// Get context parameter by ID

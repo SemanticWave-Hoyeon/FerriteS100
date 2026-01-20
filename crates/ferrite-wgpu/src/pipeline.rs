@@ -2,7 +2,7 @@
 //!
 //! Contains shader code and pipeline creation for different rendering modes.
 
-use crate::{GpuState, Result, Vertex2D, state::MSAA_SAMPLE_COUNT};
+use crate::{state::MSAA_SAMPLE_COUNT, GpuState, Result, Vertex2D};
 
 /// Basic 2D shader for solid colored geometry
 const BASIC_SHADER: &str = r#"
@@ -153,201 +153,220 @@ impl RenderPipelines {
     /// Create all render pipelines
     pub fn new(state: &GpuState) -> Result<Self> {
         // Create basic shader module
-        let basic_shader = state.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("basic_shader"),
-            source: wgpu::ShaderSource::Wgsl(BASIC_SHADER.into()),
-        });
+        let basic_shader = state
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("basic_shader"),
+                source: wgpu::ShaderSource::Wgsl(BASIC_SHADER.into()),
+            });
 
         // Create texture shader module
-        let texture_shader = state.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("texture_shader"),
-            source: wgpu::ShaderSource::Wgsl(TEXTURE_SHADER.into()),
-        });
+        let texture_shader = state
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("texture_shader"),
+                source: wgpu::ShaderSource::Wgsl(TEXTURE_SHADER.into()),
+            });
 
         // Create bind group layout for view uniforms
         let view_bind_group_layout =
-            state.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("view_bind_group_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+            state
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("view_bind_group_layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
 
         // Create bind group layout for textures
         let texture_bind_group_layout =
-            state.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("texture_bind_group_layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            state
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("texture_bind_group_layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
 
         // Create pipeline layout for basic rendering
         let basic_pipeline_layout =
-            state.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("basic_pipeline_layout"),
-                bind_group_layouts: &[&view_bind_group_layout],
-                push_constant_ranges: &[],
-            });
+            state
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("basic_pipeline_layout"),
+                    bind_group_layouts: &[&view_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
 
         // Create pipeline layout for texture rendering
         let texture_pipeline_layout =
-            state.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("texture_pipeline_layout"),
-                bind_group_layouts: &[&view_bind_group_layout, &texture_bind_group_layout],
-                push_constant_ranges: &[],
-            });
+            state
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("texture_pipeline_layout"),
+                    bind_group_layouts: &[&view_bind_group_layout, &texture_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
 
         // Create area pipeline (triangles with blending)
-        let area_pipeline = state.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("area_pipeline"),
-            layout: Some(&basic_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &basic_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex2D::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &basic_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: state.format(),
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // No culling for 2D
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLE_COUNT,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let area_pipeline = state
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("area_pipeline"),
+                layout: Some(&basic_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &basic_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex2D::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &basic_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: state.format(),
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None, // No culling for 2D
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: MSAA_SAMPLE_COUNT,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
 
         // Create line pipeline
-        let line_pipeline = state.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("line_pipeline"),
-            layout: Some(&basic_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &basic_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex2D::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &basic_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: state.format(),
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList, // Lines rendered as quads
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLE_COUNT,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let line_pipeline = state
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("line_pipeline"),
+                layout: Some(&basic_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &basic_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex2D::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &basic_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: state.format(),
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList, // Lines rendered as quads
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: MSAA_SAMPLE_COUNT,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
 
         // Create texture pipeline for symbols (premultiplied alpha blending)
-        let texture_pipeline = state.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("texture_pipeline"),
-            layout: Some(&texture_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &texture_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[TextureVertex::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &texture_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: state.format(),
-                    // Premultiplied alpha blending: src + dst * (1 - src_alpha)
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
+        let texture_pipeline =
+            state
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("texture_pipeline"),
+                    layout: Some(&texture_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &texture_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[TextureVertex::desc()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &texture_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: state.format(),
+                            // Premultiplied alpha blending: src + dst * (1 - src_alpha)
+                            blend: Some(wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                            }),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
                     }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLE_COUNT,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: MSAA_SAMPLE_COUNT,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview: None,
+                    cache: None,
+                });
 
         // Create texture sampler
         let texture_sampler = state.device.create_sampler(&wgpu::SamplerDescriptor {

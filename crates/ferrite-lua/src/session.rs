@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use mlua::Lua;
 
 use crate::{
-    CellData, ContextParameters, FeatureInfo, HostFunctions, LuaError, PortrayalResult,
-    Result, SpatialInfo, TypeCatalogue,
+    CellData, ContextParameters, FeatureInfo, HostFunctions, LuaError, PortrayalResult, Result,
+    SpatialInfo, TypeCatalogue,
 };
 
 /// Lua session for portrayal rule execution
@@ -68,7 +68,9 @@ impl LuaSession {
             }
         }
 
-        tracing::debug!("Lua sandbox applied: disabled loadfile, dofile, package.loadlib, C module loading");
+        tracing::debug!(
+            "Lua sandbox applied: disabled loadfile, dofile, package.loadlib, C module loading"
+        );
         Ok(())
     }
 
@@ -152,7 +154,9 @@ impl LuaSession {
             .lua
             .globals()
             .get("PortrayalCreateContextParameter")
-            .map_err(|_| LuaError::FunctionNotFound("PortrayalCreateContextParameter".to_string()))?;
+            .map_err(|_| {
+                LuaError::FunctionNotFound("PortrayalCreateContextParameter".to_string())
+            })?;
 
         // Create context parameters array for Lua
         let context_params = self.lua.create_table()?;
@@ -160,7 +164,8 @@ impl LuaSession {
         // Use to_lua_params() to get parameters dynamically (from PC XML)
         // This removes hardcoded parameter names and follows S-100 standard pattern
         for (name, param_type, value_str) in params.to_lua_params() {
-            let param: mlua::Table = create_param_func.call((name.as_str(), param_type.as_str(), value_str.as_str()))?;
+            let param: mlua::Table =
+                create_param_func.call((name.as_str(), param_type.as_str(), value_str.as_str()))?;
             context_params.push(param)?;
         }
 
@@ -169,11 +174,16 @@ impl LuaSession {
             .lua
             .globals()
             .get("PortrayalInitializeContextParameters")
-            .map_err(|_| LuaError::FunctionNotFound("PortrayalInitializeContextParameters".to_string()))?;
+            .map_err(|_| {
+                LuaError::FunctionNotFound("PortrayalInitializeContextParameters".to_string())
+            })?;
 
         init_func.call::<()>(context_params)?;
 
-        tracing::debug!("Portrayal context initialized with {} parameters", params.to_lua_params().len());
+        tracing::debug!(
+            "Portrayal context initialized with {} parameters",
+            params.to_lua_params().len()
+        );
         Ok(())
     }
 
@@ -309,10 +319,7 @@ impl LuaSession {
 
     /// Check if a function exists
     pub fn has_function(&self, name: &str) -> bool {
-        self.lua
-            .globals()
-            .get::<mlua::Function>(name)
-            .is_ok()
+        self.lua.globals().get::<mlua::Function>(name).is_ok()
     }
 
     /// Get the Lua state for advanced usage

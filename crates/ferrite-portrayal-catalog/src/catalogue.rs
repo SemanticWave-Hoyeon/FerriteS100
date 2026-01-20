@@ -9,14 +9,10 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::{
-    PCError, Result,
-    ColorProfile, ColorProfiles, ColorDefinition, SrgbColor,
-    Symbol, Symbols,
-    LineStyle, SimpleLineStyle, Dash, LineSymbol,
-    AreaFill, VectorPoint,
-    ViewingGroup, ViewingGroups, ViewingGroupLayer, ViewingGroupLayers,
-    DisplayMode, DisplayModes,
-    PortrayalRules, RuleFile, RuleType, ContextParameter, ContextParamType,
+    AreaFill, ColorDefinition, ColorProfile, ColorProfiles, ContextParamType, ContextParameter,
+    Dash, DisplayMode, DisplayModes, LineStyle, LineSymbol, PCError, PortrayalRules, Result,
+    RuleFile, RuleType, SimpleLineStyle, SrgbColor, Symbol, Symbols, VectorPoint, ViewingGroup,
+    ViewingGroupLayer, ViewingGroupLayers, ViewingGroups,
 };
 
 /// Portrayal Catalogue
@@ -186,12 +182,19 @@ impl PortrayalCatalogue {
             buf.clear();
         }
 
-        tracing::debug!("Loaded {} context parameters from PC", self.rules.context_parameters.len());
+        tracing::debug!(
+            "Loaded {} context parameters from PC",
+            self.rules.context_parameters.len()
+        );
         Ok(())
     }
 
     /// Parse context parameter element
-    fn parse_context_parameter<R: std::io::BufRead>(&self, reader: &mut Reader<R>, id: &str) -> Result<ContextParameter> {
+    fn parse_context_parameter<R: std::io::BufRead>(
+        &self,
+        reader: &mut Reader<R>,
+        id: &str,
+    ) -> Result<ContextParameter> {
         let mut param = ContextParameter {
             id: id.to_string(),
             param_type: ContextParamType::String,
@@ -249,7 +252,10 @@ impl PortrayalCatalogue {
     }
 
     /// Parse viewing group element
-    fn parse_viewing_group<R: std::io::BufRead>(&self, reader: &mut Reader<R>) -> Result<ViewingGroup> {
+    fn parse_viewing_group<R: std::io::BufRead>(
+        &self,
+        reader: &mut Reader<R>,
+    ) -> Result<ViewingGroup> {
         let mut vg = ViewingGroup {
             id: 0,
             name: String::new(),
@@ -298,7 +304,10 @@ impl PortrayalCatalogue {
     }
 
     /// Parse viewing group layer element
-    fn parse_viewing_group_layer<R: std::io::BufRead>(&self, reader: &mut Reader<R>) -> Result<ViewingGroupLayer> {
+    fn parse_viewing_group_layer<R: std::io::BufRead>(
+        &self,
+        reader: &mut Reader<R>,
+    ) -> Result<ViewingGroupLayer> {
         let mut vgl = ViewingGroupLayer {
             id: String::new(),
             name: String::new(),
@@ -353,7 +362,10 @@ impl PortrayalCatalogue {
     }
 
     /// Parse display mode element
-    fn parse_display_mode<R: std::io::BufRead>(&self, reader: &mut Reader<R>) -> Result<DisplayMode> {
+    fn parse_display_mode<R: std::io::BufRead>(
+        &self,
+        reader: &mut Reader<R>,
+    ) -> Result<DisplayMode> {
         let mut dm = DisplayMode {
             id: String::new(),
             name: String::new(),
@@ -404,9 +416,11 @@ impl PortrayalCatalogue {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "xml") {
+            if path.extension().is_some_and(|e| e == "xml") {
                 if let Ok(profile) = self.parse_color_profile(&path) {
-                    self.color_profiles.profiles.insert(profile.id.clone(), profile);
+                    self.color_profiles
+                        .profiles
+                        .insert(profile.id.clone(), profile);
                 }
             }
         }
@@ -435,7 +449,10 @@ impl PortrayalCatalogue {
         xml_reader.config_mut().trim_text(true);
 
         let mut profile = ColorProfile::new(
-            path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
             String::new(),
         );
 
@@ -461,12 +478,20 @@ impl PortrayalCatalogue {
             buf.clear();
         }
 
-        tracing::debug!("Loaded color profile '{}' with {} colors", profile.name, profile.colors.len());
+        tracing::debug!(
+            "Loaded color profile '{}' with {} colors",
+            profile.name,
+            profile.colors.len()
+        );
         Ok(profile)
     }
 
     /// Parse palette section with sRGB values
-    fn parse_palette<R: std::io::BufRead>(&self, reader: &mut Reader<R>, profile: &mut ColorProfile) -> Result<()> {
+    fn parse_palette<R: std::io::BufRead>(
+        &self,
+        reader: &mut Reader<R>,
+        profile: &mut ColorProfile,
+    ) -> Result<()> {
         let mut buf = Vec::new();
         let mut depth = 1;
 
@@ -501,7 +526,11 @@ impl PortrayalCatalogue {
     }
 
     /// Parse palette item with sRGB values
-    fn parse_palette_item<R: std::io::BufRead>(&self, reader: &mut Reader<R>, token: &str) -> Result<ColorDefinition> {
+    fn parse_palette_item<R: std::io::BufRead>(
+        &self,
+        reader: &mut Reader<R>,
+        token: &str,
+    ) -> Result<ColorDefinition> {
         let mut r: Option<u8> = None;
         let mut g: Option<u8> = None;
         let mut b: Option<u8> = None;
@@ -563,10 +592,16 @@ impl PortrayalCatalogue {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "svg") {
-                let id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            if path.extension().is_some_and(|e| e == "svg") {
+                let id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 let svg_ref = PathBuf::from(path.file_name().unwrap());
-                self.symbols.symbols.insert(id.clone(), Symbol::new(id, svg_ref));
+                self.symbols
+                    .symbols
+                    .insert(id.clone(), Symbol::new(id, svg_ref));
             }
         }
         Ok(())
@@ -577,8 +612,12 @@ impl PortrayalCatalogue {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "xml") {
-                let id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            if path.extension().is_some_and(|e| e == "xml") {
+                let id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 if let Ok(style) = self.parse_line_style_xml(&path, &id) {
                     self.line_styles.insert(id, style);
                 }
@@ -689,8 +728,12 @@ impl PortrayalCatalogue {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "xml") {
-                let id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            if path.extension().is_some_and(|e| e == "xml") {
+                let id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 if let Ok(fill) = self.parse_area_fill_xml(&path, &id) {
                     self.area_fills.insert(id, fill);
                 }
@@ -773,7 +816,13 @@ impl PortrayalCatalogue {
         }
 
         if !symbol_ref.is_empty() {
-            Ok(AreaFill::symbol(id.to_string(), symbol_ref, area_crs, v1, v2))
+            Ok(AreaFill::symbol(
+                id.to_string(),
+                symbol_ref,
+                area_crs,
+                v1,
+                v2,
+            ))
         } else {
             // Fallback to default if no symbol found (shouldn't happen with valid XML)
             Ok(AreaFill::solid(id.to_string(), "NODTA".to_string()))
@@ -785,8 +834,12 @@ impl PortrayalCatalogue {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "lua") {
-                let id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            if path.extension().is_some_and(|e| e == "lua") {
+                let id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 let file_name = PathBuf::from(path.file_name().unwrap());
 
                 // Check if this is the main file
@@ -864,7 +917,7 @@ fn read_text_content<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<Stri
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Text(e) => {
-                text = e.unescape().map_err(|e| PCError::Xml(e.into()))?.to_string();
+                text = e.unescape().map_err(PCError::Xml)?.to_string();
             }
             Event::End(_) => break,
             Event::Eof => break,

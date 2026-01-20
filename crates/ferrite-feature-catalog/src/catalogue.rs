@@ -9,10 +9,8 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::{
-    Result,
-    AttributeValueType, Multiplicity, ListedValue, SpatialPrimitive,
-    SimpleAttribute, ComplexAttribute, AttributeBinding,
-    FeatureType, InformationType,
+    AttributeBinding, AttributeValueType, ComplexAttribute, FeatureType, InformationType,
+    ListedValue, Multiplicity, Result, SimpleAttribute, SpatialPrimitive,
 };
 
 /// Feature Catalogue
@@ -236,7 +234,9 @@ fn parse_simple_attribute<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result
 }
 
 /// Parse complex attribute element
-fn parse_complex_attribute<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<ComplexAttribute> {
+fn parse_complex_attribute<R: std::io::BufRead>(
+    reader: &mut Reader<R>,
+) -> Result<ComplexAttribute> {
     let mut attr = ComplexAttribute {
         code: String::new(),
         name: String::new(),
@@ -280,7 +280,10 @@ fn parse_complex_attribute<R: std::io::BufRead>(reader: &mut Reader<R>) -> Resul
 }
 
 /// Parse feature type element
-fn parse_feature_type<R: std::io::BufRead>(start: &BytesStart, reader: &mut Reader<R>) -> Result<FeatureType> {
+fn parse_feature_type<R: std::io::BufRead>(
+    start: &BytesStart,
+    reader: &mut Reader<R>,
+) -> Result<FeatureType> {
     let mut ft = FeatureType {
         code: String::new(),
         name: String::new(),
@@ -339,7 +342,10 @@ fn parse_feature_type<R: std::io::BufRead>(start: &BytesStart, reader: &mut Read
 }
 
 /// Parse information type element
-fn parse_information_type<R: std::io::BufRead>(start: &BytesStart, reader: &mut Reader<R>) -> Result<InformationType> {
+fn parse_information_type<R: std::io::BufRead>(
+    start: &BytesStart,
+    reader: &mut Reader<R>,
+) -> Result<InformationType> {
     let mut it = InformationType {
         code: String::new(),
         name: String::new(),
@@ -390,7 +396,10 @@ fn parse_information_type<R: std::io::BufRead>(start: &BytesStart, reader: &mut 
 }
 
 /// Parse attribute binding element
-fn parse_attribute_binding<R: std::io::BufRead>(start: &BytesStart, reader: &mut Reader<R>) -> Result<AttributeBinding> {
+fn parse_attribute_binding<R: std::io::BufRead>(
+    start: &BytesStart,
+    reader: &mut Reader<R>,
+) -> Result<AttributeBinding> {
     let mut binding = AttributeBinding {
         attribute_code: String::new(),
         multiplicity: Multiplicity::default(),

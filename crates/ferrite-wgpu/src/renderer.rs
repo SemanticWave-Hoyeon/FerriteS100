@@ -6,17 +6,15 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use winit::window::Window;
 use winit::event::WindowEvent;
+use winit::window::Window;
 
 use ferrite_portrayal_catalog::ColorProfile;
-use ferrite_render::{
-    Color, DrawingInstruction, RenderContext, ScreenPoint,
-};
+use ferrite_render::{Color, DrawingInstruction, RenderContext, ScreenPoint};
 
-use crate::{GpuState, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError};
+use crate::egui_integration::{AppUiState, EguiIntegration};
 use crate::pipeline::TextureVertex;
-use crate::egui_integration::{EguiIntegration, AppUiState};
+use crate::{GpuState, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError};
 
 /// Cached GPU texture for a symbol
 struct SymbolTexture {
@@ -137,7 +135,7 @@ impl WgpuRenderer {
             sounding_exact_positions: std::collections::HashSet::with_capacity(5000),
             world_dedup: std::collections::HashSet::with_capacity(5000),
             danger_grid: std::collections::HashSet::with_capacity(500),
-            grid_cell_size: 30.0, // Default grid cell size in pixels
+            grid_cell_size: 30.0,         // Default grid cell size in pixels
             sounding_cell_size_px: 150.0, // Fixed pixel spacing between soundings
             danger_cell_size_px: 80.0, // Danger symbols: smaller cell for higher density than soundings
             skip_screen_declutter: false,
@@ -218,10 +216,14 @@ impl WgpuRenderer {
     fn update_view_uniforms(&self) {
         let (width, height) = self.state.viewport_size();
         let uniforms = ViewUniforms::with_pan(
-            width, height, 1.0,
-            self.screen_pan_offset.0, self.screen_pan_offset.1
+            width,
+            height,
+            1.0,
+            self.screen_pan_offset.0,
+            self.screen_pan_offset.1,
         );
-        self.state.update_view_uniforms(&self.view_buffer, &uniforms);
+        self.state
+            .update_view_uniforms(&self.view_buffer, &uniforms);
     }
 
     /// Set screen-space pan offset for fast panning during drag.
@@ -341,19 +343,24 @@ impl WgpuRenderer {
                 DrawingInstruction::Point(point) => {
                     // Show soundings at zoom >= 3x (with world-space grid decluttering)
                     // At lower zoom levels, soundings are hidden unless explicitly enabled
-                    let is_sounding = point.symbol_ref.starts_with("SOUNDG") || point.symbol_ref.starts_with("SOUNDS");
+                    let is_sounding = point.symbol_ref.starts_with("SOUNDG")
+                        || point.symbol_ref.starts_with("SOUNDS");
                     if is_sounding && !self.show_soundings && self.zoom_level < 3.0 {
                         continue;
                     }
 
                     // ISODGR01 (Isolated Danger) and DANGER02 only visible at high zoom levels (>= 5x)
-                    if (point.symbol_ref == "ISODGR01" || point.symbol_ref == "DANGER02") && self.zoom_level < 5.0 {
+                    if (point.symbol_ref == "ISODGR01" || point.symbol_ref == "DANGER02")
+                        && self.zoom_level < 5.0
+                    {
                         continue;
                     }
 
                     // Try to render as symbol if cache is available
-                    let rendered = if let (Some(cache), Some(profile)) = (symbol_cache.as_mut(), color_profile) {
-                        self.try_add_symbol(point, &context.scaler, *cache, profile)
+                    let rendered = if let (Some(cache), Some(profile)) =
+                        (symbol_cache.as_mut(), color_profile)
+                    {
+                        self.try_add_symbol(point, &context.scaler, cache, profile)
                     } else {
                         false
                     };
@@ -373,7 +380,11 @@ impl WgpuRenderer {
     }
 
     /// Add area instruction - uses earcut for proper concave polygon triangulation
-    fn add_area(&mut self, area: &ferrite_render::AreaInstruction, scaler: &ferrite_render::Scaler) {
+    fn add_area(
+        &mut self,
+        area: &ferrite_render::AreaInstruction,
+        scaler: &ferrite_render::Scaler,
+    ) {
         // Get fill color
         let color = match &area.fill {
             ferrite_render::AreaFillType::Solid(c) => c.to_array(),
@@ -464,7 +475,8 @@ impl WgpuRenderer {
             );
             let base_index = self.area_vertices.len() as u32;
             for point in &cleaned_points {
-                self.area_vertices.push(Vertex2D::new(point.x, point.y, color));
+                self.area_vertices
+                    .push(Vertex2D::new(point.x, point.y, color));
             }
             // Fan triangulation from first vertex
             for i in 1..(cleaned_points.len() - 1) {
@@ -479,16 +491,14 @@ impl WgpuRenderer {
 
         // Validate indices
         let max_idx = cleaned_points.len();
-        let valid_indices: Vec<usize> = indices
-            .into_iter()
-            .filter(|&idx| idx < max_idx)
-            .collect();
+        let valid_indices: Vec<usize> = indices.into_iter().filter(|&idx| idx < max_idx).collect();
 
-        if valid_indices.len() < 3 || valid_indices.len() % 3 != 0 {
+        if valid_indices.len() < 3 || !valid_indices.len().is_multiple_of(3) {
             // Fallback if indices are invalid
             let base_index = self.area_vertices.len() as u32;
             for point in &cleaned_points {
-                self.area_vertices.push(Vertex2D::new(point.x, point.y, color));
+                self.area_vertices
+                    .push(Vertex2D::new(point.x, point.y, color));
             }
             for i in 1..(cleaned_points.len() - 1) {
                 self.area_indices.push(base_index);
@@ -501,7 +511,8 @@ impl WgpuRenderer {
         // Add vertices first
         let base_index = self.area_vertices.len() as u32;
         for point in &cleaned_points {
-            self.area_vertices.push(Vertex2D::new(point.x, point.y, color));
+            self.area_vertices
+                .push(Vertex2D::new(point.x, point.y, color));
         }
 
         // Add triangle indices from earcut result
@@ -511,7 +522,11 @@ impl WgpuRenderer {
     }
 
     /// Add line instruction
-    fn add_line(&mut self, line: &ferrite_render::LineInstruction, scaler: &ferrite_render::Scaler) {
+    fn add_line(
+        &mut self,
+        line: &ferrite_render::LineInstruction,
+        scaler: &ferrite_render::Scaler,
+    ) {
         let color = line.style.color.to_array();
         let width = line.style.width;
 
@@ -542,10 +557,14 @@ impl WgpuRenderer {
             let base_index = self.line_vertices.len() as u32;
 
             // Four corners of the line segment quad
-            self.line_vertices.push(Vertex2D::new(p0.x - nx, p0.y - ny, color));
-            self.line_vertices.push(Vertex2D::new(p0.x + nx, p0.y + ny, color));
-            self.line_vertices.push(Vertex2D::new(p1.x + nx, p1.y + ny, color));
-            self.line_vertices.push(Vertex2D::new(p1.x - nx, p1.y - ny, color));
+            self.line_vertices
+                .push(Vertex2D::new(p0.x - nx, p0.y - ny, color));
+            self.line_vertices
+                .push(Vertex2D::new(p0.x + nx, p0.y + ny, color));
+            self.line_vertices
+                .push(Vertex2D::new(p1.x + nx, p1.y + ny, color));
+            self.line_vertices
+                .push(Vertex2D::new(p1.x - nx, p1.y - ny, color));
 
             // Two triangles
             self.line_indices.push(base_index);
@@ -571,7 +590,8 @@ impl WgpuRenderer {
         }
 
         // Log first few symbol requests for debugging
-        static SYMBOL_DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SYMBOL_DEBUG_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
         let debug_idx = SYMBOL_DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if debug_idx < 20 {
             tracing::debug!("Symbol request [{}]: '{}'", debug_idx, symbol_id);
@@ -593,21 +613,30 @@ impl WgpuRenderer {
                 &format!("symbol_{}", symbol_id),
             );
 
-            let bind_group = self.pipelines.create_texture_bind_group(&self.state.device, &view);
+            let bind_group = self
+                .pipelines
+                .create_texture_bind_group(&self.state.device, &view);
 
             let pivot_in_tex = geom.pivot_in_texture();
-            self.symbol_textures.insert(symbol_id.clone(), SymbolTexture {
-                texture: _texture,
-                bind_group,
-                width: geom.width,
-                height: geom.height,
-                pivot_in_texture: pivot_in_tex,
-                render_scale: geom.render_scale,
-            });
+            self.symbol_textures.insert(
+                symbol_id.clone(),
+                SymbolTexture {
+                    texture: _texture,
+                    bind_group,
+                    width: geom.width,
+                    height: geom.height,
+                    pivot_in_texture: pivot_in_tex,
+                    render_scale: geom.render_scale,
+                },
+            );
 
             tracing::debug!(
                 "Created GPU texture for symbol '{}': {}x{}, pivot_in_tex: ({:.2}, {:.2})",
-                symbol_id, geom.width, geom.height, pivot_in_tex.0, pivot_in_tex.1
+                symbol_id,
+                geom.width,
+                geom.height,
+                pivot_in_tex.0,
+                pivot_in_tex.1
             );
         }
 
@@ -671,13 +700,16 @@ impl WgpuRenderer {
                     // Get current sounding's depth (default to MAX if not set)
                     let current_depth = point.depth.unwrap_or(f64::MAX);
 
-                    if let Some(&(old_exact_key, old_depth)) = self.sounding_screen_grid.get(&sounding_grid_key) {
+                    if let Some(&(old_exact_key, old_depth)) =
+                        self.sounding_screen_grid.get(&sounding_grid_key)
+                    {
                         // Another sounding already claimed this screen cell
                         // For SAFETY: keep the SHALLOWEST (lowest numerical depth) sounding
                         if current_depth < old_depth {
                             // This sounding is shallower - replace the old one
                             self.sounding_exact_positions.remove(&old_exact_key);
-                            self.sounding_screen_grid.insert(sounding_grid_key, (exact_key, current_depth));
+                            self.sounding_screen_grid
+                                .insert(sounding_grid_key, (exact_key, current_depth));
                             self.sounding_exact_positions.insert(exact_key);
                         } else {
                             // Existing sounding is shallower or equal - skip this one
@@ -685,7 +717,8 @@ impl WgpuRenderer {
                         }
                     } else {
                         // Cell is empty - this sounding claims it
-                        self.sounding_screen_grid.insert(sounding_grid_key, (exact_key, current_depth));
+                        self.sounding_screen_grid
+                            .insert(sounding_grid_key, (exact_key, current_depth));
                         self.sounding_exact_positions.insert(exact_key);
                     }
                 }
@@ -747,7 +780,11 @@ impl WgpuRenderer {
     }
 
     /// Fallback point rendering (small square) when symbol not available
-    fn add_point_fallback(&mut self, point: &ferrite_render::PointInstruction, scaler: &ferrite_render::Scaler) {
+    fn add_point_fallback(
+        &mut self,
+        point: &ferrite_render::PointInstruction,
+        scaler: &ferrite_render::Scaler,
+    ) {
         let screen = scaler.world_to_screen(point.position);
         let size = 4.0 * point.scale;
         let color = [1.0, 0.0, 0.0, 1.0]; // Red for missing symbols
@@ -755,10 +792,14 @@ impl WgpuRenderer {
         let base_index = self.area_vertices.len() as u32;
 
         // Small square
-        self.area_vertices.push(Vertex2D::new(screen.x - size, screen.y - size, color));
-        self.area_vertices.push(Vertex2D::new(screen.x + size, screen.y - size, color));
-        self.area_vertices.push(Vertex2D::new(screen.x + size, screen.y + size, color));
-        self.area_vertices.push(Vertex2D::new(screen.x - size, screen.y + size, color));
+        self.area_vertices
+            .push(Vertex2D::new(screen.x - size, screen.y - size, color));
+        self.area_vertices
+            .push(Vertex2D::new(screen.x + size, screen.y - size, color));
+        self.area_vertices
+            .push(Vertex2D::new(screen.x + size, screen.y + size, color));
+        self.area_vertices
+            .push(Vertex2D::new(screen.x - size, screen.y + size, color));
 
         self.area_indices.push(base_index);
         self.area_indices.push(base_index + 1);
@@ -771,7 +812,9 @@ impl WgpuRenderer {
     /// Render the frame
     pub fn render(&mut self) -> Result<()> {
         let output = self.state.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         // Begin egui frame
         self.egui.begin_frame(&self.state.window);
@@ -782,31 +825,46 @@ impl WgpuRenderer {
         // End egui frame and get output
         let egui_output = self.egui.end_frame(&self.state.window);
 
-        let mut encoder = self.state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render_encoder"),
-        });
+        let mut encoder =
+            self.state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("render_encoder"),
+                });
 
         // Create buffers from collected vertices
         let area_vertex_buffer = if !self.area_vertices.is_empty() {
-            Some(self.state.create_vertex_buffer(&self.area_vertices, "area_vertices"))
+            Some(
+                self.state
+                    .create_vertex_buffer(&self.area_vertices, "area_vertices"),
+            )
         } else {
             None
         };
 
         let area_index_buffer = if !self.area_indices.is_empty() {
-            Some(self.state.create_index_buffer(&self.area_indices, "area_indices"))
+            Some(
+                self.state
+                    .create_index_buffer(&self.area_indices, "area_indices"),
+            )
         } else {
             None
         };
 
         let line_vertex_buffer = if !self.line_vertices.is_empty() {
-            Some(self.state.create_vertex_buffer(&self.line_vertices, "line_vertices"))
+            Some(
+                self.state
+                    .create_vertex_buffer(&self.line_vertices, "line_vertices"),
+            )
         } else {
             None
         };
 
         let line_index_buffer = if !self.line_indices.is_empty() {
-            Some(self.state.create_index_buffer(&self.line_indices, "line_indices"))
+            Some(
+                self.state
+                    .create_index_buffer(&self.line_indices, "line_indices"),
+            )
         } else {
             None
         };
@@ -872,7 +930,8 @@ impl WgpuRenderer {
                         // The symbol was rendered at render_scale pixels per mm
                         // We need to display it at the correct size based on point.scale
                         let mm_to_px = 3.78; // 96 DPI
-                        let display_scale = instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
+                        let display_scale =
+                            instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
 
                         let half_w = (tex.width as f32 * display_scale) / 2.0;
                         let half_h = (tex.height as f32 * display_scale) / 2.0;
@@ -884,13 +943,18 @@ impl WgpuRenderer {
                         let pivot_y = tex.pivot_in_texture.1 * display_scale;
 
                         // Debug: Log sounding symbol positions
-                        static SOUNDING_DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                        if instance.symbol_id.starts_with("SOUNDG") || instance.symbol_id.starts_with("SOUNDS") {
-                            let debug_idx = SOUNDING_DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        static SOUNDING_DEBUG_COUNT: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        if instance.symbol_id.starts_with("SOUNDG")
+                            || instance.symbol_id.starts_with("SOUNDS")
+                        {
+                            let debug_idx = SOUNDING_DEBUG_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if debug_idx < 50 {
                                 // Calculate actual screen bounds
                                 let left = instance.screen_x - pivot_x;
-                                let right = instance.screen_x + (tex.width as f32 * display_scale) - pivot_x;
+                                let right = instance.screen_x + (tex.width as f32 * display_scale)
+                                    - pivot_x;
                                 tracing::info!(
                                     "Sounding [{}] '{}': screen=({:.1},{:.1}), pivot_x={:.2}, bounds=[{:.1}, {:.1}]",
                                     debug_idx, instance.symbol_id,
@@ -1021,13 +1085,17 @@ impl WgpuRenderer {
         });
         let resolve_view = resolve_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        tracing::debug!("Screenshot format: {:?}, MSAA samples: {}", screenshot_format, MSAA_SAMPLE_COUNT);
+        tracing::debug!(
+            "Screenshot format: {:?}, MSAA samples: {}",
+            screenshot_format,
+            MSAA_SAMPLE_COUNT
+        );
 
         // Calculate buffer dimensions (aligned to 256 bytes)
         let bytes_per_pixel = 4u32;
         let unpadded_bytes_per_row = width * bytes_per_pixel;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) / align * align;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
         let buffer_size = (padded_bytes_per_row * height) as u64;
 
         // Create output buffer
@@ -1038,31 +1106,46 @@ impl WgpuRenderer {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self.state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("screenshot_encoder"),
-        });
+        let mut encoder =
+            self.state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("screenshot_encoder"),
+                });
 
         // Recreate buffers for rendering
         let area_vertex_buffer = if !self.area_vertices.is_empty() {
-            Some(self.state.create_vertex_buffer(&self.area_vertices, "area_vertices"))
+            Some(
+                self.state
+                    .create_vertex_buffer(&self.area_vertices, "area_vertices"),
+            )
         } else {
             None
         };
 
         let area_index_buffer = if !self.area_indices.is_empty() {
-            Some(self.state.create_index_buffer(&self.area_indices, "area_indices"))
+            Some(
+                self.state
+                    .create_index_buffer(&self.area_indices, "area_indices"),
+            )
         } else {
             None
         };
 
         let line_vertex_buffer = if !self.line_vertices.is_empty() {
-            Some(self.state.create_vertex_buffer(&self.line_vertices, "line_vertices"))
+            Some(
+                self.state
+                    .create_vertex_buffer(&self.line_vertices, "line_vertices"),
+            )
         } else {
             None
         };
 
         let line_index_buffer = if !self.line_indices.is_empty() {
-            Some(self.state.create_index_buffer(&self.line_indices, "line_indices"))
+            Some(
+                self.state
+                    .create_index_buffer(&self.line_indices, "line_indices"),
+            )
         } else {
             None
         };
@@ -1118,7 +1201,8 @@ impl WgpuRenderer {
                     let instance = &self.symbol_instances[i];
                     if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
                         let mm_to_px = 3.78;
-                        let display_scale = instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
+                        let display_scale =
+                            instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
 
                         let half_w = (tex.width as f32 * display_scale) / 2.0;
                         let half_h = (tex.height as f32 * display_scale) / 2.0;

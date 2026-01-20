@@ -20,7 +20,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-1.70+-orange?logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/License-MIT-blue" alt="License">
+  <img src="https://img.shields.io/badge/License-PolyForm%20NC-blue" alt="License">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/GPU-Vulkan%20%7C%20DX12%20%7C%20Metal-green" alt="GPU">
   <img src="https://img.shields.io/badge/Navigation-Please%20Don't-red" alt="Not for Navigation">
@@ -198,7 +198,22 @@ All dependencies are sourced from [crates.io](https://crates.io) and audited via
 
 ## License
 
-This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **PolyForm Noncommercial License 1.0.0**.
+
+| Usage | Allowed |
+|-------|---------|
+| Research / Academic | Yes |
+| Personal / Non-profit | Yes |
+| Modification | Yes (with attribution) |
+| Commercial / Enterprise | **No** |
+
+**Key points:**
+- Free for research, education, and non-commercial use
+- Modifications allowed with proper attribution
+- **Not** a copyleft license (your modifications don't have to use the same license)
+- Commercial use requires separate licensing agreement
+
+See the [LICENSE](LICENSE) file for full terms.
 
 ## Contributing
 

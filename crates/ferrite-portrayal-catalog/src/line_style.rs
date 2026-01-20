@@ -94,7 +94,11 @@ impl SimpleLineStyle {
         // Convert start/length format to length/gap format
         let mut result = Vec::new();
         let mut sorted_dashes: Vec<_> = self.dashes.iter().collect();
-        sorted_dashes.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_dashes.sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut current_pos = 0.0;
         for dash in sorted_dashes {

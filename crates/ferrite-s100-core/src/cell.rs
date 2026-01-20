@@ -5,17 +5,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ferrite_iso8211::{Iso8211Parser, DR, tags, read_string, UNIT_TERMINATOR, FIELD_TERMINATOR};
+use ferrite_iso8211::{read_string, tags, Iso8211Parser, DR, FIELD_TERMINATOR, UNIT_TERMINATOR};
 
 use crate::{
-    S100Error, Result,
-    RecordId, Coordinate,
-    PointRecord, MultiPointRecord, CurveRecord, CurveSegment, SegmentType,
-    CompositeCurveRecord, OrientedCurve, SurfaceRecord,
-    FeatureRecord, FRID, FOID, Attribute, SpatialAssociation, InformationAssociation,
-    FeatureAssociation, SpatialPrimitiveType,
-    InformationRecord, IRID,
-    DatasetCodeMappings, CodeMapping,
+    Attribute, CodeMapping, CompositeCurveRecord, Coordinate, CurveRecord, CurveSegment,
+    DatasetCodeMappings, FeatureAssociation, FeatureRecord, InformationAssociation,
+    InformationRecord, MultiPointRecord, OrientedCurve, PointRecord, RecordId, Result, S100Error,
+    SegmentType, SpatialAssociation, SpatialPrimitiveType, SurfaceRecord, FOID, FRID, IRID,
 };
 
 /// Dataset identification
@@ -151,12 +147,10 @@ impl S101Cell {
             if data.len() >= 32 {
                 // Read coordinate origins (f64, little-endian)
                 let dcox = f64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 let dcoy = f64::from_le_bytes([
-                    data[8], data[9], data[10], data[11],
-                    data[12], data[13], data[14], data[15],
+                    data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
                 ]);
 
                 self.coord_origin_x = dcox;
@@ -239,7 +233,8 @@ impl S101Cell {
 
     /// Process point record
     fn process_point(&mut self, dr: &DR) -> Result<()> {
-        let prid_field = dr.find_field(tags::PRID)
+        let prid_field = dr
+            .find_field(tags::PRID)
             .ok_or_else(|| S100Error::MissingField("PRID".into()))?;
 
         let data = prid_field.data_trimmed();
@@ -255,12 +250,25 @@ impl S101Cell {
         let mut position = Coordinate::new(0.0, 0.0);
 
         // Look for C2IT (2D Integer Tuple) for points, not C2IL (which is for lists)
-        if let Some(coord_field) = dr.find_field(tags::C2IT).or_else(|| dr.find_field(tags::C3IT)) {
+        if let Some(coord_field) = dr
+            .find_field(tags::C2IT)
+            .or_else(|| dr.find_field(tags::C3IT))
+        {
             let coord_data = coord_field.data_trimmed();
             if coord_data.len() >= 8 {
                 // S-101 stores coordinates as (YCOO, XCOO) = (latitude, longitude)
-                let y = i32::from_le_bytes([coord_data[0], coord_data[1], coord_data[2], coord_data[3]]);
-                let x = i32::from_le_bytes([coord_data[4], coord_data[5], coord_data[6], coord_data[7]]);
+                let y = i32::from_le_bytes([
+                    coord_data[0],
+                    coord_data[1],
+                    coord_data[2],
+                    coord_data[3],
+                ]);
+                let x = i32::from_le_bytes([
+                    coord_data[4],
+                    coord_data[5],
+                    coord_data[6],
+                    coord_data[7],
+                ]);
                 position = Coordinate::new(
                     x as f64 * self.coord_factor + self.coord_origin_x,
                     y as f64 * self.coord_factor + self.coord_origin_y,
@@ -281,7 +289,8 @@ impl S101Cell {
     /// Process multi-point record (for soundings)
     /// Reference: S-100 standard/GISLibrary/R_MultiPointRecord.cpp
     fn process_multi_point(&mut self, dr: &DR) -> Result<()> {
-        let mrid_field = dr.find_field(tags::MRID)
+        let mrid_field = dr
+            .find_field(tags::MRID)
             .ok_or_else(|| S100Error::MissingField("MRID".into()))?;
 
         let data = mrid_field.data_trimmed();
@@ -317,16 +326,22 @@ impl S101Cell {
                     let offset = i * triplet_size;
                     if offset + 12 <= triplet_data.len() {
                         let y = i32::from_le_bytes([
-                            triplet_data[offset], triplet_data[offset + 1],
-                            triplet_data[offset + 2], triplet_data[offset + 3],
+                            triplet_data[offset],
+                            triplet_data[offset + 1],
+                            triplet_data[offset + 2],
+                            triplet_data[offset + 3],
                         ]);
                         let x = i32::from_le_bytes([
-                            triplet_data[offset + 4], triplet_data[offset + 5],
-                            triplet_data[offset + 6], triplet_data[offset + 7],
+                            triplet_data[offset + 4],
+                            triplet_data[offset + 5],
+                            triplet_data[offset + 6],
+                            triplet_data[offset + 7],
                         ]);
                         let z = i32::from_le_bytes([
-                            triplet_data[offset + 8], triplet_data[offset + 9],
-                            triplet_data[offset + 10], triplet_data[offset + 11],
+                            triplet_data[offset + 8],
+                            triplet_data[offset + 9],
+                            triplet_data[offset + 10],
+                            triplet_data[offset + 11],
                         ]);
 
                         let coord = Coordinate::new_3d(
@@ -352,7 +367,8 @@ impl S101Cell {
 
     /// Process curve record
     fn process_curve(&mut self, dr: &DR) -> Result<()> {
-        let crid_field = dr.find_field(tags::CRID)
+        let crid_field = dr
+            .find_field(tags::CRID)
             .ok_or_else(|| S100Error::MissingField("CRID".into()))?;
 
         let data = crid_field.data_trimmed();
@@ -433,8 +449,18 @@ impl S101Cell {
             }
 
             // S-101 stores coordinates as (YCOO, XCOO) = (latitude, longitude)
-            let y_raw = i32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-            let x_raw = i32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
+            let y_raw = i32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            let x_raw = i32::from_le_bytes([
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
 
             let x = x_raw as f64 * self.coord_factor + self.coord_origin_x;
             let y = y_raw as f64 * self.coord_factor + self.coord_origin_y;
@@ -449,7 +475,8 @@ impl S101Cell {
 
     /// Process composite curve record
     fn process_composite_curve(&mut self, dr: &DR) -> Result<()> {
-        let ccid_field = dr.find_field(tags::CCID)
+        let ccid_field = dr
+            .find_field(tags::CCID)
             .ok_or_else(|| S100Error::MissingField("CCID".into()))?;
 
         let data = ccid_field.data_trimmed();
@@ -503,7 +530,8 @@ impl S101Cell {
 
     /// Process surface record
     fn process_surface(&mut self, dr: &DR) -> Result<()> {
-        let srid_field = dr.find_field(tags::SRID)
+        let srid_field = dr
+            .find_field(tags::SRID)
             .ok_or_else(|| S100Error::MissingField("SRID".into()))?;
 
         let data = srid_field.data_trimmed();
@@ -574,7 +602,8 @@ impl S101Cell {
 
     /// Process feature record
     fn process_feature(&mut self, dr: &DR) -> Result<()> {
-        let frid_field = dr.find_field(tags::FRID)
+        let frid_field = dr
+            .find_field(tags::FRID)
             .ok_or_else(|| S100Error::MissingField("FRID".into()))?;
 
         let data = frid_field.data_trimmed();
@@ -588,14 +617,22 @@ impl S101Cell {
         let rver = u16::from_le_bytes([data[6], data[7]]);
         let ruin = if data.len() > 8 { data[8] } else { 1 };
 
-        let frid = FRID { rcid, nftc, rver, ruin };
+        let frid = FRID {
+            rcid,
+            nftc,
+            rver,
+            ruin,
+        };
 
         // Debug first few features
         static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
             tracing::trace!(
                 "FRID: rcid={}, nftc={} (bytes: {:02X} {:02X})",
-                rcid, nftc, data[4], data[5]
+                rcid,
+                nftc,
+                data[4],
+                data[5]
             );
         }
 
@@ -692,7 +729,11 @@ impl S101Cell {
     }
 
     /// Parse spatial associations from SPAS field
-    fn parse_spatial_associations(&self, data: &[u8], assocs: &mut Vec<SpatialAssociation>) -> Result<()> {
+    fn parse_spatial_associations(
+        &self,
+        data: &[u8],
+        assocs: &mut Vec<SpatialAssociation>,
+    ) -> Result<()> {
         let mut offset = 0;
 
         while offset + 8 <= data.len() {
@@ -725,7 +766,11 @@ impl S101Cell {
     }
 
     /// Parse information associations from INAS field
-    fn parse_info_associations(&self, data: &[u8], assocs: &mut Vec<InformationAssociation>) -> Result<()> {
+    fn parse_info_associations(
+        &self,
+        data: &[u8],
+        assocs: &mut Vec<InformationAssociation>,
+    ) -> Result<()> {
         let mut offset = 0;
 
         while offset + 9 <= data.len() {
@@ -756,7 +801,11 @@ impl S101Cell {
     }
 
     /// Parse feature associations from FASC field
-    fn parse_feature_associations(&self, data: &[u8], assocs: &mut Vec<FeatureAssociation>) -> Result<()> {
+    fn parse_feature_associations(
+        &self,
+        data: &[u8],
+        assocs: &mut Vec<FeatureAssociation>,
+    ) -> Result<()> {
         let mut offset = 0;
 
         while offset + 9 <= data.len() {
@@ -807,7 +856,8 @@ impl S101Cell {
 
     /// Process information record
     fn process_information(&mut self, dr: &DR) -> Result<()> {
-        let irid_field = dr.find_field(tags::IRID)
+        let irid_field = dr
+            .find_field(tags::IRID)
             .ok_or_else(|| S100Error::MissingField("IRID".into()))?;
 
         let data = irid_field.data_trimmed();
@@ -820,7 +870,12 @@ impl S101Cell {
         let rver = u16::from_le_bytes([data[6], data[7]]);
         let ruin = if data.len() > 8 { data[8] } else { 1 };
 
-        let irid = IRID { rcid, nitc, rver, ruin };
+        let irid = IRID {
+            rcid,
+            nitc,
+            rver,
+            ruin,
+        };
 
         // Parse attributes
         let mut attributes = Vec::new();
@@ -868,18 +923,12 @@ impl S101Cell {
         }
 
         if !unmapped_nftc.is_empty() {
-            tracing::warn!(
-                "Unmapped NFTC codes: {:?} (not in FTCS)",
-                unmapped_nftc
-            );
+            tracing::warn!("Unmapped NFTC codes: {:?} (not in FTCS)", unmapped_nftc);
         }
 
         // Apply to information records
         for info in self.information.values_mut() {
-            info.info_code = self
-                .code_mappings
-                .info_type_code(info.irid.nitc)
-                .cloned();
+            info.info_code = self.code_mappings.info_type_code(info.irid.nitc).cloned();
 
             for attr in &mut info.attributes {
                 attr.code = self.code_mappings.attribute_code(attr.natc).cloned();
@@ -936,8 +985,7 @@ impl S101Cell {
             // "BuoyCardinal" -> "CardinalBuoy", "BeaconLateral" -> "LateralBeacon"
             let prefixes = ["Buoy", "Beacon", "Restricted"];
             for prefix in prefixes {
-                if data_code.starts_with(prefix) {
-                    let suffix = &data_code[prefix.len()..];
+                if let Some(suffix) = data_code.strip_prefix(prefix) {
                     let swapped = format!("{}{}", suffix, prefix);
                     if let Some(fc_code) = fc_codes_lower.get(&swapped.to_lowercase()) {
                         return Some((*fc_code).clone());
@@ -949,8 +997,7 @@ impl S101Cell {
             // "RestrictedAreaNavigational" -> "RestrictedArea" (drop suffix)
             let suffixes = ["Navigational", "Regulatory", "WarpingFacility"];
             for suffix in suffixes {
-                if data_code.ends_with(suffix) {
-                    let base = &data_code[..data_code.len() - suffix.len()];
+                if let Some(base) = data_code.strip_suffix(suffix) {
                     if let Some(fc_code) = fc_codes_lower.get(&base.to_lowercase()) {
                         return Some((*fc_code).clone());
                     }
@@ -975,7 +1022,9 @@ impl S101Cell {
                     if let Some(fc_code) = find_fc_code(data_code) {
                         tracing::debug!(
                             "Normalized feature code: {} -> {} (feature ID: {})",
-                            data_code, fc_code, feature.frid.rcid
+                            data_code,
+                            fc_code,
+                            feature.frid.rcid
                         );
                         feature.feature_code = Some(fc_code);
                         normalized_count += 1;
@@ -1002,7 +1051,10 @@ impl S101Cell {
         }
 
         for (num, fc_code) in ftcs_changes {
-            self.code_mappings.feature_types.num_to_str.insert(num, fc_code);
+            self.code_mappings
+                .feature_types
+                .num_to_str
+                .insert(num, fc_code);
         }
     }
 }
@@ -1024,7 +1076,12 @@ impl std::fmt::Display for CellStatistics {
         write!(
             f,
             "{} features, {} info, {} pts, {} multi-pts, {} curves, {} surfaces",
-            self.features, self.information, self.points, self.multi_points, self.curves, self.surfaces
+            self.features,
+            self.information,
+            self.points,
+            self.multi_points,
+            self.curves,
+            self.surfaces
         )
     }
 }

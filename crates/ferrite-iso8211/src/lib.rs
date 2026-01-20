@@ -3,16 +3,16 @@
 //! This crate provides parsers for reading ISO/IEC 8211 formatted files,
 //! which is the standard format for S-100 Electronic Navigational Charts.
 
-mod error;
-mod leader;
 mod directory;
+mod error;
 mod field;
-mod record;
+mod leader;
 mod parser;
+mod record;
 
-pub use error::*;
-pub use leader::*;
 pub use directory::*;
+pub use error::*;
 pub use field::*;
-pub use record::*;
+pub use leader::*;
 pub use parser::*;
+pub use record::*;

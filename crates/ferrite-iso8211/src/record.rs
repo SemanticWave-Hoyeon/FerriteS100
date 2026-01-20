@@ -2,7 +2,7 @@
 //!
 //! Contains DDR (Data Descriptive Record) and DR (Data Record) parsing.
 
-use crate::{Leader, Directory, RawField, Iso8211Error, Result};
+use crate::{Directory, Iso8211Error, Leader, RawField, Result};
 
 /// Data Descriptive Record (DDR)
 /// Contains field definitions for the file
@@ -38,7 +38,7 @@ impl DDR {
 
         if !leader.is_ddr() {
             return Err(Iso8211Error::InvalidRecord(
-                "Expected DDR (leader identifier 'L')".to_string()
+                "Expected DDR (leader identifier 'L')".to_string(),
             ));
         }
 
@@ -149,7 +149,7 @@ impl DR {
 
         if !leader.is_dr() {
             return Err(Iso8211Error::InvalidRecord(
-                "Expected DR (leader identifier 'D')".to_string()
+                "Expected DR (leader identifier 'D')".to_string(),
             ));
         }
 
