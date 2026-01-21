@@ -122,6 +122,10 @@ pub struct RenderContext {
     instructions: Vec<DrawingInstruction>,
     /// Instructions per feature ID
     feature_instructions: HashMap<i64, FeatureInstructions>,
+    /// Optimization: cache sorted state to avoid re-sorting during animation
+    sorted: bool,
+    /// Optimization: animation mode (skip expensive operations)
+    pub animation_mode: bool,
 }
 
 impl RenderContext {
@@ -134,7 +138,15 @@ impl RenderContext {
             background_color: Color::from_hex("#DEEBF7").unwrap_or(Color::WHITE), // Light blue water
             instructions: Vec::new(),
             feature_instructions: HashMap::new(),
+            sorted: false,
+            animation_mode: false,
         }
+    }
+
+    /// Set animation mode (enables fast-path optimizations)
+    #[inline]
+    pub fn set_animation_mode(&mut self, animating: bool) {
+        self.animation_mode = animating;
     }
 
     /// Set viewport size
@@ -159,6 +171,9 @@ impl RenderContext {
             return;
         }
 
+        // Mark as unsorted when new instructions are added
+        self.sorted = false;
+
         // Track by feature ID if present
         if let Some(feature_id) = instruction.feature_id() {
             self.feature_instructions
@@ -172,8 +187,14 @@ impl RenderContext {
     }
 
     /// Get all instructions sorted by priority
+    ///
+    /// Optimization: Skips re-sorting if already sorted or in animation mode
     pub fn get_sorted_instructions(&mut self) -> &[DrawingInstruction] {
-        self.instructions.sort_by_key(|i| i.priority());
+        // Skip sort during animation mode for better performance
+        if !self.sorted && !self.animation_mode {
+            self.instructions.sort_by_key(|i| i.priority());
+            self.sorted = true;
+        }
         &self.instructions
     }
 
@@ -186,6 +207,7 @@ impl RenderContext {
     pub fn clear_instructions(&mut self) {
         self.instructions.clear();
         self.feature_instructions.clear();
+        self.sorted = false;
     }
 
     /// Get total instruction count

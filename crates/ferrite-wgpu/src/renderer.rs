@@ -4,17 +4,90 @@
 //! Uses resvg for SVG symbol rendering via textures.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
 use ferrite_portrayal_catalog::ColorProfile;
-use ferrite_render::{Color, DrawingInstruction, RenderContext, ScreenPoint};
+use ferrite_render::{Color, DrawingInstruction, RenderContext, ScreenPoint, WorldPoint};
 
 use crate::egui_integration::{AppUiState, EguiIntegration};
 use crate::pipeline::TextureVertex;
 use crate::{GpuState, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError};
+
+/// Cached triangulation for an area (optimization)
+#[derive(Clone)]
+struct CachedTriangulation {
+    vertices: Vec<Vertex2D>,
+    indices: Vec<u32>,
+    /// Hash of the geometry for invalidation
+    geometry_hash: u64,
+}
+
+/// Batched symbols grouped by texture for efficient rendering
+#[allow(dead_code)]
+struct SymbolBatch {
+    /// All vertices for this texture batch
+    vertices: Vec<TextureVertex>,
+    /// All indices for this texture batch
+    indices: Vec<u32>,
+    /// The texture bind group
+    bind_group_idx: usize,
+}
+
+/// Simple Quadtree node for spatial indexing
+#[allow(dead_code)]
+struct QuadTreeNode {
+    bounds: (f64, f64, f64, f64), // (min_x, min_y, max_x, max_y)
+    feature_ids: Vec<i64>,
+    children: Option<Box<[QuadTreeNode; 4]>>,
+}
+
+#[allow(dead_code)]
+impl QuadTreeNode {
+    fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
+        QuadTreeNode {
+            bounds: (min_x, min_y, max_x, max_y),
+            feature_ids: Vec::new(),
+            children: None,
+        }
+    }
+
+    /// Query features intersecting with viewport
+    fn query(&self, viewport: (f64, f64, f64, f64), result: &mut Vec<i64>) {
+        // Check if this node intersects viewport
+        if !Self::intersects(self.bounds, viewport) {
+            return;
+        }
+
+        // Add features from this node
+        result.extend(&self.feature_ids);
+
+        // Recurse into children
+        if let Some(ref children) = self.children {
+            for child in children.iter() {
+                child.query(viewport, result);
+            }
+        }
+    }
+
+    #[inline]
+    fn intersects(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
+        a.0 <= b.2 && a.2 >= b.0 && a.1 <= b.3 && a.3 >= b.1
+    }
+}
+
+/// Hash a slice of world points for cache key
+fn hash_geometry(points: &[WorldPoint]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for p in points {
+        ((p.x * 1_000_000.0) as i64).hash(&mut hasher);
+        ((p.y * 1_000_000.0) as i64).hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 /// Cached GPU texture for a symbol
 struct SymbolTexture {
@@ -93,6 +166,17 @@ pub struct WgpuRenderer {
     egui: EguiIntegration,
     /// UI state shared with main app
     pub ui_state: AppUiState,
+    // === OPTIMIZATION FIELDS ===
+    /// Cached triangulations by feature ID (optimization)
+    triangulation_cache: HashMap<i64, CachedTriangulation>,
+    /// Batched symbols by texture (optimization)
+    symbol_batches: HashMap<String, (Vec<TextureVertex>, Vec<u32>)>,
+    /// Animation/drag mode - enables fast-path rendering
+    pub animation_mode: bool,
+    /// LOD level (0=full detail, 1=medium, 2=low)
+    lod_level: u8,
+    /// Viewport bounds in world coordinates for culling
+    viewport_world_bounds: Option<(f64, f64, f64, f64)>,
 }
 
 impl WgpuRenderer {
@@ -142,7 +226,121 @@ impl WgpuRenderer {
             screen_pan_offset: (0.0, 0.0),
             egui,
             ui_state: AppUiState::default(),
+            // Optimization fields
+            triangulation_cache: HashMap::with_capacity(500),
+            symbol_batches: HashMap::with_capacity(50),
+            animation_mode: false,
+            lod_level: 0,
+            viewport_world_bounds: None,
         })
+    }
+
+    /// Set animation mode for fast-path rendering during drag/zoom
+    #[inline]
+    pub fn set_animation_mode(&mut self, animating: bool) {
+        self.animation_mode = animating;
+        // During animation, use lower LOD
+        self.lod_level = if animating { 1 } else { 0 };
+    }
+
+    /// Update viewport world bounds for frustum culling
+    pub fn update_viewport_bounds(&mut self, scaler: &ferrite_render::Scaler) {
+        let (vw, vh) = (scaler.viewport.width, scaler.viewport.height);
+        let top_left = scaler.screen_to_world(ScreenPoint { x: 0.0, y: 0.0 });
+        let bottom_right = scaler.screen_to_world(ScreenPoint { x: vw, y: vh });
+        self.viewport_world_bounds = Some((
+            top_left.x.min(bottom_right.x),
+            top_left.y.min(bottom_right.y),
+            top_left.x.max(bottom_right.x),
+            top_left.y.max(bottom_right.y),
+        ));
+    }
+
+    /// Check if a world point is within the viewport (with margin)
+    #[inline]
+    fn is_point_visible(&self, x: f64, y: f64) -> bool {
+        if let Some((min_x, min_y, max_x, max_y)) = self.viewport_world_bounds {
+            // Add 10% margin for symbols that extend beyond their position
+            let margin_x = (max_x - min_x) * 0.1;
+            let margin_y = (max_y - min_y) * 0.1;
+            x >= min_x - margin_x
+                && x <= max_x + margin_x
+                && y >= min_y - margin_y
+                && y <= max_y + margin_y
+        } else {
+            true // No bounds set, assume visible
+        }
+    }
+
+    /// Clear triangulation cache (call when chart data changes)
+    pub fn clear_triangulation_cache(&mut self) {
+        self.triangulation_cache.clear();
+    }
+
+    /// Clear symbol textures (call when color profile changes)
+    pub fn clear_symbol_textures(&mut self) {
+        self.symbol_textures.clear();
+    }
+
+    /// Build symbol batches for efficient rendering
+    /// Groups symbol instances by texture and creates batched vertex/index arrays
+    /// This reduces draw calls from N (one per symbol) to M (one per unique texture)
+    fn build_symbol_batches(&mut self) {
+        self.symbol_batches.clear();
+
+        for instance in &self.symbol_instances {
+            if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
+                let mm_to_px = 3.78; // 96 DPI
+                let display_scale =
+                    instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
+
+                let half_w = (tex.width as f32 * display_scale) / 2.0;
+                let half_h = (tex.height as f32 * display_scale) / 2.0;
+
+                let pivot_x = tex.pivot_in_texture.0 * display_scale;
+                let pivot_y = tex.pivot_in_texture.1 * display_scale;
+
+                let rotation = instance.rotation.to_radians();
+                let cos_r = rotation.cos();
+                let sin_r = rotation.sin();
+
+                // Transform helper
+                let transform = |dx: f32, dy: f32| -> (f32, f32) {
+                    let px = dx + half_w - pivot_x;
+                    let py = dy + half_h - pivot_y;
+                    let rx = px * cos_r - py * sin_r;
+                    let ry = px * sin_r + py * cos_r;
+                    (instance.screen_x + rx, instance.screen_y + ry)
+                };
+
+                let (x0, y0) = transform(-half_w, -half_h);
+                let (x1, y1) = transform(half_w, -half_h);
+                let (x2, y2) = transform(half_w, half_h);
+                let (x3, y3) = transform(-half_w, half_h);
+
+                // Get or create batch for this symbol
+                let batch = self
+                    .symbol_batches
+                    .entry(instance.symbol_id.clone())
+                    .or_insert_with(|| (Vec::new(), Vec::new()));
+
+                let base_idx = batch.0.len() as u32;
+
+                // Add vertices
+                batch.0.push(TextureVertex::new(x0, y0, 0.0, 0.0));
+                batch.0.push(TextureVertex::new(x1, y1, 1.0, 0.0));
+                batch.0.push(TextureVertex::new(x2, y2, 1.0, 1.0));
+                batch.0.push(TextureVertex::new(x3, y3, 0.0, 1.0));
+
+                // Add indices (two triangles per quad)
+                batch.1.push(base_idx);
+                batch.1.push(base_idx + 1);
+                batch.1.push(base_idx + 2);
+                batch.1.push(base_idx);
+                batch.1.push(base_idx + 2);
+                batch.1.push(base_idx + 3);
+            }
+        }
     }
 
     /// Handle window resize
@@ -212,6 +410,23 @@ impl WgpuRenderer {
         requested
     }
 
+    /// Take color profile change request, returns new profile name if changed
+    #[inline]
+    pub fn take_color_profile_change(&mut self) -> Option<String> {
+        if self.ui_state.color_profile_changed {
+            self.ui_state.color_profile_changed = false;
+            Some(self.ui_state.color_profile.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Set the current color profile name in UI state
+    #[inline]
+    pub fn set_color_profile(&mut self, profile: &str) {
+        self.ui_state.color_profile = profile.to_string();
+    }
+
     /// Update view uniforms after resize or zoom
     fn update_view_uniforms(&self) {
         let (width, height) = self.state.viewport_size();
@@ -269,6 +484,8 @@ impl WgpuRenderer {
         self.line_vertices.clear();
         self.line_indices.clear();
         self.symbol_instances.clear();
+        // Clear symbol batches for new frame
+        self.symbol_batches.clear();
 
         // During animation (preserve_declutter=true), skip screen-space declutter
         // to prevent symbols from disappearing due to changed screen coordinates
@@ -329,18 +546,46 @@ impl WgpuRenderer {
         mut symbol_cache: Option<&mut SymbolCache>,
         color_profile: Option<&ColorProfile>,
     ) {
+        // Update viewport bounds for frustum culling
+        self.update_viewport_bounds(&context.scaler);
+
+        // Set animation mode on context
+        context.set_animation_mode(self.animation_mode);
+
         // Clone the instructions to avoid borrow issues
         let instructions: Vec<_> = context.get_sorted_instructions().to_vec();
+
+        // Track skipped counts for debugging
+        let mut _culled_count = 0usize;
 
         for instruction in &instructions {
             match instruction {
                 DrawingInstruction::Area(area) => {
-                    self.add_area(area, &context.scaler);
+                    // LOD: Skip small areas when zoomed out (animation mode)
+                    if self.animation_mode && self.lod_level > 0 {
+                        // Skip areas with few points during animation
+                        if area.exterior.len() < 10 {
+                            _culled_count += 1;
+                            continue;
+                        }
+                    }
+                    self.add_area_cached(area, &context.scaler);
                 }
                 DrawingInstruction::Line(line) => {
+                    // LOD: Skip short lines when zoomed out
+                    if self.animation_mode && self.lod_level > 0 && line.points.len() < 5 {
+                        _culled_count += 1;
+                        continue;
+                    }
                     self.add_line(line, &context.scaler);
                 }
                 DrawingInstruction::Point(point) => {
+                    // Frustum culling: skip points outside viewport
+                    if !self.is_point_visible(point.position.x, point.position.y) {
+                        _culled_count += 1;
+                        continue;
+                    }
+
                     // Show soundings at zoom >= 3x (with world-space grid decluttering)
                     // At lower zoom levels, soundings are hidden unless explicitly enabled
                     let is_sounding = point.symbol_ref.starts_with("SOUNDG")
@@ -354,6 +599,19 @@ impl WgpuRenderer {
                         && self.zoom_level < 5.0
                     {
                         continue;
+                    }
+
+                    // LOD: Skip non-essential symbols during animation
+                    if self.animation_mode && self.lod_level > 0 {
+                        // Keep only important symbols during animation
+                        if !is_sounding
+                            && !point.symbol_ref.starts_with("LIGHTS")
+                            && !point.symbol_ref.starts_with("BUOY")
+                            && !point.symbol_ref.starts_with("BCNLAT")
+                        {
+                            _culled_count += 1;
+                            continue;
+                        }
                     }
 
                     // Try to render as symbol if cache is available
@@ -371,12 +629,183 @@ impl WgpuRenderer {
                     }
                 }
                 DrawingInstruction::Text(text) => {
+                    // LOD: Skip text during animation for performance
+                    if self.animation_mode {
+                        continue;
+                    }
                     // Text rendering requires separate handling (glyph atlas)
                     // For now, skip
                     tracing::trace!("Skipping text: {}", text.text);
                 }
             }
         }
+    }
+
+    /// Add area with triangulation caching (optimization)
+    fn add_area_cached(
+        &mut self,
+        area: &ferrite_render::AreaInstruction,
+        scaler: &ferrite_render::Scaler,
+    ) {
+        // Check if we have cached triangulation for this feature
+        if let Some(feature_id) = area.feature_id {
+            let geom_hash = hash_geometry(&area.exterior);
+
+            // Check cache
+            if let Some(cached) = self.triangulation_cache.get(&feature_id) {
+                if cached.geometry_hash == geom_hash {
+                    // Use cached triangulation - just transform to current screen coords
+                    let base_idx = self.area_vertices.len() as u32;
+
+                    // Get fill color
+                    let color = match &area.fill {
+                        ferrite_render::AreaFillType::Solid(c) => c.to_array(),
+                        _ => [0.5, 0.5, 0.5, 0.5],
+                    };
+
+                    // Transform cached vertices to screen coordinates
+                    for v in &cached.vertices {
+                        // Cached vertices store world coordinates in x,y
+                        let world_pt = WorldPoint {
+                            x: v.position[0] as f64,
+                            y: v.position[1] as f64,
+                        };
+                        let screen_pt = scaler.world_to_screen(world_pt);
+                        if screen_pt.x.is_finite() && screen_pt.y.is_finite() {
+                            self.area_vertices.push(Vertex2D {
+                                position: [screen_pt.x, screen_pt.y],
+                                color,
+                            });
+                        }
+                    }
+
+                    // Add indices with offset
+                    for idx in &cached.indices {
+                        self.area_indices.push(base_idx + idx);
+                    }
+                    return;
+                }
+            }
+
+            // Cache miss or invalidated - compute and cache
+            let (vertices, indices) = self.triangulate_area(area, scaler);
+            if !vertices.is_empty() {
+                // Store in cache (using world coordinates for reuse across zoom levels)
+                let world_vertices: Vec<Vertex2D> = area
+                    .exterior
+                    .iter()
+                    .map(|p| Vertex2D {
+                        position: [p.x as f32, p.y as f32],
+                        color: [0.0; 4], // Color not cached
+                    })
+                    .collect();
+
+                self.triangulation_cache.insert(
+                    feature_id,
+                    CachedTriangulation {
+                        vertices: world_vertices,
+                        indices: indices.clone(),
+                        geometry_hash: geom_hash,
+                    },
+                );
+
+                // Add to current frame
+                let base_idx = self.area_vertices.len() as u32;
+                self.area_vertices.extend(vertices);
+                for idx in indices {
+                    self.area_indices.push(base_idx + idx);
+                }
+            }
+        } else {
+            // No feature ID, fall back to non-cached version
+            self.add_area(area, scaler);
+        }
+    }
+
+    /// Triangulate area and return vertices/indices
+    fn triangulate_area(
+        &self,
+        area: &ferrite_render::AreaInstruction,
+        scaler: &ferrite_render::Scaler,
+    ) -> (Vec<Vertex2D>, Vec<u32>) {
+        let color = match &area.fill {
+            ferrite_render::AreaFillType::Solid(c) => c.to_array(),
+            _ => [0.5, 0.5, 0.5, 0.5],
+        };
+
+        let screen_points: Vec<ScreenPoint> = area
+            .exterior
+            .iter()
+            .map(|p| scaler.world_to_screen(*p))
+            .filter(|p| p.x.is_finite() && p.y.is_finite())
+            .collect();
+
+        if screen_points.len() < 3 {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Clean duplicate points
+        let mut cleaned_points: Vec<ScreenPoint> = Vec::with_capacity(screen_points.len());
+        for point in &screen_points {
+            if cleaned_points.is_empty() {
+                cleaned_points.push(*point);
+            } else {
+                let last = cleaned_points.last().unwrap();
+                let dx = (point.x - last.x).abs();
+                let dy = (point.y - last.y).abs();
+                if dx > 0.01 || dy > 0.01 {
+                    cleaned_points.push(*point);
+                }
+            }
+        }
+
+        if cleaned_points.len() < 3 {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Flatten for earcut
+        let mut flat_coords: Vec<f64> = Vec::with_capacity(cleaned_points.len() * 2);
+        for p in &cleaned_points {
+            flat_coords.push(p.x as f64);
+            flat_coords.push(p.y as f64);
+        }
+
+        // Handle holes
+        let mut hole_indices: Vec<usize> = Vec::new();
+        for hole in &area.interiors {
+            let hole_start = flat_coords.len() / 2;
+            hole_indices.push(hole_start);
+
+            let hole_screen: Vec<ScreenPoint> = hole
+                .iter()
+                .map(|p| scaler.world_to_screen(*p))
+                .filter(|p| p.x.is_finite() && p.y.is_finite())
+                .collect();
+
+            for p in &hole_screen {
+                flat_coords.push(p.x as f64);
+                flat_coords.push(p.y as f64);
+            }
+        }
+
+        // Triangulate
+        let indices = earcutr::earcut(&flat_coords, &hole_indices, 2).unwrap_or_default();
+
+        if indices.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Create vertices
+        let mut vertices = Vec::with_capacity(flat_coords.len() / 2);
+        for i in 0..(flat_coords.len() / 2) {
+            vertices.push(Vertex2D {
+                position: [flat_coords[i * 2] as f32, flat_coords[i * 2 + 1] as f32],
+                color,
+            });
+        }
+
+        let indices: Vec<u32> = indices.into_iter().map(|i| i as u32).collect();
+        (vertices, indices)
     }
 
     /// Add area instruction - uses earcut for proper concave polygon triangulation
@@ -869,6 +1298,10 @@ impl WgpuRenderer {
             None
         };
 
+        // OPTIMIZATION: Build symbol batches before rendering
+        // Groups symbols by texture for single draw call per texture
+        self.build_symbol_batches();
+
         let bg = self.background_color.to_array();
 
         // Use MSAA texture as render target if available, resolve to surface
@@ -917,96 +1350,27 @@ impl WgpuRenderer {
                 render_pass.draw_indexed(0..self.line_indices.len() as u32, 0, 0..1);
             }
 
-            // Render symbols as textured quads
+            // OPTIMIZATION: Render symbols using batching (single draw call per texture)
+            // Instead of creating buffers per symbol, group by texture and batch
             if !self.symbol_instances.is_empty() {
                 render_pass.set_pipeline(&self.pipelines.texture_pipeline);
                 render_pass.set_bind_group(0, &self.view_bind_group, &[]);
 
-                // Iterate by index to avoid borrow conflicts with self.state
-                for i in 0..self.symbol_instances.len() {
-                    let instance = &self.symbol_instances[i];
-                    if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                        // Calculate quad vertices
-                        // The symbol was rendered at render_scale pixels per mm
-                        // We need to display it at the correct size based on point.scale
-                        let mm_to_px = 3.78; // 96 DPI
-                        let display_scale =
-                            instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
-
-                        let half_w = (tex.width as f32 * display_scale) / 2.0;
-                        let half_h = (tex.height as f32 * display_scale) / 2.0;
-
-                        // Pivot offset (in screen pixels)
-                        // pivot_in_texture is in texture pixels (from top-left)
-                        // display_scale converts texture pixels to screen pixels
-                        let pivot_x = tex.pivot_in_texture.0 * display_scale;
-                        let pivot_y = tex.pivot_in_texture.1 * display_scale;
-
-                        // Debug: Log sounding symbol positions
-                        static SOUNDING_DEBUG_COUNT: std::sync::atomic::AtomicUsize =
-                            std::sync::atomic::AtomicUsize::new(0);
-                        if instance.symbol_id.starts_with("SOUNDG")
-                            || instance.symbol_id.starts_with("SOUNDS")
-                        {
-                            let debug_idx = SOUNDING_DEBUG_COUNT
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if debug_idx < 50 {
-                                // Calculate actual screen bounds
-                                let left = instance.screen_x - pivot_x;
-                                let right = instance.screen_x + (tex.width as f32 * display_scale)
-                                    - pivot_x;
-                                tracing::info!(
-                                    "Sounding [{}] '{}': screen=({:.1},{:.1}), pivot_x={:.2}, bounds=[{:.1}, {:.1}]",
-                                    debug_idx, instance.symbol_id,
-                                    instance.screen_x, instance.screen_y,
-                                    pivot_x,
-                                    left, right
-                                );
-                            }
+                // Build batches grouped by texture (computed before render pass due to borrow rules)
+                // symbol_batches was populated in build_symbol_batches() called before render
+                for (symbol_id, (vertices, indices)) in &self.symbol_batches {
+                    if let Some(tex) = self.symbol_textures.get(symbol_id) {
+                        if vertices.is_empty() {
+                            continue;
                         }
-
-                        // Rotation
-                        let rotation = instance.rotation.to_radians();
-                        let cos_r = rotation.cos();
-                        let sin_r = rotation.sin();
-
-                        // Transform corner positions with pivot and rotation
-                        // The quad is centered at origin, but we need to shift it
-                        // so that the pivot point aligns with the screen position
-                        let transform = |dx: f32, dy: f32| -> (f32, f32) {
-                            // Offset from top-left, then shift so pivot aligns with origin
-                            let px = dx + half_w - pivot_x;
-                            let py = dy + half_h - pivot_y;
-
-                            // Rotate
-                            let rx = px * cos_r - py * sin_r;
-                            let ry = px * sin_r + py * cos_r;
-
-                            // Translate to screen position
-                            (instance.screen_x + rx, instance.screen_y + ry)
-                        };
-
-                        // Quad corners (before rotation, relative to center)
-                        let (x0, y0) = transform(-half_w, -half_h);
-                        let (x1, y1) = transform(half_w, -half_h);
-                        let (x2, y2) = transform(half_w, half_h);
-                        let (x3, y3) = transform(-half_w, half_h);
-
-                        let vertices = [
-                            TextureVertex::new(x0, y0, 0.0, 0.0),
-                            TextureVertex::new(x1, y1, 1.0, 0.0),
-                            TextureVertex::new(x2, y2, 1.0, 1.0),
-                            TextureVertex::new(x3, y3, 0.0, 1.0),
-                        ];
-                        let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
-
-                        let vb = self.state.create_vertex_buffer(&vertices, "symbol_quad_vb");
-                        let ib = self.state.create_index_buffer(&indices, "symbol_quad_ib");
+                        // Create single buffer for entire batch
+                        let vb = self.state.create_vertex_buffer(vertices, "symbol_batch_vb");
+                        let ib = self.state.create_index_buffer(indices, "symbol_batch_ib");
 
                         render_pass.set_bind_group(1, &tex.bind_group, &[]);
                         render_pass.set_vertex_buffer(0, vb.slice(..));
                         render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        render_pass.draw_indexed(0..6, 0, 0..1);
+                        render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
                     }
                 }
             }
