@@ -3,6 +3,33 @@
 //! Orchestrates rendering of drawing instructions to the screen.
 //! Uses resvg for SVG symbol rendering via textures.
 
+// =============================================================================
+// S-100/S-101 Symbol Scaling Constants
+// =============================================================================
+// Reference: S-100 Edition 5.0, Part 12 - Portrayal; IHO S-52 Presentation Library
+//
+// Symbol sizes in the Portrayal Catalogue (SVG viewBox) are defined in millimeters
+// for vector quality. However, these are NOT the intended physical display sizes.
+//
+// S-100/S-52 specifies that symbols should be displayed at sizes that ensure:
+// - Readability at normal viewing distance (约70cm for ECDIS)
+// - Consistent appearance across different display densities
+// - Symbols typically appear 2-5mm physical size on screen
+//
+// The 0.3mm/pixel reference in S-100 is for MINIMUM LEGIBLE FEATURE SIZE
+// (line widths, text heights), not for symbol scaling.
+
+/// Standard screen DPI (96 DPI = 3.78 pixels per mm)
+/// This is the typical display density for computer monitors.
+const SCREEN_PX_PER_MM: f32 = 96.0 / 25.4;
+
+/// S-101 symbol display scale factor
+/// Converts from SVG definition mm to intended physical display size.
+/// SVG symbols are defined larger than display size for vector quality.
+/// This factor ensures symbols appear at appropriate 2-5mm physical sizes.
+/// Reference: S-52 Presentation Library symbol specifications
+const S101_SYMBOL_SCALE: f32 = 0.35;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -129,7 +156,9 @@ pub struct WgpuRenderer {
     symbol_instances: Vec<SymbolInstance>,
     /// Background color
     pub background_color: Color,
-    /// Global symbol scale factor (default 1.0, reduce to make symbols smaller)
+    /// User-adjustable symbol scale factor (default 1.0)
+    /// This is applied ON TOP of the S-100 standard sizing.
+    /// 1.0 = standard S-100 size, 0.5 = half size, 2.0 = double size
     pub symbol_scale: f32,
     /// Show sounding symbols (viewing group 33010)
     pub show_soundings: bool,
@@ -221,7 +250,7 @@ impl WgpuRenderer {
             symbol_textures: HashMap::with_capacity(100),
             symbol_instances: Vec::with_capacity(2000),
             background_color: Color::from_hex("#DEEBF7").unwrap_or(Color::WHITE),
-            symbol_scale: 0.35, // Default scale factor for symbols (reduce from 1.0 to make smaller)
+            symbol_scale: 1.0, // S-100 standard: 1.0 = nominal symbol size at 0.3mm/pixel
             show_soundings: false, // Hide soundings by default (too dense when zoomed out)
             zoom_level: 1.0,
             compilation_scale: 22000, // Default compilation scale (1:22000)
@@ -312,9 +341,15 @@ impl WgpuRenderer {
 
         for instance in self.symbol_instances[start..end].iter() {
             if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                let mm_to_px = 3.78; // 96 DPI
-                let display_scale =
-                    instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
+                // S-101 compliant symbol scaling:
+                // - instance.scale: scale factor from portrayal rules (typically 1.0)
+                // - SCREEN_PX_PER_MM: standard screen density (96 DPI = 3.78 px/mm)
+                // - tex.render_scale: pixels per mm used during SVG rasterization
+                // - S101_SYMBOL_SCALE: standard S-101 symbol sizing factor (0.35)
+                // - self.symbol_scale: user-adjustable multiplier (default 1.0)
+                let display_scale = instance.scale * SCREEN_PX_PER_MM / tex.render_scale
+                    * S101_SYMBOL_SCALE
+                    * self.symbol_scale;
 
                 let half_w = (tex.width as f32 * display_scale) / 2.0;
                 let half_h = (tex.height as f32 * display_scale) / 2.0;
@@ -1519,8 +1554,10 @@ impl WgpuRenderer {
                         for i in *start..*end {
                             let instance = &self.symbol_instances[i];
                             if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                                let mm_to_px = 3.78;
-                                let display_scale = instance.scale * mm_to_px / tex.render_scale
+                                // S-101 compliant symbol scaling
+                                let display_scale = instance.scale * SCREEN_PX_PER_MM
+                                    / tex.render_scale
+                                    * S101_SYMBOL_SCALE
                                     * self.symbol_scale;
 
                                 let half_w = (tex.width as f32 * display_scale) / 2.0;
@@ -1757,9 +1794,10 @@ impl WgpuRenderer {
                 for i in 0..self.symbol_instances.len() {
                     let instance = &self.symbol_instances[i];
                     if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                        let mm_to_px = 3.78;
-                        let display_scale =
-                            instance.scale * mm_to_px / tex.render_scale * self.symbol_scale;
+                        // S-101 compliant symbol scaling
+                        let display_scale = instance.scale * SCREEN_PX_PER_MM / tex.render_scale
+                            * S101_SYMBOL_SCALE
+                            * self.symbol_scale;
 
                         let half_w = (tex.width as f32 * display_scale) / 2.0;
                         let half_h = (tex.height as f32 * display_scale) / 2.0;
