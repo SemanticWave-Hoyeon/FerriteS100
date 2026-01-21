@@ -57,6 +57,43 @@ impl Default for DisplayPriority {
     }
 }
 
+/// Geometry type for S-101 rendering order
+/// Within the same priority: Area -> Line -> Point -> Text
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GeometryType {
+    Area = 0,
+    Line = 1,
+    Point = 2,
+    Text = 3,
+}
+
+/// S-101 compliant render order key
+/// Sorts by: (1) display priority, (2) geometry type, (3) feature_id (stable tiebreaker)
+/// Lower values rendered first (background)
+/// The feature_id ensures stable sort order for overlapping features with same priority,
+/// preventing Z-fighting flickering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RenderOrder {
+    pub priority: i32,
+    pub geometry_type: GeometryType,
+    pub feature_id: i64,
+}
+
+impl RenderOrder {
+    pub fn new(
+        priority: DisplayPriority,
+        geometry_type: GeometryType,
+        feature_id: Option<i64>,
+    ) -> Self {
+        RenderOrder {
+            priority: priority.0,
+            geometry_type,
+            // Use 0 for features without ID (they will be grouped together)
+            feature_id: feature_id.unwrap_or(0),
+        }
+    }
+}
+
 /// Viewing group for display control
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewingGroup(pub u32);
@@ -516,6 +553,22 @@ impl DrawingInstruction {
             DrawingInstruction::Area(i) => i.feature_id,
             DrawingInstruction::Text(i) => i.feature_id,
         }
+    }
+
+    /// Get geometry type for S-101 render ordering
+    pub fn geometry_type(&self) -> GeometryType {
+        match self {
+            DrawingInstruction::Area(_) => GeometryType::Area,
+            DrawingInstruction::Line(_) => GeometryType::Line,
+            DrawingInstruction::Point(_) => GeometryType::Point,
+            DrawingInstruction::Text(_) => GeometryType::Text,
+        }
+    }
+
+    /// Get S-101 compliant render order key
+    /// Used for sorting: lower values rendered first (background)
+    pub fn render_order(&self) -> RenderOrder {
+        RenderOrder::new(self.priority(), self.geometry_type(), self.feature_id())
     }
 }
 

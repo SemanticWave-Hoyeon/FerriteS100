@@ -9,6 +9,8 @@ use winit::window::Window;
 /// Application state shared between egui UI and main app
 #[derive(Debug, Clone, Default)]
 pub struct AppUiState {
+    /// Application version
+    pub version: String,
     /// Current cursor position in world coordinates (lon, lat)
     pub cursor_world: (f64, f64),
     /// Current cursor position in screen coordinates
@@ -205,153 +207,148 @@ impl EguiIntegration {
     /// Draw the UI and return the app state changes
     pub fn draw_ui(&self, ui_state: &mut AppUiState) {
         // Combined toolbar with menu and buttons
-        egui::TopBottomPanel::top("toolbar").show(&self.ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                // File menu
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open Chart...").clicked() {
-                        ui_state.open_file_requested = true;
-                        ui.close_menu();
-                    }
-                    if ui_state.chart_count > 0 && ui.button("Clear All Charts").clicked() {
-                        ui_state.clear_charts_requested = true;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Save Screenshot...").clicked() {
-                        ui_state.screenshot_requested = true;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Exit").clicked() {
-                        std::process::exit(0);
-                    }
-                });
-
-                // View menu
-                ui.menu_button("View", |ui| {
-                    if ui.button("Zoom In").clicked() {
-                        ui_state.zoom_in_requested = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Zoom Out").clicked() {
-                        ui_state.zoom_out_requested = true;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Reset View").clicked() {
-                        ui_state.reset_view_requested = true;
-                        ui.close_menu();
-                    }
-                });
-
-                // Help menu
-                ui.menu_button("Help", |ui| {
-                    if ui.button("About").clicked() {
-                        ui_state.show_about = true;
-                        ui.close_menu();
-                    }
-                });
-
-                ui.separator();
-
-                // Quick action buttons
-                if ui.button("Open").on_hover_text("Open Chart(s)").clicked() {
-                    ui_state.open_file_requested = true;
-                }
-                if ui_state.chart_count > 0
-                    && ui
-                        .button("Clear")
-                        .on_hover_text("Clear All Charts")
-                        .clicked()
-                {
-                    ui_state.clear_charts_requested = true;
-                }
-                if ui
-                    .button("Screenshot")
-                    .on_hover_text("Save Screenshot")
-                    .clicked()
-                {
-                    ui_state.screenshot_requested = true;
-                }
-
-                ui.separator();
-
-                // Zoom controls
-                if ui.button("+").on_hover_text("Zoom In").clicked() {
-                    ui_state.zoom_in_requested = true;
-                }
-                if ui.button("-").on_hover_text("Zoom Out").clicked() {
-                    ui_state.zoom_out_requested = true;
-                }
-                if ui.button("Fit").on_hover_text("Reset View").clicked() {
-                    ui_state.reset_view_requested = true;
-                }
-
-                ui.separator();
-
-                // Color profile selector (Day/Dusk/Night)
-                ui.label("Mode:");
-                let profiles = ["Day", "Dusk", "Night"];
-                let current = if ui_state.color_profile.is_empty() {
-                    "Day".to_string()
-                } else {
-                    ui_state.color_profile.clone()
-                };
-                egui::ComboBox::from_id_salt("color_profile")
-                    .selected_text(&current)
-                    .show_ui(ui, |ui| {
-                        for profile in profiles {
-                            if ui.selectable_label(current == profile, profile).clicked()
-                                && current != profile
-                            {
-                                ui_state.color_profile = profile.to_string();
-                                ui_state.color_profile_changed = true;
-                            }
+        egui::TopBottomPanel::top("toolbar")
+            .min_height(32.0)
+            .show(&self.ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    // File menu
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Open Chart...").clicked() {
+                            ui_state.open_file_requested = true;
+                            ui.close_menu();
+                        }
+                        if ui_state.chart_count > 0 && ui.button("Clear All Charts").clicked() {
+                            ui_state.clear_charts_requested = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Save Screenshot...").clicked() {
+                            ui_state.screenshot_requested = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Exit").clicked() {
+                            std::process::exit(0);
                         }
                     });
+
+                    // View menu
+                    ui.menu_button("View", |ui| {
+                        if ui.button("Zoom In").clicked() {
+                            ui_state.zoom_in_requested = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Zoom Out").clicked() {
+                            ui_state.zoom_out_requested = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Reset View").clicked() {
+                            ui_state.reset_view_requested = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    // Help menu
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("About").clicked() {
+                            ui_state.show_about = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Zoom controls
+                    if ui.button("+").on_hover_text("Zoom In").clicked() {
+                        ui_state.zoom_in_requested = true;
+                    }
+                    if ui.button("-").on_hover_text("Zoom Out").clicked() {
+                        ui_state.zoom_out_requested = true;
+                    }
+                    if ui.button("Fit").on_hover_text("Reset View").clicked() {
+                        ui_state.reset_view_requested = true;
+                    }
+
+                    ui.separator();
+
+                    // Color profile selector (Day/Dusk/Night)
+                    ui.label("Mode:");
+                    let profiles = ["Day", "Dusk", "Night"];
+                    let current = if ui_state.color_profile.is_empty() {
+                        "Day".to_string()
+                    } else {
+                        ui_state.color_profile.clone()
+                    };
+                    egui::ComboBox::from_id_salt("color_profile")
+                        .selected_text(&current)
+                        .show_ui(ui, |ui| {
+                            for profile in profiles {
+                                if ui.selectable_label(current == profile, profile).clicked()
+                                    && current != profile
+                                {
+                                    ui_state.color_profile = profile.to_string();
+                                    ui_state.color_profile_changed = true;
+                                }
+                            }
+                        });
+                });
             });
-        });
 
         // Status bar
-        egui::TopBottomPanel::bottom("status_bar").show(&self.ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Coordinate display
-                let (lon, lat) = ui_state.cursor_world;
-                let lat_dir = if lat >= 0.0 { "N" } else { "S" };
-                let lon_dir = if lon >= 0.0 { "E" } else { "W" };
-                ui.label(format!(
-                    "LAT: {:.6}{} | LON: {:.6}{}",
-                    lat.abs(),
-                    lat_dir,
-                    lon.abs(),
-                    lon_dir
-                ));
-
-                ui.separator();
-
-                // Zoom level
-                ui.label(format!("Zoom: {:.1}x", ui_state.zoom_level));
-
-                ui.separator();
-
-                // Feature count and chart info
-                if ui_state.chart_count > 0 {
-                    ui.label(format!(
-                        "Charts: {} | Features: {}",
-                        ui_state.chart_count, ui_state.feature_count
-                    ));
-
-                    // Loaded chart name(s)
-                    if let Some(ref chart) = ui_state.loaded_chart {
-                        ui.separator();
-                        ui.label(chart);
+        egui::TopBottomPanel::bottom("status_bar")
+            .min_height(28.0)
+            .show(&self.ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Coordinate display (only show valid coords when chart is loaded)
+                    if ui_state.chart_count > 0 {
+                        let (lon, lat) = ui_state.cursor_world;
+                        let lat_dir = if lat >= 0.0 { "N" } else { "S" };
+                        let lon_dir = if lon >= 0.0 { "E" } else { "W" };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "LAT: {:.6}{} | LON: {:.6}{}",
+                                lat.abs(),
+                                lat_dir,
+                                lon.abs(),
+                                lon_dir
+                            ))
+                            .size(14.0),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("LAT: ------ | LON: ------").size(14.0));
                     }
-                } else {
-                    ui.label("No chart loaded");
-                }
+
+                    ui.separator();
+
+                    // Zoom level
+                    ui.label(
+                        egui::RichText::new(format!("Zoom: {:.1}x", ui_state.zoom_level))
+                            .size(14.0),
+                    );
+
+                    ui.separator();
+
+                    // Feature count and chart info
+                    if ui_state.chart_count > 0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Charts: {} | Features: {}",
+                                ui_state.chart_count, ui_state.feature_count
+                            ))
+                            .size(14.0),
+                        );
+
+                        // Loaded chart name(s)
+                        if let Some(ref chart) = ui_state.loaded_chart {
+                            ui.separator();
+                            ui.label(egui::RichText::new(chart).size(14.0));
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("No chart loaded").size(14.0));
+                    }
+                });
             });
-        });
 
         // Feature info panel (right side)
         egui::SidePanel::right("feature_panel")
@@ -518,7 +515,7 @@ impl EguiIntegration {
                         ui.heading("FerriteS100");
                         ui.label("S-101 Electronic Navigational Chart Viewer");
                         ui.add_space(10.0);
-                        ui.label("Version 0.1.0");
+                        ui.label(format!("Version {}", ui_state.version));
                         ui.add_space(5.0);
                         ui.hyperlink_to("GitHub", "https://github.com/hoyeonchoKMOU/FerriteS100");
                         ui.add_space(15.0);
