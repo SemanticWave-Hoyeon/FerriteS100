@@ -7,6 +7,7 @@ description = "wgpu-based renderer for S-100 charts"
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+rayon.workspace = true
 
 # Graphics
 wgpu.workspace = true

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -266,31 +267,50 @@ impl ChartApp {
         );
 
         let fc_feature_codes = self.fc.feature_type_codes();
-        let mut loaded_names = Vec::new();
-        #[cfg(debug_assertions)]
-        let mut total_features = 0;
         #[cfg(debug_assertions)]
         let new_paths_count = new_paths.len();
 
-        for path in new_paths {
-            #[cfg(debug_assertions)]
-            info!("Loading chart: {}", path.display());
+        // Parallel load: Load and normalize all cells concurrently using rayon
+        let loaded_cells: Vec<_> = new_paths
+            .par_iter()
+            .filter_map(|path| {
+                #[cfg(debug_assertions)]
+                info!("Loading chart: {}", path.display());
 
-            // Load cell
-            let mut cell = S101Cell::load(path)
-                .with_context(|| format!("Failed to load chart: {}", path.display()))?;
+                // Load cell
+                match S101Cell::load(path) {
+                    Ok(mut cell) => {
+                        // Normalize feature codes (can be done in parallel)
+                        cell.normalize_feature_codes(&fc_feature_codes);
 
-            // Normalize feature codes
-            cell.normalize_feature_codes(&fc_feature_codes);
+                        #[cfg(debug_assertions)]
+                        {
+                            let stats = cell.statistics();
+                            info!(
+                                "Loaded: {} features, {} points, {} curves, {} surfaces",
+                                stats.features, stats.points, stats.curves, stats.surfaces
+                            );
+                        }
 
+                        Some(((*path).clone(), cell))
+                    }
+                    Err(e) => {
+                        error!("Failed to load chart {}: {}", path.display(), e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        // Sequential post-processing: expand bounds and track paths
+        let mut loaded_names = Vec::new();
+        #[cfg(debug_assertions)]
+        let mut total_features = 0;
+
+        for (path, cell) in loaded_cells {
             #[cfg(debug_assertions)]
             {
-                let stats = cell.statistics();
-                info!(
-                    "Loaded: {} features, {} points, {} curves, {} surfaces",
-                    stats.features, stats.points, stats.curves, stats.surfaces
-                );
-                total_features += stats.features;
+                total_features += cell.statistics().features;
             }
 
             // Expand bounds to include this cell

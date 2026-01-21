@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use crate::{
     Color, DrawingInstruction, FeatureInstructions, GeoBounds, Scaler, ViewingGroup, Viewport,
 };
@@ -191,11 +193,17 @@ impl RenderContext {
     /// Sort order: (1) display priority, (2) geometry type (Area < Line < Point < Text)
     /// Lower values rendered first (background)
     ///
-    /// Optimization: Skips re-sorting if already sorted or in animation mode
+    /// Optimization: Uses parallel sort (rayon) for better performance on large datasets.
+    /// Skips re-sorting if already sorted or in animation mode.
     pub fn get_sorted_instructions(&mut self) -> &[DrawingInstruction] {
         // Skip sort during animation mode for better performance
         if !self.sorted && !self.animation_mode {
-            self.instructions.sort_by_key(|i| i.render_order());
+            // Use parallel sort for large datasets (>1000 instructions)
+            if self.instructions.len() > 1000 {
+                self.instructions.par_sort_by_key(|i| i.render_order());
+            } else {
+                self.instructions.sort_by_key(|i| i.render_order());
+            }
             self.sorted = true;
         }
         &self.instructions

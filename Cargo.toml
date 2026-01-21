@@ -33,6 +33,9 @@ earcutr = "0.4"  # Fast polygon triangulation (mapbox/earcut port)
 thiserror = "2"
 anyhow = "1"
 
+# Parallelization
+rayon = "1.10"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -95,6 +98,7 @@ egui.workspace = true
 egui-winit.workspace = true
 rfd.workspace = true
 image.workspace = true
+rayon.workspace = true
 
 # Release profile: maximum optimizations
 [profile.release]
