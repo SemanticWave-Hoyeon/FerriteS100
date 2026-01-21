@@ -44,7 +44,8 @@ struct AppConfig {
     fc_path: PathBuf,
     /// Path to Portrayal Catalogue directory
     pc_path: PathBuf,
-    /// Path to log directory
+    /// Path to log directory (used only in debug builds)
+    #[allow(dead_code)]
     log_path: PathBuf,
 }
 
