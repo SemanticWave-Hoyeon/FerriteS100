@@ -428,22 +428,34 @@ impl PortrayalCatalogue {
     }
 
     /// Load color profiles from directory
+    /// Loads all palettes (Day, Dusk, Night) as separate profiles
     fn load_color_profiles(&mut self, dir: &Path) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "xml") {
-                if let Ok(profile) = self.parse_color_profile(&path) {
+                // Parse all palettes from the XML file
+                let profiles = self.parse_color_profiles_all(&path)?;
+                for profile in profiles {
+                    tracing::debug!(
+                        "Loaded color profile '{}' with {} colors",
+                        profile.name,
+                        profile.colors.len()
+                    );
                     self.color_profiles
                         .profiles
-                        .insert(profile.id.clone(), profile);
+                        .insert(profile.name.clone(), profile);
                 }
             }
+        }
+        // Set Day as default profile
+        if self.color_profiles.profiles.contains_key("Day") {
+            self.color_profiles.default_profile = Some("Day".to_string());
         }
         Ok(())
     }
 
-    /// Parse color profile XML
+    /// Parse color profile XML - returns ALL palettes (Day, Dusk, Night)
     ///
     /// colorProfile.xml structure:
     /// ```xml
@@ -456,22 +468,17 @@ impl PortrayalCatalogue {
     ///       <srgb><red>R</red><green>G</green><blue>B</blue></srgb>
     ///     </item>
     ///   </palette>
+    ///   <palette name="Dusk">...</palette>
+    ///   <palette name="Night">...</palette>
     /// </colorProfile>
     /// ```
-    fn parse_color_profile(&self, path: &Path) -> Result<ColorProfile> {
+    fn parse_color_profiles_all(&self, path: &Path) -> Result<Vec<ColorProfile>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut xml_reader = Reader::from_reader(reader);
         xml_reader.config_mut().trim_text(true);
 
-        let mut profile = ColorProfile::new(
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            String::new(),
-        );
-
+        let mut profiles = Vec::new();
         let mut buf = Vec::new();
 
         loop {
@@ -481,10 +488,10 @@ impl PortrayalCatalogue {
                     if local_name == "palette" {
                         // Get palette name (Day, Dusk, Night)
                         let palette_name = get_attribute(e, "name").unwrap_or_default();
-                        // For now, use "Day" palette as default
-                        if palette_name == "Day" || profile.colors.is_empty() {
-                            profile.name = palette_name;
+                        if !palette_name.is_empty() {
+                            let mut profile = ColorProfile::new(palette_name.clone(), palette_name);
                             self.parse_palette(&mut xml_reader, &mut profile)?;
+                            profiles.push(profile);
                         }
                     }
                 }
@@ -494,12 +501,7 @@ impl PortrayalCatalogue {
             buf.clear();
         }
 
-        tracing::debug!(
-            "Loaded color profile '{}' with {} colors",
-            profile.name,
-            profile.colors.len()
-        );
-        Ok(profile)
+        Ok(profiles)
     }
 
     /// Parse palette section with sRGB values

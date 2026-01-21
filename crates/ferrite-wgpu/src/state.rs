@@ -65,11 +65,14 @@ impl GpuState {
             .await?;
 
         // Configure surface
+        // Use non-sRGB format to avoid automatic gamma correction
+        // PC color profiles define colors in sRGB space (for direct display)
+        // Using sRGB surface would apply gamma correction twice
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
@@ -222,7 +225,7 @@ impl GpuState {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },

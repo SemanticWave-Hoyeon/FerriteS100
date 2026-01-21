@@ -182,6 +182,12 @@ impl SymbolCache {
         // Build CSS rules for all color tokens
         let mut css_rules = String::new();
 
+        // Debug: Log which profile is being used for color injection
+        tracing::debug!(
+            "Injecting SVG colors from profile: '{}'",
+            color_profile.name
+        );
+
         // Extract all color tokens used in the SVG
         let color_tokens = self.extract_color_tokens(svg_content);
 
@@ -195,7 +201,7 @@ impl SymbolCache {
                 // Fill class: fXXXXX
                 css_rules.push_str(&format!(".f{} {{ fill: {}; }}\n", token, hex));
 
-                tracing::trace!("Color token '{}' -> {}", token, hex);
+                tracing::debug!("  SVG color: {} -> {}", token, hex);
             } else {
                 tracing::warn!("Color token '{}' not found in profile", token);
             }
@@ -233,6 +239,7 @@ impl SymbolCache {
 
         // Look for class attributes containing color tokens
         // Pattern: class="... sXXXXX ..." or class="... fXXXXX ..."
+        // S-100 color tokens are uppercase (e.g., CHBLK, CHMGD, DEPDW)
         for class_match in svg_content.split("class=\"") {
             if let Some(end) = class_match.find('"') {
                 let class_str = &class_match[..end];
@@ -245,6 +252,9 @@ impl SymbolCache {
                             && !token.is_empty()
                             && token != "0"
                             && token != "l"
+                            // S-100 color tokens are uppercase (CHBLK, CHMGD, etc.)
+                            // Skip non-color classes like "symbolBox", "svgBox", "sl"
+                            && token.chars().next().is_some_and(|c| c.is_uppercase())
                             && !tokens.contains(&token.to_string())
                         {
                             tokens.push(token.to_string());
