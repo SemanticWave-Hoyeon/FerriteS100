@@ -186,13 +186,16 @@ impl RenderContext {
         self.instructions.push(instruction);
     }
 
-    /// Get all instructions sorted by priority
+    /// Get all instructions sorted by S-101 render order
+    ///
+    /// Sort order: (1) display priority, (2) geometry type (Area < Line < Point < Text)
+    /// Lower values rendered first (background)
     ///
     /// Optimization: Skips re-sorting if already sorted or in animation mode
     pub fn get_sorted_instructions(&mut self) -> &[DrawingInstruction] {
         // Skip sort during animation mode for better performance
         if !self.sorted && !self.animation_mode {
-            self.instructions.sort_by_key(|i| i.priority());
+            self.instructions.sort_by_key(|i| i.render_order());
             self.sorted = true;
         }
         &self.instructions
