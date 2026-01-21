@@ -32,6 +32,10 @@ pub struct PortrayalCatalogue {
 }
 
 impl PortrayalCatalogue {
+    /// Maximum allowed XML file size (50 MB)
+    /// Security: Prevents resource exhaustion from oversized files
+    const MAX_XML_SIZE: u64 = 50 * 1024 * 1024;
+
     /// Load Portrayal Catalogue from directory
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
@@ -99,7 +103,19 @@ impl PortrayalCatalogue {
     }
 
     /// Parse main catalogue XML
+    ///
+    /// Security: File size is checked to prevent resource exhaustion
     fn parse_catalogue_xml(&mut self, path: &Path) -> Result<()> {
+        // Security: Check file size before loading
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > Self::MAX_XML_SIZE {
+            return Err(PCError::InvalidValue(format!(
+                "File too large: {} bytes (max {} bytes)",
+                metadata.len(),
+                Self::MAX_XML_SIZE
+            )));
+        }
+
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut xml_reader = Reader::from_reader(reader);
