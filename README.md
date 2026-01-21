@@ -182,14 +182,40 @@ All dependencies are sourced from [crates.io](https://crates.io) and audited via
 
 ## Dependencies
 
-| Crate | Purpose |
-|-------|---------|
-| [wgpu](https://wgpu.rs/) | GPU rendering |
-| [winit](https://github.com/rust-windowing/winit) | Window management |
-| [egui](https://github.com/emilk/egui) | User interface |
-| [mlua](https://github.com/mlua-rs/mlua) | Lua scripting (sandboxed) |
-| [resvg](https://github.com/RazrFalcon/resvg) | SVG rendering |
-| [quick-xml](https://github.com/tafia/quick-xml) | XML parsing |
+### Graphics & GUI
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| [wgpu](https://wgpu.rs/) | 24 | GPU rendering (Vulkan/DX12/Metal) |
+| [winit](https://github.com/rust-windowing/winit) | 0.30 | Cross-platform window management |
+| [egui](https://github.com/emilk/egui) | 0.31 | Immediate mode GUI |
+| [resvg](https://github.com/RazrFalcon/resvg) | 0.45 | SVG symbol rendering |
+| [image](https://github.com/image-rs/image) | 0.25 | Image processing (PNG export) |
+
+### Parsing & Data
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| [nom](https://github.com/rust-bakery/nom) | 8 | ISO 8211 binary parsing |
+| [quick-xml](https://github.com/tafia/quick-xml) | 0.37 | FC/PC XML catalogue parsing |
+| [serde](https://serde.rs/) | 1 | Serialization framework |
+| [encoding_rs](https://github.com/hsivonen/encoding_rs) | 0.8 | Character encoding (ISO-8859-1) |
+
+### Scripting & Runtime
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| [mlua](https://github.com/mlua-rs/mlua) | 0.10 | Sandboxed Lua 5.4 portrayal engine |
+| [rayon](https://github.com/rayon-rs/rayon) | 1.10 | Parallel chart loading & processing |
+
+### Utilities
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| [tracing](https://github.com/tokio-rs/tracing) | 0.1 | Structured logging |
+| [anyhow](https://github.com/dtolnay/anyhow) | 1 | Error handling |
+| [thiserror](https://github.com/dtolnay/thiserror) | 2 | Error derive macros |
+| [earcutr](https://github.com/frewsxcv/earcutr) | 0.4 | Polygon triangulation (earcut) |
 
 ## References
 
