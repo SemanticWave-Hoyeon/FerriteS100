@@ -41,6 +41,16 @@ pub struct S101Cell {
     pub coord_origin_x: f64,
     /// Coordinate origin Y (DCOY)
     pub coord_origin_y: f64,
+    // === S-101 Scale Information ===
+    /// Compilation scale (e.g., 22000 for 1:22000)
+    /// Used to determine feature visibility at different viewing scales
+    pub compilation_scale: u32,
+    /// Minimum display scale (smallest scale = largest denominator)
+    /// Features may not be shown at scales smaller than this
+    pub minimum_display_scale: Option<u32>,
+    /// Maximum display scale (largest scale = smallest denominator)
+    /// Overscale warning shown when viewing at scales larger than this
+    pub maximum_display_scale: Option<u32>,
     /// Point records
     pub points: HashMap<i64, PointRecord>,
     /// Multi-point records
@@ -74,6 +84,10 @@ impl S101Cell {
             coord_factor_z: 0.01, // Default CMFZ=100, so factor = 1/100
             coord_origin_x: 0.0,
             coord_origin_y: 0.0,
+            // S-101 scale defaults - will be parsed from DSID/DSPM
+            compilation_scale: 22000, // Default 1:22000 (typical harbor scale)
+            minimum_display_scale: None,
+            maximum_display_scale: None,
             points: HashMap::new(),
             multi_points: HashMap::new(),
             curves: HashMap::new(),
@@ -88,15 +102,20 @@ impl S101Cell {
             cell.process_record(&dr)?;
         }
 
+        // Try to extract compilation scale from filename (S-101 naming convention)
+        // Example: "101KR0022000.000" -> scale 22000
+        cell.extract_scale_from_filename();
+
         // Apply code mappings to records
         cell.apply_code_mappings();
 
         tracing::info!(
-            "Loaded cell: {} features, {} points, {} curves, {} surfaces",
+            "Loaded cell: {} features, {} points, {} curves, {} surfaces (scale 1:{})",
             cell.features.len(),
             cell.points.len(),
             cell.curves.len(),
-            cell.surfaces.len()
+            cell.surfaces.len(),
+            cell.compilation_scale
         );
 
         Ok(cell)
@@ -936,6 +955,57 @@ impl S101Cell {
         }
 
         self.code_mappings.log_summary();
+    }
+
+    /// Extract compilation scale from S-101 filename convention
+    /// Examples: "101KR0022000.000" -> 22000, "101US00045000.000" -> 45000
+    fn extract_scale_from_filename(&mut self) {
+        if let Some(filename) = self.file_path.file_stem().and_then(|s| s.to_str()) {
+            // S-101 filename format: 101PPNNNNNNNN where PP=producer, NNNNNNNN contains scale
+            // Try to find a sequence of digits that looks like a scale value
+            let digits: String = filename.chars().filter(|c| c.is_ascii_digit()).collect();
+
+            // Common S-101 scales (Table 3-1 in S-101 standard)
+            let valid_scales = [
+                1000, 2000, 3000, 4000, 8000, 12000, 22000, 45000, 90000, 180000, 350000, 700000,
+                1500000, 3500000, 10000000,
+            ];
+
+            // Try to match a valid scale in the digits
+            for &scale in &valid_scales {
+                let scale_str = scale.to_string();
+                if digits.contains(&scale_str) {
+                    self.compilation_scale = scale;
+                    tracing::debug!(
+                        "Extracted compilation scale {} from filename '{}'",
+                        scale,
+                        filename
+                    );
+                    return;
+                }
+            }
+
+            // Fallback: try to parse 5-7 digit numbers as potential scales
+            if digits.len() >= 5 {
+                for start in 0..=(digits.len().saturating_sub(5)) {
+                    for len in [7, 6, 5] {
+                        if start + len <= digits.len() {
+                            if let Ok(scale) = digits[start..start + len].parse::<u32>() {
+                                if (1000..=10000000).contains(&scale) {
+                                    self.compilation_scale = scale;
+                                    tracing::debug!(
+                                        "Inferred compilation scale {} from filename '{}'",
+                                        scale,
+                                        filename
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Get cell statistics

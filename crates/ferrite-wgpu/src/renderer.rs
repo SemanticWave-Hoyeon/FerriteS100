@@ -135,6 +135,9 @@ pub struct WgpuRenderer {
     pub show_soundings: bool,
     /// Current zoom level (1.0 = default, higher = zoomed in)
     pub zoom_level: f64,
+    /// Chart compilation scale (e.g., 22000 for 1:22000)
+    /// Used to calculate viewing scale for S-101 feature filtering
+    pub compilation_scale: u32,
     /// Grid for symbol decluttering (screen space) - for non-sounding symbols
     symbol_grid: std::collections::HashSet<(i32, i32)>,
     /// Screen-space grid for sounding decluttering
@@ -177,6 +180,13 @@ pub struct WgpuRenderer {
     lod_level: u8,
     /// Viewport bounds in world coordinates for culling
     viewport_world_bounds: Option<(f64, f64, f64, f64)>,
+    // === S-101 PRIORITY GROUP RENDERING ===
+    /// Area index ranges by priority: (priority, start_index, end_index)
+    area_priority_ranges: Vec<(i32, usize, usize)>,
+    /// Line index ranges by priority: (priority, start_index, end_index)
+    line_priority_ranges: Vec<(i32, usize, usize)>,
+    /// Symbol instance ranges by priority: (priority, start_index, end_index)
+    symbol_priority_ranges: Vec<(i32, usize, usize)>,
 }
 
 impl WgpuRenderer {
@@ -214,6 +224,7 @@ impl WgpuRenderer {
             symbol_scale: 0.35, // Default scale factor for symbols (reduce from 1.0 to make smaller)
             show_soundings: false, // Hide soundings by default (too dense when zoomed out)
             zoom_level: 1.0,
+            compilation_scale: 22000, // Default compilation scale (1:22000)
             symbol_grid: std::collections::HashSet::with_capacity(1000),
             sounding_screen_grid: std::collections::HashMap::with_capacity(2000),
             sounding_exact_positions: std::collections::HashSet::with_capacity(5000),
@@ -232,6 +243,10 @@ impl WgpuRenderer {
             animation_mode: false,
             lod_level: 0,
             viewport_world_bounds: None,
+            // S-101 priority group rendering
+            area_priority_ranges: Vec::with_capacity(10),
+            line_priority_ranges: Vec::with_capacity(10),
+            symbol_priority_ranges: Vec::with_capacity(10),
         })
     }
 
@@ -284,11 +299,18 @@ impl WgpuRenderer {
 
     /// Build symbol batches for efficient rendering
     /// Groups symbol instances by texture and creates batched vertex/index arrays
-    /// This reduces draw calls from N (one per symbol) to M (one per unique texture)
-    fn build_symbol_batches(&mut self) {
-        self.symbol_batches.clear();
+    /// Build symbol batches for a specific range of symbol instances (S-101 priority rendering)
+    /// Returns batches grouped by texture for efficient rendering
+    /// Note: Currently unused - we render symbols individually to maintain Z-order
+    #[allow(dead_code)]
+    fn build_symbol_batches_for_range(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> HashMap<String, (Vec<TextureVertex>, Vec<u32>)> {
+        let mut batches: HashMap<String, (Vec<TextureVertex>, Vec<u32>)> = HashMap::new();
 
-        for instance in &self.symbol_instances {
+        for instance in self.symbol_instances[start..end].iter() {
             if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
                 let mm_to_px = 3.78; // 96 DPI
                 let display_scale =
@@ -319,8 +341,7 @@ impl WgpuRenderer {
                 let (x3, y3) = transform(-half_w, half_h);
 
                 // Get or create batch for this symbol
-                let batch = self
-                    .symbol_batches
+                let batch = batches
                     .entry(instance.symbol_id.clone())
                     .or_insert_with(|| (Vec::new(), Vec::new()));
 
@@ -341,6 +362,8 @@ impl WgpuRenderer {
                 batch.1.push(base_idx + 3);
             }
         }
+
+        batches
     }
 
     /// Handle window resize
@@ -486,6 +509,10 @@ impl WgpuRenderer {
         self.symbol_instances.clear();
         // Clear symbol batches for new frame
         self.symbol_batches.clear();
+        // Clear priority ranges for S-101 compliant rendering
+        self.area_priority_ranges.clear();
+        self.line_priority_ranges.clear();
+        self.symbol_priority_ranges.clear();
 
         // During animation (preserve_declutter=true), skip screen-space declutter
         // to prevent symbols from disappearing due to changed screen coordinates
@@ -534,12 +561,38 @@ impl WgpuRenderer {
         self.zoom_level = zoom;
     }
 
+    /// Set chart compilation scale (e.g., 22000 for 1:22000)
+    #[inline]
+    pub fn set_compilation_scale(&mut self, scale: u32) {
+        self.compilation_scale = scale;
+    }
+
+    /// Calculate the current viewing scale based on zoom level
+    /// viewing_scale = compilation_scale / zoom_level
+    /// Example: At zoom 2.0 with 1:22000 chart -> viewing scale is 1:11000
+    #[inline]
+    pub fn viewing_scale(&self) -> u32 {
+        ((self.compilation_scale as f64) / self.zoom_level.max(0.01)) as u32
+    }
+
+    /// Check if a feature should be visible at the current viewing scale
+    /// Based on S-101 scale_minimum rule
+    /// scale_minimum: the smallest scale (largest denominator) at which the feature is visible
+    #[inline]
+    pub fn is_visible_at_scale(&self, scale_minimum: Option<u32>) -> bool {
+        match scale_minimum {
+            Some(min_scale) => self.viewing_scale() <= min_scale,
+            None => true, // No scale restriction
+        }
+    }
+
     /// Add drawing instructions from render context
     pub fn add_instructions(&mut self, context: &mut RenderContext) {
         self.add_instructions_with_symbols(context, None, None);
     }
 
     /// Add drawing instructions with symbol rendering support
+    /// Uses S-101 compliant priority grouping for correct render order
     pub fn add_instructions_with_symbols(
         &mut self,
         context: &mut RenderContext,
@@ -558,7 +611,51 @@ impl WgpuRenderer {
         // Track skipped counts for debugging
         let mut _culled_count = 0usize;
 
+        // S-101 Priority tracking: track index ranges per priority
+        let mut current_priority: Option<i32> = None;
+        let mut area_start_idx = 0usize;
+        let mut line_start_idx = 0usize;
+        let mut symbol_start_idx = 0usize;
+
         for instruction in &instructions {
+            let inst_priority = instruction.priority().0;
+
+            // Check if priority changed - record ranges for previous priority
+            if let Some(prev_priority) = current_priority {
+                if prev_priority != inst_priority {
+                    // Record area range if any areas were added for previous priority
+                    if self.area_indices.len() > area_start_idx {
+                        self.area_priority_ranges.push((
+                            prev_priority,
+                            area_start_idx,
+                            self.area_indices.len(),
+                        ));
+                    }
+                    area_start_idx = self.area_indices.len();
+
+                    // Record line range if any lines were added for previous priority
+                    if self.line_indices.len() > line_start_idx {
+                        self.line_priority_ranges.push((
+                            prev_priority,
+                            line_start_idx,
+                            self.line_indices.len(),
+                        ));
+                    }
+                    line_start_idx = self.line_indices.len();
+
+                    // Record symbol range if any symbols were added for previous priority
+                    if self.symbol_instances.len() > symbol_start_idx {
+                        self.symbol_priority_ranges.push((
+                            prev_priority,
+                            symbol_start_idx,
+                            self.symbol_instances.len(),
+                        ));
+                    }
+                    symbol_start_idx = self.symbol_instances.len();
+                }
+            }
+            current_priority = Some(inst_priority);
+
             match instruction {
                 DrawingInstruction::Area(area) => {
                     // LOD: Skip small areas when zoomed out (animation mode)
@@ -586,17 +683,24 @@ impl WgpuRenderer {
                         continue;
                     }
 
-                    // Show soundings at zoom >= 3x (with world-space grid decluttering)
-                    // At lower zoom levels, soundings are hidden unless explicitly enabled
+                    // S-101 Scale-based feature filtering
+                    // Calculate current viewing scale
+                    let viewing_scale = self.viewing_scale();
+
+                    // Soundings: visible at scales <= 1:45000 (larger scales = more detail)
+                    // At 1:22000 chart, this means zoom >= ~0.5x
                     let is_sounding = point.symbol_ref.starts_with("SOUNDG")
                         || point.symbol_ref.starts_with("SOUNDS");
-                    if is_sounding && !self.show_soundings && self.zoom_level < 3.0 {
+                    let sounding_scale_min = 45000; // S-101 typical scale_minimum for soundings
+                    if is_sounding && !self.show_soundings && viewing_scale > sounding_scale_min {
                         continue;
                     }
 
-                    // ISODGR01 (Isolated Danger) and DANGER02 only visible at high zoom levels (>= 5x)
+                    // ISODGR01 (Isolated Danger) and DANGER02: visible at scales <= 1:90000
+                    // These are important safety features, shown at medium-large scales
+                    let danger_scale_min = 90000;
                     if (point.symbol_ref == "ISODGR01" || point.symbol_ref == "DANGER02")
-                        && self.zoom_level < 5.0
+                        && viewing_scale > danger_scale_min
                     {
                         continue;
                     }
@@ -637,6 +741,31 @@ impl WgpuRenderer {
                     // For now, skip
                     tracing::trace!("Skipping text: {}", text.text);
                 }
+            }
+        }
+
+        // Record final priority ranges
+        if let Some(final_priority) = current_priority {
+            if self.area_indices.len() > area_start_idx {
+                self.area_priority_ranges.push((
+                    final_priority,
+                    area_start_idx,
+                    self.area_indices.len(),
+                ));
+            }
+            if self.line_indices.len() > line_start_idx {
+                self.line_priority_ranges.push((
+                    final_priority,
+                    line_start_idx,
+                    self.line_indices.len(),
+                ));
+            }
+            if self.symbol_instances.len() > symbol_start_idx {
+                self.symbol_priority_ranges.push((
+                    final_priority,
+                    symbol_start_idx,
+                    self.symbol_instances.len(),
+                ));
             }
         }
     }
@@ -1298,9 +1427,8 @@ impl WgpuRenderer {
             None
         };
 
-        // OPTIMIZATION: Build symbol batches before rendering
-        // Groups symbols by texture for single draw call per texture
-        self.build_symbol_batches();
+        // NOTE: Symbol batches are now built per-priority in the render loop below
+        // for S-101 compliant priority-based rendering
 
         let bg = self.background_color.to_array();
 
@@ -1332,45 +1460,110 @@ impl WgpuRenderer {
                 timestamp_writes: None,
             });
 
-            // Render areas first (they're usually background)
-            if let (Some(vb), Some(ib)) = (&area_vertex_buffer, &area_index_buffer) {
-                render_pass.set_pipeline(&self.pipelines.area_pipeline);
-                render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..self.area_indices.len() as u32, 0, 0..1);
+            // S-101 Priority-based rendering:
+            // Collect all unique priorities and render in order
+            // For each priority: Areas -> Lines -> Symbols
+            let mut all_priorities: Vec<i32> = Vec::new();
+            for (p, _, _) in &self.area_priority_ranges {
+                if !all_priorities.contains(p) {
+                    all_priorities.push(*p);
+                }
             }
-
-            // Render lines
-            if let (Some(vb), Some(ib)) = (&line_vertex_buffer, &line_index_buffer) {
-                render_pass.set_pipeline(&self.pipelines.line_pipeline);
-                render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..self.line_indices.len() as u32, 0, 0..1);
+            for (p, _, _) in &self.line_priority_ranges {
+                if !all_priorities.contains(p) {
+                    all_priorities.push(*p);
+                }
             }
+            for (p, _, _) in &self.symbol_priority_ranges {
+                if !all_priorities.contains(p) {
+                    all_priorities.push(*p);
+                }
+            }
+            all_priorities.sort();
 
-            // OPTIMIZATION: Render symbols using batching (single draw call per texture)
-            // Instead of creating buffers per symbol, group by texture and batch
-            if !self.symbol_instances.is_empty() {
-                render_pass.set_pipeline(&self.pipelines.texture_pipeline);
-                render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-
-                // Build batches grouped by texture (computed before render pass due to borrow rules)
-                // symbol_batches was populated in build_symbol_batches() called before render
-                for (symbol_id, (vertices, indices)) in &self.symbol_batches {
-                    if let Some(tex) = self.symbol_textures.get(symbol_id) {
-                        if vertices.is_empty() {
-                            continue;
+            // Render by priority groups
+            for priority in &all_priorities {
+                // Render areas for this priority
+                if let (Some(vb), Some(ib)) = (&area_vertex_buffer, &area_index_buffer) {
+                    for (p, start, end) in &self.area_priority_ranges {
+                        if p == priority && end > start {
+                            render_pass.set_pipeline(&self.pipelines.area_pipeline);
+                            render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                            render_pass.set_vertex_buffer(0, vb.slice(..));
+                            render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
                         }
-                        // Create single buffer for entire batch
-                        let vb = self.state.create_vertex_buffer(vertices, "symbol_batch_vb");
-                        let ib = self.state.create_index_buffer(indices, "symbol_batch_ib");
+                    }
+                }
 
-                        render_pass.set_bind_group(1, &tex.bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, vb.slice(..));
-                        render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+                // Render lines for this priority
+                if let (Some(vb), Some(ib)) = (&line_vertex_buffer, &line_index_buffer) {
+                    for (p, start, end) in &self.line_priority_ranges {
+                        if p == priority && end > start {
+                            render_pass.set_pipeline(&self.pipelines.line_pipeline);
+                            render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                            render_pass.set_vertex_buffer(0, vb.slice(..));
+                            render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
+                        }
+                    }
+                }
+
+                // Render symbols for this priority (in sorted order to prevent Z-fighting)
+                for (p, start, end) in &self.symbol_priority_ranges {
+                    if p == priority && end > start {
+                        render_pass.set_pipeline(&self.pipelines.texture_pipeline);
+                        render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+
+                        // Render symbols one by one in their sorted order to maintain Z-order
+                        for i in *start..*end {
+                            let instance = &self.symbol_instances[i];
+                            if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
+                                let mm_to_px = 3.78;
+                                let display_scale = instance.scale * mm_to_px / tex.render_scale
+                                    * self.symbol_scale;
+
+                                let half_w = (tex.width as f32 * display_scale) / 2.0;
+                                let half_h = (tex.height as f32 * display_scale) / 2.0;
+
+                                let pivot_x = tex.pivot_in_texture.0 * display_scale;
+                                let pivot_y = tex.pivot_in_texture.1 * display_scale;
+
+                                let rotation = instance.rotation.to_radians();
+                                let cos_r = rotation.cos();
+                                let sin_r = rotation.sin();
+
+                                let transform = |dx: f32, dy: f32| -> (f32, f32) {
+                                    let px = dx + half_w - pivot_x;
+                                    let py = dy + half_h - pivot_y;
+                                    let rx = px * cos_r - py * sin_r;
+                                    let ry = px * sin_r + py * cos_r;
+                                    (instance.screen_x + rx, instance.screen_y + ry)
+                                };
+
+                                let (x0, y0) = transform(-half_w, -half_h);
+                                let (x1, y1) = transform(half_w, -half_h);
+                                let (x2, y2) = transform(half_w, half_h);
+                                let (x3, y3) = transform(-half_w, half_h);
+
+                                let vertices = vec![
+                                    TextureVertex::new(x0, y0, 0.0, 0.0),
+                                    TextureVertex::new(x1, y1, 1.0, 0.0),
+                                    TextureVertex::new(x2, y2, 1.0, 1.0),
+                                    TextureVertex::new(x3, y3, 0.0, 1.0),
+                                ];
+                                let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+
+                                let vb = self.state.create_vertex_buffer(&vertices, "symbol_vb");
+                                let ib = self.state.create_index_buffer(&indices, "symbol_ib");
+
+                                render_pass.set_bind_group(1, &tex.bind_group, &[]);
+                                render_pass.set_vertex_buffer(0, vb.slice(..));
+                                render_pass
+                                    .set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                render_pass.draw_indexed(0..6, 0, 0..1);
+                            }
+                        }
                     }
                 }
             }

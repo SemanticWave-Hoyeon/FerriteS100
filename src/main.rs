@@ -6,6 +6,9 @@
 //! This application loads and parses S-101 Electronic Navigational Charts
 //! using dynamically loaded Feature Catalogue (FC) and Portrayal Catalogue (PC).
 
+/// Application version
+pub const VERSION: &str = "0.0.2";
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -339,6 +342,16 @@ impl ChartApp {
             let total_count: usize = self.cells.iter().map(|c| c.statistics().features).sum();
             renderer.ui_state.feature_count = total_count;
             renderer.ui_state.chart_count = self.cells.len();
+
+            // S-101: Set compilation scale for scale-based feature filtering
+            // Use the smallest scale (most detailed) from loaded charts
+            let min_scale = self
+                .cells
+                .iter()
+                .map(|c| c.compilation_scale)
+                .min()
+                .unwrap_or(22000);
+            renderer.set_compilation_scale(min_scale);
         }
 
         #[cfg(debug_assertions)]
@@ -576,7 +589,7 @@ impl ApplicationHandler for ChartApp {
             let window_icon = load_window_icon();
 
             let mut window_attrs = Window::default_attributes()
-                .with_title("FerriteS100 - S-101 Chart Viewer")
+                .with_title(format!("FerriteS100 v{} - S-101 Chart Viewer", VERSION))
                 .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080));
 
             if let Some(icon) = window_icon {
@@ -597,6 +610,7 @@ impl ApplicationHandler for ChartApp {
                                 .set_viewport(size.width as f32, size.height as f32);
 
                             // Initialize UI state
+                            renderer.ui_state.version = VERSION.to_string();
                             renderer.ui_state.zoom_level = self.zoom_level;
                             renderer.set_color_profile(&self.current_profile_name);
 
