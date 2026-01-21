@@ -54,10 +54,13 @@ impl Leader {
         let field_control_length = parse_numeric(&data[10..12])? as u8;
         let base_address = parse_numeric(&data[12..17])?;
         let extended_charset = [data[17] as char, data[18] as char, data[19] as char];
-        let size_field_length = data[20] - b'0';
-        let size_field_position = data[21] - b'0';
+
+        // Security: Use checked arithmetic to prevent integer underflow
+        // Malformed files with bytes < b'0' would cause wrapping in release builds
+        let size_field_length = parse_ascii_digit(data[20])?;
+        let size_field_position = parse_ascii_digit(data[21])?;
         let reserved = data[22] as char;
-        let size_field_tag = data[23] - b'0';
+        let size_field_tag = parse_ascii_digit(data[23])?;
 
         Ok(Leader {
             record_length,
@@ -91,6 +94,20 @@ impl Leader {
         self.size_field_tag as usize
             + self.size_field_length as usize
             + self.size_field_position as usize
+    }
+}
+
+/// Parse single ASCII digit ('0'-'9') to u8 with bounds checking
+///
+/// Security: Prevents integer underflow from malformed data
+fn parse_ascii_digit(byte: u8) -> Result<u8> {
+    if byte.is_ascii_digit() {
+        Ok(byte - b'0')
+    } else {
+        Err(Iso8211Error::Parse(format!(
+            "Invalid ASCII digit: 0x{:02X}",
+            byte
+        )))
     }
 }
 

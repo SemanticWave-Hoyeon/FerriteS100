@@ -167,11 +167,20 @@ impl EguiIntegration {
                 occlusion_query_set: None,
             });
 
-            // SAFETY: We're transmuting the render pass to have 'static lifetime
-            // for compatibility with egui_wgpu's API. This is safe because:
-            // 1. The render pass is used immediately and dropped at the end of this scope
-            // 2. The encoder (which render_pass borrows from) outlives this scope
-            // 3. No references to the render pass escape this block
+            // SAFETY: Transmuting render_pass lifetime to 'static for egui_wgpu API compatibility.
+            //
+            // Security consideration: This is a KNOWN LIMITATION that should be monitored.
+            // If egui_wgpu API changes to accept non-'static lifetimes, this should be removed.
+            //
+            // This transmute is safe because:
+            // 1. render_pass is created from encoder.begin_render_pass() above
+            // 2. render_pass is used ONLY within this block and dropped at line ~182
+            // 3. encoder outlives render_pass (encoder is used again at line ~183+)
+            // 4. No references to render_pass escape this lexical scope
+            // 5. The transmute only affects the borrow checker, not the actual data layout
+            //
+            // Invariant: render_pass MUST be dropped before encoder is accessed again.
+            #[allow(clippy::transmute_ptr_to_ref)]
             let mut render_pass: wgpu::RenderPass<'static> =
                 unsafe { std::mem::transmute(render_pass) };
 

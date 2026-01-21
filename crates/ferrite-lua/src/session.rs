@@ -44,22 +44,36 @@ impl LuaSession {
     }
 
     /// Apply security sandbox to Lua state
-    /// Disables dangerous functions that could be exploited
+    ///
+    /// Uses post-initialization removal approach as described in:
+    /// "Security Analysis of S-100 Portrayal Catalogue Lua Interpreter"
+    ///
+    /// This method removes dangerous library references from _G BEFORE any external
+    /// script is loaded, making it resistant to:
+    /// - rawget(_G, "os") bypass attempts
+    /// - setfenv/getfenv environment manipulation
+    /// - metatable-based __index interception
     fn sandbox_lua(lua: &Lua) -> Result<()> {
+        // [SECURITY PATCH] Disable dangerous libraries via Lua code execution
+        // This runs BEFORE any external PC script loads, so rawget bypass fails
+        lua.load(
+            r#"
+            os = nil
+            io = nil
+            debug = nil
+            package.loadlib = nil
+            package.cpath = ""
+            loadfile = nil
+            dofile = nil
+            load = nil
+            loadstring = nil
+            "#,
+        )
+        .exec()?;
+
+        // Additionally restrict package.searchers to prevent C module loading
         let globals = lua.globals();
-
-        // Disable loadfile/dofile (load arbitrary files)
-        globals.set("loadfile", mlua::Value::Nil)?;
-        globals.set("dofile", mlua::Value::Nil)?;
-
-        // Restrict package library
         if let Ok(package) = globals.get::<mlua::Table>("package") {
-            // Disable C module loading (prevents loading arbitrary .dll/.so)
-            package.set("loadlib", mlua::Value::Nil)?;
-            package.set("cpath", "")?;
-
-            // Clear searchers except for preload and Lua file loader
-            // This prevents searching system paths for modules
             if let Ok(searchers) = package.get::<mlua::Table>("searchers") {
                 // Keep only first two searchers (preload, lua loader)
                 // Remove C loader and all-in-one loader
@@ -69,18 +83,24 @@ impl LuaSession {
         }
 
         tracing::debug!(
-            "Lua sandbox applied: disabled loadfile, dofile, package.loadlib, C module loading"
+            "Lua sandbox applied: disabled os, io, debug, loadfile, dofile, load, loadstring, package.loadlib"
         );
         Ok(())
     }
 
     /// Set the rules path (directory containing Lua scripts)
+    ///
+    /// Security: Path is canonicalized to prevent path traversal attacks
     pub fn set_rules_path<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.as_ref();
 
         if !path.exists() {
             return Err(LuaError::ScriptNotFound(path.display().to_string()));
         }
+
+        // Canonicalize path to resolve symlinks and prevent path traversal
+        let path = std::fs::canonicalize(path)
+            .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
 
         self.rules_path = path.clone();
 
@@ -289,9 +309,25 @@ impl LuaSession {
     }
 
     /// Load and execute a Lua file
+    ///
+    /// Security: Path is canonicalized and validated against rules_path
     pub fn load_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let script = std::fs::read_to_string(path)
+
+        // Canonicalize to prevent path traversal (e.g., ../../../etc/passwd)
+        let canonical_path = std::fs::canonicalize(path)
+            .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
+
+        // Validate that file is within the allowed rules directory
+        if !self.rules_path.as_os_str().is_empty() && !canonical_path.starts_with(&self.rules_path)
+        {
+            return Err(LuaError::ScriptNotFound(format!(
+                "Access denied: {} is outside rules directory",
+                path.display()
+            )));
+        }
+
+        let script = std::fs::read_to_string(&canonical_path)
             .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
 
         self.lua
