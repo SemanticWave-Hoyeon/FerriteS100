@@ -2,6 +2,17 @@
 //!
 //! Uses resvg for accurate SVG rendering including even-odd fill rule.
 //! Renders SVG symbols to pixel buffers that are uploaded as GPU textures.
+//!
+//! # S-100 Symbol Sizing
+//!
+//! S-100 Portrayal Catalogue symbols are defined with dimensions in millimeters
+//! (SVG viewBox units). The S-100 standard specifies a reference display with
+//! 0.3mm per pixel (~85 DPI). At the reference scale, symbols appear at their
+//! nominal mm size on screen.
+//!
+//! The render_scale (pixels per mm) is used for SVG rasterization quality.
+//! A higher render_scale produces sharper textures but uses more memory.
+//! The actual display size is calculated at render time using S100_PX_PER_MM.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,14 +70,23 @@ pub struct SymbolCache {
     render_scale: f32,
 }
 
+/// S-100 standard: 96 DPI base (pixels per mm = 96/25.4 ≈ 3.78)
+const BASE_PX_PER_MM: f32 = 96.0 / 25.4;
+
+/// Quality multiplier for SVG rasterization (2x = sharper symbols)
+const RENDER_QUALITY_MULTIPLIER: f32 = 2.0;
+
 impl SymbolCache {
     /// Create new symbol cache
-    /// render_scale: pixels per mm (default ~3.78 for 96 DPI)
+    ///
+    /// Symbols are rasterized at `BASE_PX_PER_MM × RENDER_QUALITY_MULTIPLIER` pixels per mm
+    /// for high-quality display. The actual screen size is determined by S100_PX_PER_MM
+    /// in the renderer.
     pub fn new<P: AsRef<Path>>(symbols_path: P) -> Self {
         SymbolCache {
             symbols: HashMap::new(),
             symbols_path: symbols_path.as_ref().to_path_buf(),
-            render_scale: 3.78 * 2.0, // 2x scale for better quality
+            render_scale: BASE_PX_PER_MM * RENDER_QUALITY_MULTIPLIER,
         }
     }
 
