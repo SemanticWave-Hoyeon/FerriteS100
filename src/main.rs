@@ -78,8 +78,8 @@ struct ChartApp {
     bounds: GeoBounds,
     /// Symbol cache for SVG symbol rendering
     symbol_cache: SymbolCache,
-    /// Color profile from PC for symbol colors
-    color_profile: ferrite_portrayal_catalog::ColorProfile,
+    /// Current color profile name (Day, Dusk, Night)
+    current_profile_name: String,
     /// Current mouse position
     mouse_pos: (f64, f64),
     /// Rendered symbols for hit testing
@@ -113,7 +113,7 @@ struct ChartApp {
 impl ChartApp {
     fn new(
         symbol_cache: SymbolCache,
-        color_profile: ferrite_portrayal_catalog::ColorProfile,
+        initial_profile: String,
         fc: Arc<FeatureCatalogue>,
         pc: Arc<PortrayalCatalogue>,
     ) -> Self {
@@ -123,7 +123,7 @@ impl ChartApp {
             render_context: RenderContext::new(Viewport::new(1920.0, 1080.0)),
             bounds: GeoBounds::default(),
             symbol_cache,
-            color_profile,
+            current_profile_name: initial_profile,
             mouse_pos: (0.0, 0.0),
             rendered_symbols: Vec::new(),
             is_dragging: false,
@@ -139,6 +139,99 @@ impl ChartApp {
             chart_loaded: false,
             loaded_paths: std::collections::HashSet::new(),
         }
+    }
+
+    /// Get current color profile
+    #[allow(dead_code)]
+    fn get_current_profile(&self) -> Option<&ferrite_portrayal_catalog::ColorProfile> {
+        self.pc
+            .color_profiles
+            .profiles
+            .get(&self.current_profile_name)
+    }
+
+    /// Switch to a different color profile (Day, Dusk, Night)
+    /// Clears symbol cache to force re-rendering with new colors
+    fn set_color_profile(&mut self, profile_name: &str) {
+        if self.pc.color_profiles.profiles.contains_key(profile_name) {
+            if self.current_profile_name != profile_name {
+                self.current_profile_name = profile_name.to_string();
+                // Clear symbol cache to force re-rendering with new colors
+                self.symbol_cache.clear();
+                // Clear GPU-cached symbol textures in renderer
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.clear_symbol_textures();
+                }
+                tracing::info!("Switched to color profile: {}", profile_name);
+
+                // Re-run portrayal with new color profile to update Area/Line colors
+                // The Lua results convert color tokens to RGB values, so we need to regenerate
+                if self.chart_loaded {
+                    self.regenerate_portrayal();
+                }
+            }
+        } else {
+            tracing::warn!("Color profile '{}' not found", profile_name);
+        }
+    }
+
+    /// Regenerate portrayal instructions with current color profile
+    /// Called when color profile changes to update Area/Line colors
+    fn regenerate_portrayal(&mut self) {
+        if self.cells.is_empty() {
+            return;
+        }
+
+        let (width, height) = if let Some(renderer) = &self.renderer {
+            let size = renderer.window().inner_size();
+            (size.width as f32, size.height as f32)
+        } else {
+            (1920.0, 1080.0)
+        };
+
+        // Clear existing instructions
+        self.render_context = RenderContext::new(Viewport::new(width, height));
+        self.render_context.set_bounds(self.bounds);
+
+        // Try Lua portrayal with current color profile
+        let lua_result = try_lua_portrayal(
+            &self.cells,
+            &self.fc,
+            &self.pc,
+            &mut self.render_context,
+            &self.current_profile_name,
+        );
+
+        if let Err(e) = lua_result {
+            tracing::warn!(
+                "Lua portrayal failed during profile change: {}. Using default instructions.",
+                e
+            );
+            for cell in &self.cells {
+                generate_default_instructions(
+                    cell,
+                    &mut self.render_context,
+                    &self.pc,
+                    &self.current_profile_name,
+                );
+            }
+        }
+
+        tracing::info!(
+            "Regenerated portrayal with {} profile",
+            self.current_profile_name
+        );
+    }
+
+    /// Get available color profile names
+    #[allow(dead_code)]
+    fn get_available_profiles(&self) -> Vec<&str> {
+        self.pc
+            .color_profiles
+            .profiles
+            .keys()
+            .map(|s| s.as_str())
+            .collect()
     }
 
     /// Load chart files (appends to existing cells)
@@ -308,18 +401,34 @@ impl ChartApp {
         self.render_context = RenderContext::new(Viewport::new(width, height));
         self.render_context.set_bounds(self.bounds);
 
-        // Try Lua portrayal
-        let lua_result =
-            try_lua_portrayal(&self.cells, &self.fc, &self.pc, &mut self.render_context);
+        // Try Lua portrayal with current color profile
+        let lua_result = try_lua_portrayal(
+            &self.cells,
+            &self.fc,
+            &self.pc,
+            &mut self.render_context,
+            &self.current_profile_name,
+        );
 
         if let Err(e) = lua_result {
             warn!("Lua portrayal failed: {}. Using default instructions.", e);
             for cell in &self.cells {
-                generate_default_instructions(cell, &mut self.render_context, &self.pc);
+                generate_default_instructions(
+                    cell,
+                    &mut self.render_context,
+                    &self.pc,
+                    &self.current_profile_name,
+                );
             }
         }
 
         // Update renderer
+        // Get color profile before mutable borrows
+        let color_profile = self
+            .pc
+            .color_profiles
+            .profiles
+            .get(&self.current_profile_name);
         if let Some(renderer) = &mut self.renderer {
             let size = renderer.window().inner_size();
             self.render_context
@@ -330,7 +439,7 @@ impl ChartApp {
             renderer.add_instructions_with_symbols(
                 &mut self.render_context,
                 Some(&mut self.symbol_cache),
-                Some(&self.color_profile),
+                color_profile,
             );
 
             // Rebuild hit testing
@@ -429,6 +538,12 @@ impl ChartApp {
         self.render_context.zoom_to_fit(new_bounds);
 
         // Re-render with new view
+        // Get color profile before mutable borrows
+        let color_profile = self
+            .pc
+            .color_profiles
+            .profiles
+            .get(&self.current_profile_name);
         if let Some(renderer) = &mut self.renderer {
             // Update zoom level for symbol decluttering and UI
             renderer.set_zoom_level(self.zoom_level);
@@ -438,7 +553,7 @@ impl ChartApp {
             renderer.add_instructions_with_symbols(
                 &mut self.render_context,
                 Some(&mut self.symbol_cache),
-                Some(&self.color_profile),
+                color_profile,
             );
         }
 
@@ -483,15 +598,21 @@ impl ApplicationHandler for ChartApp {
 
                             // Initialize UI state
                             renderer.ui_state.zoom_level = self.zoom_level;
+                            renderer.set_color_profile(&self.current_profile_name);
 
                             // Only add instructions if chart is loaded
                             if self.chart_loaded {
+                                let color_profile = self
+                                    .pc
+                                    .color_profiles
+                                    .profiles
+                                    .get(&self.current_profile_name);
                                 self.render_context.zoom_to_fit(self.bounds);
                                 renderer.begin_frame();
                                 renderer.add_instructions_with_symbols(
                                     &mut self.render_context,
                                     Some(&mut self.symbol_cache),
-                                    Some(&self.color_profile),
+                                    color_profile,
                                 );
                                 self.build_rendered_symbols();
                             }
@@ -537,6 +658,13 @@ impl ApplicationHandler for ChartApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
+                // Get color profile before mutable borrows
+                let color_profile = self
+                    .pc
+                    .color_profiles
+                    .profiles
+                    .get(&self.current_profile_name);
+
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(physical_size);
 
@@ -550,7 +678,7 @@ impl ApplicationHandler for ChartApp {
                         renderer.add_instructions_with_symbols(
                             &mut self.render_context,
                             Some(&mut self.symbol_cache),
-                            Some(&self.color_profile),
+                            color_profile,
                         );
                     }
                 }
@@ -598,7 +726,15 @@ impl ApplicationHandler for ChartApp {
                 }
 
                 // Collect UI requests first (to avoid borrow conflicts)
-                let (open_file, screenshot, zoom_in, zoom_out, reset_view, clear_charts) = {
+                let (
+                    open_file,
+                    screenshot,
+                    zoom_in,
+                    zoom_out,
+                    reset_view,
+                    clear_charts,
+                    color_change,
+                ) = {
                     if let Some(renderer) = &mut self.renderer {
                         (
                             renderer.take_open_file_request(),
@@ -607,9 +743,10 @@ impl ApplicationHandler for ChartApp {
                             renderer.take_zoom_out_request(),
                             renderer.take_reset_view_request(),
                             renderer.take_clear_charts_request(),
+                            renderer.take_color_profile_change(),
                         )
                     } else {
-                        (false, false, false, false, false, false)
+                        (false, false, false, false, false, false, None)
                     }
                 };
 
@@ -679,6 +816,15 @@ impl ApplicationHandler for ChartApp {
 
                 if clear_charts {
                     self.clear_charts();
+                }
+
+                // Handle color profile change
+                if let Some(new_profile) = color_change {
+                    self.set_color_profile(&new_profile);
+                    // Force re-render with new colors
+                    if self.chart_loaded {
+                        self.update_view();
+                    }
                 }
 
                 // Render
@@ -944,33 +1090,25 @@ fn main() -> Result<()> {
     #[cfg(debug_assertions)]
     info!("Symbol cache initialized: {}", symbols_path.display());
 
-    // Get default color profile from PC
-    let color_profile = pc
+    // Get default color profile name from PC
+    let initial_profile = pc
         .color_profiles
         .default_profile
-        .as_ref()
-        .and_then(|name| pc.color_profiles.profiles.get(name))
-        .or_else(|| pc.color_profiles.profiles.values().next())
-        .cloned()
-        .unwrap_or_else(|| {
-            #[cfg(debug_assertions)]
-            warn!("No color profile found in PC, using empty profile");
-            ferrite_portrayal_catalog::ColorProfile::new(
-                "default".to_string(),
-                "Default".to_string(),
-            )
-        });
+        .clone()
+        .unwrap_or_else(|| "Day".to_string());
     #[cfg(debug_assertions)]
-    info!(
-        "Using color profile: {} ({} colors)",
-        color_profile.name,
-        color_profile.colors.len()
-    );
+    {
+        info!(
+            "Available color profiles: {:?}",
+            pc.color_profiles.profiles.keys().collect::<Vec<_>>()
+        );
+        info!("Initial color profile: {}", initial_profile);
+    }
 
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll); // Use Poll for smooth UI updates
 
-    let mut app = ChartApp::new(symbol_cache, color_profile, fc, pc);
+    let mut app = ChartApp::new(symbol_cache, initial_profile, fc, pc);
 
     event_loop.run_app(&mut app).context("Event loop error")?;
 
@@ -985,6 +1123,7 @@ fn try_lua_portrayal(
     fc: &FeatureCatalogue,
     pc: &PortrayalCatalogue,
     render_context: &mut RenderContext,
+    profile_name: &str,
 ) -> Result<()> {
     let rules_path = pc.root_path.join("Rules");
 
@@ -1051,7 +1190,14 @@ fn try_lua_portrayal(
 
                 // Convert THIS cell's Lua results using ONLY this cell's data
                 // Pass cell_index so symbols can be looked up in the correct cell
-                convert_lua_results_for_cell(&results, cell, pc, render_context, cell_index);
+                convert_lua_results_for_cell(
+                    &results,
+                    cell,
+                    pc,
+                    render_context,
+                    cell_index,
+                    profile_name,
+                );
             }
             Err(e) => {
                 warn!("  Cell {} portrayal failed: {}", cell_index, e);
@@ -1071,11 +1217,13 @@ fn convert_lua_results_for_cell(
     pc: &PortrayalCatalogue,
     context: &mut RenderContext,
     cell_index: usize,
+    profile_name: &str,
 ) {
     use ferrite_lua::DrawingCommand;
 
     // Helper to lookup color from token (from PC colorProfile.xml)
-    let lookup_color = |token: &str| -> Color { lookup_pc_color(pc, token) };
+    // Uses the specified profile (Day/Dusk/Night) for color resolution
+    let lookup_color = |token: &str| -> Color { lookup_pc_color(pc, token, profile_name) };
 
     let mut area_count = 0;
     let mut area_rendered = 0;
@@ -1899,6 +2047,7 @@ fn generate_default_instructions(
     cell: &S101Cell,
     context: &mut RenderContext,
     pc: &PortrayalCatalogue,
+    profile_name: &str,
 ) {
     // Process each feature and generate default instructions based on type
     for (key, feature) in &cell.features {
@@ -1906,7 +2055,7 @@ fn generate_default_instructions(
 
         // Get color token and priority based on feature type, then look up color from PC
         let (color_token, priority) = get_feature_color_token(feature_code);
-        let color = lookup_pc_color(pc, color_token);
+        let color = lookup_pc_color(pc, color_token, profile_name);
 
         match feature.primitive_type {
             SpatialPrimitiveType::Point => {
@@ -2082,16 +2231,34 @@ fn get_feature_color_token(feature_code: &str) -> (&'static str, i32) {
 }
 
 /// Look up color from PC color profile by token
-fn lookup_pc_color(pc: &PortrayalCatalogue, token: &str) -> Color {
+/// Uses the specified profile name (Day, Dusk, Night) for color resolution
+fn lookup_pc_color(pc: &PortrayalCatalogue, token: &str, profile_name: &str) -> Color {
+    // Try to get the specified profile, fallback to default or first available
     let profile = pc
         .color_profiles
-        .default_profile
-        .as_ref()
-        .and_then(|name| pc.color_profiles.profiles.get(name))
+        .profiles
+        .get(profile_name)
+        .or_else(|| {
+            pc.color_profiles
+                .default_profile
+                .as_ref()
+                .and_then(|name| pc.color_profiles.profiles.get(name))
+        })
         .or_else(|| pc.color_profiles.profiles.values().next());
 
     if let Some(profile) = profile {
         if let Some(srgb) = profile.get_srgb(token) {
+            // Debug: Log color lookup for depth tokens
+            if token.starts_with("DEP") {
+                tracing::debug!(
+                    "Color lookup: profile='{}' token='{}' -> RGB({}, {}, {})",
+                    profile_name,
+                    token,
+                    srgb.r,
+                    srgb.g,
+                    srgb.b
+                );
+            }
             return Color::rgb(
                 srgb.r as f32 / 255.0,
                 srgb.g as f32 / 255.0,
