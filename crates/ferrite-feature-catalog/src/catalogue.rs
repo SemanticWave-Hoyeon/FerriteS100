@@ -28,10 +28,26 @@ pub struct FeatureCatalogue {
 }
 
 impl FeatureCatalogue {
+    /// Maximum allowed XML file size (50 MB)
+    /// Security: Prevents resource exhaustion from oversized files
+    const MAX_XML_SIZE: u64 = 50 * 1024 * 1024;
+
     /// Load Feature Catalogue from XML file
+    ///
+    /// Security: File size is limited to prevent resource exhaustion attacks
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         tracing::info!("Loading Feature Catalogue: {}", path.display());
+
+        // Security: Check file size before loading
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > Self::MAX_XML_SIZE {
+            return Err(crate::FCError::InvalidValue(format!(
+                "File too large: {} bytes (max {} bytes)",
+                metadata.len(),
+                Self::MAX_XML_SIZE
+            )));
+        }
 
         let file = File::open(path)?;
         let reader = BufReader::new(file);
