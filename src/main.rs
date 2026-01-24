@@ -730,7 +730,8 @@ impl ApplicationHandler for ChartApp {
 
             let mut window_attrs = Window::default_attributes()
                 .with_title(format!("FerriteS100 v{} - S-101 Chart Viewer", VERSION))
-                .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080));
+                .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080))
+                .with_maximized(true);
 
             if let Some(icon) = window_icon {
                 window_attrs = window_attrs.with_window_icon(Some(icon));
@@ -814,28 +815,23 @@ impl ApplicationHandler for ChartApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
-                // Get color profile before mutable borrows
-                let color_profile = self
-                    .pc
-                    .color_profiles
-                    .profiles
-                    .get(&self.current_profile_name);
+                // Skip resize handling for minimized window (size 0x0)
+                if physical_size.width == 0 || physical_size.height == 0 {
+                    return;
+                }
 
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(physical_size);
+                    // Reset renderer's screen pan offset (will be recalculated by update_view)
+                    renderer.reset_pan_offset();
 
-                    // Update render context and re-add instructions
+                    // Update render context viewport (preserve zoom level)
                     self.render_context
                         .set_viewport(physical_size.width as f32, physical_size.height as f32);
 
                     if self.chart_loaded {
-                        self.render_context.zoom_to_fit(self.bounds);
-                        renderer.begin_frame();
-                        renderer.add_instructions_with_symbols(
-                            &mut self.render_context,
-                            Some(&mut self.symbol_cache),
-                            color_profile,
-                        );
+                        // Re-apply current view (zoom + pan) instead of resetting
+                        self.update_view();
                     }
                 }
             }
