@@ -11,10 +11,10 @@ pub const VERSION: &str = "0.0.2";
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -57,6 +57,22 @@ impl Default for AppConfig {
             log_path: PathBuf::from("./logs"),
         }
     }
+}
+
+/// Result of background chart loading
+struct ChartLoadResult {
+    path: PathBuf,
+    cell: S101Cell,
+}
+
+/// Background loading state
+struct BackgroundLoadingState {
+    /// Number of files being loaded
+    total_files: usize,
+    /// Number of files loaded so far
+    loaded_count: usize,
+    /// Receiver for loaded cells
+    receiver: Receiver<Option<ChartLoadResult>>,
 }
 
 /// Rendered symbol info for hit testing
@@ -117,6 +133,8 @@ struct ChartApp {
     chart_loaded: bool,
     /// Paths of already loaded chart files (to prevent duplicates)
     loaded_paths: std::collections::HashSet<PathBuf>,
+    /// Background loading state (Some if loading in progress)
+    loading_state: Option<BackgroundLoadingState>,
 }
 
 impl ChartApp {
@@ -151,6 +169,7 @@ impl ChartApp {
             cells: Vec::new(),
             chart_loaded: false,
             loaded_paths: std::collections::HashSet::new(),
+            loading_state: None,
         }
     }
 
@@ -247,19 +266,26 @@ impl ChartApp {
             .collect()
     }
 
-    /// Load chart files (appends to existing cells)
+    /// Start loading chart files in background (non-blocking)
     fn load_charts(&mut self, paths: &[PathBuf]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
 
+        // Don't start new loading if already loading
+        if self.loading_state.is_some() {
+            warn!("Loading already in progress, ignoring new load request");
+            return Ok(());
+        }
+
         // Filter out already loaded files
-        let new_paths: Vec<_> = paths
+        let new_paths: Vec<PathBuf> = paths
             .iter()
             .filter(|p| {
                 let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
                 !self.loaded_paths.contains(&canonical)
             })
+            .cloned()
             .collect();
 
         if new_paths.is_empty() {
@@ -268,28 +294,32 @@ impl ChartApp {
             return Ok(());
         }
 
+        let total_files = new_paths.len();
         #[cfg(debug_assertions)]
         info!(
-            "Loading {} new chart file(s) ({} skipped as duplicates)",
-            new_paths.len(),
-            paths.len() - new_paths.len()
+            "Starting background load of {} chart file(s) ({} skipped as duplicates)",
+            total_files,
+            paths.len() - total_files
         );
 
-        let fc_feature_codes = self.fc.feature_type_codes();
-        #[cfg(debug_assertions)]
-        let new_paths_count = new_paths.len();
+        // Create channel for receiving loaded cells
+        let (tx, rx) = mpsc::channel();
 
-        // Parallel load: Load and normalize all cells concurrently using rayon
-        let loaded_cells: Vec<_> = new_paths
-            .par_iter()
-            .filter_map(|path| {
+        // Clone FC for background thread
+        let fc = Arc::clone(&self.fc);
+
+        // Spawn background thread for loading
+        std::thread::spawn(move || {
+            let fc_feature_codes = fc.feature_type_codes();
+
+            // Load each file in the background thread
+            for path in new_paths {
                 #[cfg(debug_assertions)]
-                info!("Loading chart: {}", path.display());
+                info!("Background loading: {}", path.display());
 
-                // Load cell
-                match S101Cell::load(path) {
+                let result = match S101Cell::load(&path) {
                     Ok(mut cell) => {
-                        // Normalize feature codes (can be done in parallel)
+                        // Normalize feature codes
                         cell.normalize_feature_codes(&fc_feature_codes);
 
                         #[cfg(debug_assertions)]
@@ -301,94 +331,175 @@ impl ChartApp {
                             );
                         }
 
-                        Some(((*path).clone(), cell))
+                        Some(ChartLoadResult { path, cell })
                     }
                     Err(e) => {
                         error!("Failed to load chart {}: {}", path.display(), e);
                         None
                     }
+                };
+
+                // Send result (even None to track progress)
+                if tx.send(result).is_err() {
+                    // Receiver dropped, stop loading
+                    break;
                 }
-            })
-            .collect();
-
-        // Sequential post-processing: expand bounds and track paths
-        let mut loaded_names = Vec::new();
-        #[cfg(debug_assertions)]
-        let mut total_features = 0;
-
-        for (path, cell) in loaded_cells {
-            #[cfg(debug_assertions)]
-            {
-                total_features += cell.statistics().features;
             }
+        });
 
-            // Expand bounds to include this cell
-            for point in cell.points.values() {
+        // Set loading state
+        self.loading_state = Some(BackgroundLoadingState {
+            total_files,
+            loaded_count: 0,
+            receiver: rx,
+        });
+
+        // Update UI to show loading
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.loading_progress = Some((total_files, 0));
+        }
+
+        Ok(())
+    }
+
+    /// Poll for background loading completion (non-blocking)
+    /// Returns true if loading is complete
+    fn poll_loading(&mut self) -> bool {
+        let loading_state = match &mut self.loading_state {
+            Some(state) => state,
+            None => return true, // No loading in progress
+        };
+
+        let mut completed = false;
+        let mut new_cells = Vec::new();
+
+        // Non-blocking receive of all available results
+        loop {
+            match loading_state.receiver.try_recv() {
+                Ok(result) => {
+                    loading_state.loaded_count += 1;
+
+                    if let Some(load_result) = result {
+                        new_cells.push(load_result);
+                    }
+
+                    // Check if all files are loaded
+                    if loading_state.loaded_count >= loading_state.total_files {
+                        completed = true;
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // No more results available right now
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Sender dropped (thread finished or crashed)
+                    completed = true;
+                    break;
+                }
+            }
+        }
+
+        // Process newly loaded cells
+        for load_result in new_cells {
+            // Expand bounds
+            for point in load_result.cell.points.values() {
                 let wp = WorldPoint::new(point.position.x, point.position.y);
                 self.bounds.expand(wp);
             }
-            for curve in cell.curves.values() {
+            for curve in load_result.cell.curves.values() {
                 for pos in curve.all_positions() {
                     let wp = WorldPoint::new(pos.x, pos.y);
                     self.bounds.expand(wp);
                 }
             }
 
-            // Track loaded file path (canonical to handle symlinks/relative paths)
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            // Track loaded path
+            let canonical = load_result
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| load_result.path.clone());
             self.loaded_paths.insert(canonical);
 
-            // Track loaded file name
-            if let Some(name) = path.file_name() {
-                loaded_names.push(name.to_string_lossy().to_string());
-            }
-
-            // Append cell to existing cells
-            self.cells.push(cell);
+            // Add cell
+            self.cells.push(load_result.cell);
         }
 
-        // Expand bounds by 10%
-        self.bounds.expand_by_percent(0.1);
-        self.chart_loaded = true;
+        // Update UI progress
+        if let Some(renderer) = &mut self.renderer {
+            if let Some(state) = &self.loading_state {
+                renderer.ui_state.loading_progress = Some((state.total_files, state.loaded_count));
+            }
+        }
 
-        // Generate drawing instructions for all cells
-        self.regenerate_instructions()?;
+        // Finalize if complete
+        if completed {
+            self.finalize_loading();
+        }
+
+        completed
+    }
+
+    /// Finalize loading after all cells are loaded
+    fn finalize_loading(&mut self) {
+        // Clear loading state
+        self.loading_state = None;
+
+        if !self.cells.is_empty() {
+            // Expand bounds by 10%
+            self.bounds.expand_by_percent(0.1);
+            self.chart_loaded = true;
+
+            // Generate drawing instructions for all cells
+            if let Err(e) = self.regenerate_instructions() {
+                error!("Failed to generate instructions: {}", e);
+            }
+        }
 
         // Update UI state
         if let Some(renderer) = &mut self.renderer {
-            // Show count of loaded charts or single chart name
-            let chart_info = if self.cells.len() == 1 {
-                loaded_names
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| "Chart".to_string())
-            } else {
-                format!("{} charts loaded", self.cells.len())
-            };
-            renderer.ui_state.loaded_chart = Some(chart_info);
+            renderer.ui_state.loading_progress = None;
 
-            // Update total feature count across all cells
-            let total_count: usize = self.cells.iter().map(|c| c.statistics().features).sum();
-            renderer.ui_state.feature_count = total_count;
-            renderer.ui_state.chart_count = self.cells.len();
+            if self.chart_loaded {
+                let chart_info = if self.cells.len() == 1 {
+                    self.cells
+                        .first()
+                        .and_then(|c| {
+                            c.file_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                        })
+                        .unwrap_or_else(|| "Chart".to_string())
+                } else {
+                    format!("{} charts loaded", self.cells.len())
+                };
+                renderer.ui_state.loaded_chart = Some(chart_info);
 
-            // S-101: Set compilation scale for scale-based feature filtering
-            // Use the smallest scale (most detailed) from loaded charts
-            let min_scale = self
-                .cells
-                .iter()
-                .map(|c| c.compilation_scale)
-                .min()
-                .unwrap_or(22000);
-            renderer.set_compilation_scale(min_scale);
+                let total_count: usize = self.cells.iter().map(|c| c.statistics().features).sum();
+                renderer.ui_state.feature_count = total_count;
+                renderer.ui_state.chart_count = self.cells.len();
+
+                // Set compilation scale
+                let min_scale = self
+                    .cells
+                    .iter()
+                    .map(|c| c.compilation_scale)
+                    .min()
+                    .unwrap_or(22000);
+                renderer.set_compilation_scale(min_scale);
+            }
         }
 
         #[cfg(debug_assertions)]
         info!(
-            "Loaded {} new charts ({} total features)",
-            new_paths_count, total_features
+            "Loading complete: {} charts, {} features",
+            self.cells.len(),
+            self.cells
+                .iter()
+                .map(|c| c.statistics().features)
+                .sum::<usize>()
         );
-        Ok(())
     }
 
     /// Clear all loaded charts
@@ -770,6 +881,11 @@ impl ApplicationHandler for ChartApp {
                             renderer.add_pan_offset(screen_vx as f32, screen_vy as f32);
                         }
                     }
+                }
+
+                // Poll for background loading completion
+                if self.loading_state.is_some() {
+                    self.poll_loading();
                 }
 
                 // Collect UI requests first (to avoid borrow conflicts)
