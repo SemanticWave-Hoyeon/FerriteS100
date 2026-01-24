@@ -42,8 +42,12 @@ pub struct AppUiState {
     pub chart_count: usize,
     /// Selected feature info
     pub selected_feature: Option<SelectedFeature>,
-    /// Request to open file dialog
+    /// Request to open file dialog (chart files)
     pub open_file_requested: bool,
+    /// Request to open Feature Catalogue
+    pub open_fc_requested: bool,
+    /// Request to open Portrayal Catalogue
+    pub open_pc_requested: bool,
     /// Request to save screenshot
     pub screenshot_requested: bool,
     /// Request to zoom in
@@ -242,6 +246,15 @@ impl EguiIntegration {
                         }
                         if ui_state.chart_count > 0 && ui.button("Clear All Charts").clicked() {
                             ui_state.clear_charts_requested = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Open Feature Catalogue...").clicked() {
+                            ui_state.open_fc_requested = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Open Portrayal Catalogue...").clicked() {
+                            ui_state.open_pc_requested = true;
                             ui.close_menu();
                         }
                         ui.separator();
