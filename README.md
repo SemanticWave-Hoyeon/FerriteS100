@@ -87,9 +87,17 @@ cargo run --release
 
 1. Place S-101 chart files (`.000`) in the `ChartData/` directory
 2. Ensure catalogues are configured:
-   - Feature Catalogue: `catalogues/FC/`
-   - Portrayal Catalogue: `catalogues/PC/`
+   - Feature Catalogue: `Catalogues/FC/S-101/`
+   - Portrayal Catalogue: `Catalogues/PC/S-101/`
 3. Run the application
+
+### S-101 Test Data
+
+S-101 sample charts can be downloaded from the **UKHO Data Hub**:
+
+- [UKHO S-101 Test Data](https://datahub.admiralty.co.uk/portal/home/item.html?id=6966cb7ce9454ccf9afbbd3c9a105f9e)
+
+> **Note**: UKHO provides official S-101 test datasets for development and testing purposes. Registration may be required.
 
 ### Controls
 
@@ -114,9 +122,9 @@ FerriteS100/
 │   ├── ferrite-lua/               # Lua portrayal engine (sandboxed)
 │   ├── ferrite-render/            # Abstract rendering instructions
 │   └── ferrite-wgpu/              # GPU renderer
-├── catalogues/
-│   ├── FC/                        # Feature Catalogue XML
-│   └── PC/                        # Portrayal Catalogue (Lua, SVG, colors)
+├── Catalogues/
+│   ├── FC/S-101/                  # Feature Catalogue XML
+│   └── PC/S-101/                  # Portrayal Catalogue (Lua, SVG, colors)
 └── ChartData/                     # S-101 chart files (.000)
 ```
 

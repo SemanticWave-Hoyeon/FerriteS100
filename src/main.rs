@@ -52,8 +52,8 @@ struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
-            fc_path: PathBuf::from("./catalogues/FC/101_Feature_Catalogue_2.0.0.xml"),
-            pc_path: PathBuf::from("./catalogues/PC/PortrayalCatalog"),
+            fc_path: PathBuf::from("./Catalogues/FC/S-101"),
+            pc_path: PathBuf::from("./Catalogues/PC/S-101"),
             log_path: PathBuf::from("./logs"),
         }
     }
@@ -2074,8 +2074,31 @@ fn load_feature_catalogue(path: &Path) -> Result<FeatureCatalogue> {
         });
     }
 
-    let fc = FeatureCatalogue::load(path)
-        .with_context(|| format!("Failed to load Feature Catalogue: {}", path.display()))?;
+    // If path is a directory, scan for FC XML file
+    let fc_file = if path.is_dir() {
+        // Look for Feature Catalogue XML in the directory
+        let mut found_fc = None;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_path = entry.path();
+            if file_path.is_file() {
+                if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
+                    // Look for FC XML files (e.g., "101_Feature_Catalogue_*.xml" or "*_FC.xml")
+                    if name.contains("Feature_Catalogue") && name.ends_with(".xml") {
+                        info!("Found FC XML: {}", file_path.display());
+                        found_fc = Some(file_path);
+                        break;
+                    }
+                }
+            }
+        }
+        found_fc.unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+
+    let fc = FeatureCatalogue::load(&fc_file)
+        .with_context(|| format!("Failed to load Feature Catalogue: {}", fc_file.display()))?;
 
     info!("FC loaded successfully");
     debug!("  Product: {}", fc.product_id);
