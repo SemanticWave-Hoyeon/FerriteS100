@@ -70,6 +70,8 @@ pub struct AppUiState {
     pub fc_status: CatalogueStatus,
     /// Portrayal Catalogue status
     pub pc_status: CatalogueStatus,
+    /// Loading in progress (total files, loaded count)
+    pub loading_progress: Option<(usize, usize)>,
 }
 
 /// Information about a selected feature
@@ -370,8 +372,15 @@ impl EguiIntegration {
 
                     ui.separator();
 
-                    // Feature count and chart info
-                    if ui_state.chart_count > 0 {
+                    // Loading indicator or feature count
+                    if let Some((total, loaded)) = ui_state.loading_progress {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(format!("Loading... ({}/{})", loaded, total))
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(100, 180, 255)),
+                        );
+                    } else if ui_state.chart_count > 0 {
                         ui.label(
                             egui::RichText::new(format!(
                                 "Charts: {} | Features: {}",
