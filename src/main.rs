@@ -36,7 +36,7 @@ use ferrite_render::{
     Viewport, WorldPoint,
 };
 use ferrite_s100_core::{S101Cell, SpatialPrimitiveType};
-use ferrite_wgpu::{SelectedFeature, SymbolCache, WgpuRenderer};
+use ferrite_wgpu::{CatalogueStatus, SelectedFeature, SymbolCache, WgpuRenderer};
 
 /// Application configuration
 struct AppConfig {
@@ -107,6 +107,10 @@ struct ChartApp {
     fc: Arc<FeatureCatalogue>,
     /// Portrayal Catalogue reference
     pc: Arc<PortrayalCatalogue>,
+    /// Feature Catalogue status (for UI display)
+    fc_status: CatalogueStatus,
+    /// Portrayal Catalogue status (for UI display)
+    pc_status: CatalogueStatus,
     /// All loaded S101 cells
     cells: Vec<S101Cell>,
     /// Whether chart data is loaded
@@ -121,6 +125,8 @@ impl ChartApp {
         initial_profile: String,
         fc: Arc<FeatureCatalogue>,
         pc: Arc<PortrayalCatalogue>,
+        fc_status: CatalogueStatus,
+        pc_status: CatalogueStatus,
     ) -> Self {
         ChartApp {
             window: None,
@@ -140,6 +146,8 @@ impl ChartApp {
             recent_positions: Vec::new(),
             fc,
             pc,
+            fc_status,
+            pc_status,
             cells: Vec::new(),
             chart_loaded: false,
             loaded_paths: std::collections::HashSet::new(),
@@ -633,6 +641,8 @@ impl ApplicationHandler for ChartApp {
                             // Initialize UI state
                             renderer.ui_state.version = VERSION.to_string();
                             renderer.ui_state.zoom_level = self.zoom_level;
+                            renderer.ui_state.fc_status = self.fc_status.clone();
+                            renderer.ui_state.pc_status = self.pc_status.clone();
                             renderer.set_color_profile(&self.current_profile_name);
 
                             // Only add instructions if chart is loaded
@@ -728,19 +738,21 @@ impl ApplicationHandler for ChartApp {
                 let velocity_magnitude =
                     (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
                 if velocity_magnitude > 0.0001 && self.chart_loaded && !self.is_dragging {
-                    // Apply velocity to pan offset
+                    // Apply velocity to pan offset (using current velocity BEFORE friction)
                     self.pan_offset.0 += self.pan_velocity.0 * dt;
                     self.pan_offset.1 += self.pan_velocity.1 * dt;
+
+                    // Calculate screen-space velocity for GPU pan offset
+                    // IMPORTANT: Must use the SAME velocity as pan_offset update (pre-friction)
+                    // to keep screen offset and world offset synchronized
+                    let screen_vx =
+                        -self.pan_velocity.0 * self.render_context.scaler.scale_x() * dt;
+                    let screen_vy = self.pan_velocity.1 * self.render_context.scaler.scale_y() * dt;
 
                     // Decelerate (friction) - exponential decay for smooth stop
                     let friction = 0.95_f64.powf(dt * 60.0); // ~5% decay per frame at 60fps
                     self.pan_velocity.0 *= friction;
                     self.pan_velocity.1 *= friction;
-
-                    // Calculate screen-space velocity for GPU pan offset
-                    let screen_vx =
-                        -self.pan_velocity.0 * self.render_context.scaler.scale_x() * dt;
-                    let screen_vy = self.pan_velocity.1 * self.render_context.scaler.scale_y() * dt;
 
                     // Check if velocity is now very small (stopping)
                     let new_magnitude =
@@ -1100,6 +1112,10 @@ fn main() -> Result<()> {
     let fc = Arc::new(load_feature_catalogue(&config.fc_path)?);
     let pc = Arc::new(load_portrayal_catalogue(&config.pc_path)?);
 
+    // Validate and create status for FC/PC
+    let fc_status = validate_fc(&fc, &config.fc_path);
+    let pc_status = validate_pc(&pc, &config.pc_path);
+
     #[cfg(debug_assertions)]
     {
         info!("");
@@ -1107,12 +1123,18 @@ fn main() -> Result<()> {
         info!("  - {} feature types", fc.feature_types.len());
         info!("  - {} simple attributes", fc.simple_attributes.len());
         info!("  - {} complex attributes", fc.complex_attributes.len());
+        if let Some(ref msg) = fc_status.validation_message {
+            info!("  - Validation: {}", msg);
+        }
         info!("");
         info!("Portrayal Catalogue:");
         info!("  - {} color profiles", pc.color_profiles.profiles.len());
         info!("  - {} symbols", pc.symbols.symbols.len());
         info!("  - {} line styles", pc.line_styles.len());
         info!("  - {} area fills", pc.area_fills.len());
+        if let Some(ref msg) = pc_status.validation_message {
+            info!("  - Validation: {}", msg);
+        }
         info!("");
         info!("========================================");
         info!("Starting GUI - Use File > Open to load chart");
@@ -1143,7 +1165,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll); // Use Poll for smooth UI updates
 
-    let mut app = ChartApp::new(symbol_cache, initial_profile, fc, pc);
+    let mut app = ChartApp::new(symbol_cache, initial_profile, fc, pc, fc_status, pc_status);
 
     event_loop.run_app(&mut app).context("Event loop error")?;
 
@@ -1940,6 +1962,96 @@ fn init_logging(log_path: &Path) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Validate Feature Catalogue and create status
+fn validate_fc(fc: &FeatureCatalogue, path: &Path) -> CatalogueStatus {
+    let mut validation_messages = Vec::new();
+
+    // Check product ID
+    if fc.product_id.is_empty() {
+        validation_messages.push("Missing product ID");
+    } else if !fc.product_id.contains("S-101") && fc.product_id != "S-101" {
+        validation_messages.push("Product ID is not S-101");
+    }
+
+    // Check required content
+    if fc.feature_types.is_empty() {
+        validation_messages.push("No feature types defined");
+    }
+    if fc.simple_attributes.is_empty() {
+        validation_messages.push("No simple attributes defined");
+    }
+
+    // Check for essential S-101 feature types
+    let essential_features = ["DepthArea", "LandArea", "CoastLine", "Sounding"];
+    let missing: Vec<_> = essential_features
+        .iter()
+        .filter(|f| !fc.feature_types.contains_key(**f))
+        .collect();
+    if !missing.is_empty() {
+        validation_messages.push("Missing essential feature types");
+    }
+
+    let validation_message = if validation_messages.is_empty() {
+        Some("Valid S-101 Feature Catalogue".to_string())
+    } else {
+        Some(format!("Warning: {}", validation_messages.join(", ")))
+    };
+
+    CatalogueStatus {
+        loaded: true,
+        product_id: fc.product_id.clone(),
+        version: fc.version.clone(),
+        path: path.display().to_string(),
+        item_count: fc.feature_types.len(),
+        validation_message,
+    }
+}
+
+/// Validate Portrayal Catalogue and create status
+fn validate_pc(pc: &PortrayalCatalogue, path: &Path) -> CatalogueStatus {
+    let mut validation_messages = Vec::new();
+
+    // Check product ID
+    if pc.product_id.is_empty() {
+        validation_messages.push("Missing product ID");
+    } else if !pc.product_id.contains("S-101") && pc.product_id != "S-101" {
+        validation_messages.push("Product ID is not S-101");
+    }
+
+    // Check required content
+    if pc.color_profiles.profiles.is_empty() {
+        validation_messages.push("No color profiles defined");
+    }
+    if pc.symbols.symbols.is_empty() {
+        validation_messages.push("No symbols defined");
+    }
+
+    // Check for required color profiles (Day, Dusk, Night)
+    let required_profiles = ["Day", "Dusk", "Night"];
+    let missing: Vec<_> = required_profiles
+        .iter()
+        .filter(|p| !pc.color_profiles.profiles.contains_key(**p))
+        .collect();
+    if !missing.is_empty() {
+        validation_messages.push("Missing required color profiles");
+    }
+
+    let validation_message = if validation_messages.is_empty() {
+        Some("Valid S-101 Portrayal Catalogue".to_string())
+    } else {
+        Some(format!("Warning: {}", validation_messages.join(", ")))
+    };
+
+    CatalogueStatus {
+        loaded: true,
+        product_id: pc.product_id.clone(),
+        version: pc.version.clone(),
+        path: path.display().to_string(),
+        item_count: pc.symbols.symbols.len(),
+        validation_message,
+    }
 }
 
 /// Load Feature Catalogue from XML file

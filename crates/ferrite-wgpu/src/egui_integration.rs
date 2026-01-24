@@ -6,6 +6,23 @@ use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+/// Feature Catalogue status information
+#[derive(Debug, Clone, Default)]
+pub struct CatalogueStatus {
+    /// Whether the catalogue is loaded and valid
+    pub loaded: bool,
+    /// Product ID (e.g., "S-101")
+    pub product_id: String,
+    /// Version string
+    pub version: String,
+    /// File path
+    pub path: String,
+    /// Number of items (feature types for FC, symbols for PC)
+    pub item_count: usize,
+    /// Validation status message
+    pub validation_message: Option<String>,
+}
+
 /// Application state shared between egui UI and main app
 #[derive(Debug, Clone, Default)]
 pub struct AppUiState {
@@ -39,10 +56,16 @@ pub struct AppUiState {
     pub clear_charts_requested: bool,
     /// Show about dialog
     pub show_about: bool,
+    /// Show catalogues dialog
+    pub show_catalogues: bool,
     /// Current color profile name (Day, Dusk, Night)
     pub color_profile: String,
     /// Color profile was changed
     pub color_profile_changed: bool,
+    /// Feature Catalogue status
+    pub fc_status: CatalogueStatus,
+    /// Portrayal Catalogue status
+    pub pc_status: CatalogueStatus,
 }
 
 /// Information about a selected feature
@@ -251,6 +274,11 @@ impl EguiIntegration {
 
                     // Help menu
                     ui.menu_button("Help", |ui| {
+                        if ui.button("Catalogues...").clicked() {
+                            ui_state.show_catalogues = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("About").clicked() {
                             ui_state.show_about = true;
                             ui.close_menu();
@@ -525,5 +553,101 @@ impl EguiIntegration {
                     });
                 });
         }
+
+        // Catalogues dialog
+        if ui_state.show_catalogues {
+            egui::Window::new("S-101 Catalogues")
+                .collapsible(false)
+                .resizable(true)
+                .min_width(450.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&self.ctx, |ui| {
+                    // Feature Catalogue section
+                    ui.heading("Feature Catalogue (FC)");
+                    ui.add_space(4.0);
+
+                    Self::draw_catalogue_status(ui, &ui_state.fc_status, "Feature Types");
+
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // Portrayal Catalogue section
+                    ui.heading("Portrayal Catalogue (PC)");
+                    ui.add_space(4.0);
+
+                    Self::draw_catalogue_status(ui, &ui_state.pc_status, "Symbols/Styles");
+
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.vertical_centered(|ui| {
+                        if ui.button("Close").clicked() {
+                            ui_state.show_catalogues = false;
+                        }
+                    });
+                });
+        }
+    }
+
+    /// Draw catalogue status information
+    fn draw_catalogue_status(ui: &mut egui::Ui, status: &CatalogueStatus, item_label: &str) {
+        egui::Grid::new(format!("catalogue_grid_{}", item_label))
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                // Status indicator
+                ui.label(egui::RichText::new("Status:").strong());
+                if status.loaded {
+                    ui.label(
+                        egui::RichText::new("Loaded").color(egui::Color32::from_rgb(100, 200, 100)),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Not Loaded")
+                            .color(egui::Color32::from_rgb(200, 100, 100)),
+                    );
+                }
+                ui.end_row();
+
+                if status.loaded {
+                    // Product ID
+                    ui.label(egui::RichText::new("Product:").strong());
+                    ui.label(&status.product_id);
+                    ui.end_row();
+
+                    // Version
+                    ui.label(egui::RichText::new("Version:").strong());
+                    ui.label(&status.version);
+                    ui.end_row();
+
+                    // Item count
+                    ui.label(egui::RichText::new(format!("{}:", item_label)).strong());
+                    ui.label(format!("{}", status.item_count));
+                    ui.end_row();
+
+                    // Path
+                    ui.label(egui::RichText::new("Path:").strong());
+                    ui.label(
+                        egui::RichText::new(&status.path)
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.end_row();
+
+                    // Validation status
+                    if let Some(ref msg) = status.validation_message {
+                        ui.label(egui::RichText::new("Validation:").strong());
+                        let color = if msg.starts_with("Valid") {
+                            egui::Color32::from_rgb(100, 200, 100)
+                        } else {
+                            egui::Color32::from_rgb(255, 200, 100)
+                        };
+                        ui.label(egui::RichText::new(msg).color(color));
+                        ui.end_row();
+                    }
+                }
+            });
     }
 }
