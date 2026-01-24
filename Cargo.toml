@@ -79,6 +79,9 @@ edition.workspace = true
 name = "ferrite-s100"
 path = "src/main.rs"
 
+[build-dependencies]
+winres = "0.1"
+
 [dependencies]
 ferrite-iso8211.workspace = true
 ferrite-s100-core.workspace = true
