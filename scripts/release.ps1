@@ -39,7 +39,7 @@ Write-Host "`n[3/5] Copying files..." -ForegroundColor Yellow
 Copy-Item "$TargetDir\ferrite-s100.exe" "$ReleaseDir\FerriteS100.exe"
 
 # Create empty folders with README
-$folders = @("Catalogues\FC", "Catalogues\PC", "ChartData")
+$folders = @("Catalogues\FC\S-101", "Catalogues\PC\S-101", "ChartData")
 foreach ($folder in $folders) {
     $path = "$ReleaseDir\$folder"
     New-Item -ItemType Directory -Force -Path $path | Out-Null
@@ -47,18 +47,20 @@ foreach ($folder in $folders) {
 
 # Create README files for empty folders
 @"
-Place S-101 Feature Catalogue (S-101_FC.xml) here.
-"@ | Out-File -FilePath "$ReleaseDir\Catalogues\FC\README.txt" -Encoding UTF8
+Place S-101 Feature Catalogue XML here.
+Example: 101_Feature_Catalogue_2.0.0.xml
+"@ | Out-File -FilePath "$ReleaseDir\Catalogues\FC\S-101\README.txt" -Encoding UTF8
 
 @"
 Place S-101 Portrayal Catalogue files here.
 Required structure:
+  - portrayal_catalogue.xml
   - Rules/main.lua (and other Lua files)
   - Symbols/*.svg
   - LineStyles/*.xml
   - AreaFills/*.xml
   - ColorProfiles/*.xml
-"@ | Out-File -FilePath "$ReleaseDir\Catalogues\PC\README.txt" -Encoding UTF8
+"@ | Out-File -FilePath "$ReleaseDir\Catalogues\PC\S-101\README.txt" -Encoding UTF8
 
 @"
 Place S-101 chart files (*.000) here.
