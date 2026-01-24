@@ -775,6 +775,8 @@ impl ApplicationHandler for ChartApp {
                 // Collect UI requests first (to avoid borrow conflicts)
                 let (
                     open_file,
+                    open_fc,
+                    open_pc,
                     screenshot,
                     zoom_in,
                     zoom_out,
@@ -785,6 +787,8 @@ impl ApplicationHandler for ChartApp {
                     if let Some(renderer) = &mut self.renderer {
                         (
                             renderer.take_open_file_request(),
+                            renderer.take_open_fc_request(),
+                            renderer.take_open_pc_request(),
                             renderer.take_screenshot_request(),
                             renderer.take_zoom_in_request(),
                             renderer.take_zoom_out_request(),
@@ -793,7 +797,7 @@ impl ApplicationHandler for ChartApp {
                             renderer.take_color_profile_change(),
                         )
                     } else {
-                        (false, false, false, false, false, false, None)
+                        (false, false, false, false, false, false, false, false, None)
                     }
                 };
 
@@ -816,6 +820,60 @@ impl ApplicationHandler for ChartApp {
                     if !paths.is_empty() {
                         if let Err(e) = self.load_charts(&paths) {
                             error!("Failed to load chart(s): {}", e);
+                        }
+                    }
+                }
+
+                // Handle Feature Catalogue open request
+                if open_fc {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Feature Catalogue XML", &["xml"])
+                        .set_title("Open Feature Catalogue")
+                        .pick_folder()
+                    {
+                        match load_feature_catalogue(&path) {
+                            Ok(new_fc) => {
+                                info!("Loaded FC: {} v{}", new_fc.product_id, new_fc.version);
+                                self.fc_status = validate_fc(&new_fc, &path);
+                                self.fc = Arc::new(new_fc);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer.ui_state.fc_status = self.fc_status.clone();
+                                }
+                                // Reload charts with new FC if any are loaded
+                                if self.chart_loaded {
+                                    self.update_view();
+                                }
+                            }
+                            Err(e) => error!("Failed to load Feature Catalogue: {}", e),
+                        }
+                    }
+                }
+
+                // Handle Portrayal Catalogue open request
+                if open_pc {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Open Portrayal Catalogue Directory")
+                        .pick_folder()
+                    {
+                        match load_portrayal_catalogue(&path) {
+                            Ok(new_pc) => {
+                                info!("Loaded PC: {} v{}", new_pc.product_id, new_pc.version);
+                                self.pc_status = validate_pc(&new_pc, &path);
+
+                                // Reload symbol cache with new PC
+                                let symbols_path = path.join("Symbols");
+                                self.symbol_cache = SymbolCache::new(&symbols_path);
+                                self.pc = Arc::new(new_pc);
+
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer.ui_state.pc_status = self.pc_status.clone();
+                                }
+                                // Reload charts with new PC if any are loaded
+                                if self.chart_loaded {
+                                    self.update_view();
+                                }
+                            }
+                            Err(e) => error!("Failed to load Portrayal Catalogue: {}", e),
                         }
                     }
                 }
@@ -1984,7 +2042,7 @@ fn validate_fc(fc: &FeatureCatalogue, path: &Path) -> CatalogueStatus {
     }
 
     // Check for essential S-101 feature types
-    let essential_features = ["DepthArea", "LandArea", "CoastLine", "Sounding"];
+    let essential_features = ["DepthArea", "LandArea", "Coastline", "Sounding"];
     let missing: Vec<_> = essential_features
         .iter()
         .filter(|f| !fc.feature_types.contains_key(**f))

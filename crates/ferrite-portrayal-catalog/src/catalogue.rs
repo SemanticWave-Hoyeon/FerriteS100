@@ -128,11 +128,25 @@ impl PortrayalCatalogue {
                 Event::Start(ref e) => {
                     let local_name = get_local_name(e);
                     match local_name.as_str() {
+                        // Root element - read productId and version from attributes
+                        "portrayalCatalog" | "portrayalCatalogue" => {
+                            if let Some(pid) = get_attribute(e, "productId") {
+                                self.product_id = pid;
+                            }
+                            if let Some(ver) = get_attribute(e, "version") {
+                                self.version = ver;
+                            }
+                        }
+                        // Also support productId/version as child elements (older format)
                         "productId" => {
-                            self.product_id = read_text_content(&mut xml_reader)?;
+                            if self.product_id.is_empty() {
+                                self.product_id = read_text_content(&mut xml_reader)?;
+                            }
                         }
                         "version" | "versionNumber" => {
-                            self.version = read_text_content(&mut xml_reader)?;
+                            if self.version.is_empty() {
+                                self.version = read_text_content(&mut xml_reader)?;
+                            }
                         }
                         "viewingGroup" => {
                             let vg = self.parse_viewing_group(&mut xml_reader)?;

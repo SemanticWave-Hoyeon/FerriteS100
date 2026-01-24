@@ -440,6 +440,20 @@ impl WgpuRenderer {
     }
 
     #[inline]
+    pub fn take_open_fc_request(&mut self) -> bool {
+        let requested = self.ui_state.open_fc_requested;
+        self.ui_state.open_fc_requested = false;
+        requested
+    }
+
+    #[inline]
+    pub fn take_open_pc_request(&mut self) -> bool {
+        let requested = self.ui_state.open_pc_requested;
+        self.ui_state.open_pc_requested = false;
+        requested
+    }
+
+    #[inline]
     pub fn take_zoom_in_request(&mut self) -> bool {
         let requested = self.ui_state.zoom_in_requested;
         self.ui_state.zoom_in_requested = false;
