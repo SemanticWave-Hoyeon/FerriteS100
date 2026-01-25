@@ -39,7 +39,9 @@ use winit::window::Window;
 
 use crate::egui_integration;
 use ferrite_portrayal_catalog::ColorProfile;
-use ferrite_render::{Color, DrawingInstruction, RenderContext, ScreenPoint, WorldPoint};
+use ferrite_render::{
+    intern_symbol, Color, DrawingInstruction, RenderContext, ScreenPoint, SymbolId, WorldPoint,
+};
 
 use crate::egui_integration::{AppUiState, EguiIntegration, SettingsState};
 use crate::pipeline::TextureVertex;
@@ -130,9 +132,10 @@ struct SymbolTexture {
 }
 
 /// Symbol instance to render
-#[derive(Clone)]
+/// Memory optimized: uses interned SymbolId (4 bytes) instead of String (24 bytes)
+#[derive(Clone, Copy)]
 struct SymbolInstance {
-    symbol_id: String,
+    symbol_id: ferrite_render::SymbolId,
     screen_x: f32,
     screen_y: f32,
     scale: f32,
@@ -151,8 +154,8 @@ pub struct WgpuRenderer {
     /// Collected line vertices
     line_vertices: Vec<Vertex2D>,
     line_indices: Vec<u32>,
-    /// GPU texture cache for symbols
-    symbol_textures: HashMap<String, SymbolTexture>,
+    /// GPU texture cache for symbols (keyed by interned SymbolId for cache efficiency)
+    symbol_textures: HashMap<ferrite_render::SymbolId, SymbolTexture>,
     /// Symbol instances to render
     symbol_instances: Vec<SymbolInstance>,
     /// Background color
@@ -202,8 +205,8 @@ pub struct WgpuRenderer {
     // === OPTIMIZATION FIELDS ===
     /// Cached triangulations by feature ID (optimization)
     triangulation_cache: HashMap<i64, CachedTriangulation>,
-    /// Batched symbols by texture (optimization)
-    symbol_batches: HashMap<String, (Vec<TextureVertex>, Vec<u32>)>,
+    /// Batched symbols by texture (optimization, keyed by interned SymbolId)
+    symbol_batches: HashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)>,
     /// Animation/drag mode - enables fast-path rendering
     pub animation_mode: bool,
     /// LOD level (0=full detail, 1=medium, 2=low)
@@ -337,8 +340,8 @@ impl WgpuRenderer {
         &self,
         start: usize,
         end: usize,
-    ) -> HashMap<String, (Vec<TextureVertex>, Vec<u32>)> {
-        let mut batches: HashMap<String, (Vec<TextureVertex>, Vec<u32>)> = HashMap::new();
+    ) -> HashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)> {
+        let mut batches: HashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)> = HashMap::new();
 
         for instance in self.symbol_instances[start..end].iter() {
             if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
@@ -376,9 +379,9 @@ impl WgpuRenderer {
                 let (x2, y2) = transform(half_w, half_h);
                 let (x3, y3) = transform(-half_w, half_h);
 
-                // Get or create batch for this symbol
+                // Get or create batch for this symbol (SymbolId is Copy, no clone needed)
                 let batch = batches
-                    .entry(instance.symbol_id.clone())
+                    .entry(instance.symbol_id)
                     .or_insert_with(|| (Vec::new(), Vec::new()));
 
                 let base_idx = batch.0.len() as u32;
@@ -1267,33 +1270,36 @@ impl WgpuRenderer {
         symbol_cache: &mut SymbolCache,
         color_profile: &ColorProfile,
     ) -> bool {
-        let symbol_id = &point.symbol_ref;
-        if symbol_id.is_empty() {
+        let symbol_str = &point.symbol_ref;
+        if symbol_str.is_empty() {
             return false;
         }
+
+        // Intern the symbol ID once for cache-efficient lookups (u32 instead of String)
+        let symbol_id = intern_symbol(symbol_str);
 
         // Log first few symbol requests for debugging
         static SYMBOL_DEBUG_COUNT: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let debug_idx = SYMBOL_DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if debug_idx < 20 {
-            tracing::debug!("Symbol request [{}]: '{}'", debug_idx, symbol_id);
+            tracing::debug!("Symbol request [{}]: '{}'", debug_idx, symbol_str);
         }
 
         // Get symbol geometry from cache (this will render via resvg if not cached)
         // Use reference to avoid cloning the pixel buffer
-        let geom = match symbol_cache.get_symbol(symbol_id, color_profile) {
+        let geom = match symbol_cache.get_symbol(symbol_str, color_profile) {
             Some(g) => g,
             None => return false,
         };
 
-        // Create GPU texture if not already cached
-        if !self.symbol_textures.contains_key(symbol_id) {
+        // Create GPU texture if not already cached (using interned SymbolId for O(1) lookup)
+        if !self.symbol_textures.contains_key(&symbol_id) {
             let (_texture, view) = self.state.create_texture_from_rgba(
                 &geom.pixels,
                 geom.width,
                 geom.height,
-                &format!("symbol_{}", symbol_id),
+                &format!("symbol_{}", symbol_str),
             );
 
             let bind_group = self
@@ -1302,7 +1308,7 @@ impl WgpuRenderer {
 
             let pivot_in_tex = geom.pivot_in_texture();
             self.symbol_textures.insert(
-                symbol_id.clone(),
+                symbol_id,
                 SymbolTexture {
                     texture: _texture,
                     bind_group,
@@ -1315,7 +1321,7 @@ impl WgpuRenderer {
 
             tracing::debug!(
                 "Created GPU texture for symbol '{}': {}x{}, pivot_in_tex: ({:.2}, {:.2})",
-                symbol_id,
+                symbol_str,
                 geom.width,
                 geom.height,
                 pivot_in_tex.0,
@@ -1331,14 +1337,8 @@ impl WgpuRenderer {
         // Use high precision (6 decimal places ≈ 0.1 meter) for deduplication
         let world_x_key = (point.position.x * 1_000_000.0) as i64;
         let world_y_key = (point.position.y * 1_000_000.0) as i64;
-        // Simple hash of symbol type to allow different symbol types at same position
-        let symbol_hash = {
-            let mut h: u64 = 0;
-            for b in symbol_id.bytes().take(8) {
-                h = h.wrapping_mul(31).wrapping_add(b as u64);
-            }
-            h
-        };
+        // Use interned symbol ID as hash (already unique per symbol type)
+        let symbol_hash = symbol_id.0 as u64;
         let world_key = (world_x_key, world_y_key, symbol_hash);
 
         if self.world_dedup.contains(&world_key) {
@@ -1348,14 +1348,14 @@ impl WgpuRenderer {
         self.world_dedup.insert(world_key);
 
         // === STAGE 2: Screen-space decluttering ===
-        // Classify symbol types
-        let is_nav_aid = symbol_id.starts_with("LIGHTS")
-            || symbol_id.starts_with("BUOY")
-            || symbol_id.starts_with("BCN")
-            || symbol_id.starts_with("TOPMAR");
+        // Classify symbol types (using original string for pattern matching)
+        let is_nav_aid = symbol_str.starts_with("LIGHTS")
+            || symbol_str.starts_with("BUOY")
+            || symbol_str.starts_with("BCN")
+            || symbol_str.starts_with("TOPMAR");
 
-        let is_low_priority = symbol_id == "ISODGR01" || symbol_id == "DANGER02";
-        let is_sounding = symbol_id.starts_with("SOUND");
+        let is_low_priority = symbol_str == "ISODGR01" || symbol_str == "DANGER02";
+        let is_sounding = symbol_str.starts_with("SOUND");
 
         // Skip screen-space decluttering during animation to prevent symbols from disappearing
         // Only world-coordinate deduplication (Stage 1) applies during drag/inertia
@@ -1381,7 +1381,7 @@ impl WgpuRenderer {
                     let sounding_grid_key = (sounding_grid_x, sounding_grid_y);
 
                     // Get current sounding's depth (default to MAX if not set)
-                    let current_depth = point.depth.unwrap_or(f64::MAX);
+                    let current_depth = point.depth().unwrap_or(f64::MAX);
 
                     if let Some(&(old_exact_key, old_depth)) =
                         self.sounding_screen_grid.get(&sounding_grid_key)
@@ -1450,9 +1450,9 @@ impl WgpuRenderer {
             }
         }
 
-        // Add symbol instance for rendering
+        // Add symbol instance for rendering (uses interned SymbolId - 4 bytes vs 24+ for String)
         self.symbol_instances.push(SymbolInstance {
-            symbol_id: symbol_id.clone(),
+            symbol_id,
             screen_x: screen.x,
             screen_y: screen.y,
             scale: point.scale,

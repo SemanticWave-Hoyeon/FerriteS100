@@ -158,13 +158,16 @@ pub struct PointInstruction {
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
     /// Cell index this instruction belongs to (for multi-cell hit testing)
-    pub cell_index: Option<usize>,
+    /// Using u32 to save 8 bytes per instruction (Option<u32>=8 vs Option<usize>=16)
+    pub cell_index: Option<u32>,
     /// Sounding depth value (meters) - for sounding symbols only
     /// Used to select the shallowest sounding when decluttering
-    pub depth: Option<f64>,
+    /// NaN = no depth (saves 8 bytes vs Option<f64>)
+    depth: f64,
 }
 
 impl PointInstruction {
+    #[inline]
     pub fn new(symbol_ref: String, position: WorldPoint) -> Self {
         PointInstruction {
             symbol_ref,
@@ -175,42 +178,65 @@ impl PointInstruction {
             viewing_group: ViewingGroup::default(),
             feature_id: None,
             cell_index: None,
-            depth: None,
+            depth: f64::NAN,
         }
     }
 
+    /// Get depth value if present (non-NaN)
+    #[inline]
+    pub fn depth(&self) -> Option<f64> {
+        if self.depth.is_nan() {
+            None
+        } else {
+            Some(self.depth)
+        }
+    }
+
+    /// Check if instruction has depth value
+    #[inline]
+    pub fn has_depth(&self) -> bool {
+        !self.depth.is_nan()
+    }
+
+    #[inline]
     pub fn with_depth(mut self, depth: f64) -> Self {
-        self.depth = Some(depth);
+        self.depth = depth;
         self
     }
 
+    #[inline]
     pub fn with_rotation(mut self, degrees: f32) -> Self {
         self.rotation = degrees;
         self
     }
 
+    #[inline]
     pub fn with_scale(mut self, scale: f32) -> Self {
         self.scale = scale;
         self
     }
 
+    #[inline]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = DisplayPriority(priority);
         self
     }
 
+    #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
         self
     }
 
+    #[inline]
     pub fn with_feature_id(mut self, id: i64) -> Self {
         self.feature_id = Some(id);
         self
     }
 
+    #[inline]
     pub fn with_cell_index(mut self, index: usize) -> Self {
-        self.cell_index = Some(index);
+        self.cell_index = Some(index as u32);
         self
     }
 }
@@ -282,6 +308,7 @@ pub struct LineInstruction {
 }
 
 impl LineInstruction {
+    #[inline]
     pub fn new(points: Vec<WorldPoint>) -> Self {
         LineInstruction {
             style_ref: None,
@@ -293,26 +320,31 @@ impl LineInstruction {
         }
     }
 
+    #[inline]
     pub fn with_style_ref(mut self, style_ref: String) -> Self {
         self.style_ref = Some(style_ref);
         self
     }
 
+    #[inline]
     pub fn with_style(mut self, style: LineStyle) -> Self {
         self.style = style;
         self
     }
 
+    #[inline]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = DisplayPriority(priority);
         self
     }
 
+    #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
         self
     }
 
+    #[inline]
     pub fn with_feature_id(mut self, id: i64) -> Self {
         self.feature_id = Some(id);
         self
@@ -362,6 +394,7 @@ pub struct AreaInstruction {
 }
 
 impl AreaInstruction {
+    #[inline]
     pub fn new(exterior: Vec<WorldPoint>) -> Self {
         AreaInstruction {
             fill_ref: None,
@@ -375,16 +408,19 @@ impl AreaInstruction {
         }
     }
 
+    #[inline]
     pub fn with_fill_ref(mut self, fill_ref: String) -> Self {
         self.fill_ref = Some(fill_ref);
         self
     }
 
+    #[inline]
     pub fn with_solid_fill(mut self, color: Color) -> Self {
         self.fill = AreaFillType::Solid(color);
         self
     }
 
+    #[inline]
     pub fn with_pattern_fill(mut self, symbol_ref: String, spacing_x: f32, spacing_y: f32) -> Self {
         self.fill = AreaFillType::Pattern {
             symbol_ref,
@@ -394,26 +430,31 @@ impl AreaInstruction {
         self
     }
 
+    #[inline]
     pub fn with_interiors(mut self, interiors: Vec<Vec<WorldPoint>>) -> Self {
         self.interiors = interiors;
         self
     }
 
+    #[inline]
     pub fn with_outline(mut self, style: LineStyle) -> Self {
         self.outline = Some(style);
         self
     }
 
+    #[inline]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = DisplayPriority(priority);
         self
     }
 
+    #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
         self
     }
 
+    #[inline]
     pub fn with_feature_id(mut self, id: i64) -> Self {
         self.feature_id = Some(id);
         self
@@ -456,6 +497,7 @@ pub struct TextInstruction {
 }
 
 impl TextInstruction {
+    #[inline]
     pub fn new(text: String, position: WorldPoint) -> Self {
         TextInstruction {
             text,
@@ -476,42 +518,50 @@ impl TextInstruction {
         }
     }
 
+    #[inline]
     pub fn with_font_size(mut self, size: f32) -> Self {
         self.font_size = size;
         self
     }
 
+    #[inline]
     pub fn with_color(mut self, color: Color) -> Self {
         self.color = color;
         self
     }
 
+    #[inline]
     pub fn with_alignment(mut self, h: HAlign, v: VAlign) -> Self {
         self.h_align = h;
         self.v_align = v;
         self
     }
 
+    #[inline]
     pub fn with_rotation(mut self, degrees: f32) -> Self {
         self.rotation = degrees;
         self
     }
 
+    #[inline]
     pub fn with_offset(mut self, x: f32, y: f32) -> Self {
         self.offset = ScreenPoint::new(x, y);
         self
     }
 
+    #[inline]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = DisplayPriority(priority);
         self
     }
 
+    #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
         self
     }
 
+    #[inline]
     pub fn with_feature_id(mut self, id: i64) -> Self {
         self.feature_id = Some(id);
         self

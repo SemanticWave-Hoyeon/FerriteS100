@@ -11,10 +11,12 @@ mod color;
 mod context;
 mod error;
 mod instruction;
+mod intern;
 mod scaler;
 
 pub use color::*;
 pub use context::*;
 pub use error::*;
 pub use instruction::*;
+pub use intern::*;
 pub use scaler::*;

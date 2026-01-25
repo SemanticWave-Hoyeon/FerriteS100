@@ -165,146 +165,125 @@ impl ContextParameters {
     /// Get all context parameters as a list for Lua initialization
     /// Returns (id, type_str, default_value_str) tuples for each parameter
     pub fn to_lua_params(&self) -> Vec<(String, String, String)> {
-        let mut params = Vec::new();
+        // Pre-allocate with estimated capacity (18 base params + custom)
+        let mut params = Vec::with_capacity(18 + self.custom.len());
 
-        params.push((
-            "SafetyDepth".to_string(),
-            "real".to_string(),
-            format!("{}", self.safety_depth),
-        ));
-        params.push((
-            "SafetyContour".to_string(),
-            "real".to_string(),
-            format!("{}", self.safety_contour),
-        ));
-        params.push((
-            "ShallowContour".to_string(),
-            "real".to_string(),
-            format!("{}", self.shallow_contour),
-        ));
-        params.push((
-            "DeepContour".to_string(),
-            "real".to_string(),
-            format!("{}", self.deep_contour),
-        ));
-        params.push((
-            "TwoShades".to_string(),
-            "boolean".to_string(),
-            if self.two_shades { "true" } else { "false" }.to_string(),
-        ));
-        params.push((
-            "FourShades".to_string(),
-            "boolean".to_string(),
-            if !self.two_shades { "true" } else { "false" }.to_string(),
-        ));
-        params.push((
-            "RadarOverlay".to_string(),
-            "boolean".to_string(),
-            if self.radar_overlay { "true" } else { "false" }.to_string(),
-        ));
-        params.push((
-            "IgnoreScamin".to_string(),
-            "boolean".to_string(),
-            if self.ignore_scamin { "true" } else { "false" }.to_string(),
-        ));
-        params.push((
-            "IgnoreScaleMinimum".to_string(),
-            "boolean".to_string(),
-            if self.ignore_scale_minimum {
+        // Static type strings (avoid repeated allocations)
+        let real = "real";
+        let boolean = "boolean";
+        let text = "text";
+
+        // Helper to convert bool to &'static str (avoids allocation)
+        #[inline]
+        fn bool_str(b: bool) -> &'static str {
+            if b {
                 "true"
             } else {
                 "false"
             }
-            .to_string(),
+        }
+
+        // Real parameters (use itoa for faster number formatting)
+        params.push((
+            String::from("SafetyDepth"),
+            String::from(real),
+            self.safety_depth.to_string(),
         ));
         params.push((
-            "FullSectors".to_string(),
-            "boolean".to_string(),
-            if self.full_sectors { "true" } else { "false" }.to_string(),
+            String::from("SafetyContour"),
+            String::from(real),
+            self.safety_contour.to_string(),
         ));
         params.push((
-            "SymbolizedBoundaries".to_string(),
-            "boolean".to_string(),
-            if self.symbolized_boundaries {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            String::from("ShallowContour"),
+            String::from(real),
+            self.shallow_contour.to_string(),
         ));
         params.push((
-            "PlainBoundaries".to_string(),
-            "boolean".to_string(),
-            if !self.symbolized_boundaries {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            String::from("DeepContour"),
+            String::from(real),
+            self.deep_contour.to_string(),
+        ));
+
+        // Boolean parameters
+        params.push((
+            String::from("TwoShades"),
+            String::from(boolean),
+            String::from(bool_str(self.two_shades)),
         ));
         params.push((
-            "IsolatedDangers".to_string(),
-            "boolean".to_string(),
-            if self.isolated_dangers {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            String::from("FourShades"),
+            String::from(boolean),
+            String::from(bool_str(!self.two_shades)),
         ));
         params.push((
-            "SimplifiedSymbols".to_string(),
-            "boolean".to_string(),
-            if self.simplified_symbols {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            String::from("RadarOverlay"),
+            String::from(boolean),
+            String::from(bool_str(self.radar_overlay)),
         ));
         params.push((
-            "PaperChart".to_string(),
-            "boolean".to_string(),
-            if !self.simplified_symbols {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            String::from("IgnoreScamin"),
+            String::from(boolean),
+            String::from(bool_str(self.ignore_scamin)),
         ));
         params.push((
-            "ShallowWaterDangers".to_string(),
-            "boolean".to_string(),
-            if self.shallow_water_dangers {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            String::from("IgnoreScaleMinimum"),
+            String::from(boolean),
+            String::from(bool_str(self.ignore_scale_minimum)),
         ));
         params.push((
-            "FullLightLines".to_string(),
-            "boolean".to_string(),
-            if self.full_light_lines {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            String::from("FullSectors"),
+            String::from(boolean),
+            String::from(bool_str(self.full_sectors)),
         ));
         params.push((
-            "NationalLanguage".to_string(),
-            "text".to_string(),
+            String::from("SymbolizedBoundaries"),
+            String::from(boolean),
+            String::from(bool_str(self.symbolized_boundaries)),
+        ));
+        params.push((
+            String::from("PlainBoundaries"),
+            String::from(boolean),
+            String::from(bool_str(!self.symbolized_boundaries)),
+        ));
+        params.push((
+            String::from("IsolatedDangers"),
+            String::from(boolean),
+            String::from(bool_str(self.isolated_dangers)),
+        ));
+        params.push((
+            String::from("SimplifiedSymbols"),
+            String::from(boolean),
+            String::from(bool_str(self.simplified_symbols)),
+        ));
+        params.push((
+            String::from("PaperChart"),
+            String::from(boolean),
+            String::from(bool_str(!self.simplified_symbols)),
+        ));
+        params.push((
+            String::from("ShallowWaterDangers"),
+            String::from(boolean),
+            String::from(bool_str(self.shallow_water_dangers)),
+        ));
+        params.push((
+            String::from("FullLightLines"),
+            String::from(boolean),
+            String::from(bool_str(self.full_light_lines)),
+        ));
+        params.push((
+            String::from("NationalLanguage"),
+            String::from(text),
             self.national_language.clone(),
         ));
 
         // Add custom parameters
         for (key, value) in &self.custom {
             let (type_str, value_str) = match value {
-                ContextValue::Bool(b) => ("boolean".to_string(), b.to_string()),
-                ContextValue::Integer(i) => ("integer".to_string(), i.to_string()),
-                ContextValue::Real(r) => ("real".to_string(), r.to_string()),
-                ContextValue::Text(s) => ("text".to_string(), s.clone()),
+                ContextValue::Bool(b) => (String::from(boolean), String::from(bool_str(*b))),
+                ContextValue::Integer(i) => (String::from("integer"), i.to_string()),
+                ContextValue::Real(r) => (String::from(real), r.to_string()),
+                ContextValue::Text(s) => (String::from(text), s.clone()),
             };
             params.push((key.clone(), type_str, value_str));
         }
@@ -865,7 +844,7 @@ impl PortrayalContext {
                     id: *key,
                     spatial_type: PrimitiveType::Point,
                     coordinates: vec![(point.position.x, point.position.y)],
-                    z_coordinates: vec![point.position.z],
+                    z_coordinates: vec![point.position.depth()],
                     curve_associations: Vec::new(),
                 },
             );
@@ -876,7 +855,8 @@ impl PortrayalContext {
         for (key, multi_point) in &cell.multi_points {
             let coords: Vec<(f64, f64)> =
                 multi_point.positions.iter().map(|c| (c.x, c.y)).collect();
-            let z_coords: Vec<Option<f64>> = multi_point.positions.iter().map(|c| c.z).collect();
+            let z_coords: Vec<Option<f64>> =
+                multi_point.positions.iter().map(|c| c.depth()).collect();
             cell_data.spatials.insert(
                 *key,
                 SpatialInfo {

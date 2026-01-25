@@ -106,7 +106,7 @@ struct RenderedSymbol {
     priority: i32,
     symbol_ref: String,
     /// Cell index this symbol belongs to (for correct feature lookup in multi-cell scenarios)
-    cell_index: Option<usize>,
+    cell_index: Option<u32>,
 }
 
 /// Chart viewer application for winit
@@ -1240,7 +1240,8 @@ impl ApplicationHandler for ChartApp {
 
                 if clear_charts {
                     self.clear_charts();
-                    // Also clear plugin data (route, etc.)
+                    // Deactivate all plugins (close panels) and clear plugin data
+                    self.plugin_system.deactivate_all_plugins();
                     self.plugin_system.clear_all_data();
                 }
 
@@ -1262,9 +1263,11 @@ impl ApplicationHandler for ChartApp {
                     }
                 }
 
-                // Handle plugin toggle request
+                // Handle plugin toggle request (only when chart is loaded)
                 if let Some(plugin_id) = plugin_toggle {
-                    self.plugin_system.toggle_plugin(&plugin_id);
+                    if self.chart_loaded {
+                        self.plugin_system.toggle_plugin(&plugin_id);
+                    }
                 }
 
                 // Handle pan adjustment when panel state changes (to keep chart visually centered)
@@ -1562,8 +1565,8 @@ impl ApplicationHandler for ChartApp {
                                 .as_ref()
                                 .is_some_and(|r| r.egui_wants_pointer());
 
-                            // Skip chart/plugin handling if click was on UI
-                            if !egui_wants {
+                            // Skip chart/plugin handling if click was on UI or no chart loaded
+                            if !egui_wants && self.chart_loaded {
                                 let (x, y) = self.mouse_pos;
                                 info!("Click: screen=({:.1}, {:.1})", x, y);
                                 let screen_pt =
@@ -1586,25 +1589,8 @@ impl ApplicationHandler for ChartApp {
                                         world.x, world.y
                                     );
                                     // Update view to render plugin's new drawing instructions
-                                    if self.chart_loaded {
-                                        self.update_view();
-                                    } else {
-                                        // Even without a chart, render plugin instructions
-                                        if let Some(renderer) = &mut self.renderer {
-                                            renderer.begin_frame();
-                                            // Remove old plugin instructions
-                                            self.render_context
-                                                .truncate_instructions(self.base_instruction_count);
-                                            for instr in
-                                                self.plugin_system.get_render_instructions()
-                                            {
-                                                self.render_context.add_instruction(instr);
-                                            }
-                                            // Build geometry from plugin instructions
-                                            renderer.add_instructions(&mut self.render_context);
-                                        }
-                                    }
-                                } else if self.chart_loaded {
+                                    self.update_view();
+                                } else {
                                     // Hit testing (default behavior)
                                     // Find nearby symbols (sorted by priority then distance)
                                     let nearby = self.find_symbols_at(x, y, 20.0);
@@ -1616,7 +1602,7 @@ impl ApplicationHandler for ChartApp {
                                         let feature = if let Some(cell_idx) = sym.cell_index {
                                             // Look up in the specific cell the symbol came from
                                             self.cells
-                                                .get(cell_idx)
+                                                .get(cell_idx as usize)
                                                 .and_then(|cell| cell.features.get(&sym.feature_id))
                                         } else {
                                             // Fallback: search all cells (old behavior)
@@ -1682,29 +1668,32 @@ impl ApplicationHandler for ChartApp {
 
                 // Skip if click was on UI
                 if !egui_wants {
-                    // Route right-click to plugins first
-                    let screen_pt = ferrite_render::ScreenPoint::new(
-                        self.mouse_pos.0 as f32,
-                        self.mouse_pos.1 as f32,
-                    );
-                    let world = self.render_context.scaler.screen_to_world(screen_pt);
-                    let plugin_consumed = self.plugin_system.handle_click(
-                        world.x,
-                        world.y,
-                        ferrite_plugin_api::MouseButton::Right,
-                        false,
-                    );
-
-                    if plugin_consumed {
-                        // Plugin consumed the click, update view to show changes
-                        info!(
-                            "Right-click consumed by plugin at ({:.4}, {:.4})",
-                            world.x, world.y
+                    // Route right-click to plugins first (only when chart is loaded)
+                    let plugin_consumed = if self.chart_loaded {
+                        let screen_pt = ferrite_render::ScreenPoint::new(
+                            self.mouse_pos.0 as f32,
+                            self.mouse_pos.1 as f32,
                         );
-                        if self.chart_loaded {
+                        let world = self.render_context.scaler.screen_to_world(screen_pt);
+                        let consumed = self.plugin_system.handle_click(
+                            world.x,
+                            world.y,
+                            ferrite_plugin_api::MouseButton::Right,
+                            false,
+                        );
+                        if consumed {
+                            info!(
+                                "Right-click consumed by plugin at ({:.4}, {:.4})",
+                                world.x, world.y
+                            );
                             self.update_view();
                         }
+                        consumed
                     } else {
+                        false
+                    };
+
+                    if !plugin_consumed {
                         // Plugin didn't consume, do default behavior (reset view)
                         if let Some(renderer) = &mut self.renderer {
                             renderer.reset_pan_offset();
@@ -2062,7 +2051,7 @@ fn convert_lua_results_for_cell(
                                             if (coord.x - x).abs() < 1e-9
                                                 && (coord.y - y).abs() < 1e-9
                                             {
-                                                return coord.z;
+                                                return coord.depth();
                                             }
                                         }
                                     }
