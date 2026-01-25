@@ -6,6 +6,6 @@
     "description":  "S-421 Route Planning - Add waypoints, measure distances, export routes",
     "dll_file":  "route_plugin.dll",
     "min_host_version":  "0.2.0",
-    "dll_hash":  "6b1fa2588cb077348bfe6accad30ff31d8eb85df48dcf0d2ac0b07f2aade888f",
+    "dll_hash":  "2ff553f304e4bdb105cd754bde84ae125730da74cbbb870d551d9517dbee59c3",
     "enabled":  true
 }
