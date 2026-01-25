@@ -84,6 +84,9 @@ pub enum DistanceUnit {
     StatuteMiles,
 }
 
+/// Default PLRTE color from S-421 PC (Day palette): RGB(214, 63, 36) = #D63F24
+const DEFAULT_PLRTE_COLOR: u32 = 0xD63F24FF;
+
 impl Default for RouteSettings {
     fn default() -> Self {
         Self {
@@ -91,7 +94,8 @@ impl Default for RouteSettings {
             show_waypoint_numbers: true,
             show_bearings: false,
             distance_unit: DistanceUnit::NauticalMiles,
-            line_color: 0xFF6600FF, // Orange, full alpha
+            // PLRTE color from S-421 PC ColorProfile (Day palette)
+            line_color: DEFAULT_PLRTE_COLOR,
             line_width: 2.0,
             waypoint_symbol: "RTEWPT01".to_string(),
         }
@@ -314,10 +318,10 @@ impl Plugin for RoutePlugin {
             return instructions;
         }
 
-        // PLRTE color from S-421 PC: #D63F24 (red)
-        const PLRTE_COLOR: u32 = 0xD63F24FF; // RGBA
-        // Inactive route color (gray)
-        const INACTIVE_COLOR: u32 = 0x888888FF; // RGBA
+        // Get PLRTE color from PC (fallback to default if not loaded)
+        let plrte_color = self.catalogue.get_color_rgba("PLRTE").unwrap_or(0xD63F24FF);
+        // Get APLRT (alternate route) color for inactive routes
+        let inactive_color = self.catalogue.get_color_rgba("CHGRF").unwrap_or(0x888888FF);
 
         // Draw all routes
         for (route_idx, route) in self.routes.iter().enumerate() {
@@ -326,8 +330,14 @@ impl Plugin for RoutePlugin {
             }
 
             let is_active = self.active_route_index == Some(route_idx);
-            let line_color = if is_active { self.settings.line_color } else { INACTIVE_COLOR };
-            let marker_color = if is_active { PLRTE_COLOR } else { INACTIVE_COLOR };
+            // Use PLRTE for active route line, or settings color if customized
+            let line_color = if is_active {
+                // Use PC PLRTE color (from settings which defaults to PC value)
+                self.settings.line_color
+            } else {
+                inactive_color
+            };
+            let marker_color = if is_active { plrte_color } else { inactive_color };
 
             // Draw legs (lines between waypoints)
             if route.waypoints.len() >= 2 {
@@ -590,6 +600,16 @@ impl Plugin for RoutePlugin {
         self.host_api = Some(host_api);
         self.log("Route plugin initialized");
 
+        // Log catalogue status
+        if let Some(ref pc) = self.catalogue.pc {
+            self.log(&format!(
+                "S-421 PC loaded: {} colors, {} line styles, {} symbols",
+                pc.colors.len(),
+                pc.line_styles.len(),
+                pc.symbols.len()
+            ));
+        }
+
         // Load saved settings
         if let Some(ref api) = self.host_api {
             if let Some(config) = api.load_plugin_config(PLUGIN_ID) {
@@ -597,6 +617,14 @@ impl Plugin for RoutePlugin {
                     self.settings = settings;
                     self.log("Loaded saved settings");
                 }
+            }
+        }
+
+        // Update default line color from PC if not customized (uses old wrong color)
+        if self.settings.line_color == 0xFF6600FF {
+            if let Some(plrte) = self.catalogue.get_color_rgba("PLRTE") {
+                self.settings.line_color = plrte;
+                self.log("Updated line color from PC PLRTE");
             }
         }
     }
