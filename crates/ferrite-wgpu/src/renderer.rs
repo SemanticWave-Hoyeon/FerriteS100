@@ -37,10 +37,11 @@ use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+use crate::egui_integration;
 use ferrite_portrayal_catalog::ColorProfile;
 use ferrite_render::{Color, DrawingInstruction, RenderContext, ScreenPoint, WorldPoint};
 
-use crate::egui_integration::{AppUiState, EguiIntegration};
+use crate::egui_integration::{AppUiState, EguiIntegration, SettingsState};
 use crate::pipeline::TextureVertex;
 use crate::{GpuState, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError};
 
@@ -412,6 +413,12 @@ impl WgpuRenderer {
         self.egui.handle_event(&self.state.window, event)
     }
 
+    /// Check if egui wants pointer input (mouse is over UI element)
+    /// Call this before handling clicks to avoid clicking through UI
+    pub fn egui_wants_pointer(&self) -> bool {
+        self.egui.wants_pointer_input()
+    }
+
     /// Update cursor position in UI state (world coordinates)
     #[inline]
     pub fn set_cursor_world(&mut self, x: f64, y: f64) {
@@ -497,6 +504,59 @@ impl WgpuRenderer {
     #[inline]
     pub fn set_color_profile(&mut self, profile: &str) {
         self.ui_state.color_profile = profile.to_string();
+    }
+
+    /// Take settings change request, returns current settings if changed
+    #[inline]
+    pub fn take_settings_change(&mut self) -> Option<SettingsState> {
+        if self.ui_state.settings_changed {
+            self.ui_state.settings_changed = false;
+            Some(self.ui_state.settings.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Take pan adjustment (in pixels) when panel state changes
+    #[inline]
+    pub fn take_pan_adjust_pixels(&mut self) -> Option<f32> {
+        self.ui_state.pan_adjust_pixels.take()
+    }
+
+    /// Get current settings state (read-only)
+    #[inline]
+    pub fn settings(&self) -> &SettingsState {
+        &self.ui_state.settings
+    }
+
+    /// Update settings state
+    #[inline]
+    pub fn set_settings(&mut self, settings: SettingsState) {
+        self.ui_state.settings = settings;
+    }
+
+    /// Take plugin toggle request, returns plugin_id if a toggle was requested
+    #[inline]
+    pub fn take_plugin_toggle_request(&mut self) -> Option<String> {
+        self.ui_state.plugin_toggle_requested.take()
+    }
+
+    /// Update plugin toolbar buttons
+    #[inline]
+    pub fn set_plugin_buttons(&mut self, buttons: Vec<egui_integration::PluginButton>) {
+        self.ui_state.plugin_buttons = buttons;
+    }
+
+    /// Update plugin UI data
+    #[inline]
+    pub fn set_plugin_ui_data(&mut self, data: Vec<(String, String)>) {
+        self.ui_state.plugin_ui_data = data;
+    }
+
+    /// Take pending plugin UI events
+    #[inline]
+    pub fn take_plugin_ui_events(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.ui_state.plugin_ui_events)
     }
 
     /// Update view uniforms after resize or zoom
@@ -637,16 +697,24 @@ impl WgpuRenderer {
 
     /// Add drawing instructions from render context
     pub fn add_instructions(&mut self, context: &mut RenderContext) {
-        self.add_instructions_with_symbols(context, None, None);
+        self.add_instructions_with_symbols(context, None, None, None);
     }
 
     /// Add drawing instructions with symbol rendering support
     /// Uses S-101 compliant priority grouping for correct render order
+    ///
+    /// # Arguments
+    /// * `context` - The render context containing drawing instructions
+    /// * `symbol_cache` - Optional symbol cache for SVG rendering
+    /// * `color_profile` - Optional color profile for symbol coloring
+    /// * `visible_viewing_groups` - Optional set of viewing group IDs that should be visible.
+    ///   If None, all viewing groups are visible. Used for Display Mode filtering.
     pub fn add_instructions_with_symbols(
         &mut self,
         context: &mut RenderContext,
         mut symbol_cache: Option<&mut SymbolCache>,
         color_profile: Option<&ColorProfile>,
+        visible_viewing_groups: Option<&std::collections::HashSet<u32>>,
     ) {
         // Update viewport bounds for frustum culling
         self.update_viewport_bounds(&context.scaler);
@@ -667,6 +735,14 @@ impl WgpuRenderer {
         let mut symbol_start_idx = 0usize;
 
         for instruction in &instructions {
+            // Display Mode filtering: skip instructions not in visible viewing groups
+            if let Some(visible) = visible_viewing_groups {
+                let vg = instruction.viewing_group().0;
+                if !visible.contains(&vg) {
+                    continue;
+                }
+            }
+
             let inst_priority = instruction.priority().0;
 
             // Check if priority changed - record ranges for previous priority

@@ -46,8 +46,14 @@ Write-Host "Found: $($latestZip.Name)" -ForegroundColor Green
 if ($latestZip.Name -match "FerriteS100-v([0-9.]+)") {
     $version = $matches[1]
 } else {
-    Write-Host "Warning: Could not extract version from filename." -ForegroundColor Yellow
-    $version = "0.0.0"
+    Write-Host "Warning: Could not extract version from filename. Reading from Cargo.toml..." -ForegroundColor Yellow
+    $CargoToml = Get-Content "$ProjectRoot\Cargo.toml" -Raw
+    if ($CargoToml -match '\[workspace\.package\][\s\S]*?version\s*=\s*"([^"]+)"') {
+        $version = $matches[1]
+    } else {
+        Write-Host "Error: Could not read version from Cargo.toml" -ForegroundColor Red
+        exit 1
+    }
 }
 
 # Use provided tag or generate from version
