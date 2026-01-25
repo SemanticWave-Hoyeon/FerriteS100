@@ -1231,6 +1231,7 @@ version = "0.3.0"
 dependencies = [
  "bytes",
  "encoding_rs",
+ "memmap2",
  "nom",
  "thiserror 2.0.17",
  "tracing",

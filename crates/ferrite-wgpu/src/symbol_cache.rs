@@ -255,6 +255,8 @@ impl SymbolCache {
 
     /// Extract color tokens from SVG content
     fn extract_color_tokens(&self, svg_content: &str) -> Vec<String> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut tokens = Vec::new();
 
         // Look for class attributes containing color tokens
@@ -275,7 +277,8 @@ impl SymbolCache {
                             // S-100 color tokens are uppercase (CHBLK, CHMGD, etc.)
                             // Skip non-color classes like "symbolBox", "svgBox", "sl"
                             && token.chars().next().is_some_and(|c| c.is_uppercase())
-                            && !tokens.contains(&token.to_string())
+                            && seen.insert(token)
+                        // O(1) check + insert
                         {
                             tokens.push(token.to_string());
                         }

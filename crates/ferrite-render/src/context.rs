@@ -2,11 +2,9 @@
 //!
 //! Manages rendering state, display settings, and instruction collection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{
-    Color, DrawingInstruction, FeatureInstructions, GeoBounds, Scaler, ViewingGroup, Viewport,
-};
+use crate::{Color, DrawingInstruction, GeoBounds, Scaler, ViewingGroup, Viewport};
 
 /// Display settings
 #[derive(Debug, Clone)]
@@ -120,8 +118,8 @@ pub struct RenderContext {
     pub background_color: Color,
     /// Collected drawing instructions (by priority)
     instructions: Vec<DrawingInstruction>,
-    /// Instructions per feature ID
-    feature_instructions: HashMap<i64, FeatureInstructions>,
+    /// Unique feature IDs (for statistics only - no instruction duplication)
+    feature_ids: HashSet<i64>,
     /// Optimization: cache sorted state to avoid re-sorting during animation
     sorted: bool,
     /// Optimization: animation mode (skip expensive operations)
@@ -137,7 +135,7 @@ impl RenderContext {
             viewing_groups: ViewingGroupState::default(),
             background_color: Color::from_hex("#DEEBF7").unwrap_or(Color::WHITE), // Light blue water
             instructions: Vec::new(),
-            feature_instructions: HashMap::new(),
+            feature_ids: HashSet::new(),
             sorted: false,
             animation_mode: false,
         }
@@ -180,13 +178,9 @@ impl RenderContext {
         // Mark as unsorted when new instructions are added
         self.sorted = false;
 
-        // Track by feature ID if present
+        // Track unique feature IDs (no instruction cloning - just the ID)
         if let Some(feature_id) = instruction.feature_id() {
-            self.feature_instructions
-                .entry(feature_id)
-                .or_default()
-                .instructions
-                .push(instruction.clone());
+            self.feature_ids.insert(feature_id);
         }
 
         self.instructions.push(instruction);
@@ -211,15 +205,10 @@ impl RenderContext {
         &self.instructions
     }
 
-    /// Get instructions for a specific feature
-    pub fn get_feature_instructions(&self, feature_id: i64) -> Option<&FeatureInstructions> {
-        self.feature_instructions.get(&feature_id)
-    }
-
     /// Clear all instructions
     pub fn clear_instructions(&mut self) {
         self.instructions.clear();
-        self.feature_instructions.clear();
+        self.feature_ids.clear();
         self.sorted = false;
     }
 
@@ -251,7 +240,7 @@ impl RenderContext {
         }
 
         stats.total_count = self.instructions.len();
-        stats.feature_count = self.feature_instructions.len();
+        stats.feature_count = self.feature_ids.len();
 
         stats
     }

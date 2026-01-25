@@ -47,11 +47,13 @@ The project leverages modern GPU rendering via [wgpu](https://wgpu.rs/) and *att
 | Category | Description |
 |----------|-------------|
 | **Chart Parsing** | Full ISO 8211 binary format parsing for S-101 ENC files (`.000`) |
+| **Memory-Mapped I/O** | Zero-copy file loading using OS page cache for faster chart loading |
 | **Dynamic Catalogues** | Runtime loading of Feature Catalogue (FC) and Portrayal Catalogue (PC) from XML |
 | **Lua Portrayal** | Standard-compliant portrayal using official S-100 Lua scripts |
 | **GPU Rendering** | Hardware-accelerated rendering with wgpu (Vulkan/DX12/Metal) |
 | **Multi-cell Support** | Load and display multiple chart cells simultaneously |
 | **Symbol Rendering** | SVG-based symbol rendering with color profile support |
+| **String Interning** | Game-style optimization reducing memory usage for symbol references |
 | **Plugin System** | Extensible architecture with ABI-stable plugin support |
 
 ### Interactive Features
@@ -277,6 +279,7 @@ All dependencies are sourced from [crates.io](https://crates.io) and audited via
 | [quick-xml](https://github.com/tafia/quick-xml) | 0.37 | FC/PC XML catalogue parsing |
 | [serde](https://serde.rs/) | 1 | Serialization framework |
 | [encoding_rs](https://github.com/hsivonen/encoding_rs) | 0.8 | Character encoding (ISO-8859-1) |
+| [memmap2](https://github.com/RazrFalcon/memmap2-rs) | 0.9 | Memory-mapped file I/O for zero-copy chart loading |
 
 ### Scripting & Runtime
 

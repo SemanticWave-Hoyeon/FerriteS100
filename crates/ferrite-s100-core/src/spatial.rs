@@ -35,21 +35,44 @@ impl RecordId {
     }
 }
 
-/// Coordinate with optional depth
+/// Coordinate with optional depth (NaN = no depth)
+/// Memory optimized: 24 bytes instead of 32 bytes with Option<f64>
 #[derive(Debug, Clone, Copy)]
 pub struct Coordinate {
-    pub x: f64,         // Longitude
-    pub y: f64,         // Latitude
-    pub z: Option<f64>, // Depth/height
+    pub x: f64, // Longitude
+    pub y: f64, // Latitude
+    z: f64,     // Depth/height (NaN = not present)
 }
 
 impl Coordinate {
     pub fn new(x: f64, y: f64) -> Self {
-        Coordinate { x, y, z: None }
+        Coordinate { x, y, z: f64::NAN }
     }
 
     pub fn new_3d(x: f64, y: f64, z: f64) -> Self {
-        Coordinate { x, y, z: Some(z) }
+        Coordinate { x, y, z }
+    }
+
+    /// Get depth value if present (non-NaN)
+    #[inline]
+    pub fn depth(&self) -> Option<f64> {
+        if self.z.is_nan() {
+            None
+        } else {
+            Some(self.z)
+        }
+    }
+
+    /// Check if coordinate has depth value
+    #[inline]
+    pub fn has_depth(&self) -> bool {
+        !self.z.is_nan()
+    }
+
+    /// Get raw z value (may be NaN)
+    #[inline]
+    pub fn z_raw(&self) -> f64 {
+        self.z
     }
 }
 
@@ -104,17 +127,23 @@ pub struct CurveRecord {
 }
 
 impl CurveRecord {
-    /// Get all positions in the curve
-    pub fn all_positions(&self) -> Vec<Coordinate> {
-        self.segments
-            .iter()
-            .flat_map(|s| s.positions.iter().cloned())
-            .collect()
+    /// Get all positions in the curve as an iterator (avoids allocation)
+    pub fn positions_iter(&self) -> impl Iterator<Item = &Coordinate> + '_ {
+        self.segments.iter().flat_map(|s| s.positions.iter())
     }
 
-    /// Convert to geo-types LineString
+    /// Get all positions in the curve (allocates Vec)
+    pub fn all_positions(&self) -> Vec<Coordinate> {
+        self.positions_iter().cloned().collect()
+    }
+
+    /// Convert to geo-types LineString (single allocation)
     pub fn to_linestring(&self) -> LineString<f64> {
-        let coords: Vec<Coord<f64>> = self.all_positions().into_iter().map(|c| c.into()).collect();
+        // Direct conversion without intermediate Vec<Coordinate>
+        let coords: Vec<Coord<f64>> = self
+            .positions_iter()
+            .map(|c| Coord { x: c.x, y: c.y })
+            .collect();
         LineString::new(coords)
     }
 }
