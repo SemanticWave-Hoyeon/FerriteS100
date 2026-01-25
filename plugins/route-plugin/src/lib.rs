@@ -246,8 +246,8 @@ impl Plugin for RoutePlugin {
     }
 
     fn on_mouse_click(&mut self, event: MouseEvent) -> bool {
-        // Only consume clicks when panel is visible and in editing mode
-        if !self.panel_visible || !self.editing {
+        // Only consume clicks when panel is visible, rendering is enabled, and in editing mode
+        if !self.panel_visible || !self.rendering_enabled || !self.editing {
             return false;
         }
 
@@ -504,6 +504,10 @@ impl Plugin for RoutePlugin {
                 }
                 ui::UiEvent::ToggleRendering => {
                     self.rendering_enabled = !self.rendering_enabled;
+                    // Turn off editing mode when rendering is disabled
+                    if !self.rendering_enabled {
+                        self.editing = false;
+                    }
                     self.log(&format!("Route rendering: {}", if self.rendering_enabled { "ON" } else { "OFF" }));
                     self.request_redraw();
                 }
