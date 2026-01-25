@@ -151,38 +151,27 @@ Place S-101 chart files (*.000) here.
 "@ | Out-File -FilePath "$ReleaseDir\ChartData\README.txt" -Encoding UTF8
 }
 
-# Copy plugins
+# Copy plugins from plugins_out (already built and deployed by build section)
 if (-not $SkipPlugins) {
     Write-Host "  Copying plugins..." -ForegroundColor Gray
     $PluginOutDir = "$ReleaseDir\plugins"
     New-Item -ItemType Directory -Force -Path $PluginOutDir | Out-Null
 
-    foreach ($PluginSubDir in $PluginSubDirs) {
-        $PluginName = $PluginSubDir.Name
-        $DllName = $PluginName -replace "-", "_"
-        $SourceDll = "$PluginSubDir\target\release\$DllName.dll"
-        $ManifestPath = "$PluginSubDir\manifest.json"
-
-        if (Test-Path $SourceDll) {
+    # Use plugins_out directory which has ready-to-use plugins
+    $PluginsOutSource = "$ProjectRoot\plugins_out"
+    if (Test-Path $PluginsOutSource) {
+        $DeployedPlugins = Get-ChildItem -Path $PluginsOutSource -Directory -ErrorAction SilentlyContinue
+        foreach ($Plugin in $DeployedPlugins) {
+            $PluginName = $Plugin.Name
             $PluginDestDir = "$PluginOutDir\$PluginName"
             New-Item -ItemType Directory -Force -Path $PluginDestDir | Out-Null
 
-            Copy-Item $SourceDll "$PluginDestDir\$DllName.dll"
-            Write-Host "    Copied: $PluginName/$DllName.dll" -ForegroundColor Gray
-
-            if (Test-Path $ManifestPath) {
-                # Read manifest and update hash
-                $ManifestContent = Get-Content $ManifestPath -Raw | ConvertFrom-Json
-
-                # Calculate SHA-256 hash of DLL
-                $DllHash = (Get-FileHash -Path $SourceDll -Algorithm SHA256).Hash.ToLower()
-                $ManifestContent.dll_hash = $DllHash
-
-                # Write updated manifest
-                $ManifestContent | ConvertTo-Json -Depth 10 | Out-File "$PluginDestDir\manifest.json" -Encoding UTF8
-                Write-Host "    Copied: $PluginName/manifest.json (hash updated)" -ForegroundColor Gray
-            }
+            # Copy all files from the plugin directory
+            Copy-Item "$($Plugin.FullName)\*" "$PluginDestDir\" -Recurse -Force
+            Write-Host "    Copied: $PluginName/" -ForegroundColor Gray
         }
+    } else {
+        Write-Host "    Warning: plugins_out directory not found" -ForegroundColor Yellow
     }
 }
 
