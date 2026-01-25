@@ -6,8 +6,10 @@
 //! This application loads and parses S-101 Electronic Navigational Charts
 //! using dynamically loaded Feature Catalogue (FC) and Portrayal Catalogue (PC).
 
-/// Application version
-pub const VERSION: &str = "0.0.2";
+/// Application version (from Cargo.toml)
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+mod plugins;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,7 +38,17 @@ use ferrite_render::{
     Viewport, WorldPoint,
 };
 use ferrite_s100_core::{S101Cell, SpatialPrimitiveType};
-use ferrite_wgpu::{CatalogueStatus, SelectedFeature, SymbolCache, WgpuRenderer};
+use ferrite_wgpu::{
+    CatalogueStatus, DisplayMode, SelectedFeature, SettingsState, SymbolCache, WgpuRenderer,
+};
+
+/// Get the application base directory (where the executable is located)
+fn get_app_base_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
 /// Application configuration
 struct AppConfig {
@@ -45,16 +57,22 @@ struct AppConfig {
     /// Path to Portrayal Catalogue directory
     pc_path: PathBuf,
     /// Path to log directory (used only in debug builds)
-    #[allow(dead_code)]
     log_path: PathBuf,
+    /// Debug mode enabled (--debug flag)
+    debug_mode: bool,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
+impl AppConfig {
+    fn from_args() -> Self {
+        let base = get_app_base_dir();
+        let args: Vec<String> = std::env::args().collect();
+        let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "--DEBUG");
+
         AppConfig {
-            fc_path: PathBuf::from("./Catalogues/FC/S-101"),
-            pc_path: PathBuf::from("./Catalogues/PC/S-101"),
-            log_path: PathBuf::from("./logs"),
+            fc_path: base.join("Catalogues/FC/S-101"),
+            pc_path: base.join("Catalogues/PC/S-101"),
+            log_path: base.join("logs"),
+            debug_mode,
         }
     }
 }
@@ -135,6 +153,19 @@ struct ChartApp {
     loaded_paths: std::collections::HashSet<PathBuf>,
     /// Background loading state (Some if loading in progress)
     loading_state: Option<BackgroundLoadingState>,
+    /// Plugin system
+    plugin_system: plugins::PluginSystem,
+    /// Base instruction count (chart instructions only, before plugin instructions)
+    base_instruction_count: usize,
+    /// Debug mode enabled
+    debug_mode: bool,
+    /// Frame times for FPS calculation
+    frame_times: std::collections::VecDeque<std::time::Instant>,
+    /// Previous CPU time measurement (kernel_time, user_time, wall_time) in 100-nanosecond intervals
+    #[cfg(windows)]
+    prev_cpu_times: Option<(u64, u64, std::time::Instant)>,
+    /// Last debug stats update time (for throttling to 0.5s intervals)
+    last_debug_update: std::time::Instant,
 }
 
 impl ChartApp {
@@ -145,6 +176,7 @@ impl ChartApp {
         pc: Arc<PortrayalCatalogue>,
         fc_status: CatalogueStatus,
         pc_status: CatalogueStatus,
+        debug_mode: bool,
     ) -> Self {
         ChartApp {
             window: None,
@@ -170,6 +202,85 @@ impl ChartApp {
             chart_loaded: false,
             loaded_paths: std::collections::HashSet::new(),
             loading_state: None,
+            plugin_system: {
+                let plugins_path = get_app_base_dir().join("plugins_out");
+                info!("Plugin directory: {}", plugins_path.display());
+
+                let mut ps = plugins::PluginSystem::new(plugins_path, VERSION);
+                ps.load_all();
+
+                // Set up file dialog callbacks for plugins
+                ps.set_file_save_callback(|filter_str, default_name, data| {
+                    // Parse filter string "name|*.ext1;*.ext2"
+                    let parts: Vec<&str> = filter_str.splitn(2, '|').collect();
+                    let filter_name = *parts.first().unwrap_or(&"Files");
+                    let extensions: Vec<&str> = parts
+                        .get(1)
+                        .unwrap_or(&"*.*")
+                        .split(';')
+                        .filter_map(|e| e.strip_prefix("*."))
+                        .collect();
+
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Save File")
+                        .set_file_name(default_name)
+                        .add_filter(filter_name, &extensions)
+                        .save_file()
+                    {
+                        match std::fs::write(&path, data) {
+                            Ok(_) => {
+                                info!("Plugin saved file: {}", path.display());
+                                true
+                            }
+                            Err(e) => {
+                                error!("Failed to save file: {}", e);
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                });
+
+                ps.set_file_open_callback(|filter_str| {
+                    // Parse filter string "name|*.ext1;*.ext2"
+                    let parts: Vec<&str> = filter_str.splitn(2, '|').collect();
+                    let filter_name = *parts.first().unwrap_or(&"Files");
+                    let extensions: Vec<&str> = parts
+                        .get(1)
+                        .unwrap_or(&"*.*")
+                        .split(';')
+                        .filter_map(|e| e.strip_prefix("*."))
+                        .collect();
+
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Open File")
+                        .add_filter(filter_name, &extensions)
+                        .pick_file()
+                    {
+                        match std::fs::read_to_string(&path) {
+                            Ok(content) => {
+                                info!("Plugin opened file: {}", path.display());
+                                Some(content)
+                            }
+                            Err(e) => {
+                                error!("Failed to read file: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                });
+
+                ps
+            },
+            base_instruction_count: 0,
+            debug_mode,
+            frame_times: std::collections::VecDeque::with_capacity(60),
+            #[cfg(windows)]
+            prev_cpu_times: None,
+            last_debug_update: std::time::Instant::now(),
         }
     }
 
@@ -225,13 +336,17 @@ impl ChartApp {
         self.render_context = RenderContext::new(Viewport::new(width, height));
         self.render_context.set_bounds(self.bounds);
 
-        // Try Lua portrayal with current color profile
+        // Get current settings from renderer
+        let current_settings = self.renderer.as_ref().map(|r| r.settings().clone());
+
+        // Try Lua portrayal with current color profile and settings
         let lua_result = try_lua_portrayal(
             &self.cells,
             &self.fc,
             &self.pc,
             &mut self.render_context,
             &self.current_profile_name,
+            current_settings.as_ref(),
         );
 
         if let Err(e) = lua_result {
@@ -264,6 +379,55 @@ impl ChartApp {
             .keys()
             .map(|s| s.as_str())
             .collect()
+    }
+
+    /// Get visible viewing groups for the current display mode
+    /// Returns None if All mode (show everything), otherwise returns the set of visible viewing group IDs
+    fn get_visible_viewing_groups(&self) -> Option<std::collections::HashSet<u32>> {
+        let display_mode = self
+            .renderer
+            .as_ref()
+            .map(|r| r.settings().display_mode)
+            .unwrap_or(DisplayMode::Standard);
+
+        // Map UI DisplayMode to PC display mode ID
+        let mode_id = match display_mode {
+            DisplayMode::Base => "DisplayBase",
+            DisplayMode::Standard => "StandardDisplay",
+            DisplayMode::All => return None, // Show all viewing groups
+        };
+
+        // Get the display mode from PC
+        let Some(mode) = self.pc.display_modes.get(mode_id) else {
+            return None; // Mode not found, show all
+        };
+
+        // Collect all viewing groups from the visible layers
+        let mut visible_vgs = std::collections::HashSet::new();
+        for layer_id in &mode.viewing_group_layers {
+            let vgs = self
+                .pc
+                .viewing_group_layers
+                .get_viewing_groups_for_layer(layer_id);
+            visible_vgs.extend(vgs);
+        }
+
+        // If no viewing groups found, return None to show all (safety fallback)
+        if visible_vgs.is_empty() {
+            tracing::warn!(
+                "No viewing groups found for display mode '{}', showing all",
+                mode_id
+            );
+            return None;
+        }
+
+        tracing::debug!(
+            "Display mode '{}': {} visible viewing groups",
+            mode_id,
+            visible_vgs.len()
+        );
+
+        Some(visible_vgs)
     }
 
     /// Start loading chart files in background (non-blocking)
@@ -515,12 +679,13 @@ impl ChartApp {
         self.rendered_symbols.clear();
         self.loaded_paths.clear();
 
-        // Clear render context
+        // Clear render context and base instruction count
         if let Some(renderer) = &self.renderer {
             let size = renderer.window().inner_size();
             self.render_context =
                 RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         }
+        self.base_instruction_count = 0;
 
         // Update UI state
         if let Some(renderer) = &mut self.renderer {
@@ -554,13 +719,17 @@ impl ChartApp {
         self.render_context = RenderContext::new(Viewport::new(width, height));
         self.render_context.set_bounds(self.bounds);
 
-        // Try Lua portrayal with current color profile
+        // Get current settings from renderer
+        let current_settings = self.renderer.as_ref().map(|r| r.settings().clone());
+
+        // Try Lua portrayal with current color profile and settings
         let lua_result = try_lua_portrayal(
             &self.cells,
             &self.fc,
             &self.pc,
             &mut self.render_context,
             &self.current_profile_name,
+            current_settings.as_ref(),
         );
 
         if let Err(e) = lua_result {
@@ -575,13 +744,18 @@ impl ChartApp {
             }
         }
 
+        // Save base instruction count (chart instructions only, before plugin instructions)
+        self.base_instruction_count = self.render_context.instruction_count();
+
         // Update renderer
-        // Get color profile before mutable borrows
+        // Get color profile and visible viewing groups before mutable borrows
         let color_profile = self
             .pc
             .color_profiles
             .profiles
             .get(&self.current_profile_name);
+        let visible_vgs = self.get_visible_viewing_groups();
+
         if let Some(renderer) = &mut self.renderer {
             let size = renderer.window().inner_size();
             self.render_context
@@ -593,6 +767,7 @@ impl ChartApp {
                 &mut self.render_context,
                 Some(&mut self.symbol_cache),
                 color_profile,
+                visible_vgs.as_ref(),
             );
 
             // Rebuild hit testing
@@ -672,6 +847,14 @@ impl ChartApp {
             return;
         }
 
+        // Update viewport to use actual chart area (excluding UI panels)
+        if let Some(renderer) = &self.renderer {
+            let (x, y, w, h) = renderer.ui_state.chart_area;
+            if w > 0.0 && h > 0.0 {
+                self.render_context.set_viewport_rect(x, y, w, h);
+            }
+        }
+
         // Calculate the zoomed and panned bounds
         let base_width = self.bounds.max_x - self.bounds.min_x;
         let base_height = self.bounds.max_y - self.bounds.min_y;
@@ -691,22 +874,36 @@ impl ChartApp {
         self.render_context.zoom_to_fit(new_bounds);
 
         // Re-render with new view
-        // Get color profile before mutable borrows
+        // Get color profile and visible viewing groups before mutable borrows
         let color_profile = self
             .pc
             .color_profiles
             .profiles
             .get(&self.current_profile_name);
+        let visible_vgs = self.get_visible_viewing_groups();
+
         if let Some(renderer) = &mut self.renderer {
             // Update zoom level for symbol decluttering and UI
             renderer.set_zoom_level(self.zoom_level);
             renderer.ui_state.zoom_level = self.zoom_level;
             // During animation, preserve declutter state to avoid flickering
             renderer.begin_frame_ex(preserve_declutter);
+
+            // Remove old plugin instructions (keep only chart instructions)
+            self.render_context
+                .truncate_instructions(self.base_instruction_count);
+
+            // Add plugin drawing instructions BEFORE building geometry
+            // (they need to be in render_context before add_instructions_with_symbols clones them)
+            for instr in self.plugin_system.get_render_instructions() {
+                self.render_context.add_instruction(instr);
+            }
+
             renderer.add_instructions_with_symbols(
                 &mut self.render_context,
                 Some(&mut self.symbol_cache),
                 color_profile,
+                visible_vgs.as_ref(),
             );
         }
 
@@ -755,6 +952,7 @@ impl ApplicationHandler for ChartApp {
                             renderer.ui_state.zoom_level = self.zoom_level;
                             renderer.ui_state.fc_status = self.fc_status.clone();
                             renderer.ui_state.pc_status = self.pc_status.clone();
+                            renderer.ui_state.debug_mode = self.debug_mode;
                             renderer.set_color_profile(&self.current_profile_name);
 
                             // Only add instructions if chart is loaded
@@ -764,12 +962,14 @@ impl ApplicationHandler for ChartApp {
                                     .color_profiles
                                     .profiles
                                     .get(&self.current_profile_name);
+                                let visible_vgs = self.get_visible_viewing_groups();
                                 self.render_context.zoom_to_fit(self.bounds);
                                 renderer.begin_frame();
                                 renderer.add_instructions_with_symbols(
                                     &mut self.render_context,
                                     Some(&mut self.symbol_cache),
                                     color_profile,
+                                    visible_vgs.as_ref(),
                                 );
                                 self.build_rendered_symbols();
                             }
@@ -895,6 +1095,8 @@ impl ApplicationHandler for ChartApp {
                     reset_view,
                     clear_charts,
                     color_change,
+                    settings_change,
+                    plugin_toggle,
                 ) = {
                     if let Some(renderer) = &mut self.renderer {
                         (
@@ -907,9 +1109,14 @@ impl ApplicationHandler for ChartApp {
                             renderer.take_reset_view_request(),
                             renderer.take_clear_charts_request(),
                             renderer.take_color_profile_change(),
+                            renderer.take_settings_change(),
+                            renderer.take_plugin_toggle_request(),
                         )
                     } else {
-                        (false, false, false, false, false, false, false, false, None)
+                        (
+                            false, false, false, false, false, false, false, false, None, None,
+                            None,
+                        )
                     }
                 };
 
@@ -1033,6 +1240,8 @@ impl ApplicationHandler for ChartApp {
 
                 if clear_charts {
                     self.clear_charts();
+                    // Also clear plugin data (route, etc.)
+                    self.plugin_system.clear_all_data();
                 }
 
                 // Handle color profile change
@@ -1041,6 +1250,172 @@ impl ApplicationHandler for ChartApp {
                     // Force re-render with new colors
                     if self.chart_loaded {
                         self.update_view();
+                    }
+                }
+
+                // Handle settings change (S-101 context parameters)
+                if settings_change.is_some() {
+                    // Settings have been updated in UI state, regenerate portrayal
+                    tracing::info!("Settings changed, regenerating portrayal");
+                    if self.chart_loaded {
+                        self.regenerate_portrayal();
+                    }
+                }
+
+                // Handle plugin toggle request
+                if let Some(plugin_id) = plugin_toggle {
+                    self.plugin_system.toggle_plugin(&plugin_id);
+                }
+
+                // Handle pan adjustment when panel state changes (to keep chart visually centered)
+                if let Some(renderer) = &mut self.renderer {
+                    if let Some(adjust_pixels) = renderer.take_pan_adjust_pixels() {
+                        // Convert pixel adjustment to world coordinates
+                        let world_adjust =
+                            adjust_pixels as f64 / self.render_context.scaler.scale_x();
+                        self.pan_offset.0 += world_adjust;
+                        // Force view update with new pan offset
+                        if self.chart_loaded {
+                            self.update_view();
+                        }
+                    }
+                }
+
+                // Update plugin toolbar buttons in UI
+                if let Some(renderer) = &mut self.renderer {
+                    let buttons: Vec<_> = self
+                        .plugin_system
+                        .get_toolbar_buttons()
+                        .into_iter()
+                        .map(|btn| ferrite_wgpu::PluginButton {
+                            plugin_id: btn.plugin_id,
+                            label: btn.label,
+                            tooltip: btn.tooltip,
+                            active: btn.active,
+                        })
+                        .collect();
+                    renderer.set_plugin_buttons(buttons);
+
+                    // Update plugin UI data
+                    let ui_data = self.plugin_system.get_active_plugin_ui_data();
+                    renderer.set_plugin_ui_data(ui_data);
+
+                    // Process plugin UI events
+                    for (plugin_id, event_json) in renderer.take_plugin_ui_events() {
+                        self.plugin_system.send_ui_event(&plugin_id, &event_json);
+                        // Update view after UI event
+                        if self.chart_loaded {
+                            self.update_view();
+                        }
+                    }
+                }
+
+                // Update debug stats
+                if self.debug_mode {
+                    if let Some(renderer) = &mut self.renderer {
+                        // FPS calculation (always update for accurate measurement)
+                        self.frame_times.push_back(now);
+                        while self.frame_times.len() > 60 {
+                            self.frame_times.pop_front();
+                        }
+
+                        // Throttle other stats to update every 0.5 seconds
+                        let debug_update_interval = std::time::Duration::from_millis(500);
+                        let should_update_stats =
+                            now.duration_since(self.last_debug_update) >= debug_update_interval;
+
+                        if should_update_stats {
+                            self.last_debug_update = now;
+
+                            // Calculate FPS from accumulated frame times
+                            if self.frame_times.len() >= 2 {
+                                let oldest = self.frame_times.front().unwrap();
+                                let elapsed = now.duration_since(*oldest).as_secs_f32();
+                                renderer.ui_state.debug_fps =
+                                    (self.frame_times.len() - 1) as f32 / elapsed;
+                            }
+
+                            // Memory and CPU usage (Windows only)
+                            #[cfg(windows)]
+                            {
+                                use std::mem::MaybeUninit;
+                                use windows_sys::Win32::Foundation::FILETIME;
+                                use windows_sys::Win32::System::ProcessStatus::{
+                                    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+                                };
+                                use windows_sys::Win32::System::Threading::{
+                                    GetCurrentProcess, GetProcessTimes,
+                                };
+
+                                unsafe {
+                                    let process = GetCurrentProcess();
+
+                                    // Memory usage (Working Set - physical memory used)
+                                    let mut pmc = MaybeUninit::<PROCESS_MEMORY_COUNTERS>::zeroed();
+                                    if GetProcessMemoryInfo(
+                                        process,
+                                        pmc.as_mut_ptr(),
+                                        std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                                    ) != 0
+                                    {
+                                        let pmc = pmc.assume_init();
+                                        renderer.ui_state.debug_memory_mb =
+                                            pmc.WorkingSetSize as f32 / (1024.0 * 1024.0);
+                                    }
+
+                                    // CPU usage calculation
+                                    let mut creation_time = MaybeUninit::<FILETIME>::zeroed();
+                                    let mut exit_time = MaybeUninit::<FILETIME>::zeroed();
+                                    let mut kernel_time = MaybeUninit::<FILETIME>::zeroed();
+                                    let mut user_time = MaybeUninit::<FILETIME>::zeroed();
+
+                                    if GetProcessTimes(
+                                        process,
+                                        creation_time.as_mut_ptr(),
+                                        exit_time.as_mut_ptr(),
+                                        kernel_time.as_mut_ptr(),
+                                        user_time.as_mut_ptr(),
+                                    ) != 0
+                                    {
+                                        let kernel = kernel_time.assume_init();
+                                        let user = user_time.assume_init();
+
+                                        // Convert FILETIME to u64 (100-nanosecond intervals)
+                                        let kernel_100ns = ((kernel.dwHighDateTime as u64) << 32)
+                                            | (kernel.dwLowDateTime as u64);
+                                        let user_100ns = ((user.dwHighDateTime as u64) << 32)
+                                            | (user.dwLowDateTime as u64);
+
+                                        if let Some((prev_kernel, prev_user, prev_time)) =
+                                            self.prev_cpu_times
+                                        {
+                                            let wall_elapsed =
+                                                now.duration_since(prev_time).as_nanos() as u64
+                                                    / 100;
+                                            if wall_elapsed > 0 {
+                                                let cpu_elapsed = (kernel_100ns - prev_kernel)
+                                                    + (user_100ns - prev_user);
+                                                let num_cpus = std::thread::available_parallelism()
+                                                    .map(|n| n.get())
+                                                    .unwrap_or(1)
+                                                    as f32;
+                                                renderer.ui_state.debug_cpu_usage =
+                                                    (cpu_elapsed as f32 / wall_elapsed as f32)
+                                                        * 100.0
+                                                        / num_cpus;
+                                            }
+                                        }
+
+                                        self.prev_cpu_times = Some((kernel_100ns, user_100ns, now));
+                                    }
+                                }
+                            }
+
+                            // Instruction and symbol counts
+                            renderer.ui_state.debug_instruction_count =
+                                self.render_context.instruction_count();
+                            renderer.ui_state.debug_symbol_count = self.rendered_symbols.len();
+                        }
                     }
                 }
 
@@ -1180,68 +1555,117 @@ impl ApplicationHandler for ChartApp {
                             self.update_view();
                         }
 
-                        if (!was_dragging || drag_dist < 5.0) && self.chart_loaded {
-                            // Hit testing
-                            let (x, y) = self.mouse_pos;
-                            let screen_pt = ferrite_render::ScreenPoint::new(x as f32, y as f32);
-                            let world = self.render_context.scaler.screen_to_world(screen_pt);
+                        if !was_dragging || drag_dist < 5.0 {
+                            // Check if egui wants the pointer (click is on UI)
+                            let egui_wants = self
+                                .renderer
+                                .as_ref()
+                                .is_some_and(|r| r.egui_wants_pointer());
 
-                            // Find nearby symbols (sorted by priority then distance)
-                            let nearby = self.find_symbols_at(x, y, 20.0);
+                            // Skip chart/plugin handling if click was on UI
+                            if !egui_wants {
+                                let (x, y) = self.mouse_pos;
+                                info!("Click: screen=({:.1}, {:.1})", x, y);
+                                let screen_pt =
+                                    ferrite_render::ScreenPoint::new(x as f32, y as f32);
+                                let world = self.render_context.scaler.screen_to_world(screen_pt);
+                                info!("Click: world=({:.6}, {:.6})", world.x, world.y);
 
-                            let selected = nearby.first().map(|sym| {
-                                // Use cell_index to look up feature in the correct cell
-                                // This fixes the bug where multiple cells have the same feature_id
-                                // but different feature types
-                                let feature = if let Some(cell_idx) = sym.cell_index {
-                                    // Look up in the specific cell the symbol came from
-                                    self.cells
-                                        .get(cell_idx)
-                                        .and_then(|cell| cell.features.get(&sym.feature_id))
-                                } else {
-                                    // Fallback: search all cells (old behavior)
-                                    self.cells
-                                        .iter()
-                                        .find_map(|cell| cell.features.get(&sym.feature_id))
-                                };
+                                // Route click to plugins first
+                                let plugin_consumed = self.plugin_system.handle_click(
+                                    world.x,
+                                    world.y,
+                                    ferrite_plugin_api::MouseButton::Left,
+                                    false,
+                                );
 
-                                let (feature_code, definition) = feature
-                                    .map(|f| {
-                                        let code =
-                                            f.feature_code.as_deref().unwrap_or(&sym.symbol_ref);
-                                        // Look up definition from FC
-                                        let def = self
-                                            .fc
-                                            .feature_types
-                                            .get(code)
-                                            .and_then(|ft| ft.definition.clone());
-                                        (code.to_string(), def)
-                                    })
-                                    .unwrap_or_else(|| (sym.symbol_ref.clone(), None));
+                                // If plugin consumed the event, skip default handling but update view
+                                if plugin_consumed {
+                                    info!(
+                                        "Click consumed by plugin at world ({:.6}, {:.6})",
+                                        world.x, world.y
+                                    );
+                                    // Update view to render plugin's new drawing instructions
+                                    if self.chart_loaded {
+                                        self.update_view();
+                                    } else {
+                                        // Even without a chart, render plugin instructions
+                                        if let Some(renderer) = &mut self.renderer {
+                                            renderer.begin_frame();
+                                            // Remove old plugin instructions
+                                            self.render_context
+                                                .truncate_instructions(self.base_instruction_count);
+                                            for instr in
+                                                self.plugin_system.get_render_instructions()
+                                            {
+                                                self.render_context.add_instruction(instr);
+                                            }
+                                            // Build geometry from plugin instructions
+                                            renderer.add_instructions(&mut self.render_context);
+                                        }
+                                    }
+                                } else if self.chart_loaded {
+                                    // Hit testing (default behavior)
+                                    // Find nearby symbols (sorted by priority then distance)
+                                    let nearby = self.find_symbols_at(x, y, 20.0);
 
-                                SelectedFeature {
-                                    feature_type: feature_code,
-                                    feature_id: sym.feature_id,
-                                    primitive_type: "Point".to_string(),
-                                    attributes: vec![],
-                                    world_pos: (sym.world_x, sym.world_y),
-                                    definition,
-                                    symbol_name: Some(sym.symbol_ref.clone()),
+                                    let selected = nearby.first().map(|sym| {
+                                        // Use cell_index to look up feature in the correct cell
+                                        // This fixes the bug where multiple cells have the same feature_id
+                                        // but different feature types
+                                        let feature = if let Some(cell_idx) = sym.cell_index {
+                                            // Look up in the specific cell the symbol came from
+                                            self.cells
+                                                .get(cell_idx)
+                                                .and_then(|cell| cell.features.get(&sym.feature_id))
+                                        } else {
+                                            // Fallback: search all cells (old behavior)
+                                            self.cells
+                                                .iter()
+                                                .find_map(|cell| cell.features.get(&sym.feature_id))
+                                        };
+
+                                        let (feature_code, definition) = feature
+                                            .map(|f| {
+                                                let code = f
+                                                    .feature_code
+                                                    .as_deref()
+                                                    .unwrap_or(&sym.symbol_ref);
+                                                // Look up definition from FC
+                                                let def = self
+                                                    .fc
+                                                    .feature_types
+                                                    .get(code)
+                                                    .and_then(|ft| ft.definition.clone());
+                                                (code.to_string(), def)
+                                            })
+                                            .unwrap_or_else(|| (sym.symbol_ref.clone(), None));
+
+                                        SelectedFeature {
+                                            feature_type: feature_code,
+                                            feature_id: sym.feature_id,
+                                            primitive_type: "Point".to_string(),
+                                            attributes: vec![],
+                                            world_pos: (sym.world_x, sym.world_y),
+                                            definition,
+                                            symbol_name: Some(sym.symbol_ref.clone()),
+                                        }
+                                    });
+                                    let nearby_count = nearby.len();
+                                    drop(nearby); // Release borrow on self.rendered_symbols
+
+                                    // Update selected feature in UI
+                                    if let Some(renderer) = &mut self.renderer {
+                                        renderer.ui_state.selected_feature = selected;
+                                    }
+
+                                    info!(
+                                        "Click at ({:.4}, {:.4}): {} symbols found",
+                                        world.x, world.y, nearby_count
+                                    );
                                 }
-                            });
-                            let nearby_count = nearby.len();
-                            drop(nearby); // Release borrow on self.rendered_symbols
-
-                            // Update selected feature in UI
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.ui_state.selected_feature = selected;
                             }
-
-                            info!(
-                                "Click at ({:.4}, {:.4}): {} symbols found",
-                                world.x, world.y, nearby_count
-                            );
-                        }
+                        } // end if !egui_wants
                     }
                 }
             }
@@ -1250,13 +1674,47 @@ impl ApplicationHandler for ChartApp {
                 button: MouseButton::Right,
                 ..
             } if !egui_consumed => {
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.reset_pan_offset();
-                }
-                self.zoom_level = 1.0;
-                self.pan_offset = (0.0, 0.0);
-                self.pan_velocity = (0.0, 0.0); // Stop inertia on reset
-                self.update_view();
+                // Check if egui wants the pointer (click is on UI)
+                let egui_wants = self
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|r| r.egui_wants_pointer());
+
+                // Skip if click was on UI
+                if !egui_wants {
+                    // Route right-click to plugins first
+                    let screen_pt = ferrite_render::ScreenPoint::new(
+                        self.mouse_pos.0 as f32,
+                        self.mouse_pos.1 as f32,
+                    );
+                    let world = self.render_context.scaler.screen_to_world(screen_pt);
+                    let plugin_consumed = self.plugin_system.handle_click(
+                        world.x,
+                        world.y,
+                        ferrite_plugin_api::MouseButton::Right,
+                        false,
+                    );
+
+                    if plugin_consumed {
+                        // Plugin consumed the click, update view to show changes
+                        info!(
+                            "Right-click consumed by plugin at ({:.4}, {:.4})",
+                            world.x, world.y
+                        );
+                        if self.chart_loaded {
+                            self.update_view();
+                        }
+                    } else {
+                        // Plugin didn't consume, do default behavior (reset view)
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.reset_pan_offset();
+                        }
+                        self.zoom_level = 1.0;
+                        self.pan_offset = (0.0, 0.0);
+                        self.pan_velocity = (0.0, 0.0); // Stop inertia on reset
+                        self.update_view();
+                    }
+                } // end if !egui_wants
             }
             _ => {}
         }
@@ -1264,20 +1722,19 @@ impl ApplicationHandler for ChartApp {
 }
 
 fn main() -> Result<()> {
-    let config = AppConfig::default();
+    let config = AppConfig::from_args();
 
-    // Initialize logging (only in debug mode)
-    #[cfg(debug_assertions)]
-    init_logging(&config.log_path)?;
-
-    #[cfg(debug_assertions)]
-    {
-        info!("========================================");
-        info!("FerriteS100 Starting...");
-        info!("========================================");
-        info!("");
-        info!("=== Loading Catalogues ===");
+    // Initialize logging only in debug mode
+    if config.debug_mode {
+        init_logging(&config.log_path)?;
     }
+
+    info!("========================================");
+    info!("FerriteS100 v{} Starting...", VERSION);
+    info!("App base directory: {}", get_app_base_dir().display());
+    info!("========================================");
+    info!("");
+    info!("=== Loading Catalogues ===");
 
     let fc = Arc::new(load_feature_catalogue(&config.fc_path)?);
     let pc = Arc::new(load_portrayal_catalogue(&config.pc_path)?);
@@ -1311,7 +1768,7 @@ fn main() -> Result<()> {
         info!("========================================");
     }
 
-    // Create symbol cache for SVG rendering
+    // Create symbol cache for SVG rendering (S-101 only)
     let symbols_path = config.pc_path.join("Symbols");
     let symbol_cache = SymbolCache::new(&symbols_path);
     #[cfg(debug_assertions)]
@@ -1335,7 +1792,15 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll); // Use Poll for smooth UI updates
 
-    let mut app = ChartApp::new(symbol_cache, initial_profile, fc, pc, fc_status, pc_status);
+    let mut app = ChartApp::new(
+        symbol_cache,
+        initial_profile,
+        fc,
+        pc,
+        fc_status,
+        pc_status,
+        config.debug_mode,
+    );
 
     event_loop.run_app(&mut app).context("Event loop error")?;
 
@@ -1351,6 +1816,7 @@ fn try_lua_portrayal(
     pc: &PortrayalCatalogue,
     render_context: &mut RenderContext,
     profile_name: &str,
+    settings: Option<&SettingsState>,
 ) -> Result<()> {
     let rules_path = pc.root_path.join("Rules");
 
@@ -1384,7 +1850,27 @@ fn try_lua_portrayal(
 
     // Load context parameters from PC XML (dynamically, no hardcoding)
     let pc_context_params = pc.get_context_parameters();
-    let context = LuaContextParameters::from_pc_context(pc_context_params);
+    let mut context = LuaContextParameters::from_pc_context(pc_context_params);
+
+    // Apply UI settings to context parameters if provided
+    if let Some(s) = settings {
+        context.safety_depth = s.safety_depth;
+        context.safety_contour = s.safety_contour;
+        context.shallow_contour = s.shallow_contour;
+        context.deep_contour = s.deep_contour;
+        context.two_shades = s.two_shades;
+        context.simplified_symbols = s.simplified_symbols;
+        context.isolated_dangers = s.isolated_dangers;
+        context.full_sectors = s.full_light_sectors;
+        context.ignore_scale_minimum = s.ignore_scale_minimum;
+        context.ignore_scamin = s.ignore_scale_minimum;
+        context.symbolized_boundaries = !s.plain_boundaries;
+        info!(
+            "  Applied UI settings: SafetyDepth={}, SafetyContour={}, TwoShades={}",
+            s.safety_depth, s.safety_contour, s.two_shades
+        );
+    }
+
     info!(
         "  Context parameters loaded from PC XML: {} parameters",
         pc_context_params.len()
@@ -2116,8 +2602,11 @@ fn init_logging(log_path: &Path) -> Result<()> {
         .with_writer(file_appender);
 
     // Environment filter - default to info, debug for core modules
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,ferrite_s100_core=debug"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,ferrite_s100=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug",
+        )
+    });
 
     // Initialize subscriber
     tracing_subscriber::registry()

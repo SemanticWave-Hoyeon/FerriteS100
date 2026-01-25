@@ -52,6 +52,7 @@ The project leverages modern GPU rendering via [wgpu](https://wgpu.rs/) and *att
 | **GPU Rendering** | Hardware-accelerated rendering with wgpu (Vulkan/DX12/Metal) |
 | **Multi-cell Support** | Load and display multiple chart cells simultaneously |
 | **Symbol Rendering** | SVG-based symbol rendering with color profile support |
+| **Plugin System** | Extensible architecture with ABI-stable plugin support |
 
 ### Interactive Features
 
@@ -59,6 +60,23 @@ The project leverages modern GPU rendering via [wgpu](https://wgpu.rs/) and *att
 - **Feature Inspector** — Click any feature to view detailed attributes
 - **Real-time Coordinates** — Live latitude/longitude display
 - **Screenshot Export** — Save rendered charts as PNG
+
+### Plugin System
+
+FerriteS100 supports plugins for extended functionality. Each plugin:
+- Loads independently as a dynamic library (DLL)
+- Has its own FC/PC catalogue loading (e.g., S-421 for route planning)
+- Uses ABI-stable interface via [abi_stable](https://docs.rs/abi_stable)
+- Runs in a sandboxed environment with limited host API access
+
+**Included Plugin: S-421 Route Planner**
+
+| Feature | Description |
+|---------|-------------|
+| **Waypoint Management** | Click to add, right-click to remove waypoints |
+| **Distance Calculation** | Haversine formula for accurate nautical miles |
+| **S-421 Export/Import** | Standard-compliant GML route exchange format |
+| **Customizable Display** | Line color, width, distance units, waypoint symbols |
 
 ## Installation
 
@@ -79,6 +97,22 @@ cargo build --release
 
 # Run
 cargo run --release
+```
+
+### Build with Plugins (Windows PowerShell)
+
+```powershell
+# Build main app and all plugins
+.\scripts\build.ps1
+
+# Build main app only (skip plugins)
+.\scripts\build.ps1 -SkipPlugins
+
+# Create release package
+.\scripts\release.ps1
+
+# Create KMOU edition (includes Catalogues and ChartData)
+.\scripts\release.ps1 -KMOU
 ```
 
 ## Usage
@@ -109,11 +143,22 @@ S-101 sample charts can be downloaded from the **UKHO Data Hub**:
 | **Right Click** | Reset view |
 | **File → Open** | Load additional charts |
 
+#### Route Plugin Controls (when active)
+
+| Input | Action |
+|-------|--------|
+| **Left Click** | Add waypoint at position |
+| **Right Click** | Remove last waypoint |
+| **Export** | Save route as S-421 GML file |
+| **Import** | Load route from S-421 GML file |
+
 ## Project Structure
 
 ```
 FerriteS100/
-├── src/main.rs                    # Application entry point
+├── src/
+│   ├── main.rs                    # Application entry point
+│   └── plugins.rs                 # Plugin system integration
 ├── crates/
 │   ├── ferrite-iso8211/           # ISO 8211 binary format parser
 │   ├── ferrite-s100-core/         # S-100 core data structures
@@ -121,11 +166,23 @@ FerriteS100/
 │   ├── ferrite-portrayal-catalog/ # Portrayal Catalogue XML parser
 │   ├── ferrite-lua/               # Lua portrayal engine (sandboxed)
 │   ├── ferrite-render/            # Abstract rendering instructions
-│   └── ferrite-wgpu/              # GPU renderer
+│   ├── ferrite-wgpu/              # GPU renderer
+│   ├── ferrite-plugin-api/        # Plugin API (ABI-stable traits)
+│   └── ferrite-plugin-loader/     # Plugin DLL loader & verifier
+├── plugins/
+│   └── route-plugin/              # S-421 Route Planner plugin
 ├── Catalogues/
-│   ├── FC/S-101/                  # Feature Catalogue XML
-│   └── PC/S-101/                  # Portrayal Catalogue (Lua, SVG, colors)
-└── ChartData/                     # S-101 chart files (.000)
+│   ├── FC/
+│   │   ├── S-101/                 # S-101 Feature Catalogue
+│   │   └── S-421/                 # S-421 Feature Catalogue (for plugins)
+│   └── PC/
+│       ├── S-101/                 # S-101 Portrayal Catalogue
+│       └── S-421/                 # S-421 Portrayal Catalogue (for plugins)
+├── ChartData/                     # S-101 chart files (.000)
+└── scripts/
+    ├── build.ps1                  # Build main app & plugins
+    ├── release.ps1                # Create release package
+    └── upload.ps1                 # Upload to GitHub releases
 ```
 
 ## Key Principles
@@ -147,6 +204,18 @@ FerriteS100 implements a **sandboxed Lua environment** via [mlua](https://github
 | **Restricted Search** | Only Portrayal Catalogue directory is searchable |
 
 This design mitigates potential security risks from malicious Portrayal Catalogue scripts (**CWE-829**, **CWE-749**).
+
+### Plugin Security
+
+Plugins are loaded as dynamic libraries with security verification:
+
+| Protection | Description |
+|------------|-------------|
+| **Ed25519 Signatures** | DLLs are verified against signed manifests (production mode) |
+| **SHA-256 Hash** | DLL integrity verified before loading |
+| **Sandboxed Host API** | Plugins can only call whitelisted host functions |
+| **ABI Stable Interface** | [abi_stable](https://docs.rs/abi_stable) ensures safe FFI |
+| **Version Compatibility** | API version checked before plugin initialization |
 
 ## SBOM (Software Bill of Materials)
 
@@ -215,6 +284,15 @@ All dependencies are sourced from [crates.io](https://crates.io) and audited via
 |-------|---------|---------|
 | [mlua](https://github.com/mlua-rs/mlua) | 0.10 | Sandboxed Lua 5.4 portrayal engine |
 | [rayon](https://github.com/rayon-rs/rayon) | 1.10 | Parallel chart loading & processing |
+
+### Plugin System
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| [abi_stable](https://docs.rs/abi_stable) | 0.11 | ABI-stable trait objects for plugins |
+| [libloading](https://github.com/nagisa/rust_libloading) | 0.8 | Dynamic library loading |
+| [ed25519-dalek](https://github.com/dalek-cryptography/ed25519-dalek) | 2 | Plugin signature verification |
+| [sha2](https://github.com/RustCrypto/hashes) | 0.10 | DLL hash verification |
 
 ### Utilities
 

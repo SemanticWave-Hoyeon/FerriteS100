@@ -21,6 +21,8 @@ pub struct GpuState {
     /// MSAA render target texture
     pub msaa_texture: Option<wgpu::Texture>,
     pub msaa_view: Option<wgpu::TextureView>,
+    /// GPU adapter name
+    pub gpu_name: String,
 }
 
 impl GpuState {
@@ -49,7 +51,9 @@ impl GpuState {
             .await
             .ok_or(WgpuError::AdapterNotFound)?;
 
-        tracing::info!("Using GPU adapter: {:?}", adapter.get_info().name);
+        let adapter_info = adapter.get_info();
+        let gpu_name = adapter_info.name.clone();
+        tracing::info!("Using GPU adapter: {:?}", gpu_name);
 
         // Request device
         let (device, queue) = adapter
@@ -102,6 +106,7 @@ impl GpuState {
             window,
             msaa_texture: Some(msaa_texture),
             msaa_view: Some(msaa_view),
+            gpu_name,
         })
     }
 

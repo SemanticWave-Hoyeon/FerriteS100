@@ -6,6 +6,74 @@ use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+/// S-101 Display Mode following IHO standard ViewingGroupLayers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    /// Base display - essential navigation information only
+    Base,
+    /// Standard display - default operational view
+    #[default]
+    Standard,
+    /// All - display all available information
+    All,
+}
+
+impl DisplayMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DisplayMode::Base => "Base",
+            DisplayMode::Standard => "Standard",
+            DisplayMode::All => "All",
+        }
+    }
+}
+
+/// S-101 Context Parameters settings
+/// Following IHO S-101 standard for mariner-settable parameters
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsState {
+    /// Safety depth in meters (for danger highlighting)
+    pub safety_depth: f64,
+    /// Safety contour in meters (primary safety boundary)
+    pub safety_contour: f64,
+    /// Shallow contour in meters
+    pub shallow_contour: f64,
+    /// Deep contour in meters
+    pub deep_contour: f64,
+    /// Two shades depth display (simplified)
+    pub two_shades: bool,
+    /// Use simplified point symbols (vs paper chart symbols)
+    pub simplified_symbols: bool,
+    /// Display isolated dangers in shallow water
+    pub isolated_dangers: bool,
+    /// Show full light sectors
+    pub full_light_sectors: bool,
+    /// Ignore scale minimum attribute
+    pub ignore_scale_minimum: bool,
+    /// Use plain boundaries (vs symbolized)
+    pub plain_boundaries: bool,
+    /// Display mode (Base/Standard/All)
+    pub display_mode: DisplayMode,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        SettingsState {
+            safety_depth: 30.0,
+            safety_contour: 30.0,
+            shallow_contour: 2.0,
+            deep_contour: 30.0,
+            two_shades: false,
+            simplified_symbols: false,
+            isolated_dangers: true,
+            full_light_sectors: true,
+            ignore_scale_minimum: false,
+            plain_boundaries: false,
+            display_mode: DisplayMode::Standard,
+        }
+    }
+}
+
 /// Feature Catalogue status information
 #[derive(Debug, Clone, Default)]
 pub struct CatalogueStatus {
@@ -21,6 +89,15 @@ pub struct CatalogueStatus {
     pub item_count: usize,
     /// Validation status message
     pub validation_message: Option<String>,
+}
+
+/// Plugin toolbar button state
+#[derive(Debug, Clone, Default)]
+pub struct PluginButton {
+    pub plugin_id: String,
+    pub label: String,
+    pub tooltip: Option<String>,
+    pub active: bool,
 }
 
 /// Application state shared between egui UI and main app
@@ -72,6 +149,45 @@ pub struct AppUiState {
     pub pc_status: CatalogueStatus,
     /// Loading in progress (total files, loaded count)
     pub loading_progress: Option<(usize, usize)>,
+    /// Show settings dialog
+    pub show_settings: bool,
+    /// Current settings state
+    pub settings: SettingsState,
+    /// Settings were changed (triggers re-render)
+    pub settings_changed: bool,
+    /// Pending settings (edited but not yet applied)
+    pub pending_settings: Option<SettingsState>,
+    /// Actual chart area after UI panels (x, y, width, height)
+    /// Used for proper viewport calculation excluding UI panels
+    pub chart_area: (f32, f32, f32, f32),
+    /// Plugin toolbar buttons
+    pub plugin_buttons: Vec<PluginButton>,
+    /// Plugin toggle request (plugin_id)
+    pub plugin_toggle_requested: Option<String>,
+    /// Active plugin UI data (plugin_id, json_data)
+    pub plugin_ui_data: Vec<(String, String)>,
+    /// Plugin UI event queue (plugin_id, event_json)
+    pub plugin_ui_events: Vec<(String, String)>,
+    /// Previous chart area x offset (for detecting panel changes)
+    prev_chart_x: f32,
+    /// Pan offset adjustment needed due to panel changes (in pixels)
+    pub pan_adjust_pixels: Option<f32>,
+    /// Route being edited (route_id, current_edit_text)
+    route_editing: Option<(u32, String)>,
+    /// Waypoint being edited (waypoint_id, current_edit_text)
+    waypoint_editing: Option<(u32, String)>,
+    /// Debug mode enabled (--debug flag)
+    pub debug_mode: bool,
+    /// Debug stats: FPS
+    pub debug_fps: f32,
+    /// Debug stats: CPU usage percentage
+    pub debug_cpu_usage: f32,
+    /// Debug stats: Memory usage in MB
+    pub debug_memory_mb: f32,
+    /// Debug stats: Render instruction count
+    pub debug_instruction_count: usize,
+    /// Debug stats: Symbol count
+    pub debug_symbol_count: usize,
 }
 
 /// Information about a selected feature
@@ -86,6 +202,36 @@ pub struct SelectedFeature {
     pub definition: Option<String>,
     /// Symbol name (e.g., "ISODGR01", "SOUNDG10")
     pub symbol_name: Option<String>,
+}
+
+/// Convert decimal degrees to degrees, minutes, seconds format
+/// Latitude uses 2 digits (00-90), Longitude uses 3 digits (000-180)
+fn format_dms(decimal_degrees: f64, is_lat: bool) -> String {
+    let abs_deg = decimal_degrees.abs();
+    let degrees = abs_deg.floor() as i32;
+    let minutes_full = (abs_deg - degrees as f64) * 60.0;
+    let minutes = minutes_full.floor() as i32;
+    let seconds = (minutes_full - minutes as f64) * 60.0;
+
+    let dir = if is_lat {
+        if decimal_degrees >= 0.0 {
+            "N"
+        } else {
+            "S"
+        }
+    } else if decimal_degrees >= 0.0 {
+        "E"
+    } else {
+        "W"
+    };
+
+    if is_lat {
+        // Latitude: 2 digits for degrees (00-90)
+        format!("{:02}°{:02}'{:05.2}\"{}", degrees, minutes, seconds, dir)
+    } else {
+        // Longitude: 3 digits for degrees (000-180)
+        format!("{:03}°{:02}'{:05.2}\"{}", degrees, minutes, seconds, dir)
+    }
 }
 
 /// egui integration wrapper
@@ -147,6 +293,11 @@ impl EguiIntegration {
         self.state
             .handle_platform_output(window, output.platform_output.clone());
         output
+    }
+
+    /// Check if egui wants pointer input (mouse is over UI element)
+    pub fn wants_pointer_input(&self) -> bool {
+        self.ctx.wants_pointer_input()
     }
 
     /// Render egui UI
@@ -281,8 +432,16 @@ impl EguiIntegration {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("Reset View").clicked() {
+                        if ui.button("Fit to Chart").clicked() {
                             ui_state.reset_view_requested = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    // Settings menu (independent top-level menu)
+                    ui.menu_button("Settings", |ui| {
+                        if ui.button("Display Settings...").clicked() {
+                            ui_state.show_settings = true;
                             ui.close_menu();
                         }
                     });
@@ -335,8 +494,27 @@ impl EguiIntegration {
                                 }
                             }
                         });
+
+                    // Plugin toolbar buttons
+                    if !ui_state.plugin_buttons.is_empty() {
+                        ui.separator();
+                        for btn in &ui_state.plugin_buttons {
+                            let button = egui::Button::new(&btn.label).selected(btn.active);
+                            let response = if let Some(ref tooltip) = btn.tooltip {
+                                ui.add(button).on_hover_text(tooltip)
+                            } else {
+                                ui.add(button)
+                            };
+                            if response.clicked() {
+                                ui_state.plugin_toggle_requested = Some(btn.plugin_id.clone());
+                            }
+                        }
+                    }
                 });
             });
+
+        // Route panel (left side) - shown when route plugin is active
+        Self::draw_route_panel(&self.ctx, ui_state);
 
         // Status bar
         egui::TopBottomPanel::bottom("status_bar")
@@ -346,20 +524,15 @@ impl EguiIntegration {
                     // Coordinate display (only show valid coords when chart is loaded)
                     if ui_state.chart_count > 0 {
                         let (lon, lat) = ui_state.cursor_world;
-                        let lat_dir = if lat >= 0.0 { "N" } else { "S" };
-                        let lon_dir = if lon >= 0.0 { "E" } else { "W" };
+                        let lat_dms = format_dms(lat, true);
+                        let lon_dms = format_dms(lon, false);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "LAT: {:.6}{} | LON: {:.6}{}",
-                                lat.abs(),
-                                lat_dir,
-                                lon.abs(),
-                                lon_dir
-                            ))
-                            .size(14.0),
+                            egui::RichText::new(format!("{} | {}", lat_dms, lon_dms)).size(14.0),
                         );
                     } else {
-                        ui.label(egui::RichText::new("LAT: ------ | LON: ------").size(14.0));
+                        ui.label(
+                            egui::RichText::new("--°--'--.--\"- | ---°--'--.--\"-").size(14.0),
+                        );
                     }
 
                     ui.separator();
@@ -466,18 +639,16 @@ impl EguiIntegration {
 
                     ui.add_space(4.0);
 
-                    // Position with better formatting
+                    // Position with better formatting (DMS)
                     ui.group(|ui| {
                         ui.label(egui::RichText::new("Position").size(13.0).strong());
                         let (lon, lat) = feature.world_pos;
-                        let lat_dir = if lat >= 0.0 { "N" } else { "S" };
-                        let lon_dir = if lon >= 0.0 { "E" } else { "W" };
                         ui.label(
-                            egui::RichText::new(format!("  LAT: {:.6}° {}", lat.abs(), lat_dir))
+                            egui::RichText::new(format!("  LAT: {}", format_dms(lat, true)))
                                 .size(12.0),
                         );
                         ui.label(
-                            egui::RichText::new(format!("  LON: {:.6}° {}", lon.abs(), lon_dir))
+                            egui::RichText::new(format!("  LON: {}", format_dms(lon, false)))
                                 .size(12.0),
                         );
                     });
@@ -610,6 +781,651 @@ impl EguiIntegration {
                         }
                     });
                 });
+        }
+
+        // Settings dialog
+        if ui_state.show_settings {
+            Self::draw_settings_dialog(&self.ctx, ui_state);
+        }
+
+        // Calculate actual chart area from screen size and known panel dimensions
+        // This avoids using CentralPanel which would consume mouse events
+        let screen_rect = self.ctx.screen_rect();
+        let top_panel_height = 32.0; // toolbar min_height
+        let bottom_panel_height = 28.0; // status bar min_height
+        let right_panel_width = 320.0; // feature panel default_width
+
+        // Check if route panel is active (adds left panel width)
+        let route_active = ui_state
+            .plugin_buttons
+            .iter()
+            .any(|b| b.plugin_id.contains("route") && b.active);
+        let left_panel_width = if route_active { 280.0 } else { 0.0 }; // route panel default_width
+
+        let chart_x = left_panel_width;
+        let chart_y = top_panel_height;
+        let chart_width = (screen_rect.width() - left_panel_width - right_panel_width).max(100.0);
+        let chart_height =
+            (screen_rect.height() - top_panel_height - bottom_panel_height).max(100.0);
+
+        // Detect chart_x change (panel opened/closed) and calculate pan adjustment
+        // to keep the visual center in the same position
+        if (chart_x - ui_state.prev_chart_x).abs() > 1.0 {
+            // Half the shift to maintain visual center
+            let adjust = (chart_x - ui_state.prev_chart_x) / 2.0;
+            ui_state.pan_adjust_pixels = Some(adjust);
+            ui_state.prev_chart_x = chart_x;
+        }
+
+        ui_state.chart_area = (chart_x, chart_y, chart_width, chart_height);
+
+        // Debug overlay (only in debug mode)
+        if ui_state.debug_mode {
+            Self::draw_debug_overlay(&self.ctx, ui_state, chart_x, chart_y);
+        }
+    }
+
+    /// Draw debug overlay on chart (top-left corner, green text)
+    fn draw_debug_overlay(ctx: &egui::Context, ui_state: &AppUiState, chart_x: f32, chart_y: f32) {
+        egui::Area::new(egui::Id::new("debug_overlay"))
+            .fixed_pos(egui::pos2(chart_x + 10.0, chart_y + 10.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.style_mut().visuals.override_text_color =
+                    Some(egui::Color32::from_rgb(0, 255, 0));
+
+                let frame_response = egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180))
+                    .inner_margin(egui::Margin::same(8))
+                    .corner_radius(4.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(200.0);
+                        ui.label(egui::RichText::new("DEBUG MODE").size(14.0).strong());
+
+                        ui.separator();
+
+                        // Performance stats
+                        ui.label(format!("FPS: {:.1}", ui_state.debug_fps));
+                        ui.label(format!("CPU: {:.1}%", ui_state.debug_cpu_usage));
+                        ui.label(format!("RAM: {:.1} MB", ui_state.debug_memory_mb));
+
+                        ui.separator();
+
+                        // Render stats
+                        ui.label(format!(
+                            "Instructions: {}",
+                            ui_state.debug_instruction_count
+                        ));
+                        ui.label(format!("Symbols: {}", ui_state.debug_symbol_count));
+                        ui.label(format!("Charts: {}", ui_state.chart_count));
+                        ui.label(format!("Features: {}", ui_state.feature_count));
+
+                        ui.separator();
+
+                        // View stats
+                        ui.label(format!("Zoom: {:.2}x", ui_state.zoom_level));
+                        if ui_state.chart_count > 0 {
+                            ui.label(format!(
+                                "Pos: {:.4}, {:.4}",
+                                ui_state.cursor_world.1, ui_state.cursor_world.0
+                            ));
+                        } else {
+                            ui.label("Pos: (no chart)");
+                        }
+                    });
+                // Consume mouse events on the frame area to prevent chart from moving when dragging on overlay
+                ui.interact(
+                    frame_response.response.rect,
+                    egui::Id::new("debug_overlay_blocker"),
+                    egui::Sense::click_and_drag(),
+                );
+            });
+    }
+
+    /// Draw the Route panel (for route plugin)
+    fn draw_route_panel(ctx: &egui::Context, ui_state: &mut AppUiState) {
+        // Check if route plugin is active
+        let route_active = ui_state
+            .plugin_buttons
+            .iter()
+            .any(|b| b.plugin_id.contains("route") && b.active);
+        if !route_active {
+            return;
+        }
+
+        // Find route plugin UI data
+        let route_data = ui_state
+            .plugin_ui_data
+            .iter()
+            .find(|(id, _)| id.contains("route"))
+            .map(|(_, data)| data.clone());
+
+        egui::SidePanel::left("route_panel")
+            .default_width(280.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                if let Some(data) = &route_data {
+                    if let Ok(route_ui) = serde_json::from_str::<serde_json::Value>(data) {
+                        let editing = route_ui.get("editing").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let title = route_ui.get("title").and_then(|v| v.as_str()).unwrap_or("Route Plan");
+
+                        // Header with editing indicator
+                        ui.vertical_centered(|ui| {
+                            ui.heading(egui::RichText::new(title).size(18.0).strong());
+                            if editing {
+                                ui.label(egui::RichText::new("Click on chart to add waypoints")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(100, 200, 100)));
+                            }
+                        });
+                        ui.separator();
+
+                        // Rendering toggle at top of panel
+                        let rendering_enabled = route_ui.get("rendering_enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                        ui.horizontal(|ui| {
+                            ui.label("Route Display:");
+                            let btn_text = if rendering_enabled { "ON" } else { "OFF" };
+                            let btn_color = if rendering_enabled {
+                                egui::Color32::from_rgb(100, 200, 100)
+                            } else {
+                                egui::Color32::from_rgb(200, 100, 100)
+                            };
+                            if ui.add(egui::Button::new(egui::RichText::new(btn_text).color(btn_color))).clicked() {
+                                ui_state.plugin_ui_events.push((
+                                    "com.ferrite.route-planner".to_string(),
+                                    r#"{"type":"ToggleRendering"}"#.to_string(),
+                                ));
+                            }
+                        });
+                        ui.separator();
+
+                        // Route list section
+                        if let Some(routes) = route_ui.get("routes").and_then(|v| v.as_array()) {
+                            if !routes.is_empty() {
+                                egui::CollapsingHeader::new(egui::RichText::new(format!("Routes ({})", routes.len())).strong())
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        let available_width = ui.available_width();
+                                        for (idx, route) in routes.iter().enumerate() {
+                                            let route_id = route.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                            let name = route.get("name").and_then(|v| v.as_str()).unwrap_or("Route");
+                                            let wp_count = route.get("waypoint_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let dist = route.get("total_distance").and_then(|v| v.as_str()).unwrap_or("0 NM");
+                                            let is_active = route.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                                            let bg_color = if is_active {
+                                                egui::Color32::from_rgb(60, 80, 100)
+                                            } else {
+                                                egui::Color32::from_rgb(45, 55, 72)
+                                            };
+
+                                            // Check if this route is being edited
+                                            let is_editing = ui_state.route_editing.as_ref().is_some_and(|(id, _)| *id == route_id);
+
+                                            let frame_response = egui::Frame::new()
+                                                .fill(bg_color)
+                                                .corner_radius(4.0)
+                                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(available_width - 16.0);
+                                                    ui.horizontal(|ui| {
+                                                        // Route info (left side)
+                                                        ui.vertical(|ui| {
+                                                            if is_editing {
+                                                                // Inline text edit
+                                                                if let Some((_, ref mut edit_text)) = ui_state.route_editing {
+                                                                    let response = ui.add(
+                                                                        egui::TextEdit::singleline(edit_text)
+                                                                            .desired_width(available_width - 80.0)
+                                                                            .font(egui::TextStyle::Body)
+                                                                    );
+                                                                    // Auto-focus on the text field
+                                                                    response.request_focus();
+                                                                    // Confirm on Enter or focus lost
+                                                                    if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                                                        let new_name = edit_text.clone();
+                                                                        let event = format!(
+                                                                            r#"{{"type":"RenameRoute","id":{},"name":"{}"}}"#,
+                                                                            route_id,
+                                                                            new_name.replace('\\', "\\\\").replace('"', "\\\"")
+                                                                        );
+                                                                        ui_state.plugin_ui_events.push((
+                                                                            "com.ferrite.route-planner".to_string(),
+                                                                            event
+                                                                        ));
+                                                                        ui_state.route_editing = None;
+                                                                    }
+                                                                    // Cancel on Escape
+                                                                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                                                        ui_state.route_editing = None;
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                ui.label(egui::RichText::new(name).strong());
+                                                            }
+                                                            ui.label(egui::RichText::new(format!("{} WP • {}", wp_count, dist))
+                                                                .size(11.0)
+                                                                .color(egui::Color32::LIGHT_GRAY));
+                                                        });
+
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            // Delete route button
+                                                            if ui.add(egui::Button::new("X").small()).on_hover_text("Delete route").clicked() {
+                                                                let event = format!(r#"{{"type":"DeleteRoute","id":{}}}"#, route_id);
+                                                                ui_state.plugin_ui_events.push((
+                                                                    "com.ferrite.route-planner".to_string(),
+                                                                    event
+                                                                ));
+                                                            }
+                                                            // Edit route name button
+                                                            if !is_editing
+                                                                && ui.add(egui::Button::new("E").small()).on_hover_text("Rename route").clicked()
+                                                            {
+                                                                ui_state.route_editing = Some((route_id, name.to_string()));
+                                                            }
+                                                        });
+                                                    });
+                                                });
+
+                                            // Make entire frame clickable for selection (except when editing or clicking buttons)
+                                            if !is_editing && frame_response.response.interact(egui::Sense::click()).clicked() && !is_active {
+                                                let event = format!(r#"{{"type":"SelectRoute","index":{}}}"#, idx);
+                                                ui_state.plugin_ui_events.push((
+                                                    "com.ferrite.route-planner".to_string(),
+                                                    event
+                                                ));
+                                            }
+                                            ui.add_space(2.0);
+                                        }
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        }
+
+                        // Active route waypoints
+                        if let Some(_active_idx) = route_ui.get("active_route_index").and_then(|v| v.as_u64()) {
+                            ui.separator();
+
+                            // Waypoint count and total distance for active route
+                            if let Some(count) = route_ui.get("waypoint_count").and_then(|v| v.as_u64()) {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Waypoints:").strong());
+                                    ui.label(format!("{}", count));
+                                });
+                            }
+                            if let Some(dist) = route_ui.get("total_distance").and_then(|v| v.as_str()) {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Total:").strong());
+                                    ui.label(dist);
+                                });
+                            }
+                            ui.add_space(8.0);
+
+                            // Waypoint list with delete and edit buttons
+                            if let Some(waypoints) = route_ui.get("waypoints").and_then(|v| v.as_array()) {
+                                egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                                    let available_width = ui.available_width();
+
+                                    for wp in waypoints {
+                                        let wp_id = wp.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                        let name = wp.get("name").and_then(|v| v.as_str()).unwrap_or("WP");
+                                        let pos = wp.get("position").and_then(|v| v.as_str()).unwrap_or("");
+                                        let leg = wp.get("leg_distance").and_then(|v| v.as_str());
+
+                                        // Check if this waypoint is being edited
+                                        let is_wp_editing = ui_state.waypoint_editing.as_ref().is_some_and(|(id, _)| *id == wp_id);
+
+                                        egui::Frame::new()
+                                            .fill(egui::Color32::from_rgb(45, 55, 72))
+                                            .corner_radius(4.0)
+                                            .inner_margin(egui::Margin::symmetric(8, 4))
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(available_width - 16.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.vertical(|ui| {
+                                                        if is_wp_editing {
+                                                            // Inline text edit for waypoint name
+                                                            if let Some((_, ref mut edit_text)) = ui_state.waypoint_editing {
+                                                                let response = ui.add(
+                                                                    egui::TextEdit::singleline(edit_text)
+                                                                        .desired_width(available_width - 80.0)
+                                                                        .font(egui::TextStyle::Body)
+                                                                );
+                                                                response.request_focus();
+
+                                                                // Confirm on Enter
+                                                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                                                    let event = format!(
+                                                                        r#"{{"type":"RenameWaypoint","id":{},"name":"{}"}}"#,
+                                                                        wp_id,
+                                                                        edit_text.replace('"', "\\\"")
+                                                                    );
+                                                                    ui_state.plugin_ui_events.push((
+                                                                        "com.ferrite.route-planner".to_string(),
+                                                                        event
+                                                                    ));
+                                                                    ui_state.waypoint_editing = None;
+                                                                }
+                                                                // Cancel on Escape
+                                                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                                                    ui_state.waypoint_editing = None;
+                                                                }
+                                                            }
+                                                        } else {
+                                                            ui.label(egui::RichText::new(name).strong());
+                                                        }
+                                                        ui.label(egui::RichText::new(pos).size(11.0).color(egui::Color32::LIGHT_GRAY));
+                                                        if let Some(d) = leg {
+                                                            ui.label(egui::RichText::new(format!("Leg: {}", d)).size(11.0).color(egui::Color32::from_rgb(100, 180, 255)));
+                                                        }
+                                                    });
+
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        // Delete button
+                                                        if ui.add(egui::Button::new("X").small()).on_hover_text("Delete waypoint").clicked() {
+                                                            let event = format!(r#"{{"type":"DeleteWaypoint","id":{}}}"#, wp_id);
+                                                            ui_state.plugin_ui_events.push((
+                                                                "com.ferrite.route-planner".to_string(),
+                                                                event
+                                                            ));
+                                                        }
+                                                        // Edit button
+                                                        if !is_wp_editing
+                                                            && ui.add(egui::Button::new("E").small()).on_hover_text("Rename waypoint").clicked()
+                                                        {
+                                                            ui_state.waypoint_editing = Some((wp_id, name.to_string()));
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                        ui.add_space(2.0);
+                                    }
+                                });
+                            }
+                        } else if route_ui.get("routes").and_then(|v| v.as_array()).is_some_and(|r| r.is_empty()) {
+                            ui.label(egui::RichText::new("No routes. Click 'New' to create one.").size(12.0).color(egui::Color32::GRAY));
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        // Action buttons
+                        if let Some(actions) = route_ui.get("actions").and_then(|v| v.as_array()) {
+                            ui.horizontal_wrapped(|ui| {
+                                for action in actions {
+                                    let id = action.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let label = action.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let enabled = action.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                        let event = match id {
+                                            "new" => r#"{"type":"New"}"#,
+                                            "finish" => r#"{"type":"Finish"}"#,
+                                            "clear" => r#"{"type":"Clear"}"#,
+                                            "export" => r#"{"type":"Export"}"#,
+                                            "import" => r#"{"type":"Import"}"#,
+                                            _ => continue,
+                                        };
+                                        ui_state.plugin_ui_events.push((
+                                            "com.ferrite.route-planner".to_string(),
+                                            event.to_string(),
+                                        ));
+                                    }
+                                }
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        // S-421 Catalogue Settings
+                        egui::CollapsingHeader::new(egui::RichText::new("S-421 Catalogues").strong())
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                // FC Status
+                                ui.horizontal(|ui| {
+                                    ui.label("FC:");
+                                    if let Some(fc) = route_ui.get("fc_status") {
+                                        let loaded = fc.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
+                                        let message = fc.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown");
+                                        let color = if loaded {
+                                            egui::Color32::from_rgb(100, 200, 100)
+                                        } else {
+                                            egui::Color32::from_rgb(200, 100, 100)
+                                        };
+                                        ui.label(egui::RichText::new(message).color(color).size(11.0));
+                                    } else {
+                                        ui.label(egui::RichText::new("Not loaded").color(egui::Color32::GRAY).size(11.0));
+                                    }
+                                });
+
+                                // PC Status
+                                ui.horizontal(|ui| {
+                                    ui.label("PC:");
+                                    if let Some(pc) = route_ui.get("pc_status") {
+                                        let loaded = pc.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
+                                        let message = pc.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown");
+                                        let color = if loaded {
+                                            egui::Color32::from_rgb(100, 200, 100)
+                                        } else {
+                                            egui::Color32::from_rgb(200, 100, 100)
+                                        };
+                                        ui.label(egui::RichText::new(message).color(color).size(11.0));
+                                    } else {
+                                        ui.label(egui::RichText::new("Not loaded").color(egui::Color32::GRAY).size(11.0));
+                                    }
+                                });
+
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Catalogue path: ./Catalogues/*/S-421/").size(10.0).color(egui::Color32::GRAY));
+                            });
+
+                        ui.add_space(4.0);
+
+                        // Instructions based on mode
+                        if editing {
+                            ui.label(egui::RichText::new("Editing Mode:").size(12.0).strong());
+                            ui.label(egui::RichText::new("• Left click: Add waypoint").size(11.0));
+                            ui.label(egui::RichText::new("• Right click: Remove last").size(11.0));
+                            ui.label(egui::RichText::new("• Click 'Finish' when done").size(11.0));
+                        } else if route_ui.get("active_route_index").is_some() {
+                            ui.label(egui::RichText::new("Click 'New' to add another route").size(12.0).color(egui::Color32::GRAY));
+                        } else {
+                            ui.label(egui::RichText::new("Click 'New' to start a route").size(12.0).color(egui::Color32::GRAY));
+                        }
+                    }
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.heading(egui::RichText::new("Route Plan").size(18.0).strong());
+                    });
+                    ui.separator();
+                    ui.label("Loading plugin...");
+                }
+            });
+    }
+
+    /// Draw the Settings dialog
+    fn draw_settings_dialog(ctx: &egui::Context, ui_state: &mut AppUiState) {
+        // Initialize pending settings when dialog opens
+        if ui_state.pending_settings.is_none() {
+            ui_state.pending_settings = Some(ui_state.settings.clone());
+        }
+
+        let mut open = ui_state.show_settings;
+        egui::Window::new("S-101 Display Settings")
+            .collapsible(false)
+            .resizable(false)
+            .min_width(400.0)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                // Get mutable reference to pending settings
+                let pending = ui_state.pending_settings.as_mut().unwrap();
+
+                ui.add_space(4.0);
+
+                // Display Mode section
+                ui.heading("Display Mode");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Mode:");
+                    ui.add_space(8.0);
+                    let modes = [DisplayMode::Base, DisplayMode::Standard, DisplayMode::All];
+                    for mode in modes {
+                        if ui
+                            .selectable_label(pending.display_mode == mode, mode.as_str())
+                            .clicked()
+                        {
+                            pending.display_mode = mode;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(match pending.display_mode {
+                        DisplayMode::Base => "Essential navigation information only",
+                        DisplayMode::Standard => "Default operational display",
+                        DisplayMode::All => "All available chart information",
+                    })
+                    .size(11.0)
+                    .color(egui::Color32::GRAY),
+                );
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Depth Contours section
+                ui.heading("Depth Contours (meters)");
+                ui.add_space(4.0);
+
+                egui::Grid::new("depth_contours_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        // Safety Depth
+                        ui.label("Safety Depth:");
+                        ui.add(
+                            egui::DragValue::new(&mut pending.safety_depth)
+                                .speed(0.5)
+                                .range(0.0..=1000.0)
+                                .suffix(" m"),
+                        );
+                        ui.end_row();
+
+                        // Safety Contour
+                        ui.label("Safety Contour:");
+                        ui.add(
+                            egui::DragValue::new(&mut pending.safety_contour)
+                                .speed(0.5)
+                                .range(0.0..=1000.0)
+                                .suffix(" m"),
+                        );
+                        ui.end_row();
+
+                        // Shallow Contour
+                        ui.label("Shallow Contour:");
+                        ui.add(
+                            egui::DragValue::new(&mut pending.shallow_contour)
+                                .speed(0.5)
+                                .range(0.0..=1000.0)
+                                .suffix(" m"),
+                        );
+                        ui.end_row();
+
+                        // Deep Contour
+                        ui.label("Deep Contour:");
+                        ui.add(
+                            egui::DragValue::new(&mut pending.deep_contour)
+                                .speed(0.5)
+                                .range(0.0..=1000.0)
+                                .suffix(" m"),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Display Options section
+                ui.heading("Display Options");
+                ui.add_space(4.0);
+
+                egui::Grid::new("display_options_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 6.0])
+                    .show(ui, |ui| {
+                        // Two Shades
+                        ui.checkbox(&mut pending.two_shades, "Two Shades")
+                            .on_hover_text("Simplified two-color depth shading");
+
+                        // Simplified Symbols
+                        ui.checkbox(&mut pending.simplified_symbols, "Simplified Symbols")
+                            .on_hover_text(
+                                "Use simplified point symbols instead of paper chart symbols",
+                            );
+                        ui.end_row();
+
+                        // Isolated Dangers
+                        ui.checkbox(&mut pending.isolated_dangers, "Isolated Dangers")
+                            .on_hover_text("Highlight isolated dangers in shallow water");
+
+                        // Full Light Sectors
+                        ui.checkbox(&mut pending.full_light_sectors, "Full Light Sectors")
+                            .on_hover_text("Show complete light sector arcs");
+                        ui.end_row();
+
+                        // Ignore Scale Minimum
+                        ui.checkbox(&mut pending.ignore_scale_minimum, "Ignore Scale Min")
+                            .on_hover_text(
+                                "Display features regardless of scale minimum attribute",
+                            );
+
+                        // Plain Boundaries
+                        ui.checkbox(&mut pending.plain_boundaries, "Plain Boundaries")
+                            .on_hover_text("Use plain lines instead of symbolized boundaries");
+                        ui.end_row();
+                    });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Check if settings have been modified
+                let has_changes = ui_state.pending_settings.as_ref() != Some(&ui_state.settings);
+
+                // Buttons
+                ui.horizontal(|ui| {
+                    if ui.button("Reset to Defaults").clicked() {
+                        ui_state.pending_settings = Some(SettingsState::default());
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            ui_state.pending_settings = None;
+                            ui_state.show_settings = false;
+                        }
+
+                        // Apply button - only enabled if there are changes
+                        let apply_btn = ui.add_enabled(has_changes, egui::Button::new("Apply"));
+                        if apply_btn.clicked() {
+                            if let Some(pending) = ui_state.pending_settings.take() {
+                                ui_state.settings = pending;
+                                ui_state.settings_changed = true;
+                                ui_state.pending_settings = Some(ui_state.settings.clone());
+                            }
+                        }
+                    });
+                });
+            });
+
+        // Handle window close via X button
+        if !open {
+            ui_state.pending_settings = None;
+            ui_state.show_settings = false;
         }
     }
 

@@ -1,0 +1,11 @@
+{
+  "id": "com.ferrite.route-planner",
+  "name": "Route Planner",
+  "version": "0.1.0",
+  "author": "FerriteS100 Team",
+  "description": "S-421 Route Planning - Add waypoints, measure distances, export routes",
+  "dll_file": "route_plugin.dll",
+  "min_host_version": "0.2.0",
+  "dll_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "enabled": true
+}
