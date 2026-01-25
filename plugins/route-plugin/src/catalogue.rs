@@ -85,6 +85,10 @@ pub struct LineStyleInfo {
     pub id: String,
     pub width: f32,
     pub color_token: String,
+    /// Dash pattern: [(start, length), ...]
+    pub dashes: Vec<(f32, f32)>,
+    /// Interval length for dash pattern (0 = solid)
+    pub interval_length: f32,
 }
 
 /// Color information
@@ -275,6 +279,18 @@ impl CatalogueManager {
             .and_then(|pc| pc.colors.get(token))
             .map(|c| (c.r, c.g, c.b))
     }
+
+    /// Get color as RGBA u32 (0xRRGGBBAA format)
+    pub fn get_color_rgba(&self, token: &str) -> Option<u32> {
+        self.get_color(token).map(|(r, g, b)| {
+            ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF
+        })
+    }
+
+    /// Get line style by ID
+    pub fn get_line_style(&self, id: &str) -> Option<&LineStyleInfo> {
+        self.pc.as_ref().and_then(|pc| pc.line_styles.get(id))
+    }
 }
 
 /// Parse Feature Catalogue XML
@@ -394,8 +410,10 @@ fn parse_portrayal_catalogue(path: &Path) -> Result<S421PortrayalCatalogue, Stri
     let mut buf = Vec::new();
     let mut current_element = String::new();
 
-    // Also scan for symbol files in the Symbols directory
-    let symbols_dir = path.parent().unwrap_or(Path::new(".")).join("Symbols");
+    let pc_dir = path.parent().unwrap_or(Path::new("."));
+
+    // Scan for symbol files in the Symbols directory
+    let symbols_dir = pc_dir.join("Symbols");
     if symbols_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&symbols_dir) {
             for entry in entries.filter_map(|e| e.ok()) {
@@ -409,6 +427,35 @@ fn parse_portrayal_catalogue(path: &Path) -> Result<S421PortrayalCatalogue, Stri
                                 file_path: path.display().to_string(),
                             },
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse ColorProfile from ColorProfiles directory
+    let color_profile_path = pc_dir.join("ColorProfiles").join("colorProfile.xml");
+    if color_profile_path.exists() {
+        if let Ok(colors) = parse_color_profile(&color_profile_path) {
+            pc.colors = colors;
+        }
+    }
+
+    // Parse LineStyles from LineStyles directory
+    let line_styles_dir = pc_dir.join("LineStyles");
+    if line_styles_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&line_styles_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().map(|e| e == "xml").unwrap_or(false) {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        // Skip sample files
+                        if stem.starts_with("s100") {
+                            continue;
+                        }
+                        if let Ok(style) = parse_line_style(&path, stem) {
+                            pc.line_styles.insert(stem.to_string(), style);
+                        }
                     }
                 }
             }
@@ -440,6 +487,184 @@ fn parse_portrayal_catalogue(path: &Path) -> Result<S421PortrayalCatalogue, Stri
     }
 
     Ok(pc)
+}
+
+/// Parse ColorProfile XML (Day palette)
+fn parse_color_profile(path: &Path) -> Result<HashMap<String, ColorInfo>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read color profile: {}", e))?;
+
+    let mut reader = Reader::from_str(&content);
+    reader.config_mut().trim_text(true);
+
+    let mut colors = HashMap::new();
+    let mut buf = Vec::new();
+    let mut current_element = String::new();
+    let mut current_token = String::new();
+    let mut in_day_palette = false;
+    let mut in_item = false;
+    let mut in_srgb = false;
+    let mut r: u8 = 0;
+    let mut g: u8 = 0;
+    let mut b: u8 = 0;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                current_element = name.clone();
+
+                match name.as_str() {
+                    "palette" => {
+                        // Check if it's the Day palette
+                        for attr in e.attributes().filter_map(|a| a.ok()) {
+                            if attr.key.as_ref() == b"name" {
+                                let value = String::from_utf8_lossy(&attr.value).to_string();
+                                in_day_palette = value == "Day";
+                            }
+                        }
+                    }
+                    "item" if in_day_palette => {
+                        in_item = true;
+                        // Get token attribute
+                        for attr in e.attributes().filter_map(|a| a.ok()) {
+                            if attr.key.as_ref() == b"token" {
+                                current_token = String::from_utf8_lossy(&attr.value).to_string();
+                            }
+                        }
+                    }
+                    "srgb" if in_item => {
+                        in_srgb = true;
+                        r = 0;
+                        g = 0;
+                        b = 0;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if in_srgb {
+                    let text = e.unescape().unwrap_or_default().to_string();
+                    match current_element.as_str() {
+                        "red" => r = text.parse().unwrap_or(0),
+                        "green" => g = text.parse().unwrap_or(0),
+                        "blue" => b = text.parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match name.as_str() {
+                    "palette" => in_day_palette = false,
+                    "item" => {
+                        if in_item && !current_token.is_empty() {
+                            colors.insert(
+                                current_token.clone(),
+                                ColorInfo {
+                                    token: current_token.clone(),
+                                    r,
+                                    g,
+                                    b,
+                                },
+                            );
+                        }
+                        in_item = false;
+                        current_token.clear();
+                    }
+                    "srgb" => in_srgb = false,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(colors)
+}
+
+/// Parse LineStyle XML
+fn parse_line_style(path: &Path, id: &str) -> Result<LineStyleInfo, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read line style: {}", e))?;
+
+    let mut reader = Reader::from_str(&content);
+    reader.config_mut().trim_text(true);
+
+    let mut style = LineStyleInfo {
+        id: id.to_string(),
+        width: 0.64, // default
+        color_token: String::new(),
+        dashes: Vec::new(),
+        interval_length: 0.0,
+    };
+
+    let mut buf = Vec::new();
+    let mut current_element = String::new();
+    let mut in_pen = false;
+    let mut in_dash = false;
+    let mut dash_start: f32 = 0.0;
+    let mut dash_length: f32 = 0.0;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                current_element = name.clone();
+
+                match name.as_str() {
+                    "pen" => {
+                        in_pen = true;
+                        // Get width attribute
+                        for attr in e.attributes().filter_map(|a| a.ok()) {
+                            if attr.key.as_ref() == b"width" {
+                                let value = String::from_utf8_lossy(&attr.value).to_string();
+                                style.width = value.parse().unwrap_or(0.64);
+                            }
+                        }
+                    }
+                    "dash" => {
+                        in_dash = true;
+                        dash_start = 0.0;
+                        dash_length = 0.0;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) => {
+                let text = e.unescape().unwrap_or_default().to_string();
+                match current_element.as_str() {
+                    "color" if in_pen => style.color_token = text,
+                    "intervalLength" => style.interval_length = text.parse().unwrap_or(0.0),
+                    "start" if in_dash => dash_start = text.parse().unwrap_or(0.0),
+                    "length" if in_dash => dash_length = text.parse().unwrap_or(0.0),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match name.as_str() {
+                    "pen" => in_pen = false,
+                    "dash" => {
+                        if in_dash && dash_length > 0.0 {
+                            style.dashes.push((dash_start, dash_length));
+                        }
+                        in_dash = false;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(style)
 }
 
 #[cfg(test)]
