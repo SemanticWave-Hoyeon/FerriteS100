@@ -10,3 +10,4 @@ bytes.workspace = true
 encoding_rs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+memmap2.workspace = true

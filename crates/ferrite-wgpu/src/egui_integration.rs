@@ -495,17 +495,25 @@ impl EguiIntegration {
                             }
                         });
 
-                    // Plugin toolbar buttons
+                    // Plugin toolbar buttons (disabled when no chart loaded)
                     if !ui_state.plugin_buttons.is_empty() {
                         ui.separator();
+                        let chart_loaded = ui_state.chart_count > 0;
                         for btn in &ui_state.plugin_buttons {
                             let button = egui::Button::new(&btn.label).selected(btn.active);
-                            let response = if let Some(ref tooltip) = btn.tooltip {
-                                ui.add(button).on_hover_text(tooltip)
+                            let tooltip_text = if chart_loaded {
+                                btn.tooltip.clone()
                             } else {
-                                ui.add(button)
+                                Some("Load a chart first".to_string())
                             };
-                            if response.clicked() {
+                            let response = ui.add_enabled(chart_loaded || btn.active, button);
+                            let response = if let Some(ref tooltip) = tooltip_text {
+                                response.on_hover_text(tooltip)
+                            } else {
+                                response
+                            };
+                            // Only allow toggling if chart is loaded (or deactivating an active plugin)
+                            if response.clicked() && (chart_loaded || btn.active) {
                                 ui_state.plugin_toggle_requested = Some(btn.plugin_id.clone());
                             }
                         }
@@ -962,6 +970,9 @@ impl EguiIntegration {
                                             // Check if this route is being edited
                                             let is_editing = ui_state.route_editing.as_ref().is_some_and(|(id, _)| *id == route_id);
 
+                                            // Track button clicks to prevent frame from consuming them
+                                            let mut button_clicked = false;
+
                                             let frame_response = egui::Frame::new()
                                                 .fill(bg_color)
                                                 .corner_radius(4.0)
@@ -1009,8 +1020,10 @@ impl EguiIntegration {
                                                         });
 
                                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                            // Delete route button
-                                                            if ui.add(egui::Button::new("X").small()).on_hover_text("Delete route").clicked() {
+                                                            // Delete route button - use sense to capture click properly
+                                                            let delete_btn = ui.add(egui::Button::new("X").small().sense(egui::Sense::click()));
+                                                            if delete_btn.on_hover_text("Delete route").clicked() {
+                                                                button_clicked = true;
                                                                 let event = format!(r#"{{"type":"DeleteRoute","id":{}}}"#, route_id);
                                                                 ui_state.plugin_ui_events.push((
                                                                     "com.ferrite.route-planner".to_string(),
@@ -1018,17 +1031,19 @@ impl EguiIntegration {
                                                                 ));
                                                             }
                                                             // Edit route name button
-                                                            if !is_editing
-                                                                && ui.add(egui::Button::new("E").small()).on_hover_text("Rename route").clicked()
-                                                            {
-                                                                ui_state.route_editing = Some((route_id, name.to_string()));
+                                                            if !is_editing {
+                                                                let edit_btn = ui.add(egui::Button::new("E").small().sense(egui::Sense::click()));
+                                                                if edit_btn.on_hover_text("Rename route").clicked() {
+                                                                    button_clicked = true;
+                                                                    ui_state.route_editing = Some((route_id, name.to_string()));
+                                                                }
                                                             }
                                                         });
                                                     });
                                                 });
 
                                             // Make entire frame clickable for selection (except when editing or clicking buttons)
-                                            if !is_editing && frame_response.response.interact(egui::Sense::click()).clicked() && !is_active {
+                                            if !is_editing && !button_clicked && frame_response.response.clicked() && !is_active {
                                                 let event = format!(r#"{{"type":"SelectRoute","index":{}}}"#, idx);
                                                 ui_state.plugin_ui_events.push((
                                                     "com.ferrite.route-planner".to_string(),
@@ -1121,8 +1136,9 @@ impl EguiIntegration {
                                                     });
 
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        // Delete button
-                                                        if ui.add(egui::Button::new("X").small()).on_hover_text("Delete waypoint").clicked() {
+                                                        // Delete button - use sense to capture click properly
+                                                        let delete_btn = ui.add(egui::Button::new("X").small().sense(egui::Sense::click()));
+                                                        if delete_btn.on_hover_text("Delete waypoint").clicked() {
                                                             let event = format!(r#"{{"type":"DeleteWaypoint","id":{}}}"#, wp_id);
                                                             ui_state.plugin_ui_events.push((
                                                                 "com.ferrite.route-planner".to_string(),
@@ -1130,10 +1146,11 @@ impl EguiIntegration {
                                                             ));
                                                         }
                                                         // Edit button
-                                                        if !is_wp_editing
-                                                            && ui.add(egui::Button::new("E").small()).on_hover_text("Rename waypoint").clicked()
-                                                        {
-                                                            ui_state.waypoint_editing = Some((wp_id, name.to_string()));
+                                                        if !is_wp_editing {
+                                                            let edit_btn = ui.add(egui::Button::new("E").small().sense(egui::Sense::click()));
+                                                            if edit_btn.on_hover_text("Rename waypoint").clicked() {
+                                                                ui_state.waypoint_editing = Some((wp_id, name.to_string()));
+                                                            }
                                                         }
                                                     });
                                                 });

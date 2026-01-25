@@ -308,6 +308,26 @@ impl PluginSystem {
         self.manager.shutdown_all();
     }
 
+    /// Deactivate all plugins (close panels)
+    pub fn deactivate_all_plugins(&mut self) {
+        // Collect plugin IDs first to avoid borrow issues
+        let plugin_ids: Vec<String> = self
+            .manager
+            .loaded_plugins()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+
+        for plugin_id in plugin_ids {
+            if let Some(plugin) = self.manager.get_plugin_mut(&plugin_id) {
+                if plugin.is_active() {
+                    plugin.set_active(false);
+                    debug!("Plugin {} deactivated", plugin_id);
+                }
+            }
+        }
+    }
+
     /// Get UI data from active plugins (JSON)
     pub fn get_active_plugin_ui_data(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
