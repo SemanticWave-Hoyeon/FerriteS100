@@ -922,6 +922,38 @@ impl PortrayalCatalogue {
     pub fn get_context_parameter(&self, id: &str) -> Option<&ContextParameter> {
         self.rules.context_parameters.get(id)
     }
+
+    /// Check if a viewing group is visible for a given display mode
+    ///
+    /// # Arguments
+    /// * `viewing_group_id` - The viewing group ID (e.g., 21010 for DISPLBASE)
+    /// * `display_mode_id` - The display mode ID ("DisplayBase", "StandardDisplay", "OtherInformation")
+    ///
+    /// # Returns
+    /// `true` if the viewing group should be displayed in the given mode
+    pub fn is_viewing_group_visible(&self, viewing_group_id: u32, display_mode_id: &str) -> bool {
+        crate::viewing::is_viewing_group_visible(
+            viewing_group_id,
+            display_mode_id,
+            &self.viewing_group_layers,
+            &self.display_modes,
+        )
+    }
+
+    /// Get the display mode ID for a given mode type
+    ///
+    /// # Arguments
+    /// * `mode` - 0 = Base, 1 = Standard, 2 = All
+    ///
+    /// # Returns
+    /// The display mode ID string
+    pub fn get_display_mode_id(mode: u8) -> &'static str {
+        match mode {
+            0 => "DisplayBase",
+            1 => "StandardDisplay",
+            _ => "OtherInformation",
+        }
+    }
 }
 
 /// Get local name without namespace prefix

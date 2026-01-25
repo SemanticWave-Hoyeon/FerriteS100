@@ -1,0 +1,3 @@
+cargo:rustc-link-arg=/DYNAMICBASE
+cargo:rustc-link-arg=/NXCOMPAT
+cargo:rustc-link-arg=/HIGHENTROPYVA

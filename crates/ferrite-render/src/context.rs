@@ -154,6 +154,12 @@ impl RenderContext {
         self.scaler.set_viewport(Viewport::new(width, height));
     }
 
+    /// Set viewport with origin (for UI panel-aware rendering)
+    pub fn set_viewport_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        self.scaler
+            .set_viewport(Viewport::with_origin(x, y, width, height));
+    }
+
     /// Set geographic bounds
     pub fn set_bounds(&mut self, bounds: GeoBounds) {
         self.scaler.set_bounds(bounds);
@@ -220,6 +226,15 @@ impl RenderContext {
     /// Get total instruction count
     pub fn instruction_count(&self) -> usize {
         self.instructions.len()
+    }
+
+    /// Truncate instructions to a specific count
+    /// Used to remove plugin instructions while keeping chart instructions
+    pub fn truncate_instructions(&mut self, count: usize) {
+        if count < self.instructions.len() {
+            self.instructions.truncate(count);
+            self.sorted = false;
+        }
     }
 
     /// Get statistics about collected instructions

@@ -8,10 +8,15 @@ members = [
     "crates/ferrite-render",
     "crates/ferrite-wgpu",
     "crates/ferrite-lua",
+    "crates/ferrite-plugin-api",
+    "crates/ferrite-plugin-loader",
+]
+exclude = [
+    "plugins/*",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/user/ferrite-s100"
@@ -61,6 +66,13 @@ rfd = "0.15"  # Native file dialogs
 # Scripting
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 
+# Plugin system
+abi_stable = "0.11"
+libloading = "0.8"
+ed25519-dalek = { version = "2", features = ["std"] }
+sha2 = "0.10"
+serde_json = "1"
+
 # Internal crates
 ferrite-iso8211 = { path = "crates/ferrite-iso8211" }
 ferrite-s100-core = { path = "crates/ferrite-s100-core" }
@@ -69,6 +81,8 @@ ferrite-portrayal-catalog = { path = "crates/ferrite-portrayal-catalog" }
 ferrite-render = { path = "crates/ferrite-render" }
 ferrite-wgpu = { path = "crates/ferrite-wgpu" }
 ferrite-lua = { path = "crates/ferrite-lua" }
+ferrite-plugin-api = { path = "crates/ferrite-plugin-api" }
+ferrite-plugin-loader = { path = "crates/ferrite-plugin-loader" }
 
 [package]
 name = "ferrite-s100"
@@ -90,6 +104,9 @@ ferrite-portrayal-catalog.workspace = true
 ferrite-render.workspace = true
 ferrite-wgpu.workspace = true
 ferrite-lua.workspace = true
+ferrite-plugin-api.workspace = true
+ferrite-plugin-loader.workspace = true
+abi_stable.workspace = true
 winit.workspace = true
 pollster.workspace = true
 tracing.workspace = true
@@ -103,6 +120,14 @@ rfd.workspace = true
 image.workspace = true
 rayon.workspace = true
 
+# Windows system APIs (for debug info)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
+
 # Release profile: maximum optimizations
 [profile.release]
 opt-level = 3          # Maximum optimization
@@ -110,6 +135,10 @@ lto = "thin"           # Link-time optimization (thin is faster to compile than 
 codegen-units = 1      # Single codegen unit for better optimization
 strip = "symbols"      # Strip symbols for smaller binary
 panic = "abort"        # Abort on panic (smaller binary, faster)
+
+# Static link C runtime for standalone executable (no VC++ Redistributable needed)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
 
 # Development profile: faster compile, some optimization for usable performance
 [profile.dev]
