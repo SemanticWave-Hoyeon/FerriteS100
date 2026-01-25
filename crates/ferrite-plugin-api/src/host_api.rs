@@ -1,0 +1,225 @@
+//! Host API - Sandboxed interface for plugins to interact with host
+//!
+//! This API is the ONLY way plugins can interact with the host application.
+//! Direct file system, network, or system access is not available to plugins.
+
+use abi_stable::{
+    std_types::{ROption, RStr, RString, RVec},
+    StableAbi,
+};
+
+use crate::GeoBounds;
+
+/// Log level for plugin logging
+#[repr(C)]
+#[derive(StableAbi, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
+    Warn = 3,
+    Error = 4,
+}
+
+/// File filter for file dialogs
+#[repr(C)]
+#[derive(StableAbi, Clone, Debug)]
+pub struct FileFilter {
+    /// Filter name (e.g., "S-421 Route Files")
+    pub name: RString,
+    /// File extensions (e.g., ["gml", "xml"])
+    pub extensions: RVec<RString>,
+}
+
+/// Host API provided to plugins
+///
+/// This is the sandboxed interface that plugins use to interact with the host.
+/// Plugins cannot access the file system, network, or system directly.
+#[repr(C)]
+#[derive(StableAbi, Clone)]
+pub struct HostApi {
+    /// Internal pointer to host context (opaque to plugin)
+    pub context: *const (),
+
+    /// Log a message through the host's logging system
+    pub log: extern "C" fn(ctx: *const (), level: LogLevel, message: RStr<'_>),
+
+    /// Get current chart bounds (if a chart is loaded)
+    pub get_chart_bounds: extern "C" fn(ctx: *const ()) -> ROption<GeoBounds>,
+
+    /// Get current zoom level
+    pub get_zoom_level: extern "C" fn(ctx: *const ()) -> f64,
+
+    /// Get current display scale (pixels per degree)
+    pub get_display_scale: extern "C" fn(ctx: *const ()) -> f64,
+
+    /// Request to save a file (host shows save dialog)
+    /// Returns true if save was successful
+    pub request_file_save: extern "C" fn(
+        ctx: *const (),
+        filter: FileFilter,
+        default_name: RStr<'_>,
+        data: RStr<'_>,
+    ) -> bool,
+
+    /// Request to open a file (host shows open dialog)
+    /// Returns file contents if successful
+    pub request_file_open: extern "C" fn(ctx: *const (), filter: FileFilter) -> ROption<RString>,
+
+    /// Save plugin configuration (host manages storage)
+    pub save_config:
+        extern "C" fn(ctx: *const (), plugin_id: RStr<'_>, config_json: RStr<'_>) -> bool,
+
+    /// Load plugin configuration
+    pub load_config: extern "C" fn(ctx: *const (), plugin_id: RStr<'_>) -> ROption<RString>,
+
+    /// Request UI refresh (re-render plugin panel)
+    pub request_ui_refresh: extern "C" fn(ctx: *const ()),
+
+    /// Request chart redraw (re-render plugin drawings)
+    pub request_chart_redraw: extern "C" fn(ctx: *const ()),
+
+    /// Show a toast notification
+    pub show_toast: extern "C" fn(ctx: *const (), message: RStr<'_>, is_error: bool),
+}
+
+// SAFETY: HostApi contains only function pointers and a context pointer
+// that are valid for the lifetime of the plugin
+unsafe impl Send for HostApi {}
+unsafe impl Sync for HostApi {}
+
+impl HostApi {
+    /// Log a trace message
+    pub fn trace(&self, message: &str) {
+        (self.log)(self.context, LogLevel::Trace, RStr::from(message));
+    }
+
+    /// Log a debug message
+    pub fn debug(&self, message: &str) {
+        (self.log)(self.context, LogLevel::Debug, RStr::from(message));
+    }
+
+    /// Log an info message
+    pub fn info(&self, message: &str) {
+        (self.log)(self.context, LogLevel::Info, RStr::from(message));
+    }
+
+    /// Log a warning message
+    pub fn warn(&self, message: &str) {
+        (self.log)(self.context, LogLevel::Warn, RStr::from(message));
+    }
+
+    /// Log an error message
+    pub fn error(&self, message: &str) {
+        (self.log)(self.context, LogLevel::Error, RStr::from(message));
+    }
+
+    /// Get chart bounds
+    pub fn chart_bounds(&self) -> Option<GeoBounds> {
+        (self.get_chart_bounds)(self.context).into_option()
+    }
+
+    /// Get zoom level
+    pub fn zoom_level(&self) -> f64 {
+        (self.get_zoom_level)(self.context)
+    }
+
+    /// Get display scale
+    pub fn display_scale(&self) -> f64 {
+        (self.get_display_scale)(self.context)
+    }
+
+    /// Save file with dialog
+    pub fn save_file(&self, filter: FileFilter, default_name: &str, data: &str) -> bool {
+        (self.request_file_save)(
+            self.context,
+            filter,
+            RStr::from(default_name),
+            RStr::from(data),
+        )
+    }
+
+    /// Open file with dialog
+    pub fn open_file(&self, filter: FileFilter) -> Option<String> {
+        (self.request_file_open)(self.context, filter)
+            .into_option()
+            .map(|s| s.into_string())
+    }
+
+    /// Save plugin config
+    pub fn save_plugin_config(&self, plugin_id: &str, config_json: &str) -> bool {
+        (self.save_config)(self.context, RStr::from(plugin_id), RStr::from(config_json))
+    }
+
+    /// Load plugin config
+    pub fn load_plugin_config(&self, plugin_id: &str) -> Option<String> {
+        (self.load_config)(self.context, RStr::from(plugin_id))
+            .into_option()
+            .map(|s| s.into_string())
+    }
+
+    /// Request UI panel refresh
+    pub fn refresh_ui(&self) {
+        (self.request_ui_refresh)(self.context);
+    }
+
+    /// Request chart redraw
+    pub fn redraw_chart(&self) {
+        (self.request_chart_redraw)(self.context);
+    }
+
+    /// Show toast notification
+    pub fn toast(&self, message: &str) {
+        (self.show_toast)(self.context, RStr::from(message), false);
+    }
+
+    /// Show error toast notification
+    pub fn toast_error(&self, message: &str) {
+        (self.show_toast)(self.context, RStr::from(message), true);
+    }
+}
+
+/// Create a dummy HostApi for testing
+#[cfg(test)]
+pub fn dummy_host_api() -> HostApi {
+    extern "C" fn dummy_log(_: *const (), _: LogLevel, _: RStr<'_>) {}
+    extern "C" fn dummy_bounds(_: *const ()) -> ROption<GeoBounds> {
+        ROption::RNone
+    }
+    extern "C" fn dummy_zoom(_: *const ()) -> f64 {
+        1.0
+    }
+    extern "C" fn dummy_scale(_: *const ()) -> f64 {
+        1.0
+    }
+    extern "C" fn dummy_save(_: *const (), _: FileFilter, _: RStr<'_>, _: RStr<'_>) -> bool {
+        false
+    }
+    extern "C" fn dummy_open(_: *const (), _: FileFilter) -> ROption<RString> {
+        ROption::RNone
+    }
+    extern "C" fn dummy_save_config(_: *const (), _: RStr<'_>, _: RStr<'_>) -> bool {
+        false
+    }
+    extern "C" fn dummy_load_config(_: *const (), _: RStr<'_>) -> ROption<RString> {
+        ROption::RNone
+    }
+    extern "C" fn dummy_refresh(_: *const ()) {}
+    extern "C" fn dummy_redraw(_: *const ()) {}
+    extern "C" fn dummy_toast(_: *const (), _: RStr<'_>, _: bool) {}
+
+    HostApi {
+        context: std::ptr::null(),
+        log: dummy_log,
+        get_chart_bounds: dummy_bounds,
+        get_zoom_level: dummy_zoom,
+        get_display_scale: dummy_scale,
+        request_file_save: dummy_save,
+        request_file_open: dummy_open,
+        save_config: dummy_save_config,
+        load_config: dummy_load_config,
+        request_ui_refresh: dummy_refresh,
+        request_chart_redraw: dummy_redraw,
+        show_toast: dummy_toast,
+    }
+}

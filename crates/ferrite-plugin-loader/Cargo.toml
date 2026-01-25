@@ -1,0 +1,16 @@
+[package]
+name = "ferrite-plugin-loader"
+version.workspace = true
+edition.workspace = true
+description = "Plugin loader with security verification for FerriteS100"
+
+[dependencies]
+ferrite-plugin-api = { path = "../ferrite-plugin-api" }
+abi_stable.workspace = true
+libloading.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

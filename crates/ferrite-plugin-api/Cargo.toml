@@ -1,0 +1,8 @@
+[package]
+name = "ferrite-plugin-api"
+version.workspace = true
+edition.workspace = true
+description = "ABI-stable plugin API for FerriteS100"
+
+[dependencies]
+abi_stable = "0.11"
