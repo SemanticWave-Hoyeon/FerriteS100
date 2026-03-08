@@ -17,6 +17,30 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+/// Show a native Windows error dialog (release mode only, no-op on other platforms)
+#[cfg(all(windows, not(debug_assertions)))]
+fn show_error_dialog(title: &str, message: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let wide_title: Vec<u16> = std::ffi::OsStr::new(title)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_msg: Vec<u16> = std::ffi::OsStr::new(message)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut() as _,
+            wide_msg.as_ptr(),
+            wide_title.as_ptr(),
+            MB_ICONERROR | MB_OK,
+        );
+    }
+}
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -984,12 +1008,24 @@ impl ApplicationHandler for ChartApp {
                             self.renderer = Some(renderer);
                         }
                         Err(e) => {
-                            error!("Failed to create renderer: {}", e);
+                            let msg = format!(
+                                "Failed to initialize GPU renderer:\n\n{}\n\n\
+                                 This may be caused by missing or outdated graphics drivers.",
+                                e
+                            );
+                            error!("{}", msg);
+                            #[cfg(all(windows, not(debug_assertions)))]
+                            show_error_dialog("FerriteS100 - Renderer Error", &msg);
+                            event_loop.exit();
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Failed to create window: {}", e);
+                    let msg = format!("Failed to create window:\n\n{}", e);
+                    error!("{}", msg);
+                    #[cfg(all(windows, not(debug_assertions)))]
+                    show_error_dialog("FerriteS100 - Window Error", &msg);
+                    event_loop.exit();
                 }
             }
         }
@@ -1710,7 +1746,44 @@ impl ApplicationHandler for ChartApp {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    // Install panic hook to show error dialog in release mode (no console window)
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let message = if let Some(msg) = info.payload().downcast_ref::<&str>() {
+                format!("FerriteS100 crashed:\n\n{}", msg)
+            } else if let Some(msg) = info.payload().downcast_ref::<String>() {
+                format!("FerriteS100 crashed:\n\n{}", msg)
+            } else {
+                "FerriteS100 crashed with an unknown error.".to_string()
+            };
+            let message = if let Some(loc) = info.location() {
+                format!("{}\n\nLocation: {}:{}", message, loc.file(), loc.line())
+            } else {
+                message
+            };
+            show_error_dialog("FerriteS100 - Fatal Error", &message);
+            default_hook(info);
+        }));
+    }
+
+    if let Err(e) = run_app() {
+        let msg = format!("FerriteS100 failed to start:\n\n{:?}", e);
+        error!("{}", msg);
+
+        #[cfg(all(windows, not(debug_assertions)))]
+        show_error_dialog("FerriteS100 - Startup Error", &msg);
+
+        #[cfg(any(not(windows), debug_assertions))]
+        eprintln!("{}", msg);
+
+        std::process::exit(1);
+    }
+}
+
+fn run_app() -> Result<()> {
     let config = AppConfig::from_args();
 
     // Initialize logging only in debug mode
