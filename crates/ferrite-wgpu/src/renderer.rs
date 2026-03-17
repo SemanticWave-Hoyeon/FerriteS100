@@ -1635,13 +1635,14 @@ impl WgpuRenderer {
         let (scale_x, scale_y, offset_x, offset_y, min_x, max_y) = transform;
 
         // Screen-space bounds for triangle culling: skip triangles with any vertex
-        // beyond this range to prevent GPU rasterizer ray artifacts at high zoom.
-        let guard = 100.0_f32;
-        let (vp_w, vp_h) = self.state.viewport_size();
-        let bound_min_x = -guard;
-        let bound_min_y = -guard;
-        let bound_max_x = vp_w + guard;
-        let bound_max_y = vp_h + guard;
+        // beyond extreme range to prevent f32 precision artifacts in the GPU rasterizer.
+        // Must be large enough to cover nearby off-screen triangles (needed for complete fills)
+        // but small enough to reject extreme coordinates (±50000px at 50x zoom).
+        let extreme_guard = 16000.0_f32;
+        let bound_min_x = -extreme_guard;
+        let bound_min_y = -extreme_guard;
+        let bound_max_x = extreme_guard;
+        let bound_max_y = extreme_guard;
 
         // Transform all vertices to screen space (store raw coordinates)
         let vertex_start = self.area_vertices.len();
@@ -1817,12 +1818,11 @@ impl WgpuRenderer {
         let shear_screen = shear;
 
         // Triangle guard bounds: skip triangles with extreme off-screen vertices
-        let guard = 100.0_f32;
-        let (vp_w, vp_h) = self.state.viewport_size();
-        let bnd_min_x = -guard;
-        let bnd_min_y = -guard;
-        let bnd_max_x = vp_w + guard;
-        let bnd_max_y = vp_h + guard;
+        let extreme_guard = 16000.0_f32;
+        let bnd_min_x = -extreme_guard;
+        let bnd_min_y = -extreme_guard;
+        let bnd_max_x = extreme_guard;
+        let bnd_max_y = extreme_guard;
 
         let base_index = self.pattern_vertices.len() as u32;
         let total_points = coords.len() / 2;
@@ -2306,8 +2306,25 @@ impl WgpuRenderer {
                 continue;
             }
 
-            // Clip line segment to screen bounds using Cohen-Sutherland.
-            // Prevents extreme off-screen coordinates from reaching the GPU.
+            // Two-stage line culling:
+            // 1) Reject segments where EITHER endpoint is extremely far off-screen.
+            //    At high zoom, polyline vertices can be thousands of pixels apart.
+            //    Clipping these would create "ray" stubs from on-screen to viewport edge.
+            let far_limit = 16000.0_f32;
+            if prev.x < -far_limit
+                || prev.x > far_limit
+                || prev.y < -far_limit
+                || prev.y > far_limit
+                || curr.x < -far_limit
+                || curr.x > far_limit
+                || curr.y < -far_limit
+                || curr.y > far_limit
+            {
+                prev = curr;
+                continue;
+            }
+
+            // 2) Clip to viewport bounds for clean edges (both endpoints are now reasonable)
             if let Some((cx0, cy0, cx1, cy1)) = Self::clip_line_segment(
                 prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
             ) {
