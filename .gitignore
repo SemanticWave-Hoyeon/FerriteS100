@@ -1,0 +1,55 @@
+# This file
+.gitignore
+
+# Rust build output
+/target/
+
+# Old catalogue location
+/ProgramData/
+
+# Catalogues - FC/PC included in repo, but allow excluding large files if needed
+# /Catalogues/
+
+# Chart data
+/ChartData/
+
+# Reference implementations
+/reference/
+/OpenS100/
+
+# Logs
+/logs/
+*.log
+
+# Executables
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code session data
+/.claude/
+/claude.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+
+# Release distribution
+/dist/
+*.zip
+# Markdown documents (planning, notes, etc.)
+*.md
+
+# Planning documents
+/plan/

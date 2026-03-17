@@ -51,6 +51,9 @@ pub mod tags {
     pub const SRID: &str = "SRID"; // Surface Record Identifier
     pub const RIAS: &str = "RIAS"; // Ring Association
 
+    // Dataset parameters
+    pub const DSPM: &str = "DSPM"; // Dataset Parameters
+
     // Feature records
     pub const FRID: &str = "FRID"; // Feature Record Identifier
     pub const FOID: &str = "FOID"; // Feature Object Identifier

@@ -144,23 +144,9 @@ local function LookupAttributeValue(container, attributeCode, HostGetSimpleAttri
 		complexAttributeTypeInfo = GetComplexAttributeTypeInfo(attributeCode)
 	end
 
-	-- DEBUG: trace attribute lookup for sector-related
-	if string.find(attributeCode, "sector") or string.find(attributeCode, "Sector") then
-		print("[LUA DEBUG] LookupAttributeValue: attributeCode=" .. attributeCode ..
-			", isSimple=" .. tostring(ti.SimpleAttributeInfos[attributeCode] ~= nil) ..
-			", complexTypeInfo=" .. tostring(complexAttributeTypeInfo ~= nil))
-	end
-
 	if complexAttributeTypeInfo then
 		Debug.StopPerformance('Lua Code - Total')
-		-- DEBUG: about to call HostGetComplexAttributeCount
-		if string.find(attributeCode, "sector") or string.find(attributeCode, "Sector") then
-			print("[LUA DEBUG] Calling HostGetComplexAttributeCount: attributeCode=" .. attributeCode .. ", containerID=" .. tostring(container.ID))
-		end
 		local attributeCount = HostGetComplexAttributeCount(container.ID, attributePath, attributeCode)
-		if string.find(attributeCode, "sector") or string.find(attributeCode, "Sector") then
-			print("[LUA DEBUG] HostGetComplexAttributeCount returned: " .. tostring(attributeCount))
-		end
 		Debug.StartPerformance('Lua Code - Total')
 
 		if containerTypeInfo.AttributeBindings[attributeCode].UpperMultiplicity == 1 then
@@ -190,15 +176,7 @@ local function LookupAttributeValue(container, attributeCode, HostGetSimpleAttri
 		end
 	else
 		Debug.StopPerformance('Lua Code - Total')
-		-- DEBUG: about to call HostGetSimpleAttribute
-		if string.find(attributeCode, "sector") or string.find(attributeCode, "Sector") then
-			print("[LUA DEBUG] Calling HostGetSimpleAttribute: attributeCode=" .. attributeCode .. ", containerID=" .. tostring(container.ID) .. ", path=" .. tostring(attributePath))
-			print("[LUA DEBUG] containerTypeInfo.Code=" .. tostring(containerTypeInfo and containerTypeInfo.Code))
-		end
 		local values = HostGetSimpleAttribute(container.ID, attributePath, attributeCode)
-		if string.find(attributeCode, "sector") or string.find(attributeCode, "Sector") then
-			print("[LUA DEBUG] HostGetSimpleAttribute returned: " .. tostring(#values) .. " values")
-		end
 		Debug.StartPerformance('Lua Code - Total')
 
 		--Debug.Break()

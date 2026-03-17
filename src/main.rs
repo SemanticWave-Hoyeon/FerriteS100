@@ -58,20 +58,28 @@ use ferrite_lua::{
 };
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{
-    AreaInstruction, Color, GeoBounds, LineInstruction, LineStyle, PointInstruction, RenderContext,
-    Viewport, WorldPoint,
+    AreaInstruction, Color, GeoBounds, HAlign, LineInstruction, LineStyle, PointInstruction,
+    RenderContext, TextInstruction as RenderTextInstruction, VAlign, Viewport, WorldPoint,
 };
 use ferrite_s100_core::{S101Cell, SpatialPrimitiveType};
 use ferrite_wgpu::{
     CatalogueStatus, DisplayMode, SelectedFeature, SettingsState, SymbolCache, WgpuRenderer,
 };
 
-/// Get the application base directory (where the executable is located)
+/// Get the application base directory.
+/// Prefers the executable's directory if it contains Catalogues/,
+/// otherwise falls back to the current working directory (for dev builds).
 fn get_app_base_dir() -> PathBuf {
-    std::env::current_exe()
+    if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
+    {
+        if exe_dir.join("Catalogues").exists() {
+            return exe_dir;
+        }
+    }
+    // Fallback: current working directory (typical for `cargo run`)
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Application configuration
@@ -84,6 +92,14 @@ struct AppConfig {
     log_path: PathBuf,
     /// Debug mode enabled (--debug flag)
     debug_mode: bool,
+    /// Auto-load chart file(s) on startup
+    auto_chart: Vec<PathBuf>,
+    /// Auto-save screenshot after loading (then exit)
+    auto_screenshot: Option<PathBuf>,
+    /// Debug interior rings: log detailed ring info
+    debug_rings: bool,
+    /// Override zoom level for auto-screenshot (1.0 = fit to window)
+    auto_zoom: Option<f64>,
 }
 
 impl AppConfig {
@@ -91,12 +107,59 @@ impl AppConfig {
         let base = get_app_base_dir();
         let args: Vec<String> = std::env::args().collect();
         let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "--DEBUG");
+        let debug_rings = args.iter().any(|arg| arg == "--debug-rings");
+
+        // Parse --chart <path> (can appear multiple times or use glob)
+        let mut auto_chart = Vec::new();
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--chart" {
+                if let Some(path_str) = args.get(i + 1) {
+                    let path = PathBuf::from(path_str);
+                    if path.is_dir() {
+                        // Load all .000 files from directory
+                        if let Ok(entries) = std::fs::read_dir(&path) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().is_some_and(|e| e == "000") {
+                                    auto_chart.push(p);
+                                }
+                            }
+                        }
+                    } else {
+                        auto_chart.push(path);
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Parse --screenshot <path>
+        let auto_screenshot = args
+            .windows(2)
+            .find(|w| w[0] == "--screenshot")
+            .map(|w| PathBuf::from(&w[1]));
+
+        // Parse --zoom <level>
+        let auto_zoom = args
+            .windows(2)
+            .find(|w| w[0] == "--zoom")
+            .and_then(|w| w[1].parse::<f64>().ok());
+
+        // Force debug mode if debug-rings or screenshot is set
+        let debug_mode = debug_mode || debug_rings || auto_screenshot.is_some();
 
         AppConfig {
             fc_path: base.join("Catalogues/FC/S-101"),
             pc_path: base.join("Catalogues/PC/S-101"),
             log_path: base.join("logs"),
             debug_mode,
+            auto_chart,
+            auto_screenshot,
+            debug_rings,
+            auto_zoom,
         }
     }
 }
@@ -183,6 +246,16 @@ struct ChartApp {
     base_instruction_count: usize,
     /// Debug mode enabled
     debug_mode: bool,
+    /// Charts to auto-load on startup
+    pending_auto_chart: Vec<PathBuf>,
+    /// Auto-screenshot path (take screenshot after load, then exit)
+    auto_screenshot: Option<PathBuf>,
+    /// Debug interior rings
+    debug_rings: bool,
+    /// Override zoom level for auto-screenshot
+    auto_zoom: Option<f64>,
+    /// Frame count since load completed (for auto-screenshot timing)
+    frames_since_loaded: Option<u32>,
     /// Frame times for FPS calculation
     frame_times: std::collections::VecDeque<std::time::Instant>,
     /// Previous CPU time measurement (kernel_time, user_time, wall_time) in 100-nanosecond intervals
@@ -193,6 +266,7 @@ struct ChartApp {
 }
 
 impl ChartApp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         symbol_cache: SymbolCache,
         initial_profile: String,
@@ -201,6 +275,10 @@ impl ChartApp {
         fc_status: CatalogueStatus,
         pc_status: CatalogueStatus,
         debug_mode: bool,
+        pending_auto_chart: Vec<PathBuf>,
+        auto_screenshot: Option<PathBuf>,
+        debug_rings: bool,
+        auto_zoom: Option<f64>,
     ) -> Self {
         ChartApp {
             window: None,
@@ -301,6 +379,11 @@ impl ChartApp {
             },
             base_instruction_count: 0,
             debug_mode,
+            pending_auto_chart,
+            auto_screenshot,
+            debug_rings,
+            auto_zoom,
+            frames_since_loaded: None,
             frame_times: std::collections::VecDeque::with_capacity(60),
             #[cfg(windows)]
             prev_cpu_times: None,
@@ -423,6 +506,7 @@ impl ChartApp {
 
         // Get the display mode from PC
         let Some(mode) = self.pc.display_modes.get(mode_id) else {
+            tracing::debug!("Display mode '{}' not found in PC, showing all", mode_id);
             return None; // Mode not found, show all
         };
 
@@ -448,7 +532,7 @@ impl ChartApp {
         tracing::debug!(
             "Display mode '{}': {} visible viewing groups",
             mode_id,
-            visible_vgs.len()
+            visible_vgs.len(),
         );
 
         Some(visible_vgs)
@@ -679,7 +763,6 @@ impl ChartApp {
             }
         }
 
-        #[cfg(debug_assertions)]
         info!(
             "Loading complete: {} charts, {} features",
             self.cells.len(),
@@ -688,9 +771,141 @@ impl ChartApp {
                 .map(|c| c.statistics().features)
                 .sum::<usize>()
         );
+
+        // Debug interior rings if --debug-rings
+        if self.debug_rings {
+            self.log_interior_ring_debug();
+        }
+
+        // Start auto-screenshot countdown (wait a few frames for rendering)
+        if self.auto_screenshot.is_some() && self.chart_loaded {
+            // Apply zoom override if specified
+            if let Some(zoom) = self.auto_zoom {
+                self.zoom_level = zoom;
+            }
+            // Re-render with zoom applied
+            self.update_view();
+            self.frames_since_loaded = Some(0);
+        }
     }
 
     /// Clear all loaded charts
+    /// Log detailed interior ring debug info for all loaded cells
+    fn log_interior_ring_debug(&self) {
+        info!("=== INTERIOR RING DEBUG ===");
+        for (ci, cell) in self.cells.iter().enumerate() {
+            let mut surfaces_with_holes = 0;
+            let mut total_interior_rings = 0;
+            let mut unclosed_rings = 0;
+
+            for surface in cell.surfaces.values() {
+                if surface.interior_rings.is_empty() {
+                    continue;
+                }
+                surfaces_with_holes += 1;
+                total_interior_rings += surface.interior_rings.len();
+
+                for (ri, ring_curves) in surface.interior_rings.iter().enumerate() {
+                    // Check closure by collecting raw points
+                    let mut pts = Vec::new();
+                    for oc in ring_curves {
+                        let key = oc.curve_id.key();
+                        if let Some(curve) = cell.curves.get(&key) {
+                            let positions = curve.all_positions();
+                            if oc.orientation {
+                                for p in &positions {
+                                    pts.push((p.x, p.y));
+                                }
+                            } else {
+                                for p in positions.iter().rev() {
+                                    pts.push((p.x, p.y));
+                                }
+                            }
+                        } else if let Some(composite) = cell.composite_curves.get(&key) {
+                            for sub in &composite.curves {
+                                let sk = sub.curve_id.key();
+                                if let Some(c) = cell.curves.get(&sk) {
+                                    let positions = c.all_positions();
+                                    let forward = oc.orientation == sub.orientation;
+                                    if forward {
+                                        for p in &positions {
+                                            pts.push((p.x, p.y));
+                                        }
+                                    } else {
+                                        for p in positions.iter().rev() {
+                                            pts.push((p.x, p.y));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let is_closed = if pts.len() >= 2 {
+                        let first = pts.first().unwrap();
+                        let last = pts.last().unwrap();
+                        (first.0 - last.0).abs() < 1e-7 && (first.1 - last.1).abs() < 1e-7
+                    } else {
+                        false
+                    };
+
+                    if !is_closed {
+                        unclosed_rings += 1;
+                    }
+
+                    // Find which features reference this surface
+                    let surface_key = surface.id.key();
+                    let referencing_features: Vec<_> = cell
+                        .features
+                        .values()
+                        .filter(|f| {
+                            f.spatial_associations
+                                .iter()
+                                .any(|sa| sa.spatial_id.key() == surface_key)
+                        })
+                        .filter_map(|f| f.feature_code.as_deref())
+                        .collect();
+
+                    // Compute ring bounding box
+                    let (mut rx0, mut ry0, mut rx1, mut ry1) =
+                        (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                    for &(x, y) in &pts {
+                        if x < rx0 {
+                            rx0 = x;
+                        }
+                        if y < ry0 {
+                            ry0 = y;
+                        }
+                        if x > rx1 {
+                            rx1 = x;
+                        }
+                        if y > ry1 {
+                            ry1 = y;
+                        }
+                    }
+
+                    info!(
+                        "  Cell[{}] Surface {} ring[{}]: {} curves, {} pts, closed={}, bbox=[{:.6},{:.6}]-[{:.6},{:.6}], features={:?}",
+                        ci,
+                        surface_key,
+                        ri,
+                        ring_curves.len(),
+                        pts.len(),
+                        is_closed,
+                        rx0, ry0, rx1, ry1,
+                        referencing_features,
+                    );
+                }
+            }
+
+            info!(
+                "Cell[{}]: {} surfaces with holes, {} total interior rings, {} unclosed",
+                ci, surfaces_with_holes, total_interior_rings, unclosed_rings
+            );
+        }
+        info!("=== END INTERIOR RING DEBUG ===");
+    }
+
     fn clear_charts(&mut self) {
         #[cfg(debug_assertions)]
         info!("Clearing all charts");
@@ -1006,6 +1221,15 @@ impl ApplicationHandler for ChartApp {
                             );
 
                             self.renderer = Some(renderer);
+
+                            // Auto-load chart if --chart was specified
+                            if !self.pending_auto_chart.is_empty() {
+                                let paths = std::mem::take(&mut self.pending_auto_chart);
+                                info!("Auto-loading {} chart file(s)", paths.len());
+                                if let Err(e) = self.load_charts(&paths) {
+                                    error!("Failed to auto-load chart(s): {}", e);
+                                }
+                            }
                         }
                         Err(e) => {
                             let msg = format!(
@@ -1465,6 +1689,26 @@ impl ApplicationHandler for ChartApp {
                     }
                 }
 
+                // Auto-screenshot: wait a few frames after load for rendering to stabilize
+                if let Some(count) = &mut self.frames_since_loaded {
+                    *count += 1;
+                    if *count >= 5 {
+                        if let Some(path) = self.auto_screenshot.take() {
+                            info!("Auto-screenshot: saving to {}", path.display());
+                            if let Some(renderer) = &mut self.renderer {
+                                match renderer.save_screenshot(&path) {
+                                    Ok(_) => info!("Screenshot saved successfully"),
+                                    Err(e) => error!("Screenshot failed: {}", e),
+                                }
+                            }
+                            self.frames_since_loaded = None;
+                            // Exit after screenshot
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                }
+
                 // Request next frame
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -1862,6 +2106,10 @@ fn run_app() -> Result<()> {
         fc_status,
         pc_status,
         config.debug_mode,
+        config.auto_chart,
+        config.auto_screenshot,
+        config.debug_rings,
+        config.auto_zoom,
     );
 
     event_loop.run_app(&mut app).context("Event loop error")?;
@@ -1996,95 +2244,232 @@ fn convert_lua_results_for_cell(
 ) {
     use ferrite_lua::DrawingCommand;
 
+    // Helper: convert Lua visibility scale fields to ScaleRange
+    let make_scale_range = |vis: &ferrite_lua::VisibilityState| -> ferrite_render::ScaleRange {
+        ferrite_render::ScaleRange {
+            scale_minimum: vis.scale_minimum,
+            scale_maximum: vis.scale_maximum,
+        }
+    };
+
+    // Helper: convert Lua DisplayPlane to render DisplayPlane
+    let make_display_plane = |vis: &ferrite_lua::VisibilityState| -> ferrite_render::DisplayPlane {
+        match vis.display_plane {
+            ferrite_lua::DisplayPlane::OverRadar => ferrite_render::DisplayPlane::OverRadar,
+            _ => ferrite_render::DisplayPlane::UnderRadar,
+        }
+    };
+
+    // Helper: extract primary viewing group from visibility state
+    let make_viewing_group = |vis: &ferrite_lua::VisibilityState| -> u32 {
+        vis.viewing_groups.first().copied().unwrap_or(21010)
+    };
+
     // Helper to lookup color from token (from PC colorProfile.xml)
     // Uses the specified profile (Day/Dusk/Night) for color resolution
     let lookup_color = |token: &str| -> Color { lookup_pc_color(pc, token, profile_name) };
 
-    let mut area_count = 0;
-    let mut area_rendered = 0;
-    let mut line_count = 0;
-    let mut point_count = 0;
-
-    // Count total LandArea features in cell (before Lua processing)
-    let total_land_area_in_cell: usize = cell
-        .features
-        .values()
-        .filter(|f| f.feature_code.as_deref() == Some("LandArea"))
-        .count();
-    let total_land_area_surface_in_cell: usize = cell
-        .features
-        .values()
-        .filter(|f| {
-            f.feature_code.as_deref() == Some("LandArea")
-                && f.primitive_type == SpatialPrimitiveType::Surface
-        })
-        .count();
-
-    // Count all Surface-type features by feature code
-    let mut surface_feature_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for f in cell.features.values() {
-        if f.primitive_type == SpatialPrimitiveType::Surface {
-            let code = f.feature_code.as_deref().unwrap_or("UNKNOWN").to_string();
-            *surface_feature_counts.entry(code).or_insert(0) += 1;
-        }
-    }
-    info!(
-        "Cell total: {} LandArea features ({} with Surface primitive)",
-        total_land_area_in_cell, total_land_area_surface_in_cell
-    );
-    info!("All Surface features by type: {:?}", surface_feature_counts);
-
-    // Log LandArea results from Lua (feature_id is numeric, lookup feature code)
-    let mut land_area_count = 0;
-    let mut land_area_surface_count = 0;
-    let mut land_area_curve_count = 0;
-    for r in results.iter() {
-        if let Ok(fid) = r.feature_id.parse::<i64>() {
-            if let Some(feature) = cell.features.get(&fid) {
-                if feature.feature_code.as_deref() == Some("LandArea") {
-                    land_area_count += 1;
-
-                    // Count by primitive type
-                    match feature.primitive_type {
-                        SpatialPrimitiveType::Surface => land_area_surface_count += 1,
-                        SpatialPrimitiveType::Curve | SpatialPrimitiveType::CompositeCurve => {
-                            land_area_curve_count += 1
-                        }
-                        _ => {}
+    // Helper: collect points from a ring (list of oriented curves)
+    let collect_ring_points = |curves: &[ferrite_s100_core::OrientedCurve]| -> Vec<WorldPoint> {
+        let mut points = Vec::new();
+        for oriented_curve in curves {
+            let curve_key = oriented_curve.curve_id.key();
+            if let Some(curve) = cell.curves.get(&curve_key) {
+                let positions = curve.all_positions();
+                if oriented_curve.orientation {
+                    for pos in positions {
+                        points.push(WorldPoint::new(pos.x, pos.y));
                     }
-
-                    if land_area_count <= 5 {
-                        // Log feature PrimitiveType and spatial associations
-                        let spas_types: Vec<_> = feature
-                            .spatial_associations
-                            .iter()
-                            .map(|sa| format!("RCNM{}", sa.spatial_id.rcnm))
-                            .collect();
-                        info!(
-                            "LandArea[{}] id={} primitive={:?} spas={:?}: {} instructions",
-                            land_area_count,
-                            fid,
-                            feature.primitive_type,
-                            spas_types,
-                            r.instructions.len()
-                        );
-                        for inst in &r.instructions {
-                            for cmd in &inst.commands {
-                                info!("    cmd: {:?}", cmd);
+                } else {
+                    for pos in positions.into_iter().rev() {
+                        points.push(WorldPoint::new(pos.x, pos.y));
+                    }
+                }
+            } else if let Some(composite) = cell.composite_curves.get(&curve_key) {
+                for sub_curve in &composite.curves {
+                    let sub_key = sub_curve.curve_id.key();
+                    if let Some(curve) = cell.curves.get(&sub_key) {
+                        let positions = curve.all_positions();
+                        let forward = oriented_curve.orientation == sub_curve.orientation;
+                        if forward {
+                            for pos in positions {
+                                points.push(WorldPoint::new(pos.x, pos.y));
+                            }
+                        } else {
+                            for pos in positions.into_iter().rev() {
+                                points.push(WorldPoint::new(pos.x, pos.y));
                             }
                         }
                     }
                 }
             }
         }
-    }
-    if land_area_count > 0 {
-        info!(
-            "Cell has {} LandArea results from Lua total ({} Surface, {} Curve)",
-            land_area_count, land_area_surface_count, land_area_curve_count
-        );
-    }
+        // Remove duplicate consecutive points
+        let mut cleaned = Vec::with_capacity(points.len());
+        for point in points {
+            if cleaned.is_empty() {
+                cleaned.push(point);
+            } else {
+                let last = cleaned.last().unwrap();
+                if (point.x - last.x).abs() > 1e-9 || (point.y - last.y).abs() > 1e-9 {
+                    cleaned.push(point);
+                }
+            }
+        }
+        // Remove duplicate closing point
+        if cleaned.len() > 3 {
+            let first = cleaned.first().unwrap();
+            let last = cleaned.last().unwrap();
+            if (first.x - last.x).abs() < 1e-9 && (first.y - last.y).abs() < 1e-9 {
+                cleaned.pop();
+            }
+        }
+        cleaned
+    };
+
+    // Helper: collect exterior + validated interior rings from a surface.
+    // Only includes interior rings whose bounding box is fully inside
+    // the exterior ring's bounding box (prevents earcut failures).
+    let collect_surface_points =
+        |surface: &ferrite_s100_core::SurfaceRecord| -> (Vec<WorldPoint>, Vec<Vec<WorldPoint>>) {
+            let exterior = collect_ring_points(&surface.exterior_ring);
+            if exterior.len() < 3 || surface.interior_rings.is_empty() {
+                return (exterior, Vec::new());
+            }
+
+            // Compute exterior bounding box
+            let (mut ex0, mut ey0, mut ex1, mut ey1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for p in &exterior {
+                if p.x < ex0 {
+                    ex0 = p.x;
+                }
+                if p.y < ey0 {
+                    ey0 = p.y;
+                }
+                if p.x > ex1 {
+                    ex1 = p.x;
+                }
+                if p.y > ey1 {
+                    ey1 = p.y;
+                }
+            }
+
+            let mut valid_interiors = Vec::new();
+            for ring_curves in &surface.interior_rings {
+                if ring_curves.is_empty() {
+                    continue;
+                }
+                // Verify ring closure from raw curve endpoints before collecting points.
+                // collect_ring_points removes the closing duplicate so we can't check after.
+                let is_closed = {
+                    // Get first point of first curve
+                    let first_oc = &ring_curves[0];
+                    let last_oc = &ring_curves[ring_curves.len() - 1];
+                    let first_key = first_oc.curve_id.key();
+                    let last_key = last_oc.curve_id.key();
+
+                    let get_positions = |key: i64,
+                                         oc: &ferrite_s100_core::OrientedCurve|
+                     -> Option<Vec<WorldPoint>> {
+                        if let Some(curve) = cell.curves.get(&key) {
+                            let pos = curve.all_positions();
+                            if pos.is_empty() {
+                                return None;
+                            }
+                            let pts: Vec<WorldPoint> = if oc.orientation {
+                                pos.iter().map(|p| WorldPoint::new(p.x, p.y)).collect()
+                            } else {
+                                pos.iter()
+                                    .rev()
+                                    .map(|p| WorldPoint::new(p.x, p.y))
+                                    .collect()
+                            };
+                            Some(pts)
+                        } else if let Some(composite) = cell.composite_curves.get(&key) {
+                            // Get first/last sub-curve points
+                            let mut pts = Vec::new();
+                            for sub in &composite.curves {
+                                let sk = sub.curve_id.key();
+                                if let Some(c) = cell.curves.get(&sk) {
+                                    let p = c.all_positions();
+                                    let forward = oc.orientation == sub.orientation;
+                                    if forward {
+                                        pts.extend(p.iter().map(|p| WorldPoint::new(p.x, p.y)));
+                                    } else {
+                                        pts.extend(
+                                            p.iter().rev().map(|p| WorldPoint::new(p.x, p.y)),
+                                        );
+                                    }
+                                }
+                            }
+                            if pts.is_empty() {
+                                None
+                            } else {
+                                Some(pts)
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    match (
+                        get_positions(first_key, first_oc),
+                        get_positions(last_key, last_oc),
+                    ) {
+                        (Some(first_pts), Some(last_pts)) => {
+                            let start = first_pts.first().unwrap();
+                            let end = last_pts.last().unwrap();
+                            (start.x - end.x).abs() < 1e-5 && (start.y - end.y).abs() < 1e-5
+                        }
+                        _ => false,
+                    }
+                };
+
+                if !is_closed {
+                    continue;
+                }
+
+                let ring = collect_ring_points(ring_curves);
+                if ring.len() < 3 {
+                    continue;
+                }
+                // Check that ring bbox is inside exterior bbox
+                let mut inside = true;
+                for p in &ring {
+                    if p.x < ex0 || p.x > ex1 || p.y < ey0 || p.y > ey1 {
+                        inside = false;
+                        break;
+                    }
+                }
+                if inside {
+                    valid_interiors.push(ring);
+                }
+            }
+            (exterior, valid_interiors)
+        };
+
+    // Helper: convert h_align string to render enum
+    let parse_h_align = |s: &str| -> HAlign {
+        match s {
+            "Center" | "centre" => HAlign::Center,
+            "End" | "right" => HAlign::Right,
+            _ => HAlign::Left,
+        }
+    };
+
+    // Helper: convert v_align string to render enum
+    let parse_v_align = |s: &str| -> VAlign {
+        match s {
+            "Top" | "top" => VAlign::Top,
+            "Bottom" | "bottom" => VAlign::Bottom,
+            _ => VAlign::Middle,
+        }
+    };
+
+    let mut area_count = 0;
+    let mut area_rendered = 0;
+    let mut line_count = 0;
+    let mut point_count = 0;
 
     for result in results {
         // Parse feature ID from the result (format: "type|id")
@@ -2105,6 +2490,9 @@ fn convert_lua_results_for_cell(
                         rotation,
                         scale,
                         position,
+                        line_placement,
+                        visibility,
+                        ..
                     } => {
                         point_count += 1;
 
@@ -2136,7 +2524,10 @@ fn convert_lua_results_for_cell(
                                 PointInstruction::new(symbol_ref.clone(), WorldPoint::new(*x, *y))
                                     .with_rotation(*rotation)
                                     .with_scale(*scale)
-                                    .with_priority(instruction.drawing_priority)
+                                    .with_priority(visibility.drawing_priority)
+                                    .with_viewing_group(make_viewing_group(visibility))
+                                    .with_scale_range(make_scale_range(visibility))
+                                    .with_display_plane(make_display_plane(visibility))
                                     .with_feature_id(feature_id.unwrap_or(0))
                                     .with_cell_index(cell_index);
 
@@ -2149,38 +2540,276 @@ fn convert_lua_results_for_cell(
                                 point_inst,
                             ));
                         } else if let Some(feature) = feature {
-                            // Get coordinates from feature's spatial associations
-                            for spas in &feature.spatial_associations {
-                                if let Some(point) = cell.points.get(&spas.spatial_id.key()) {
-                                    let point_inst = PointInstruction::new(
-                                        symbol_ref.clone(),
-                                        WorldPoint::new(point.position.x, point.position.y),
-                                    )
-                                    .with_rotation(*rotation)
-                                    .with_scale(*scale)
-                                    .with_priority(instruction.drawing_priority)
-                                    .with_feature_id(feature_id.unwrap_or(0))
-                                    .with_cell_index(cell_index);
+                            // S-100 Part 9a LinePlacement: when the feature has curve geometry,
+                            // place the symbol at a specific position along the curve.
+                            let has_curve_geometry = feature.spatial_associations.iter().any(|s| {
+                                let key = s.spatial_id.key();
+                                cell.curves.contains_key(&key)
+                                    || cell.composite_curves.contains_key(&key)
+                            });
 
-                                    context.add_instruction(
-                                        ferrite_render::DrawingInstruction::Point(point_inst),
-                                    );
+                            if has_curve_geometry {
+                                if let Some((mode, offset)) = line_placement {
+                                    // Collect all curve points from the feature's spatial associations
+                                    let mut curve_points: Vec<(f64, f64)> = Vec::new();
+                                    for spas in &feature.spatial_associations {
+                                        let key = spas.spatial_id.key();
+                                        let forward = spas.ornt != 2; // ornt=2 means reverse
+                                        if let Some(curve) = cell.curves.get(&key) {
+                                            let positions = curve.all_positions();
+                                            if forward {
+                                                for pos in &positions {
+                                                    curve_points.push((pos.x, pos.y));
+                                                }
+                                            } else {
+                                                for pos in positions.iter().rev() {
+                                                    curve_points.push((pos.x, pos.y));
+                                                }
+                                            }
+                                        } else if let Some(composite) =
+                                            cell.composite_curves.get(&key)
+                                        {
+                                            for sub_curve in &composite.curves {
+                                                let sub_key = sub_curve.curve_id.key();
+                                                if let Some(curve) = cell.curves.get(&sub_key) {
+                                                    let positions = curve.all_positions();
+                                                    let sub_forward =
+                                                        forward == sub_curve.orientation;
+                                                    if sub_forward {
+                                                        for pos in &positions {
+                                                            curve_points.push((pos.x, pos.y));
+                                                        }
+                                                    } else {
+                                                        for pos in positions.iter().rev() {
+                                                            curve_points.push((pos.x, pos.y));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Remove consecutive duplicates
+                                    curve_points.dedup_by(|a, b| {
+                                        (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12
+                                    });
+
+                                    if curve_points.len() >= 2 {
+                                        // Calculate cumulative segment lengths along the curve
+                                        let mut seg_lengths =
+                                            Vec::with_capacity(curve_points.len() - 1);
+                                        let mut total_length = 0.0_f64;
+                                        for i in 1..curve_points.len() {
+                                            let dx = curve_points[i].0 - curve_points[i - 1].0;
+                                            let dy = curve_points[i].1 - curve_points[i - 1].1;
+                                            let len = (dx * dx + dy * dy).sqrt();
+                                            seg_lengths.push(len);
+                                            total_length += len;
+                                        }
+
+                                        if total_length > 0.0 {
+                                            // Determine the target distance along the curve
+                                            let target_dist = if mode == "Relative" {
+                                                offset.clamp(0.0, 1.0) * total_length
+                                            } else {
+                                                // Absolute mode: offset is in mm.
+                                                // Convert mm to approximate geographic degrees.
+                                                // At the feature's latitude, 1 degree longitude ~
+                                                // 111320 * cos(lat) meters.
+                                                // Use midpoint latitude for the conversion.
+                                                let mid_lat =
+                                                    curve_points.iter().map(|p| p.1).sum::<f64>()
+                                                        / curve_points.len() as f64;
+                                                let meters_per_deg =
+                                                    111_320.0 * mid_lat.to_radians().cos();
+                                                let mm_to_deg = 1.0 / (meters_per_deg * 1000.0);
+                                                let abs_dist = *offset * mm_to_deg;
+                                                abs_dist.min(total_length)
+                                            };
+
+                                            // Walk along segments to find the interpolated point
+                                            let mut accum = 0.0_f64;
+                                            let mut placed = false;
+                                            for (i, &seg_len) in seg_lengths.iter().enumerate() {
+                                                if accum + seg_len >= target_dist {
+                                                    // Interpolate within this segment
+                                                    let t = if seg_len > 0.0 {
+                                                        (target_dist - accum) / seg_len
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    let px = curve_points[i].0
+                                                        + t * (curve_points[i + 1].0
+                                                            - curve_points[i].0);
+                                                    let py = curve_points[i].1
+                                                        + t * (curve_points[i + 1].1
+                                                            - curve_points[i].1);
+
+                                                    let point_inst = PointInstruction::new(
+                                                        symbol_ref.clone(),
+                                                        WorldPoint::new(px, py),
+                                                    )
+                                                    .with_rotation(*rotation)
+                                                    .with_scale(*scale)
+                                                    .with_priority(visibility.drawing_priority)
+                                                    .with_viewing_group(make_viewing_group(
+                                                        visibility,
+                                                    ))
+                                                    .with_scale_range(make_scale_range(visibility))
+                                                    .with_display_plane(make_display_plane(
+                                                        visibility,
+                                                    ))
+                                                    .with_feature_id(feature_id.unwrap_or(0))
+                                                    .with_cell_index(cell_index);
+
+                                                    context.add_instruction(
+                                                        ferrite_render::DrawingInstruction::Point(
+                                                            point_inst,
+                                                        ),
+                                                    );
+                                                    placed = true;
+                                                    break;
+                                                }
+                                                accum += seg_len;
+                                            }
+                                            // If rounding prevented placement, use last point
+                                            if !placed {
+                                                let last = curve_points.last().unwrap();
+                                                let point_inst = PointInstruction::new(
+                                                    symbol_ref.clone(),
+                                                    WorldPoint::new(last.0, last.1),
+                                                )
+                                                .with_rotation(*rotation)
+                                                .with_scale(*scale)
+                                                .with_priority(visibility.drawing_priority)
+                                                .with_viewing_group(make_viewing_group(visibility))
+                                                .with_scale_range(make_scale_range(visibility))
+                                                .with_display_plane(make_display_plane(visibility))
+                                                .with_feature_id(feature_id.unwrap_or(0))
+                                                .with_cell_index(cell_index);
+
+                                                context.add_instruction(
+                                                    ferrite_render::DrawingInstruction::Point(
+                                                        point_inst,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Point or Surface geometry: place symbol at point position
+                                // or surface centroid (S-100 Part 9a: area features with
+                                // PointInstruction place the symbol at the area centroid)
+                                let mut placed = false;
+
+                                // Try point geometry first
+                                for spas in &feature.spatial_associations {
+                                    if let Some(point) = cell.points.get(&spas.spatial_id.key()) {
+                                        let point_inst = PointInstruction::new(
+                                            symbol_ref.clone(),
+                                            WorldPoint::new(point.position.x, point.position.y),
+                                        )
+                                        .with_rotation(*rotation)
+                                        .with_scale(*scale)
+                                        .with_priority(visibility.drawing_priority)
+                                        .with_viewing_group(make_viewing_group(visibility))
+                                        .with_scale_range(make_scale_range(visibility))
+                                        .with_display_plane(make_display_plane(visibility))
+                                        .with_feature_id(feature_id.unwrap_or(0))
+                                        .with_cell_index(cell_index);
+
+                                        context.add_instruction(
+                                            ferrite_render::DrawingInstruction::Point(point_inst),
+                                        );
+                                        placed = true;
+                                    }
+                                }
+
+                                // Surface geometry: compute centroid and place symbol there
+                                if !placed {
+                                    for spas in &feature.spatial_associations {
+                                        if let Some(surface) =
+                                            cell.surfaces.get(&spas.spatial_id.key())
+                                        {
+                                            let ext = collect_ring_points(&surface.exterior_ring);
+                                            if ext.len() >= 3 {
+                                                // Compute polygon centroid using the shoelace formula
+                                                let mut cx = 0.0_f64;
+                                                let mut cy = 0.0_f64;
+                                                let mut area2 = 0.0_f64;
+                                                let n = ext.len();
+                                                for i in 0..n {
+                                                    let j = (i + 1) % n;
+                                                    let cross =
+                                                        ext[i].x * ext[j].y - ext[j].x * ext[i].y;
+                                                    cx += (ext[i].x + ext[j].x) * cross;
+                                                    cy += (ext[i].y + ext[j].y) * cross;
+                                                    area2 += cross;
+                                                }
+                                                if area2.abs() > 1e-15 {
+                                                    cx /= 3.0 * area2;
+                                                    cy /= 3.0 * area2;
+                                                } else {
+                                                    // Degenerate polygon: use average of points
+                                                    cx = ext.iter().map(|p| p.x).sum::<f64>()
+                                                        / n as f64;
+                                                    cy = ext.iter().map(|p| p.y).sum::<f64>()
+                                                        / n as f64;
+                                                }
+
+                                                let point_inst = PointInstruction::new(
+                                                    symbol_ref.clone(),
+                                                    WorldPoint::new(cx, cy),
+                                                )
+                                                .with_rotation(*rotation)
+                                                .with_scale(*scale)
+                                                .with_priority(visibility.drawing_priority)
+                                                .with_viewing_group(make_viewing_group(visibility))
+                                                .with_scale_range(make_scale_range(visibility))
+                                                .with_display_plane(make_display_plane(visibility))
+                                                .with_feature_id(feature_id.unwrap_or(0))
+                                                .with_cell_index(cell_index);
+
+                                                context.add_instruction(
+                                                    ferrite_render::DrawingInstruction::Point(
+                                                        point_inst,
+                                                    ),
+                                                );
+                                                break; // One centroid symbol per feature
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    DrawingCommand::AugmentedPoint { .. } => {
-                        // AugmentedPoint is handled during parsing, position is passed to PointInstruction
-                    }
                     DrawingCommand::LineInstruction {
-                        style_ref,
+                        style_refs,
                         simple_style,
+                        augmented_ray,
+                        augmented_segments,
+                        visibility,
+                        ..
+                    }
+                    | DrawingCommand::LineInstructionUnsuppressed {
+                        style_refs,
+                        simple_style,
+                        augmented_ray,
+                        augmented_segments,
+                        visibility,
+                        ..
                     } => {
+                        // S-100 Part 9-11.1.9: LineInstructionUnsuppressed cannot be
+                        // suppressed by higher-priority lines on the same curve.
+                        let unsuppressed =
+                            matches!(cmd, DrawingCommand::LineInstructionUnsuppressed { .. });
+
                         line_count += 1;
                         // Determine line color and width from PC (no hardcoding)
                         let (color, width) = if let Some((w, token)) = simple_style {
                             (lookup_color(token), *w)
-                        } else if let Some(ref_name) = style_ref {
+                        } else if let Some(ref_name) = style_refs.first() {
                             // Look up from PC line styles
                             if let Some(style) = pc.line_styles.get(ref_name) {
                                 match style {
@@ -2209,9 +2838,223 @@ fn convert_lua_results_for_cell(
                             (lookup_color("CSTLN"), 1.0)
                         };
 
-                        // Get coordinates from feature's spatial associations
-                        if let Some(feature) = feature {
+                        // S-100 Part 9a-11.2.15: AugmentedRay — a line from the point
+                        // feature's position in a given direction for a given length.
+                        // Used for light sector lines, bearing lines, etc.
+                        if let Some(ray) = augmented_ray {
+                            // Find the feature's point position as the ray origin.
+                            let origin = feature.and_then(|f| {
+                                for spas in &f.spatial_associations {
+                                    if let Some(pt) = cell.points.get(&spas.spatial_id.key()) {
+                                        return Some((pt.position.x, pt.position.y));
+                                    }
+                                }
+                                None
+                            });
+
+                            if let Some((ox, oy)) = origin {
+                                // S-100: direction is degrees clockwise from north
+                                // (GeographicCRS) or from positive y-axis (PortrayalCRS/LocalCRS).
+                                // The trigonometric conversion is the same for both.
+                                let dir_rad = ray.direction.to_radians();
+
+                                // Compute endpoint based on length CRS.
+                                let (ex, ey) = if ray.length_crs == "GeographicCRS" {
+                                    // Length is in metres; convert to approximate degrees.
+                                    // 1 degree latitude ~ 111320 m.
+                                    // 1 degree longitude ~ 111320 * cos(lat) m.
+                                    let lat_rad = oy.to_radians();
+                                    let cos_lat = lat_rad.cos();
+                                    let dy_deg = (ray.length * dir_rad.cos()) / 111_320.0;
+                                    let dx_deg = if cos_lat.abs() > 1e-10 {
+                                        (ray.length * dir_rad.sin()) / (111_320.0 * cos_lat)
+                                    } else {
+                                        0.0
+                                    };
+                                    (ox + dx_deg, oy + dy_deg)
+                                } else {
+                                    // PortrayalCRS or LocalCRS: length is in mm (screen space).
+                                    // Convert mm to metres using the cell's compilation scale,
+                                    // then to approximate degrees.
+                                    let scale = cell.compilation_scale as f64;
+                                    let length_m = ray.length * scale / 1000.0;
+                                    let lat_rad = oy.to_radians();
+                                    let cos_lat = lat_rad.cos();
+                                    let dy_deg = (length_m * dir_rad.cos()) / 111_320.0;
+                                    let dx_deg = if cos_lat.abs() > 1e-10 {
+                                        (length_m * dir_rad.sin()) / (111_320.0 * cos_lat)
+                                    } else {
+                                        0.0
+                                    };
+                                    (ox + dx_deg, oy + dy_deg)
+                                };
+
+                                let points = vec![WorldPoint::new(ox, oy), WorldPoint::new(ex, ey)];
+
+                                let mut line_inst = LineInstruction::new(points)
+                                    .with_style(LineStyle::solid(color, width))
+                                    .with_priority(visibility.drawing_priority)
+                                    .with_viewing_group(make_viewing_group(visibility))
+                                    .with_scale_range(make_scale_range(visibility))
+                                    .with_display_plane(make_display_plane(visibility))
+                                    .with_feature_id(feature_id.unwrap_or(0));
+
+                                if unsuppressed {
+                                    line_inst = line_inst.with_unsuppressed();
+                                }
+
+                                context.add_instruction(ferrite_render::DrawingInstruction::Line(
+                                    line_inst,
+                                ));
+                            }
+                        } else if !augmented_segments.is_empty() {
+                            // S-100 Part 9a-11.2.16: AugmentedPath — line from path segments.
+                            // Find the feature's point position as the local origin for
+                            // LocalCRS/PortrayalCRS segments.
+                            let origin = feature.and_then(|f| {
+                                for spas in &f.spatial_associations {
+                                    if let Some(pt) = cell.points.get(&spas.spatial_id.key()) {
+                                        return Some((pt.position.x, pt.position.y));
+                                    }
+                                }
+                                None
+                            });
+
+                            let scale = cell.compilation_scale as f64;
+
+                            for seg in augmented_segments {
+                                match seg {
+                                    ferrite_lua::PathSegment::Polyline(pts) => {
+                                        let points: Vec<WorldPoint> = pts
+                                            .iter()
+                                            .map(|(x, y)| WorldPoint::new(*x, *y))
+                                            .collect();
+                                        if points.len() >= 2 {
+                                            let mut line_inst = LineInstruction::new(points)
+                                                .with_style(LineStyle::solid(color, width))
+                                                .with_priority(visibility.drawing_priority)
+                                                .with_viewing_group(make_viewing_group(visibility))
+                                                .with_scale_range(make_scale_range(visibility))
+                                                .with_display_plane(make_display_plane(visibility))
+                                                .with_feature_id(feature_id.unwrap_or(0));
+                                            if unsuppressed {
+                                                line_inst = line_inst.with_unsuppressed();
+                                            }
+                                            context.add_instruction(
+                                                ferrite_render::DrawingInstruction::Line(line_inst),
+                                            );
+                                        }
+                                    }
+                                    ferrite_lua::PathSegment::ArcByRadius {
+                                        center,
+                                        radius,
+                                        start_angle,
+                                        angular_distance,
+                                    } => {
+                                        // Arc center/radius are typically in LocalCRS (mm from
+                                        // feature point).  Convert to geographic coordinates.
+                                        if let Some((ox, oy)) = origin {
+                                            let lat_rad = oy.to_radians();
+                                            let cos_lat = lat_rad.cos();
+                                            let r_m = radius * scale / 1000.0;
+                                            let cx_deg = if cos_lat.abs() > 1e-10 {
+                                                ox + (center.0 * scale / 1000.0)
+                                                    / (111_320.0 * cos_lat)
+                                            } else {
+                                                ox
+                                            };
+                                            let cy_deg =
+                                                oy + (center.1 * scale / 1000.0) / 111_320.0;
+                                            let r_deg = r_m / 111_320.0;
+
+                                            // Tessellate arc into polyline segments
+                                            let step_count = ((angular_distance.abs() / 5.0).ceil()
+                                                as usize)
+                                                .max(8);
+                                            let mut arc_pts = Vec::with_capacity(step_count + 1);
+                                            for i in 0..=step_count {
+                                                let frac = i as f64 / step_count as f64;
+                                                let angle_deg =
+                                                    start_angle + angular_distance * frac;
+                                                let angle_rad = angle_deg.to_radians();
+                                                // Angles are clockwise from north/+Y
+                                                let px = if cos_lat.abs() > 1e-10 {
+                                                    cx_deg + r_deg * angle_rad.sin() / cos_lat
+                                                } else {
+                                                    cx_deg
+                                                };
+                                                let py = cy_deg + r_deg * angle_rad.cos();
+                                                arc_pts.push(WorldPoint::new(px, py));
+                                            }
+
+                                            if arc_pts.len() >= 2 {
+                                                let mut line_inst = LineInstruction::new(arc_pts)
+                                                    .with_style(LineStyle::solid(color, width))
+                                                    .with_priority(visibility.drawing_priority)
+                                                    .with_viewing_group(make_viewing_group(
+                                                        visibility,
+                                                    ))
+                                                    .with_scale_range(make_scale_range(visibility))
+                                                    .with_display_plane(make_display_plane(
+                                                        visibility,
+                                                    ))
+                                                    .with_feature_id(feature_id.unwrap_or(0));
+                                                if unsuppressed {
+                                                    line_inst = line_inst.with_unsuppressed();
+                                                }
+                                                context.add_instruction(
+                                                    ferrite_render::DrawingInstruction::Line(
+                                                        line_inst,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    ferrite_lua::PathSegment::Arc3Points { start, median, end } => {
+                                        // Approximate 3-point arc: compute the circle through
+                                        // the three points and tessellate.
+                                        let points = vec![
+                                            WorldPoint::new(start.0, start.1),
+                                            WorldPoint::new(median.0, median.1),
+                                            WorldPoint::new(end.0, end.1),
+                                        ];
+                                        let mut line_inst = LineInstruction::new(points)
+                                            .with_style(LineStyle::solid(color, width))
+                                            .with_priority(visibility.drawing_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0));
+                                        if unsuppressed {
+                                            line_inst = line_inst.with_unsuppressed();
+                                        }
+                                        context.add_instruction(
+                                            ferrite_render::DrawingInstruction::Line(line_inst),
+                                        );
+                                    }
+                                    ferrite_lua::PathSegment::Annulus { .. } => {
+                                        // Annulus is primarily for area fills; not applicable
+                                        // to line rendering.
+                                    }
+                                }
+                            }
+                        } else if let Some(feature) = feature {
+                            // Default: get coordinates from feature's spatial associations
                             for spas in &feature.spatial_associations {
+                                // S-101 4.8.3: Edge masking — check if this curve is
+                                // suppressed for this feature.
+                                // mask=2 in SPAS means "suppress portrayal" of this edge.
+                                if spas.mask == 2 {
+                                    continue;
+                                }
+                                // Also check the MASK field records (MIND=2 = suppress)
+                                let masked_by_mask_field = feature.masks.iter().any(|m| {
+                                    m.spatial_id.key() == spas.spatial_id.key() && m.mask_type == 2
+                                });
+                                if masked_by_mask_field {
+                                    continue;
+                                }
+
                                 if let Some(curve) = cell.curves.get(&spas.spatial_id.key()) {
                                     let points: Vec<WorldPoint> = curve
                                         .all_positions()
@@ -2220,10 +3063,17 @@ fn convert_lua_results_for_cell(
                                         .collect();
 
                                     if points.len() >= 2 {
-                                        let line_inst = LineInstruction::new(points)
+                                        let mut line_inst = LineInstruction::new(points)
                                             .with_style(LineStyle::solid(color, width))
-                                            .with_priority(instruction.drawing_priority)
+                                            .with_priority(visibility.drawing_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
                                             .with_feature_id(feature_id.unwrap_or(0));
+
+                                        if unsuppressed {
+                                            line_inst = line_inst.with_unsuppressed();
+                                        }
 
                                         context.add_instruction(
                                             ferrite_render::DrawingInstruction::Line(line_inst),
@@ -2233,199 +3083,288 @@ fn convert_lua_results_for_cell(
                             }
                         }
                     }
-                    DrawingCommand::AreaInstruction {
-                        fill_ref,
-                        color_fill,
+                    DrawingCommand::ColorFill {
+                        color_token,
+                        visibility,
+                        ..
                     } => {
                         area_count += 1;
-
-                        // Log area assignments by feature type
-                        // feature here is FeatureRecord from S101Cell
-                        let feature_code_str = feature
-                            .and_then(|f| f.feature_code.as_deref())
-                            .unwrap_or("unknown");
-                        if feature_code_str == "LandArea" {
-                            static LAND_LOG: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            if LAND_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                                info!(
-                                    "LandArea area: color_fill={:?} fill_ref={:?} priority={}",
-                                    color_fill, fill_ref, instruction.drawing_priority
-                                );
-                            }
-                        }
-                        if feature_code_str == "DepthArea" {
-                            static DEPTH_LOG: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            if DEPTH_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                                info!(
-                                    "DepthArea area: color_fill={:?} fill_ref={:?} priority={}",
-                                    color_fill, fill_ref, instruction.drawing_priority
-                                );
-                            }
-                        }
-
-                        // Determine area color from PC (no hardcoding)
-                        let color = if let Some(token) = color_fill {
-                            lookup_color(token)
-                        } else if let Some(ref_name) = fill_ref {
-                            // Look up from PC area fills
-                            if let Some(fill) = pc.area_fills.get(ref_name) {
-                                match &fill.fill_type {
-                                    ferrite_portrayal_catalog::AreaFillType::Color(c) => {
-                                        lookup_color(&c.color_token)
-                                    }
-                                    ferrite_portrayal_catalog::AreaFillType::Symbol(_)
-                                    | ferrite_portrayal_catalog::AreaFillType::Pattern(_)
-                                    | ferrite_portrayal_catalog::AreaFillType::Pixmap(_) => {
-                                        lookup_color("DEPVS")
-                                    }
-                                    ferrite_portrayal_catalog::AreaFillType::Hatch(h) => {
-                                        lookup_color(&h.line_color)
-                                    }
-                                }
-                            } else {
-                                lookup_color("NODTA")
-                            }
-                        } else {
-                            lookup_color("NODTA")
-                        };
-
-                        // Get area from feature's spatial associations (surfaces)
+                        let color = lookup_color(color_token);
+                        let draw_priority = visibility.drawing_priority;
                         if let Some(feature) = feature {
-                            // Debug: track LandArea surface processing
-                            let is_land_area = feature.feature_code.as_deref() == Some("LandArea");
-                            static LAND_DEBUG: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            let land_debug_idx = if is_land_area {
-                                LAND_DEBUG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            } else {
-                                999
-                            };
-
-                            if is_land_area && land_debug_idx < 5 {
-                                debug!(
-                                    "LandArea[{}] fid={:?} spas_count={}",
-                                    land_debug_idx,
-                                    feature_id,
-                                    feature.spatial_associations.len()
-                                );
-                            }
-
                             for spas in &feature.spatial_associations {
-                                // Only process surfaces (RCNM=130)
                                 if spas.spatial_id.rcnm != 130 {
                                     continue;
                                 }
-
-                                let surface_key = spas.spatial_id.key();
-                                if is_land_area && land_debug_idx < 5 {
-                                    debug!(
-                                        "  LandArea[{}] looking for surface key={}",
-                                        land_debug_idx, surface_key
-                                    );
-                                    debug!(
-                                        "  cell.surfaces has {} entries, keys sample: {:?}",
-                                        cell.surfaces.len(),
-                                        cell.surfaces.keys().take(5).collect::<Vec<_>>()
-                                    );
-                                }
-
-                                if let Some(surface) = cell.surfaces.get(&surface_key) {
-                                    if is_land_area && land_debug_idx < 5 {
-                                        debug!("  LandArea[{}] found surface, exterior_ring has {} curves", land_debug_idx, surface.exterior_ring.len());
-                                    }
-                                    let mut exterior_points = Vec::new();
-
-                                    // Collect points from exterior ring curves
-                                    for oriented_curve in &surface.exterior_ring {
-                                        let curve_key = oriented_curve.curve_id.key();
-
-                                        if let Some(curve) = cell.curves.get(&curve_key) {
-                                            let positions = curve.all_positions();
-                                            if oriented_curve.orientation {
-                                                for pos in positions {
-                                                    exterior_points
-                                                        .push(WorldPoint::new(pos.x, pos.y));
-                                                }
-                                            } else {
-                                                for pos in positions.into_iter().rev() {
-                                                    exterior_points
-                                                        .push(WorldPoint::new(pos.x, pos.y));
-                                                }
-                                            }
-                                        } else if let Some(composite) =
-                                            cell.composite_curves.get(&curve_key)
-                                        {
-                                            for sub_curve in &composite.curves {
-                                                let sub_key = sub_curve.curve_id.key();
-                                                if let Some(curve) = cell.curves.get(&sub_key) {
-                                                    let positions = curve.all_positions();
-                                                    let forward = oriented_curve.orientation
-                                                        == sub_curve.orientation;
-                                                    if forward {
-                                                        for pos in positions {
-                                                            exterior_points.push(WorldPoint::new(
-                                                                pos.x, pos.y,
-                                                            ));
-                                                        }
-                                                    } else {
-                                                        for pos in positions.into_iter().rev() {
-                                                            exterior_points.push(WorldPoint::new(
-                                                                pos.x, pos.y,
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Remove duplicate consecutive points (curves share endpoints)
-                                    // This prevents triangulation issues
-                                    let mut cleaned_points =
-                                        Vec::with_capacity(exterior_points.len());
-                                    for point in exterior_points {
-                                        if cleaned_points.is_empty() {
-                                            cleaned_points.push(point);
-                                        } else {
-                                            let last = cleaned_points.last().unwrap();
-                                            // Skip if same as previous point (within tolerance)
-                                            let dx = (point.x - last.x).abs();
-                                            let dy = (point.y - last.y).abs();
-                                            if dx > 1e-9 || dy > 1e-9 {
-                                                cleaned_points.push(point);
-                                            }
-                                        }
-                                    }
-
-                                    // Also check if first and last points are the same (closed ring)
-                                    // and remove the duplicate closing point
-                                    if cleaned_points.len() > 3 {
-                                        let first = cleaned_points.first().unwrap();
-                                        let last = cleaned_points.last().unwrap();
-                                        let dx = (first.x - last.x).abs();
-                                        let dy = (first.y - last.y).abs();
-                                        if dx < 1e-9 && dy < 1e-9 {
-                                            cleaned_points.pop();
-                                        }
-                                    }
-
-                                    if cleaned_points.len() >= 3 {
+                                if let Some(surface) = cell.surfaces.get(&spas.spatial_id.key()) {
+                                    let (exterior, interiors) = collect_surface_points(surface);
+                                    if exterior.len() >= 3 {
                                         area_rendered += 1;
-                                        // Adjust priority: LandArea should be on top of DepthArea
-                                        // S-52 standard: land is always above water
-                                        let adjusted_priority = if feature_code_str == "LandArea" {
-                                            instruction.drawing_priority.max(4)
-                                        // Ensure land is above depth (priority 3)
-                                        } else {
-                                            instruction.drawing_priority
-                                        };
-                                        let area_inst = AreaInstruction::new(cleaned_points)
+                                        let area_inst = AreaInstruction::new(exterior)
+                                            .with_interiors(interiors)
                                             .with_solid_fill(color)
-                                            .with_priority(adjusted_priority)
+                                            .with_priority(draw_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0));
+                                        context.add_instruction(
+                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DrawingCommand::AreaFillReference {
+                        reference,
+                        visibility,
+                        ..
+                    } => {
+                        area_count += 1;
+                        let draw_priority = visibility.drawing_priority;
+
+                        // Look up fill type from PC
+                        let fill = pc.area_fills.get(reference.as_str());
+
+                        if let Some(feature) = feature {
+                            for spas in &feature.spatial_associations {
+                                if spas.spatial_id.rcnm != 130 {
+                                    continue;
+                                }
+                                if let Some(surface) = cell.surfaces.get(&spas.spatial_id.key()) {
+                                    let (exterior, interiors) = collect_surface_points(surface);
+                                    if exterior.len() >= 3 {
+                                        area_rendered += 1;
+                                        let area_inst = AreaInstruction::new(exterior.clone())
+                                            .with_interiors(interiors.clone())
+                                            .with_priority(draw_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
                                             .with_feature_id(feature_id.unwrap_or(0));
 
+                                        let area_inst = if let Some(fill) = fill {
+                                            match &fill.fill_type {
+                                                ferrite_portrayal_catalog::AreaFillType::Color(c) => {
+                                                    area_inst.with_solid_fill(lookup_color(&c.color_token))
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Hatch(h) => {
+                                                    area_inst.with_hatch_fill(
+                                                        lookup_color(&h.line_color),
+                                                        h.line_width as f32,
+                                                        h.spacing as f32,
+                                                        h.angle as f32,
+                                                    )
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Symbol(s) => {
+                                                    area_inst.with_pattern_fill(
+                                                        s.symbol_ref.clone(),
+                                                        (s.v1.x as f32, s.v1.y as f32),
+                                                        (s.v2.x as f32, s.v2.y as f32),
+                                                    )
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Pattern(p) => {
+                                                    area_inst.with_pattern_fill(
+                                                        p.symbol_ref.clone(),
+                                                        (p.spacing_x as f32, 0.0),
+                                                        (0.0, p.spacing_y as f32),
+                                                    )
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Pixmap(px) => {
+                                                    tracing::warn!("AreaFillReference: raster pixmap fill not yet renderable (image: {:?}), falling back to NODTA", px.image_ref);
+                                                    area_inst.with_solid_fill(lookup_color("NODTA"))
+                                                }
+                                            }
+                                        } else {
+                                            area_inst.with_solid_fill(lookup_color("NODTA"))
+                                        };
+
+                                        context.add_instruction(
+                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DrawingCommand::PixmapFill {
+                        reference,
+                        visibility,
+                        ..
+                    } => {
+                        area_count += 1;
+                        let draw_priority = visibility.drawing_priority;
+
+                        let fill = pc.area_fills.get(reference.as_str());
+
+                        if let Some(feature) = feature {
+                            for spas in &feature.spatial_associations {
+                                if spas.spatial_id.rcnm != 130 {
+                                    continue;
+                                }
+                                if let Some(surface) = cell.surfaces.get(&spas.spatial_id.key()) {
+                                    let (exterior, interiors) = collect_surface_points(surface);
+                                    if exterior.len() >= 3 {
+                                        area_rendered += 1;
+                                        let area_inst = AreaInstruction::new(exterior.clone())
+                                            .with_interiors(interiors.clone())
+                                            .with_priority(draw_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0));
+
+                                        let area_inst = if let Some(fill) = fill {
+                                            match &fill.fill_type {
+                                                ferrite_portrayal_catalog::AreaFillType::Color(c) => {
+                                                    area_inst.with_solid_fill(lookup_color(&c.color_token))
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Hatch(h) => {
+                                                    area_inst.with_hatch_fill(
+                                                        lookup_color(&h.line_color),
+                                                        h.line_width as f32,
+                                                        h.spacing as f32,
+                                                        h.angle as f32,
+                                                    )
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Symbol(s) => {
+                                                    area_inst.with_pattern_fill(
+                                                        s.symbol_ref.clone(),
+                                                        (s.v1.x as f32, s.v1.y as f32),
+                                                        (s.v2.x as f32, s.v2.y as f32),
+                                                    )
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Pattern(p) => {
+                                                    area_inst.with_pattern_fill(
+                                                        p.symbol_ref.clone(),
+                                                        (p.spacing_x as f32, 0.0),
+                                                        (0.0, p.spacing_y as f32),
+                                                    )
+                                                }
+                                                ferrite_portrayal_catalog::AreaFillType::Pixmap(px) => {
+                                                    tracing::warn!("PixmapFill: raster pixmap fill not yet renderable (image: {:?}), falling back to NODTA", px.image_ref);
+                                                    area_inst.with_solid_fill(lookup_color("NODTA"))
+                                                }
+                                            }
+                                        } else {
+                                            area_inst.with_solid_fill(lookup_color("NODTA"))
+                                        };
+
+                                        context.add_instruction(
+                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DrawingCommand::SymbolFill {
+                        symbol,
+                        v1,
+                        v2,
+                        visibility,
+                        ..
+                    } => {
+                        area_count += 1;
+                        // S-100 Part 9a: v1/v2 define parallelogram lattice for symbol tiling
+                        let v1f = (v1.0 as f32, v1.1 as f32);
+                        let v2f = (v2.0 as f32, v2.1 as f32);
+                        if let Some(feature) = feature {
+                            for spas in &feature.spatial_associations {
+                                if spas.spatial_id.rcnm != 130 {
+                                    continue;
+                                }
+                                if let Some(surface) = cell.surfaces.get(&spas.spatial_id.key()) {
+                                    let (exterior, interiors) = collect_surface_points(surface);
+                                    if exterior.len() >= 3 {
+                                        area_rendered += 1;
+                                        let area_inst = AreaInstruction::new(exterior)
+                                            .with_interiors(interiors)
+                                            .with_pattern_fill(symbol.clone(), v1f, v2f)
+                                            .with_priority(visibility.drawing_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0));
+                                        context.add_instruction(
+                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DrawingCommand::HatchFill {
+                        direction,
+                        distance,
+                        line_styles,
+                        visibility,
+                        ..
+                    } => {
+                        area_count += 1;
+                        // Look up first line style from PC for color and width
+                        let (color, line_width_mm) = line_styles
+                            .first()
+                            .and_then(|name| pc.line_styles.get(name.as_str()))
+                            .map(|style| match style {
+                                ferrite_portrayal_catalog::LineStyle::Simple(s) => {
+                                    (lookup_color(&s.pen.color_token), s.pen.width as f32)
+                                }
+                                ferrite_portrayal_catalog::LineStyle::Complex(c) => {
+                                    let col = c
+                                        .strokes
+                                        .first()
+                                        .map(|s| lookup_color(&s.pen.color_token))
+                                        .unwrap_or_else(|| lookup_color("CSTLN"));
+                                    let w = c
+                                        .strokes
+                                        .first()
+                                        .map(|s| s.pen.width as f32)
+                                        .unwrap_or(0.32);
+                                    (col, w)
+                                }
+                                ferrite_portrayal_catalog::LineStyle::Composite(c) => {
+                                    let col = c
+                                        .components
+                                        .first()
+                                        .map(|s| lookup_color(&s.pen.color_token))
+                                        .unwrap_or_else(|| lookup_color("CSTLN"));
+                                    let w = c
+                                        .components
+                                        .first()
+                                        .map(|s| s.pen.width as f32)
+                                        .unwrap_or(0.32);
+                                    (col, w)
+                                }
+                            })
+                            .unwrap_or_else(|| (lookup_color("CSTLN"), 0.32));
+                        // Compute angle from direction vector (dirX, dirY) in degrees
+                        let angle = (direction.1.atan2(direction.0).to_degrees()) as f32;
+                        // distance is in mm per S-100 spec
+                        let spacing_mm = (*distance as f32).max(0.5);
+                        if let Some(feature) = feature {
+                            for spas in &feature.spatial_associations {
+                                if spas.spatial_id.rcnm != 130 {
+                                    continue;
+                                }
+                                if let Some(surface) = cell.surfaces.get(&spas.spatial_id.key()) {
+                                    let (exterior, interiors) = collect_surface_points(surface);
+                                    if exterior.len() >= 3 {
+                                        area_rendered += 1;
+                                        let area_inst = AreaInstruction::new(exterior)
+                                            .with_interiors(interiors)
+                                            .with_hatch_fill(
+                                                color,
+                                                line_width_mm,
+                                                spacing_mm,
+                                                angle,
+                                            )
+                                            .with_priority(visibility.drawing_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0));
                                         context.add_instruction(
                                             ferrite_render::DrawingInstruction::Area(area_inst),
                                         );
@@ -2436,14 +3375,168 @@ fn convert_lua_results_for_cell(
                     }
                     DrawingCommand::TextInstruction {
                         text,
-                        font_size: _,
+                        font_size,
                         color_token,
+                        bold,
+                        italic,
+                        h_align,
+                        v_align,
+                        rotation,
+                        local_offset,
+                        position,
+                        visibility,
+                        ..
                     } => {
-                        let _color = lookup_color(color_token);
-                        debug!("Text instruction (not rendered yet): {}", text);
+                        let color = lookup_color(color_token);
+                        // If explicit position from AugmentedPoint, use it
+                        if let Some((x, y)) = position {
+                            let text_inst =
+                                RenderTextInstruction::new(text.clone(), WorldPoint::new(*x, *y))
+                                    .with_font_size(*font_size)
+                                    .with_color(color)
+                                    .with_alignment(parse_h_align(h_align), parse_v_align(v_align))
+                                    .with_rotation(*rotation)
+                                    .with_offset(local_offset.0 as f32, local_offset.1 as f32)
+                                    .with_priority(visibility.drawing_priority)
+                                    .with_viewing_group(make_viewing_group(visibility))
+                                    .with_scale_range(make_scale_range(visibility))
+                                    .with_display_plane(make_display_plane(visibility))
+                                    .with_feature_id(feature_id.unwrap_or(0));
+                            context.add_instruction(ferrite_render::DrawingInstruction::Text(
+                                text_inst,
+                            ));
+                        } else if let Some(feature) = feature {
+                            // Place text at feature geometry:
+                            // 1. Point geometry → at point position
+                            // 2. Surface geometry → at area centroid
+                            let mut placed = false;
+
+                            // Try point geometry first
+                            for spas in &feature.spatial_associations {
+                                if let Some(point) = cell.points.get(&spas.spatial_id.key()) {
+                                    let mut ti = RenderTextInstruction::new(
+                                        text.clone(),
+                                        WorldPoint::new(point.position.x, point.position.y),
+                                    )
+                                    .with_font_size(*font_size)
+                                    .with_color(color)
+                                    .with_alignment(parse_h_align(h_align), parse_v_align(v_align))
+                                    .with_rotation(*rotation)
+                                    .with_offset(local_offset.0 as f32, local_offset.1 as f32)
+                                    .with_priority(visibility.drawing_priority)
+                                    .with_viewing_group(make_viewing_group(visibility))
+                                    .with_scale_range(make_scale_range(visibility))
+                                    .with_display_plane(make_display_plane(visibility))
+                                    .with_feature_id(feature_id.unwrap_or(0));
+                                    ti.bold = *bold;
+                                    ti.italic = *italic;
+                                    context.add_instruction(
+                                        ferrite_render::DrawingInstruction::Text(ti),
+                                    );
+                                    placed = true;
+                                }
+                            }
+
+                            // Surface geometry: place text at centroid
+                            if !placed {
+                                for spas in &feature.spatial_associations {
+                                    if let Some(surface) = cell.surfaces.get(&spas.spatial_id.key())
+                                    {
+                                        let ext = collect_ring_points(&surface.exterior_ring);
+                                        if ext.len() >= 3 {
+                                            let mut cx = 0.0_f64;
+                                            let mut cy = 0.0_f64;
+                                            let mut area2 = 0.0_f64;
+                                            let n = ext.len();
+                                            for i in 0..n {
+                                                let j = (i + 1) % n;
+                                                let cross =
+                                                    ext[i].x * ext[j].y - ext[j].x * ext[i].y;
+                                                cx += (ext[i].x + ext[j].x) * cross;
+                                                cy += (ext[i].y + ext[j].y) * cross;
+                                                area2 += cross;
+                                            }
+                                            if area2.abs() > 1e-15 {
+                                                cx /= 3.0 * area2;
+                                                cy /= 3.0 * area2;
+                                            } else {
+                                                cx =
+                                                    ext.iter().map(|p| p.x).sum::<f64>() / n as f64;
+                                                cy =
+                                                    ext.iter().map(|p| p.y).sum::<f64>() / n as f64;
+                                            }
+
+                                            let mut ti = RenderTextInstruction::new(
+                                                text.clone(),
+                                                WorldPoint::new(cx, cy),
+                                            )
+                                            .with_font_size(*font_size)
+                                            .with_color(color)
+                                            .with_alignment(
+                                                parse_h_align(h_align),
+                                                parse_v_align(v_align),
+                                            )
+                                            .with_rotation(*rotation)
+                                            .with_offset(
+                                                local_offset.0 as f32,
+                                                local_offset.1 as f32,
+                                            )
+                                            .with_priority(visibility.drawing_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0));
+                                            ti.bold = *bold;
+                                            ti.italic = *italic;
+                                            context.add_instruction(
+                                                ferrite_render::DrawingInstruction::Text(ti),
+                                            );
+                                            break; // One text label per feature
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    DrawingCommand::SpatialReference { .. } | DrawingCommand::Dash { .. } => {
-                        // These modify other instructions, handled separately
+                    DrawingCommand::CoverageFill { visibility, .. } => {
+                        // Coverage fills require per-cell attribute grid rendering
+                        // Rendered as transparent area placeholder for now
+                        area_count += 1;
+                        if let Some(feature) = feature {
+                            for spas in &feature.spatial_associations {
+                                if spas.spatial_id.rcnm != 130 {
+                                    continue;
+                                }
+                                if let Some(surface) = cell.surfaces.get(&spas.spatial_id.key()) {
+                                    let (exterior, interiors) = collect_surface_points(surface);
+                                    if exterior.len() >= 3 {
+                                        area_rendered += 1;
+                                        let area_inst = AreaInstruction::new(exterior)
+                                            .with_interiors(interiors)
+                                            .with_solid_fill(lookup_color("NODTA"))
+                                            .with_priority(visibility.drawing_priority)
+                                            .with_viewing_group(make_viewing_group(visibility))
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0));
+                                        context.add_instruction(
+                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DrawingCommand::NullInstruction { .. } => {
+                        // Feature purposefully not portrayed
+                    }
+                    DrawingCommand::AlertReference { .. } => {
+                        // Alert handling is not part of visual rendering
+                    }
+                    DrawingCommand::AugmentedPoint { .. }
+                    | DrawingCommand::SpatialReference { .. }
+                    | DrawingCommand::Dash { .. } => {
+                        // State-carrying commands, consumed during parse phase
                     }
                 }
             }
@@ -2969,6 +4062,18 @@ fn generate_default_instructions(
             SpatialPrimitiveType::Curve | SpatialPrimitiveType::CompositeCurve => {
                 // Get curve coordinates
                 for spas in &feature.spatial_associations {
+                    // S-101 4.8.3: Edge masking — skip suppressed edges
+                    if spas.mask == 2 {
+                        continue;
+                    }
+                    let masked_by_mask_field = feature
+                        .masks
+                        .iter()
+                        .any(|m| m.spatial_id.key() == spas.spatial_id.key() && m.mask_type == 2);
+                    if masked_by_mask_field {
+                        continue;
+                    }
+
                     if let Some(curve) = cell.curves.get(&spas.spatial_id.key()) {
                         let points: Vec<WorldPoint> = curve
                             .all_positions()
@@ -3139,17 +4244,6 @@ fn lookup_pc_color(pc: &PortrayalCatalogue, token: &str, profile_name: &str) -> 
 
     if let Some(profile) = profile {
         if let Some(srgb) = profile.get_srgb(token) {
-            // Debug: Log color lookup for depth tokens
-            if token.starts_with("DEP") {
-                tracing::debug!(
-                    "Color lookup: profile='{}' token='{}' -> RGB({}, {}, {})",
-                    profile_name,
-                    token,
-                    srgb.r,
-                    srgb.g,
-                    srgb.b
-                );
-            }
             return Color::rgb(
                 srgb.r as f32 / 255.0,
                 srgb.g as f32 / 255.0,
