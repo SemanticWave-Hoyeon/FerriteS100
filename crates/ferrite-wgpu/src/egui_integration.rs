@@ -54,6 +54,8 @@ pub struct SettingsState {
     pub plain_boundaries: bool,
     /// Display mode (Base/Standard/All)
     pub display_mode: DisplayMode,
+    /// Show shallow water pattern overlay (DIAMOND1 - areas less than safety contour)
+    pub show_shallow_pattern: bool,
 }
 
 impl Default for SettingsState {
@@ -70,6 +72,7 @@ impl Default for SettingsState {
             ignore_scale_minimum: false,
             plain_boundaries: false,
             display_mode: DisplayMode::Standard,
+            show_shallow_pattern: true,
         }
     }
 }
@@ -153,8 +156,10 @@ pub struct AppUiState {
     pub show_settings: bool,
     /// Current settings state
     pub settings: SettingsState,
-    /// Settings were changed (triggers re-render)
+    /// Settings were changed (triggers Lua re-run + re-render)
     pub settings_changed: bool,
+    /// Settings are dirty (waiting for pointer release to apply)
+    pub settings_dirty: bool,
     /// Pending settings (edited but not yet applied)
     pub pending_settings: Option<SettingsState>,
     /// Actual chart area after UI panels (x, y, width, height)
@@ -1375,31 +1380,36 @@ impl EguiIntegration {
                     .num_columns(2)
                     .spacing([20.0, 6.0])
                     .show(ui, |ui| {
+                        // Shallow Water Pattern
+                        ui.checkbox(&mut pending.show_shallow_pattern, "Shallow Pattern")
+                            .on_hover_text("Show diamond pattern overlay on areas shallower than safety contour");
+
                         // Two Shades
                         ui.checkbox(&mut pending.two_shades, "Two Shades")
                             .on_hover_text("Simplified two-color depth shading");
+                        ui.end_row();
 
                         // Simplified Symbols
                         ui.checkbox(&mut pending.simplified_symbols, "Simplified Symbols")
                             .on_hover_text(
                                 "Use simplified point symbols instead of paper chart symbols",
                             );
-                        ui.end_row();
 
                         // Isolated Dangers
                         ui.checkbox(&mut pending.isolated_dangers, "Isolated Dangers")
                             .on_hover_text("Highlight isolated dangers in shallow water");
+                        ui.end_row();
 
                         // Full Light Sectors
                         ui.checkbox(&mut pending.full_light_sectors, "Full Light Sectors")
                             .on_hover_text("Show complete light sector arcs");
-                        ui.end_row();
 
                         // Ignore Scale Minimum
                         ui.checkbox(&mut pending.ignore_scale_minimum, "Ignore Scale Min")
                             .on_hover_text(
                                 "Display features regardless of scale minimum attribute",
                             );
+                        ui.end_row();
 
                         // Plain Boundaries
                         ui.checkbox(&mut pending.plain_boundaries, "Plain Boundaries")
@@ -1411,8 +1421,34 @@ impl EguiIntegration {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // Check if settings have been modified
-                let has_changes = ui_state.pending_settings.as_ref() != Some(&ui_state.settings);
+                // Auto-apply: immediately apply any changes
+                if let Some(pending) = ui_state.pending_settings.as_ref() {
+                    if *pending != ui_state.settings {
+                        let needs_lua = pending.safety_depth != ui_state.settings.safety_depth
+                            || pending.safety_contour != ui_state.settings.safety_contour
+                            || pending.shallow_contour != ui_state.settings.shallow_contour
+                            || pending.deep_contour != ui_state.settings.deep_contour
+                            || pending.two_shades != ui_state.settings.two_shades
+                            || pending.simplified_symbols != ui_state.settings.simplified_symbols
+                            || pending.isolated_dangers != ui_state.settings.isolated_dangers
+                            || pending.full_light_sectors != ui_state.settings.full_light_sectors
+                            || pending.ignore_scale_minimum != ui_state.settings.ignore_scale_minimum
+                            || pending.plain_boundaries != ui_state.settings.plain_boundaries
+                            || pending.display_mode != ui_state.settings.display_mode;
+
+                        ui_state.settings = pending.clone();
+                        if needs_lua {
+                            // Lua-affecting settings: apply on pointer release (debounce drag)
+                            ui_state.settings_dirty = true;
+                        }
+                        // show_shallow_pattern takes effect immediately via renderer (no Lua)
+                    }
+                }
+                // Flush dirty settings when pointer is released
+                if ui_state.settings_dirty && !ctx.input(|i| i.pointer.any_down()) {
+                    ui_state.settings_dirty = false;
+                    ui_state.settings_changed = true;
+                }
 
                 // Buttons
                 ui.horizontal(|ui| {
@@ -1424,16 +1460,6 @@ impl EguiIntegration {
                         if ui.button("Close").clicked() {
                             ui_state.pending_settings = None;
                             ui_state.show_settings = false;
-                        }
-
-                        // Apply button - only enabled if there are changes
-                        let apply_btn = ui.add_enabled(has_changes, egui::Button::new("Apply"));
-                        if apply_btn.clicked() {
-                            if let Some(pending) = ui_state.pending_settings.take() {
-                                ui_state.settings = pending;
-                                ui_state.settings_changed = true;
-                                ui_state.pending_settings = Some(ui_state.settings.clone());
-                            }
                         }
                     });
                 });
