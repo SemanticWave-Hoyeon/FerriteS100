@@ -226,6 +226,23 @@ impl RenderContext {
         }
     }
 
+    /// Get raw instructions slice for cache serialization
+    pub fn raw_instructions(&self) -> &[DrawingInstruction] {
+        &self.instructions
+    }
+
+    /// Set instructions from a pre-built cache (skips viewing group filtering)
+    pub fn set_instructions_from_cache(&mut self, instructions: Vec<DrawingInstruction>) {
+        self.instructions = instructions;
+        self.sorted = false;
+        self.feature_ids.clear();
+        for inst in &self.instructions {
+            if let Some(feature_id) = inst.feature_id() {
+                self.feature_ids.insert(feature_id);
+            }
+        }
+    }
+
     /// Get statistics about collected instructions
     pub fn statistics(&self) -> RenderStatistics {
         let mut stats = RenderStatistics::default();

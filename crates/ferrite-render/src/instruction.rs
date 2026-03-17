@@ -7,9 +7,10 @@
 //! Based on S-100 standard: S100_PointInstruction, S100_LineInstruction, etc.
 
 use crate::Color;
+use serde::{Deserialize, Serialize};
 
 /// Screen coordinate (in pixels)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ScreenPoint {
     pub x: f32,
     pub y: f32,
@@ -28,7 +29,7 @@ impl ScreenPoint {
 }
 
 /// World coordinate (in geographic units, typically degrees)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WorldPoint {
     pub x: f64, // Longitude
     pub y: f64, // Latitude
@@ -48,7 +49,7 @@ impl From<ferrite_s100_core::Coordinate> for WorldPoint {
 }
 
 /// Display priority (higher = rendered later/on top)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DisplayPriority(pub i32);
 
 impl Default for DisplayPriority {
@@ -59,7 +60,7 @@ impl Default for DisplayPriority {
 
 /// Geometry type for S-101 rendering order
 /// Within the same priority: Area -> Line -> Point -> Text
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GeometryType {
     Area = 0,
     Line = 1,
@@ -77,7 +78,7 @@ pub enum GeometryType {
 ///
 /// For area features, `neg_extent` is the negative bounding box area so that
 /// larger polygons sort first (drawn as background).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RenderOrder {
     pub priority: i32,
     /// 0 = water/depth (VG 13xxx), 1 = land (VG 12xxx), 2 = everything else
@@ -135,7 +136,7 @@ impl RenderOrder {
 }
 
 /// Display plane for radar overlay separation (S-100 Part 9-11.1.5)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DisplayPlane {
     #[default]
     UnderRadar,
@@ -143,7 +144,7 @@ pub enum DisplayPlane {
 }
 
 /// Scale-dependent visibility (S-100 Part 9a ScaleMinimum/ScaleMaximum)
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ScaleRange {
     /// Scale denominator below which the instruction is hidden (zoomed out too far)
     pub scale_minimum: Option<u32>,
@@ -170,7 +171,7 @@ impl ScaleRange {
 }
 
 /// Viewing group for display control
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewingGroup(pub u32);
 
 impl Default for ViewingGroup {
@@ -180,7 +181,7 @@ impl Default for ViewingGroup {
 }
 
 /// Text horizontal alignment
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum HAlign {
     #[default]
     Left,
@@ -189,7 +190,7 @@ pub enum HAlign {
 }
 
 /// Text vertical alignment
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum VAlign {
     Top,
     #[default]
@@ -198,7 +199,7 @@ pub enum VAlign {
 }
 
 /// Cap style for line ends
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CapStyle {
     #[default]
     Butt,
@@ -207,7 +208,7 @@ pub enum CapStyle {
 }
 
 /// Join style for line corners
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum JoinStyle {
     #[default]
     Miter,
@@ -216,7 +217,7 @@ pub enum JoinStyle {
 }
 
 /// Point instruction - renders a symbol at a position
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointInstruction {
     /// Symbol reference ID (from Portrayal Catalogue)
     pub symbol_ref: String,
@@ -335,7 +336,7 @@ impl PointInstruction {
 }
 
 /// Line style definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineStyle {
     /// Color
     pub color: Color,
@@ -384,7 +385,7 @@ impl LineStyle {
 }
 
 /// Line instruction - renders a line/polyline
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineInstruction {
     /// Line style reference ID (from PC) or inline style
     pub style_ref: Option<String>,
@@ -477,7 +478,7 @@ impl LineInstruction {
 }
 
 /// Area fill type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AreaFillType {
     /// Solid color fill
     Solid(Color),
@@ -512,7 +513,7 @@ impl Default for AreaFillType {
 }
 
 /// Area instruction - renders a filled polygon
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AreaInstruction {
     /// Fill style reference ID (from PC) or inline fill
     pub fill_ref: Option<String>,
@@ -626,7 +627,7 @@ impl AreaInstruction {
 }
 
 /// Text instruction - renders text label
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextInstruction {
     /// Text content
     pub text: String,
@@ -751,7 +752,7 @@ impl TextInstruction {
 }
 
 /// All drawing instruction types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DrawingInstruction {
     Point(PointInstruction),
     Line(LineInstruction),
