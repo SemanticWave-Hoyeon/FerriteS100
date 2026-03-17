@@ -16,7 +16,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.8.5"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/user/ferrite-s100"
@@ -41,8 +41,11 @@ anyhow = "1"
 # Parallelization
 rayon = "1.10"
 
+# Performance
+rustc-hash = "2"  # FxHashMap/FxHashSet: faster hashing for integer keys
+
 # Logging
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_off"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 
@@ -73,6 +76,7 @@ libloading = "0.8"
 ed25519-dalek = { version = "2", features = ["std"] }
 sha2 = "0.10"
 serde_json = "1"
+bincode = "1"
 
 # Internal crates
 ferrite-iso8211 = { path = "crates/ferrite-iso8211" }
@@ -121,6 +125,8 @@ egui-winit.workspace = true
 rfd.workspace = true
 image.workspace = true
 rayon.workspace = true
+bincode.workspace = true
+mimalloc = "0.1"
 
 # Windows system APIs (for debug info)
 [target.'cfg(windows)'.dependencies]
@@ -134,7 +140,7 @@ windows-sys = { version = "0.59", features = [
 # Release profile: maximum optimizations
 [profile.release]
 opt-level = 3          # Maximum optimization
-lto = "thin"           # Link-time optimization (thin is faster to compile than fat)
+lto = "fat"            # Full link-time optimization (slower build, fastest runtime)
 codegen-units = 1      # Single codegen unit for better optimization
 strip = "symbols"      # Strip symbols for smaller binary
 panic = "abort"        # Abort on panic (smaller binary, faster)

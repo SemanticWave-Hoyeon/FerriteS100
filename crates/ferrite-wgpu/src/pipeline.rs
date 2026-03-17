@@ -4,7 +4,7 @@
 
 use crate::{state::MSAA_SAMPLE_COUNT, GpuState, Result, Vertex2D};
 
-/// Basic 2D shader for solid colored geometry
+/// Basic 2D shader for solid colored geometry (screen-space vertices)
 const BASIC_SHADER: &str = r#"
 // Vertex shader
 struct VertexInput {
@@ -23,7 +23,10 @@ struct ViewUniforms {
     scale: f32,
     _padding: f32,
     pan_offset: vec2<f32>,
-    _padding2: vec2<f32>,
+    zoom_scale: f32,
+    _padding2: f32,
+    zoom_pivot: vec2<f32>,
+    _padding3: vec2<f32>,
 }
 
 @group(0) @binding(0)
@@ -32,8 +35,9 @@ var<uniform> view: ViewUniforms;
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    // Apply pan offset before projection
-    let pos = in.position + view.pan_offset;
+    // Screen-space vertex: apply pan offset + zoom
+    var pos = in.position + view.pan_offset;
+    pos = (pos - view.zoom_pivot) * view.zoom_scale + view.zoom_pivot;
     out.clip_position = view.view_proj * vec4<f32>(pos, 0.0, 1.0);
     out.color = in.color;
     return out;
@@ -65,7 +69,10 @@ struct ViewUniforms {
     scale: f32,
     _padding: f32,
     pan_offset: vec2<f32>,
-    _padding2: vec2<f32>,
+    zoom_scale: f32,
+    _padding2: f32,
+    zoom_pivot: vec2<f32>,
+    _padding3: vec2<f32>,
 }
 
 @group(0) @binding(0)
@@ -79,8 +86,9 @@ var s_diffuse: sampler;
 @vertex
 fn vs_main(in: TextureVertexInput) -> TextureVertexOutput {
     var out: TextureVertexOutput;
-    // Apply pan offset before projection
-    let pos = in.position + view.pan_offset;
+    // Apply pan offset, then zoom around pivot point
+    var pos = in.position + view.pan_offset;
+    pos = (pos - view.zoom_pivot) * view.zoom_scale + view.zoom_pivot;
     out.clip_position = view.view_proj * vec4<f32>(pos, 0.0, 1.0);
     out.tex_coord = in.tex_coord;
     return out;
@@ -90,8 +98,6 @@ fn vs_main(in: TextureVertexInput) -> TextureVertexOutput {
 @fragment
 fn fs_main(in: TextureVertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(t_diffuse, s_diffuse, in.tex_coord);
-    // resvg outputs premultiplied alpha, so we need to handle it properly
-    // For alpha blending with premultiplied alpha, we use: src + dst * (1 - src_alpha)
     return color;
 }
 "#;
@@ -116,7 +122,10 @@ struct ViewUniforms {
     scale: f32,
     _padding: f32,
     pan_offset: vec2<f32>,
-    _padding2: vec2<f32>,
+    zoom_scale: f32,
+    _padding2: f32,
+    zoom_pivot: vec2<f32>,
+    _padding3: vec2<f32>,
 }
 
 @group(0) @binding(0)
@@ -130,10 +139,10 @@ var s_pattern: sampler;
 @vertex
 fn vs_main(in: PatternVertexInput) -> PatternVertexOutput {
     var out: PatternVertexOutput;
-    let pos = in.position + view.pan_offset;
+    var pos = in.position + view.pan_offset;
+    pos = (pos - view.zoom_pivot) * view.zoom_scale + view.zoom_pivot;
     out.clip_position = view.view_proj * vec4<f32>(pos, 0.0, 1.0);
     // S-100 parallelogram tiling: apply shear to UV so rows offset horizontally
-    // shear = v2.x / v2.y (how much each row shifts in texture-space)
     let inv_tx = in.tile_params.x;
     let inv_ty = in.tile_params.y;
     let shear = in.tile_params.z;

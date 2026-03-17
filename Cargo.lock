@@ -404,6 +404,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1217,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-feature-catalog"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "quick-xml 0.37.5",
  "serde",
@@ -1227,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-iso8211"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "encoding_rs",
@@ -1239,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-lua"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "ferrite-feature-catalog",
  "ferrite-portrayal-catalog",
@@ -1252,14 +1261,14 @@ dependencies = [
 
 [[package]]
 name = "ferrite-plugin-api"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "abi_stable",
 ]
 
 [[package]]
 name = "ferrite-plugin-loader"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "abi_stable",
  "ed25519-dalek",
@@ -1274,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-portrayal-catalog"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "quick-xml 0.37.5",
  "serde",
@@ -1284,21 +1293,23 @@ dependencies = [
 
 [[package]]
 name = "ferrite-render"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "ferrite-portrayal-catalog",
  "ferrite-s100-core",
  "geo-types",
+ "serde",
  "thiserror 2.0.17",
  "tracing",
 ]
 
 [[package]]
 name = "ferrite-s100"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "abi_stable",
  "anyhow",
+ "bincode",
  "egui",
  "egui-winit",
  "ferrite-feature-catalog",
@@ -1311,6 +1322,7 @@ dependencies = [
  "ferrite-s100-core",
  "ferrite-wgpu",
  "image",
+ "mimalloc",
  "pollster",
  "rayon",
  "rfd",
@@ -1325,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-s100-core"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "ferrite-iso8211",
@@ -1336,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-wgpu"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "earcutr",
@@ -1349,10 +1361,12 @@ dependencies = [
  "pollster",
  "rayon",
  "resvg",
+ "rustc-hash 2.1.1",
  "serde_json",
  "thiserror 2.0.17",
  "tracing",
  "wgpu",
+ "wgpu-profiler",
  "winit",
 ]
 
@@ -2012,6 +2026,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667f4fec20f29dfc6bc7357c582d91796c169ad7e2fce709468aefeb2c099870"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2135,6 +2159,15 @@ dependencies = [
  "log",
  "objc",
  "paste",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -4340,6 +4373,17 @@ dependencies = [
  "wgpu-types",
  "windows",
  "windows-core 0.58.0",
+]
+
+[[package]]
+name = "wgpu-profiler"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a4a6f78dabb0ef257b8c6a806c9edc3ffd90f5f4491b5845d6d5c738482d36d"
+dependencies = [
+ "parking_lot",
+ "thiserror 2.0.17",
+ "wgpu",
 ]
 
 [[package]]
