@@ -581,6 +581,14 @@ impl WgpuRenderer {
         self.packed_symbol_indices.clear();
         self.packed_symbol_ranges.clear();
 
+        // Screen-space guard bounds for symbol culling
+        let (vp_w, vp_h) = self.state.viewport_size();
+        let sym_guard = 200.0_f32;
+        let sym_min_x = -sym_guard;
+        let sym_min_y = -sym_guard;
+        let sym_max_x = vp_w + sym_guard;
+        let sym_max_y = vp_h + sym_guard;
+
         // First, group by symbol_id using the existing batches map
         self.symbol_batches.clear();
         for instance in &self.symbol_instances[start..end] {
@@ -606,6 +614,17 @@ impl WgpuRenderer {
                 let (x1, y1) = transform(half_w, -half_h);
                 let (x2, y2) = transform(half_w, half_h);
                 let (x3, y3) = transform(-half_w, half_h);
+
+                // Skip symbols entirely outside viewport guard bounds
+                let all_left = x0 < sym_min_x && x1 < sym_min_x && x2 < sym_min_x && x3 < sym_min_x;
+                let all_right =
+                    x0 > sym_max_x && x1 > sym_max_x && x2 > sym_max_x && x3 > sym_max_x;
+                let all_top = y0 < sym_min_y && y1 < sym_min_y && y2 < sym_min_y && y3 < sym_min_y;
+                let all_bottom =
+                    y0 > sym_max_y && y1 > sym_max_y && y2 > sym_max_y && y3 > sym_max_y;
+                if all_left || all_right || all_top || all_bottom {
+                    continue;
+                }
 
                 let batch = self
                     .symbol_batches
@@ -1615,32 +1634,56 @@ impl WgpuRenderer {
         // CPU-side world→screen transform (f64 precision, no GPU artifacts)
         let (scale_x, scale_y, offset_x, offset_y, min_x, max_y) = transform;
 
-        // Clamp screen coordinates to a reasonable range to prevent GPU precision
-        // issues with extreme off-screen vertices at high zoom.
-        // Large triangles with vertices at ±50000px cause rasterizer artifacts ("rays").
-        // Clamping to ±8192px beyond viewport preserves visual correctness for on-screen
-        // triangles while eliminating extreme coordinates.
-        let clamp_margin = 8192.0_f32;
+        // Screen-space bounds for triangle culling: skip triangles with any vertex
+        // beyond this range to prevent GPU rasterizer ray artifacts at high zoom.
+        let guard = 100.0_f32;
         let (vp_w, vp_h) = self.state.viewport_size();
-        let clamp_min_x = -clamp_margin;
-        let clamp_min_y = -clamp_margin;
-        let clamp_max_x = vp_w + clamp_margin;
-        let clamp_max_y = vp_h + clamp_margin;
+        let bound_min_x = -guard;
+        let bound_min_y = -guard;
+        let bound_max_x = vp_w + guard;
+        let bound_max_y = vp_h + guard;
 
+        // Transform all vertices to screen space (store raw coordinates)
+        let vertex_start = self.area_vertices.len();
         self.area_vertices.extend((0..total_vertex_count).map(|i| {
             let wx = wv[i * 2];
             let wy = wv[i * 2 + 1];
             let sx = ((wx - min_x) * scale_x + offset_x) as f32;
             let sy = ((max_y - wy) * scale_y + offset_y) as f32;
-            Vertex2D::new(
-                sx.clamp(clamp_min_x, clamp_max_x),
-                sy.clamp(clamp_min_y, clamp_max_y),
-                color,
-            )
+            Vertex2D::new(sx, sy, color)
         }));
 
-        self.area_indices
-            .extend(indices.iter().map(|&idx| base_index + idx as u32));
+        // Add triangle indices, but SKIP triangles where any vertex is far off-screen.
+        // This prevents the GPU rasterizer from creating ray artifacts when interpolating
+        // across extremely large triangles (e.g. 50000px span at 50x zoom).
+        let verts = &self.area_vertices[vertex_start..];
+        for tri in indices.chunks(3) {
+            if tri.len() < 3 {
+                break;
+            }
+            let (i0, i1, i2) = (tri[0], tri[1], tri[2]);
+            let v0 = &verts[i0];
+            let v1 = &verts[i1];
+            let v2 = &verts[i2];
+            // Skip triangle if ANY vertex is far outside the viewport
+            let all_in_bounds = v0.position[0] >= bound_min_x
+                && v0.position[0] <= bound_max_x
+                && v0.position[1] >= bound_min_y
+                && v0.position[1] <= bound_max_y
+                && v1.position[0] >= bound_min_x
+                && v1.position[0] <= bound_max_x
+                && v1.position[1] >= bound_min_y
+                && v1.position[1] <= bound_max_y
+                && v2.position[0] >= bound_min_x
+                && v2.position[0] <= bound_max_x
+                && v2.position[1] >= bound_min_y
+                && v2.position[1] <= bound_max_y;
+            if all_in_bounds {
+                self.area_indices.push(base_index + i0 as u32);
+                self.area_indices.push(base_index + i1 as u32);
+                self.area_indices.push(base_index + i2 as u32);
+            }
+        }
     }
 
     /// Fill an area polygon with a tiled pattern texture (S-100 standard).
@@ -1722,19 +1765,12 @@ impl WgpuRenderer {
         let inv_ty = 1.0 / pat_tex.height as f32;
 
         // Triangulate the polygon (same approach as add_area_cached)
-        // Clamp screen coordinates to prevent GPU rasterizer artifacts at high zoom
-        let clamp_m = 8192.0_f32;
-        let (vpw, vph) = self.state.viewport_size();
-        let cl_lo_x = -clamp_m;
-        let cl_lo_y = -clamp_m;
-        let cl_hi_x = vpw + clamp_m;
-        let cl_hi_y = vph + clamp_m;
         let screen_points: Vec<(f32, f32)> = area
             .exterior
             .iter()
             .map(|p| {
                 let s = scaler.world_to_screen(*p);
-                (s.x.clamp(cl_lo_x, cl_hi_x), s.y.clamp(cl_lo_y, cl_hi_y))
+                (s.x, s.y)
             })
             .filter(|(x, y)| x.is_finite() && y.is_finite())
             .collect();
@@ -1756,7 +1792,7 @@ impl WgpuRenderer {
                 .iter()
                 .map(|p| {
                     let s = scaler.world_to_screen(*p);
-                    (s.x.clamp(cl_lo_x, cl_hi_x), s.y.clamp(cl_lo_y, cl_hi_y))
+                    (s.x, s.y)
                 })
                 .filter(|(x, y)| x.is_finite() && y.is_finite())
                 .collect();
@@ -1779,26 +1815,54 @@ impl WgpuRenderer {
         // shear = v2.x / v2.y: for each pixel of Y movement, X shifts by shear pixels.
         // The shader computes: u = (pos.x - shear * pos.y) * inv_tx
         let shear_screen = shear;
-        // Clamp screen coordinates to prevent GPU rasterizer artifacts
-        let clamp_margin = 8192.0_f32;
+
+        // Triangle guard bounds: skip triangles with extreme off-screen vertices
+        let guard = 100.0_f32;
         let (vp_w, vp_h) = self.state.viewport_size();
-        let cl_min_x = -clamp_margin;
-        let cl_min_y = -clamp_margin;
-        let cl_max_x = vp_w + clamp_margin;
-        let cl_max_y = vp_h + clamp_margin;
+        let bnd_min_x = -guard;
+        let bnd_min_y = -guard;
+        let bnd_max_x = vp_w + guard;
+        let bnd_max_y = vp_h + guard;
 
         let base_index = self.pattern_vertices.len() as u32;
         let total_points = coords.len() / 2;
         for i in 0..total_points {
-            let x = (coords[i * 2] as f32).clamp(cl_min_x, cl_max_x);
-            let y = (coords[i * 2 + 1] as f32).clamp(cl_min_y, cl_max_y);
+            let x = coords[i * 2] as f32;
+            let y = coords[i * 2 + 1] as f32;
             self.pattern_vertices
                 .push(PatternVertex::new(x, y, inv_tx, inv_ty, shear_screen));
         }
 
         let idx_start = self.pattern_indices.len();
-        for idx in &indices {
-            self.pattern_indices.push(base_index + *idx as u32);
+        // Skip triangles with any vertex far off-screen to prevent ray artifacts
+        for tri in indices.chunks(3) {
+            if tri.len() < 3 {
+                break;
+            }
+            let (i0, i1, i2) = (tri[0], tri[1], tri[2]);
+            let x0 = coords[i0 * 2] as f32;
+            let y0 = coords[i0 * 2 + 1] as f32;
+            let x1 = coords[i1 * 2] as f32;
+            let y1 = coords[i1 * 2 + 1] as f32;
+            let x2 = coords[i2 * 2] as f32;
+            let y2 = coords[i2 * 2 + 1] as f32;
+            if x0 >= bnd_min_x
+                && x0 <= bnd_max_x
+                && y0 >= bnd_min_y
+                && y0 <= bnd_max_y
+                && x1 >= bnd_min_x
+                && x1 <= bnd_max_x
+                && y1 >= bnd_min_y
+                && y1 <= bnd_max_y
+                && x2 >= bnd_min_x
+                && x2 <= bnd_max_x
+                && y2 >= bnd_min_y
+                && y2 <= bnd_max_y
+            {
+                self.pattern_indices.push(base_index + i0 as u32);
+                self.pattern_indices.push(base_index + i1 as u32);
+                self.pattern_indices.push(base_index + i2 as u32);
+            }
         }
         let idx_end = self.pattern_indices.len();
 
@@ -1834,19 +1898,13 @@ impl WgpuRenderer {
         let line_width = (width * SCREEN_PX_PER_MM * dpi_scale).max(0.5);
         let color_arr = color.to_array();
 
-        // Convert polygon exterior to screen coordinates (clamped to prevent extreme values)
-        let clamp_margin = 8192.0_f32;
-        let (vp_w, vp_h) = self.state.viewport_size();
-        let cl_min_x = -clamp_margin;
-        let cl_min_y = -clamp_margin;
-        let cl_max_x = vp_w + clamp_margin;
-        let cl_max_y = vp_h + clamp_margin;
+        // Convert polygon exterior to screen coordinates (no clamping — clip_line_to_polygon handles bounds)
         let screen_ring: Vec<(f32, f32)> = area
             .exterior
             .iter()
             .map(|p| {
                 let s = scaler.world_to_screen(*p);
-                (s.x.clamp(cl_min_x, cl_max_x), s.y.clamp(cl_min_y, cl_max_y))
+                (s.x, s.y)
             })
             .filter(|(x, y)| x.is_finite() && y.is_finite())
             .collect();
@@ -1920,6 +1978,22 @@ impl WgpuRenderer {
             // Clip this line segment to the polygon using intersection tests
             let segments = Self::clip_line_to_polygon(lx0, ly0, lx1, ly1, &screen_ring);
             for (sx, sy, ex, ey) in segments {
+                // Reject hatch segments where either endpoint is outside viewport + margin.
+                // Polygon can extend far off-screen at high zoom; clip_line_to_polygon
+                // produces segments within the polygon, but those can be far off-screen.
+                let hatch_margin = line_width * 2.0 + 50.0;
+                let (vp_w, vp_h) = self.state.viewport_size();
+                if sx < -hatch_margin
+                    || sx > vp_w + hatch_margin
+                    || sy < -hatch_margin
+                    || sy > vp_h + hatch_margin
+                    || ex < -hatch_margin
+                    || ex > vp_w + hatch_margin
+                    || ey < -hatch_margin
+                    || ey > vp_h + hatch_margin
+                {
+                    continue;
+                }
                 // Render as a line quad (same approach as add_line)
                 let ldx = ex - sx;
                 let ldy = ey - sy;
@@ -2232,8 +2306,8 @@ impl WgpuRenderer {
                 continue;
             }
 
-            // Clip line segment to screen bounds to prevent GPU precision issues
-            // with extreme off-screen coordinates (ray artifacts at high zoom)
+            // Clip line segment to screen bounds using Cohen-Sutherland.
+            // Prevents extreme off-screen coordinates from reaching the GPU.
             if let Some((cx0, cy0, cx1, cy1)) = Self::clip_line_segment(
                 prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
             ) {
