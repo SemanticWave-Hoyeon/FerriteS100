@@ -353,7 +353,7 @@ impl WgpuRenderer {
             symbol_instances: Vec::with_capacity(2000),
             background_color: Color::from_hex("#DEEBF7").unwrap_or(Color::WHITE),
             symbol_scale: 1.0, // S-100 standard: 1.0 = nominal symbol size at 0.3mm/pixel
-            show_soundings: false, // Hide soundings by default (too dense when zoomed out)
+            show_soundings: true, // Visibility controlled by S-101 viewing groups
             zoom_level: 1.0,
             compilation_scale: 22000, // Default compilation scale (1:22000)
             symbol_grid: std::collections::HashSet::with_capacity(1000),
@@ -877,7 +877,10 @@ impl WgpuRenderer {
             if let Some(visible) = visible_viewing_groups {
                 let vg = instruction.viewing_group().0;
                 if !visible.contains(&vg) {
-                    continue;
+                    // Allow sounding viewing group (33010) through when show_soundings is enabled
+                    if !(self.show_soundings && vg == 33010) {
+                        continue;
+                    }
                 }
             }
 
