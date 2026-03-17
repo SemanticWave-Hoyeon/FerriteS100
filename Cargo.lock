@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-feature-catalog"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "quick-xml 0.37.5",
  "serde",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-iso8211"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "encoding_rs",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-lua"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "ferrite-feature-catalog",
  "ferrite-portrayal-catalog",
@@ -1252,14 +1252,14 @@ dependencies = [
 
 [[package]]
 name = "ferrite-plugin-api"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "abi_stable",
 ]
 
 [[package]]
 name = "ferrite-plugin-loader"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "abi_stable",
  "ed25519-dalek",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-portrayal-catalog"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "quick-xml 0.37.5",
  "serde",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-render"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "ferrite-portrayal-catalog",
  "ferrite-s100-core",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-s100"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "abi_stable",
  "anyhow",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-s100-core"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "ferrite-iso8211",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-wgpu"
-version = "0.3.5"
+version = "0.8.0"
 dependencies = [
  "bytemuck",
  "earcutr",

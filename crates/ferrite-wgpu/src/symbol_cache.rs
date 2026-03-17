@@ -132,6 +132,104 @@ impl SymbolCache {
         }
     }
 
+    /// Get or load symbol at a specific target pixel size (for pattern fills).
+    /// Renders at a scale that produces a texture close to the target display size,
+    /// avoiding downscale artifacts that make thin lines appear thick.
+    pub fn get_symbol_for_pattern(
+        &mut self,
+        symbol_id: &str,
+        color_profile: &ColorProfile,
+        target_width_px: f32,
+        target_height_px: f32,
+        mm_to_px: f32,
+    ) -> Option<&SymbolGeometry> {
+        let key = format!("{}_pat", symbol_id);
+        if self.symbols.contains_key(&key) {
+            return self.symbols.get(&key);
+        }
+
+        let svg_path = self.symbols_path.join(format!("{}.svg", symbol_id));
+        if !svg_path.exists() {
+            return None;
+        }
+
+        let svg_content = match std::fs::read_to_string(&svg_path) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
+        let view_box = self.extract_viewbox(&svg_content);
+        let svg_with_colors = self.inject_colors(&svg_content, color_profile);
+
+        let opts = resvg::usvg::Options::default();
+        let tree = match resvg::usvg::Tree::from_str(&svg_with_colors, &opts) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+
+        let tree_size = tree.size();
+        let vb_width = tree_size.width();
+        let vb_height = tree_size.height();
+        let (vb_min_x, vb_min_y) = match view_box {
+            Some((x, y, _, _)) => (x, y),
+            None => (0.0, 0.0),
+        };
+
+        // S-100: The tile size (target_width_px × target_height_px) defines the
+        // tiling period. The SVG symbol must be rendered at its natural size
+        // and centered within the tile.
+        //
+        // usvg already converts SVG mm units to pixels at 96 DPI, so
+        // tree_size.width() is already in screen pixels at 96 DPI baseline.
+        // We only need dpi_scale (= mm_to_px / BASE_PX_PER_MM) to adjust
+        // for HiDPI displays.
+        let dpi_scale = mm_to_px / BASE_PX_PER_MM;
+
+        let tile_w = target_width_px.ceil() as u32;
+        let tile_h = target_height_px.ceil() as u32;
+        let tile_w = tile_w.max(1);
+        let tile_h = tile_h.max(1);
+
+        // SVG native pixel size (tree_size is already px at 96 DPI, apply dpi_scale)
+        let svg_px_w = (vb_width * dpi_scale).ceil() as u32;
+        let svg_px_h = (vb_height * dpi_scale).ceil() as u32;
+
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(tile_w, tile_h)?;
+
+        // Center the SVG symbol within the tile
+        let offset_x = (tile_w as f32 - svg_px_w as f32) / 2.0;
+        let offset_y = (tile_h as f32 - svg_px_h as f32) / 2.0;
+
+        // Render at dpi_scale (1 SVG user unit = dpi_scale output pixels)
+        let transform = resvg::tiny_skia::Transform::from_scale(dpi_scale, dpi_scale)
+            .post_translate(offset_x, offset_y);
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+        let pattern_render_scale = dpi_scale;
+        let pivot = self.extract_pivot_point(&svg_content, vb_width, vb_height);
+
+        let geom = SymbolGeometry {
+            name: key.clone(),
+            pixels: pixmap.data().to_vec(),
+            width: tile_w,
+            height: tile_h,
+            bounds: (vb_min_x, vb_min_y, vb_width, vb_height),
+            pivot,
+            render_scale: pattern_render_scale,
+        };
+        tracing::debug!(
+            "Pattern symbol '{}': tile {}x{} px, svg {}x{} px (dpi_scale={:.2})",
+            symbol_id,
+            tile_w,
+            tile_h,
+            svg_px_w,
+            svg_px_h,
+            dpi_scale
+        );
+        self.symbols.insert(key.clone(), geom);
+        self.symbols.get(&key)
+    }
+
     /// Render SVG file to pixel buffer using resvg
     fn render_svg(
         &self,

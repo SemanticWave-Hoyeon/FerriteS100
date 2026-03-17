@@ -12,8 +12,9 @@ use ferrite_iso8211::{
 use crate::{
     Attribute, CodeMapping, CompositeCurveRecord, Coordinate, CurveRecord, CurveSegment,
     DatasetCodeMappings, FeatureAssociation, FeatureRecord, InformationAssociation,
-    InformationRecord, MultiPointRecord, OrientedCurve, PointRecord, RecordId, Result, S100Error,
-    SegmentType, SpatialAssociation, SpatialPrimitiveType, SurfaceRecord, FOID, FRID, IRID,
+    InformationRecord, MaskRecord, MultiPointRecord, OrientedCurve, PointRecord, RecordId, Result,
+    S100Error, SegmentType, SpatialAssociation, SpatialPrimitiveType, SurfaceRecord, FOID, FRID,
+    IRID,
 };
 
 /// Dataset identification
@@ -112,6 +113,11 @@ impl S101Cell {
         // Apply code mappings to records
         cell.apply_code_mappings();
 
+        // Separate interior rings by connectivity (S-100 10a-7.2.6)
+        // The RIAS parser collects all interior curves into a single Vec,
+        // but they may form multiple disjoint closed rings (holes).
+        cell.separate_interior_rings();
+
         // Shrink excess memory after loading is complete
         cell.shrink_to_fit();
 
@@ -132,7 +138,7 @@ impl S101Cell {
         // Determine record type by first field tag
         if let Some(first_field) = dr.fields.first() {
             match first_field.tag.as_str() {
-                tags::DSID => self.process_dsid(dr)?,
+                tags::DSID | tags::DSPM => self.process_dsid(dr)?,
                 tags::ATCS | tags::ITCS | tags::FTCS | tags::IACS | tags::FACS | tags::ARCS => {
                     self.process_code_mapping(dr)?
                 }
@@ -201,6 +207,42 @@ impl S101Cell {
                     "DSSI: DCOX={:.6}, DCOY={:.6}, CMFX={}, CMFY={}, CMFZ={}, coord_factor={}, coord_factor_z={}",
                     dcox, dcoy, cmfx, cmfy, cmfz, self.coord_factor, self.coord_factor_z
                 );
+            }
+        }
+
+        // Parse DSPM (Dataset Parameters) for compilation scale
+        // S-101 DSPM format:
+        // HDAT (b11/1 byte) - Horizontal Datum
+        // VDAT (b11/1 byte) - Vertical Datum
+        // SDAT (b11/1 byte) - Sounding Datum
+        // CSCL (b14/4 bytes) - Compilation Scale denominator
+        // DUNI (b11/1 byte) - Depth Unit
+        // HUNI (b11/1 byte) - Height Unit
+        // PUNI (b11/1 byte) - Positional Accuracy Unit
+        // COUN (b11/1 byte) - Coordinate Units
+        if let Some(dspm_field) = dr.find_field(tags::DSPM) {
+            let data = dspm_field.data_trimmed();
+            if data.len() >= 7 {
+                // CSCL at offset 3, 4 bytes unsigned integer (big-endian per S-100)
+                let cscl = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
+                if cscl > 0 && cscl < 100_000_000 {
+                    self.compilation_scale = cscl;
+                    tracing::info!("DSPM: Compilation scale = 1:{}", cscl);
+                } else {
+                    // Try little-endian
+                    let cscl_le = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+                    if cscl_le > 0 && cscl_le < 100_000_000 {
+                        self.compilation_scale = cscl_le;
+                        tracing::info!("DSPM: Compilation scale = 1:{} (LE)", cscl_le);
+                    } else {
+                        tracing::warn!(
+                            "DSPM: Invalid compilation scale BE={} LE={}, raw bytes={:02X?}",
+                            cscl,
+                            cscl_le,
+                            &data[3..7]
+                        );
+                    }
+                }
             }
         }
 
@@ -699,6 +741,12 @@ impl S101Cell {
             self.parse_feature_associations(&fasc_field.data, &mut feature_associations)?;
         }
 
+        // Parse MASK field (S-100 4.8.3: mask/show indicators for spatial associations)
+        let mut masks = Vec::new();
+        for mask_field in dr.find_fields(tags::MASK) {
+            self.parse_mask_records(&mask_field.data, &mut masks)?;
+        }
+
         // Determine primitive type from spatial associations
         let primitive_type = self.determine_primitive_type(&spatial_associations);
 
@@ -709,7 +757,7 @@ impl S101Cell {
             spatial_associations,
             information_associations,
             feature_associations,
-            masks: Vec::new(),
+            masks,
             feature_code: None,
             primitive_type,
         };
@@ -785,6 +833,36 @@ impl S101Cell {
             });
 
             offset += 8;
+        }
+
+        Ok(())
+    }
+
+    /// Parse MASK field records (S-100 4.8.3: mask indicators for spatial edges)
+    /// Each record: RCNM(1) + RCID(4) + MIND(1) = 6 bytes
+    fn parse_mask_records(&self, data: &[u8], masks: &mut Vec<MaskRecord>) -> Result<()> {
+        let mut offset = 0;
+
+        while offset + 6 <= data.len() {
+            if data[offset] == FIELD_TERMINATOR {
+                break;
+            }
+
+            let rcnm = data[offset];
+            let rcid = u32::from_le_bytes([
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+            ]);
+            let mask_type = data[offset + 5];
+
+            masks.push(MaskRecord {
+                mask_type,
+                spatial_id: RecordId::new(rcnm, rcid),
+            });
+
+            offset += 6;
         }
 
         Ok(())
@@ -963,6 +1041,166 @@ impl S101Cell {
         self.code_mappings.log_summary();
     }
 
+    /// Separate interior rings by curve connectivity (S-100 10a-7.2.6).
+    ///
+    /// During RIAS parsing, all USAG=2 (interior) curves are collected into a
+    /// single Vec because the RIAS field doesn't explicitly mark ring boundaries.
+    /// Multiple disjoint holes end up merged. This post-processing step uses
+    /// curve start/end coordinates to split them into separate closed rings.
+    fn separate_interior_rings(&mut self) {
+        /// Get the start and end coordinates of an oriented curve, respecting orientation.
+        fn curve_endpoints(
+            oc: &OrientedCurve,
+            curves: &std::collections::HashMap<i64, CurveRecord>,
+            composites: &std::collections::HashMap<i64, CompositeCurveRecord>,
+        ) -> Option<(Coordinate, Coordinate)> {
+            let key = oc.curve_id.key();
+            if let Some(curve) = curves.get(&key) {
+                let positions = curve.all_positions();
+                if positions.is_empty() {
+                    return None;
+                }
+                let (start, end) = (*positions.first().unwrap(), *positions.last().unwrap());
+                if oc.orientation {
+                    Some((start, end))
+                } else {
+                    Some((end, start))
+                }
+            } else if let Some(composite) = composites.get(&key) {
+                let sub_curves = &composite.curves;
+                if sub_curves.is_empty() {
+                    return None;
+                }
+                let first_sub = sub_curves.first().unwrap();
+                let last_sub = sub_curves.last().unwrap();
+                let first_ep = curve_endpoints(
+                    &OrientedCurve {
+                        curve_id: first_sub.curve_id,
+                        orientation: oc.orientation == first_sub.orientation,
+                    },
+                    curves,
+                    composites,
+                )?;
+                let last_ep = curve_endpoints(
+                    &OrientedCurve {
+                        curve_id: last_sub.curve_id,
+                        orientation: oc.orientation == last_sub.orientation,
+                    },
+                    curves,
+                    composites,
+                )?;
+                if oc.orientation {
+                    Some((first_ep.0, last_ep.1))
+                } else {
+                    Some((last_ep.1, first_ep.0))
+                }
+            } else {
+                None
+            }
+        }
+
+        fn coords_close(a: &Coordinate, b: &Coordinate) -> bool {
+            (a.x - b.x).abs() < 1e-5 && (a.y - b.y).abs() < 1e-5
+        }
+
+        let curves_ref = &self.curves;
+        let composites_ref = &self.composite_curves;
+
+        for surface in self.surfaces.values_mut() {
+            if surface.interior_rings.len() != 1 {
+                continue;
+            }
+            let all_curves = &surface.interior_rings[0];
+            if all_curves.len() <= 1 {
+                continue;
+            }
+
+            // Graph-based ring separation: handles arbitrary curve ordering
+            // per S-100 10a-7.2.6 "The order of ring associations is arbitrary"
+
+            // 1. Compute endpoints for all curves
+            let endpoints: Vec<Option<(Coordinate, Coordinate)>> = all_curves
+                .iter()
+                .map(|oc| curve_endpoints(oc, curves_ref, composites_ref))
+                .collect();
+
+            // 2. Track which curves are used
+            let mut used = vec![false; all_curves.len()];
+            let mut separated: Vec<Vec<OrientedCurve>> = Vec::new();
+
+            // 3. Find self-closing curves first (single-curve rings)
+            for (i, ep) in endpoints.iter().enumerate() {
+                if let Some((start, end)) = ep {
+                    if coords_close(start, end) {
+                        separated.push(vec![all_curves[i].clone()]);
+                        used[i] = true;
+                    }
+                }
+            }
+
+            // 4. Build multi-curve rings by greedy endpoint matching
+            loop {
+                // Find first unused curve to start a new ring
+                let start_idx = used.iter().position(|&u| !u);
+                let start_idx = match start_idx {
+                    Some(i) if endpoints[i].is_some() => i,
+                    _ => break,
+                };
+
+                let mut ring = vec![all_curves[start_idx].clone()];
+                used[start_idx] = true;
+                let ring_start = endpoints[start_idx].unwrap().0;
+                let mut ring_end = endpoints[start_idx].unwrap().1;
+
+                // Greedily find curves that connect to the ring's end
+                let mut found = true;
+                while found {
+                    found = false;
+                    // Check if ring is closed
+                    if ring.len() > 1 && coords_close(&ring_end, &ring_start) {
+                        break;
+                    }
+                    // Search all unused curves for one that connects
+                    for (i, ep) in endpoints.iter().enumerate() {
+                        if used[i] {
+                            continue;
+                        }
+                        if let Some((start, end)) = ep {
+                            if coords_close(&ring_end, start) {
+                                ring.push(all_curves[i].clone());
+                                used[i] = true;
+                                ring_end = *end;
+                                found = true;
+                                break; // restart search from new end
+                            }
+                        }
+                    }
+                }
+
+                // Only keep closed rings
+                if coords_close(&ring_end, &ring_start) {
+                    separated.push(ring);
+                } else {
+                    tracing::trace!(
+                        "Surface {}: discarding {} unclosed interior curves",
+                        surface.id.key(),
+                        ring.len()
+                    );
+                }
+            }
+
+            if !separated.is_empty() && separated.len() != surface.interior_rings.len() {
+                tracing::debug!(
+                    "Surface {}: separated {} interior curves into {} rings",
+                    surface.id.key(),
+                    all_curves.len(),
+                    separated.len()
+                );
+                surface.interior_rings = separated;
+            }
+        }
+    }
+
     /// Shrink all internal Vecs to their actual size
     /// Called after loading to release unused capacity (~10-15% memory savings)
     fn shrink_to_fit(&mut self) {
@@ -1010,53 +1248,51 @@ impl S101Cell {
     }
 
     /// Extract compilation scale from S-101 filename convention
-    /// Examples: "101KR0022000.000" -> 22000, "101US00045000.000" -> 45000
+    /// S-101 filename format: 101PPNNNSSSSSS where:
+    ///   101 = product specification (S-101)
+    ///   PP = producer code (2 letters)
+    ///   NNN = navigational purpose (3 digits)
+    ///   SSSSSS = cell identifier
+    /// Navigational purpose maps to typical scales per S-101 Table 3-1
     fn extract_scale_from_filename(&mut self) {
         if let Some(filename) = self.file_path.file_stem().and_then(|s| s.to_str()) {
-            // S-101 filename format: 101PPNNNNNNNN where PP=producer, NNNNNNNN contains scale
-            // Try to find a sequence of digits that looks like a scale value
-            let digits: String = filename.chars().filter(|c| c.is_ascii_digit()).collect();
-
-            // Common S-101 scales (Table 3-1 in S-101 standard)
-            let valid_scales = [
-                1000, 2000, 3000, 4000, 8000, 12000, 22000, 45000, 90000, 180000, 350000, 700000,
-                1500000, 3500000, 10000000,
-            ];
-
-            // Try to match a valid scale in the digits
-            for &scale in &valid_scales {
-                let scale_str = scale.to_string();
-                if digits.contains(&scale_str) {
+            // S-101 filenames start with "101" followed by 2-letter producer code
+            // then 3-digit navigational purpose
+            if filename.len() >= 8 && filename.starts_with("101") {
+                // Producer code at position 3-4 (2 chars), navigational purpose at 5-7 (3 digits)
+                let nav_purpose_str = &filename[5..8];
+                if let Ok(nav_purpose) = nav_purpose_str.parse::<u32>() {
+                    // S-101 Table 3-1: Navigational Purpose to typical compilation scale
+                    let scale = match nav_purpose {
+                        1 => 3_500_000, // Overview
+                        2 => 350_000,   // General
+                        3 => 90_000,    // Coastal
+                        4 => 22_000,    // Approach
+                        5 => 12_000,    // Harbour
+                        6 => 4_000,     // Berthing
+                        _ => {
+                            tracing::debug!(
+                                "Unknown navigational purpose {} in filename '{}', using default scale",
+                                nav_purpose, filename
+                            );
+                            return;
+                        }
+                    };
                     self.compilation_scale = scale;
                     tracing::debug!(
-                        "Extracted compilation scale {} from filename '{}'",
-                        scale,
-                        filename
+                        "Filename '{}': navigational purpose {} -> scale 1:{}",
+                        filename,
+                        nav_purpose,
+                        scale
                     );
                     return;
                 }
             }
 
-            // Fallback: try to parse 5-7 digit numbers as potential scales
-            if digits.len() >= 5 {
-                for start in 0..=(digits.len().saturating_sub(5)) {
-                    for len in [7, 6, 5] {
-                        if start + len <= digits.len() {
-                            if let Ok(scale) = digits[start..start + len].parse::<u32>() {
-                                if (1000..=10000000).contains(&scale) {
-                                    self.compilation_scale = scale;
-                                    tracing::debug!(
-                                        "Inferred compilation scale {} from filename '{}'",
-                                        scale,
-                                        filename
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            tracing::debug!(
+                "Could not extract navigational purpose from filename '{}', using default scale",
+                filename
+            );
         }
     }
 

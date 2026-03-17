@@ -307,74 +307,6 @@ impl TypeCatalogue {
         catalogue.simple_attribute_codes.sort();
         catalogue.complex_attribute_codes.sort();
 
-        // Debug: verify featureName is in complex attributes
-        if catalogue
-            .complex_attribute_codes
-            .contains(&"featureName".to_string())
-        {
-            tracing::debug!("TypeCatalogue: featureName is in complex_attribute_codes");
-        } else if catalogue
-            .simple_attribute_codes
-            .contains(&"featureName".to_string())
-        {
-            tracing::warn!("TypeCatalogue: featureName is INCORRECTLY in simple_attribute_codes!");
-        } else {
-            tracing::warn!("TypeCatalogue: featureName is NOT in any attribute codes!");
-        }
-
-        // Debug: verify colour is in simple attributes (used by LightSectored)
-        if catalogue
-            .simple_attribute_codes
-            .contains(&"colour".to_string())
-        {
-            tracing::warn!("TypeCatalogue: colour is in simple_attribute_codes (correct)");
-        } else if catalogue
-            .complex_attribute_codes
-            .contains(&"colour".to_string())
-        {
-            tracing::error!("TypeCatalogue: colour is INCORRECTLY in complex_attribute_codes!");
-        } else {
-            tracing::error!("TypeCatalogue: colour is NOT in any attribute codes!");
-        }
-
-        // Debug: check lightSector's sub-attributes
-        if let Some(light_sector_info) = catalogue.complex_attribute_info.get("lightSector") {
-            tracing::warn!(
-                "TypeCatalogue: lightSector has sub_attributes: {:?}",
-                light_sector_info.sub_attributes
-            );
-            if light_sector_info
-                .sub_attributes
-                .contains(&"colour".to_string())
-            {
-                tracing::warn!(
-                    "TypeCatalogue: lightSector contains colour as sub-attribute (correct)"
-                );
-            } else {
-                tracing::error!(
-                    "TypeCatalogue: lightSector does NOT contain colour as sub-attribute!"
-                );
-            }
-        } else {
-            tracing::error!("TypeCatalogue: lightSector not found in complex_attribute_info!");
-        }
-
-        // Debug: check sectorLimit is in complex attributes
-        if catalogue
-            .complex_attribute_codes
-            .contains(&"sectorLimit".to_string())
-        {
-            tracing::warn!("TypeCatalogue: sectorLimit is in complex_attribute_codes (correct)");
-            if let Some(sector_limit_info) = catalogue.complex_attribute_info.get("sectorLimit") {
-                tracing::warn!(
-                    "TypeCatalogue: sectorLimit has sub_attributes: {:?}",
-                    sector_limit_info.sub_attributes
-                );
-            }
-        } else {
-            tracing::error!("TypeCatalogue: sectorLimit is NOT in complex_attribute_codes!");
-        }
-
         catalogue
     }
 }
@@ -643,7 +575,9 @@ impl HostFunctions {
                             for (idx, value) in values.iter().enumerate() {
                                 match value {
                                     AttributeValue::Text(s) => {
-                                        table.set(idx + 1, s.as_str())?;
+                                        if !s.is_empty() {
+                                            table.set(idx + 1, s.as_str())?;
+                                        }
                                     }
                                     AttributeValue::Integer(i) => {
                                         table.set(idx + 1, *i)?;
@@ -673,7 +607,11 @@ impl HostFunctions {
                     if let Some(attr_val) = feature.attributes.get(&attr_code) {
                         match attr_val {
                             AttributeValue::Text(s) => {
-                                table.set(1, s.as_str())?;
+                                // Skip empty strings — Lua's tonumber("") returns nil,
+                                // causing ScaledDecimal with nil Value for real attributes
+                                if !s.is_empty() {
+                                    table.set(1, s.as_str())?;
+                                }
                             }
                             AttributeValue::Integer(i) => {
                                 table.set(1, *i)?;
@@ -1464,21 +1402,6 @@ impl HostFunctions {
             lua.create_function(move |lua, ()| {
                 let table = lua.create_table()?;
                 if let Ok(cat) = type_cat.read() {
-                    // DEBUG: Verify sectorBearing IS in simple attributes
-                    let has_sector_bearing = cat
-                        .simple_attribute_codes
-                        .contains(&"sectorBearing".to_string());
-                    if !has_sector_bearing {
-                        tracing::error!("BUG: sectorBearing is NOT in simple_attribute_codes!");
-                    } else {
-                        tracing::warn!(
-                            "HostGetSimpleAttributeTypeCodes: sectorBearing IS in list (correct)"
-                        );
-                    }
-                    tracing::info!(
-                        "HostGetSimpleAttributeTypeCodes: {} codes",
-                        cat.simple_attribute_codes.len()
-                    );
                     for (i, code) in cat.simple_attribute_codes.iter().enumerate() {
                         table.set(i + 1, code.as_str())?;
                     }
@@ -1494,21 +1417,6 @@ impl HostFunctions {
             lua.create_function(move |lua, ()| {
                 let table = lua.create_table()?;
                 if let Ok(cat) = type_cat.read() {
-                    // DEBUG: Verify sectorLimitOne IS in complex attributes
-                    let has_sector_limit_one = cat
-                        .complex_attribute_codes
-                        .contains(&"sectorLimitOne".to_string());
-                    if !has_sector_limit_one {
-                        tracing::error!("BUG: sectorLimitOne is NOT in complex_attribute_codes!");
-                    } else {
-                        tracing::warn!(
-                            "HostGetComplexAttributeTypeCodes: sectorLimitOne IS in list (correct)"
-                        );
-                    }
-                    tracing::info!(
-                        "HostGetComplexAttributeTypeCodes: {} codes",
-                        cat.complex_attribute_codes.len()
-                    );
                     for (i, code) in cat.complex_attribute_codes.iter().enumerate() {
                         table.set(i + 1, code.as_str())?;
                     }
@@ -1569,20 +1477,6 @@ impl HostFunctions {
             lua.create_function(move |lua, code: String| {
                 if let Ok(cat) = type_cat.read() {
                     if let Some(info) = cat.feature_type_info.get(&code) {
-                        // Debug: log bindings for LightSectored
-                        if code == "LightSectored" {
-                            let binding_codes: Vec<_> = info
-                                .bindings
-                                .iter()
-                                .map(|b| b.attribute_code.as_str())
-                                .collect();
-                            tracing::warn!(
-                                "HostGetFeatureTypeInfo: code={} bindings={:?}",
-                                code,
-                                binding_codes
-                            );
-                        }
-
                         let table = lua.create_table()?;
                         table.set("Code", info.code.as_str())?;
                         if let Some(alias) = &info.alias {
@@ -1681,14 +1575,6 @@ impl HostFunctions {
             lua.create_function(move |lua, code: String| {
                 if let Ok(cat) = type_cat.read() {
                     if let Some(info) = cat.complex_attribute_info.get(&code) {
-                        // Debug: log sector-related complex attributes
-                        if code.contains("sector") || code.contains("Sector") || code.contains("light") || code.contains("Light") {
-                            tracing::warn!(
-                                "HostGetComplexAttributeTypeInfo: code={} sub_attrs={:?}",
-                                code, info.sub_attributes
-                            );
-                        }
-
                         let table = lua.create_table()?;
                         table.set("Code", info.code.as_str())?;
                         if let Some(alias) = &info.alias {
@@ -1710,7 +1596,8 @@ impl HostFunctions {
                             binding.set("AttributeCode", sub_code.as_str())?;
 
                             // Get actual multiplicity from FC binding info
-                            let (lower, upper) = info.sub_attribute_bindings
+                            let (lower, upper) = info
+                                .sub_attribute_bindings
                                 .get(sub_code)
                                 .copied()
                                 .unwrap_or((0, Some(1)));
@@ -1728,31 +1615,11 @@ impl HostFunctions {
                             // Set both numeric index and code key
                             bindings.set(i + 1, binding.clone())?;
                             bindings.set(sub_code.as_str(), binding.clone())?;
-
-                        }
-
-                        // Debug: for sector-related, print all keys in bindings table
-                        if code.contains("sector") || code.contains("Sector") {
-                            let mut keys = Vec::new();
-                            for (k, _) in bindings.pairs::<Value, Value>().flatten() {
-                                let key_str = match k {
-                                    Value::String(s) => format!("str:{}", s.to_str().map(|s| s.to_string()).unwrap_or_else(|_| "?".to_string())),
-                                    Value::Integer(i) => format!("int:{}", i),
-                                    _ => "other".to_string(),
-                                };
-                                keys.push(key_str);
-                            }
-                            tracing::error!(
-                                "DEBUG {} bindings keys: {:?}",
-                                code, keys
-                            );
                         }
 
                         table.set("AttributeBindings", bindings)?;
 
                         return Ok(Value::Table(table));
-                    } else if code == "featureName" {
-                        tracing::warn!("HostGetComplexAttributeTypeInfo: featureName NOT FOUND in complex_attribute_info");
                     }
                 }
                 Ok(Value::Nil)

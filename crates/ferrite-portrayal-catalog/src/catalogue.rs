@@ -149,15 +149,29 @@ impl PortrayalCatalogue {
                             }
                         }
                         "viewingGroup" => {
-                            let vg = self.parse_viewing_group(&mut xml_reader)?;
+                            let attr_id = get_attribute(e, "id").unwrap_or_default();
+                            let mut vg = self.parse_viewing_group(&mut xml_reader)?;
+                            if vg.id == 0 {
+                                if let Ok(id) = attr_id.parse::<u32>() {
+                                    vg.id = id;
+                                }
+                            }
                             self.viewing_groups.groups.insert(vg.id, vg);
                         }
                         "viewingGroupLayer" => {
-                            let vgl = self.parse_viewing_group_layer(&mut xml_reader)?;
+                            let attr_id = get_attribute(e, "id").unwrap_or_default();
+                            let mut vgl = self.parse_viewing_group_layer(&mut xml_reader)?;
+                            if vgl.id.is_empty() && !attr_id.is_empty() {
+                                vgl.id = attr_id;
+                            }
                             self.viewing_group_layers.layers.insert(vgl.id.clone(), vgl);
                         }
                         "displayMode" => {
-                            let dm = self.parse_display_mode(&mut xml_reader)?;
+                            let attr_id = get_attribute(e, "id").unwrap_or_default();
+                            let mut dm = self.parse_display_mode(&mut xml_reader)?;
+                            if dm.id.is_empty() && !attr_id.is_empty() {
+                                dm.id = attr_id;
+                            }
                             self.display_modes.modes.insert(dm.id.clone(), dm);
                         }
                         "context" => {

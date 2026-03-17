@@ -68,29 +68,104 @@ pub enum GeometryType {
 }
 
 /// S-101 compliant render order key
-/// Sorts by: (1) display priority, (2) geometry type, (3) feature_id (stable tiebreaker)
-/// Lower values rendered first (background)
-/// The feature_id ensures stable sort order for overlapping features with same priority,
-/// preventing Z-fighting flickering.
+/// Sorts by: (1) display priority, (2) render category, (3) geometry type,
+/// (4) negative extent. Lower values rendered first (background).
+///
+/// `render_category` ensures that at the same priority, water/depth features
+/// (VG 13xxx) are drawn before land features (VG 12xxx). This follows the
+/// S-52 painter's algorithm where sea areas are drawn before land areas.
+///
+/// For area features, `neg_extent` is the negative bounding box area so that
+/// larger polygons sort first (drawn as background).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RenderOrder {
     pub priority: i32,
+    /// 0 = water/depth (VG 13xxx), 1 = land (VG 12xxx), 2 = everything else
+    pub render_category: i32,
     pub geometry_type: GeometryType,
-    pub feature_id: i64,
+    /// Negative bbox extent (larger areas → more negative → drawn first)
+    pub neg_extent: i64,
 }
 
 impl RenderOrder {
     pub fn new(
         priority: DisplayPriority,
         geometry_type: GeometryType,
-        feature_id: Option<i64>,
+        _feature_id: Option<i64>,
     ) -> Self {
         RenderOrder {
             priority: priority.0,
+            render_category: 2,
             geometry_type,
-            // Use 0 for features without ID (they will be grouped together)
-            feature_id: feature_id.unwrap_or(0),
+            neg_extent: 0,
         }
+    }
+
+    pub fn with_render_category(mut self, viewing_group: u32) -> Self {
+        // S-101 viewing group classification:
+        // 13xxx = depth/water features (drawn first at same priority)
+        // 12xxx = land features (drawn after water at same priority)
+        let vg_class = viewing_group / 10000;
+        self.render_category = match vg_class {
+            1 => {
+                let sub = (viewing_group / 1000) % 10;
+                if sub == 3 {
+                    0
+                }
+                // 13xxx = depth/water
+                else if sub == 2 {
+                    1
+                }
+                // 12xxx = land
+                else {
+                    2
+                }
+            }
+            _ => 2,
+        };
+        self
+    }
+
+    pub fn with_extent(mut self, extent: f64) -> Self {
+        // Convert to negative integer (larger area → more negative → sorts first)
+        // Scale by 1e10 to preserve precision for geographic coordinates
+        self.neg_extent = -(extent * 1e10) as i64;
+        self
+    }
+}
+
+/// Display plane for radar overlay separation (S-100 Part 9-11.1.5)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayPlane {
+    #[default]
+    UnderRadar,
+    OverRadar,
+}
+
+/// Scale-dependent visibility (S-100 Part 9a ScaleMinimum/ScaleMaximum)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScaleRange {
+    /// Scale denominator below which the instruction is hidden (zoomed out too far)
+    pub scale_minimum: Option<u32>,
+    /// Scale denominator above which the instruction is hidden (zoomed in too far)
+    pub scale_maximum: Option<u32>,
+}
+
+impl ScaleRange {
+    /// Check if this instruction should be visible at the given viewing scale denominator
+    #[inline]
+    pub fn is_visible_at(&self, viewing_scale: u32) -> bool {
+        if let Some(min) = self.scale_minimum {
+            if viewing_scale > min {
+                return false;
+            }
+        }
+        if let Some(max) = self.scale_maximum {
+            if viewing_scale < max {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -155,6 +230,10 @@ pub struct PointInstruction {
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Scale-dependent visibility range
+    pub scale_range: ScaleRange,
+    /// Display plane (UnderRadar or OverRadar)
+    pub display_plane: DisplayPlane,
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
     /// Cell index this instruction belongs to (for multi-cell hit testing)
@@ -176,6 +255,8 @@ impl PointInstruction {
             scale: 1.0,
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            scale_range: ScaleRange::default(),
+            display_plane: DisplayPlane::default(),
             feature_id: None,
             cell_index: None,
             depth: f64::NAN,
@@ -237,6 +318,18 @@ impl PointInstruction {
     #[inline]
     pub fn with_cell_index(mut self, index: usize) -> Self {
         self.cell_index = Some(index as u32);
+        self
+    }
+
+    #[inline]
+    pub fn with_scale_range(mut self, scale_range: ScaleRange) -> Self {
+        self.scale_range = scale_range;
+        self
+    }
+
+    #[inline]
+    pub fn with_display_plane(mut self, display_plane: DisplayPlane) -> Self {
+        self.display_plane = display_plane;
         self
     }
 }
@@ -303,8 +396,16 @@ pub struct LineInstruction {
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Scale-dependent visibility range
+    pub scale_range: ScaleRange,
+    /// Display plane (UnderRadar or OverRadar)
+    pub display_plane: DisplayPlane,
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
+    /// S-100 Part 9-11.1.9: When true (default), this line CAN be suppressed by
+    /// higher-priority lines sharing the same curve geometry.
+    /// LineInstructionUnsuppressed sets this to false.
+    pub suppressible: bool,
 }
 
 impl LineInstruction {
@@ -316,8 +417,20 @@ impl LineInstruction {
             points,
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            scale_range: ScaleRange::default(),
+            display_plane: DisplayPlane::default(),
             feature_id: None,
+            suppressible: true,
         }
+    }
+
+    /// Mark this line as unsuppressible (S-100 LineInstructionUnsuppressed).
+    /// Unsuppressed lines always render regardless of higher-priority lines
+    /// on the same curve.
+    #[inline]
+    pub fn with_unsuppressed(mut self) -> Self {
+        self.suppressible = false;
+        self
     }
 
     #[inline]
@@ -349,6 +462,18 @@ impl LineInstruction {
         self.feature_id = Some(id);
         self
     }
+
+    #[inline]
+    pub fn with_scale_range(mut self, scale_range: ScaleRange) -> Self {
+        self.scale_range = scale_range;
+        self
+    }
+
+    #[inline]
+    pub fn with_display_plane(mut self, display_plane: DisplayPlane) -> Self {
+        self.display_plane = display_plane;
+        self
+    }
 }
 
 /// Area fill type
@@ -356,11 +481,25 @@ impl LineInstruction {
 pub enum AreaFillType {
     /// Solid color fill
     Solid(Color),
-    /// Pattern fill (symbol reference)
+    /// Pattern fill (symbol reference) with parallelogram tiling vectors
+    /// v1 and v2 define the lattice: each symbol is at origin + n*v1 + m*v2 (in mm)
     Pattern {
         symbol_ref: String,
-        spacing_x: f32,
-        spacing_y: f32,
+        /// First lattice vector (mm). v1.y is always 0 in S-101 catalogues.
+        v1: (f32, f32),
+        /// Second lattice vector (mm). May have non-zero x for parallelogram tiling.
+        v2: (f32, f32),
+    },
+    /// Hatch fill: parallel lines at a given angle (S-100 Part 9a)
+    HatchFill {
+        /// Line color
+        color: Color,
+        /// Line width in mm
+        width: f32,
+        /// Distance between parallel lines in mm
+        spacing: f32,
+        /// Direction angle in degrees (from the direction vector)
+        angle: f32,
     },
     /// Centroid symbol only
     CentroidSymbol(String),
@@ -389,6 +528,10 @@ pub struct AreaInstruction {
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Scale-dependent visibility range
+    pub scale_range: ScaleRange,
+    /// Display plane (UnderRadar or OverRadar)
+    pub display_plane: DisplayPlane,
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
 }
@@ -404,6 +547,8 @@ impl AreaInstruction {
             outline: None,
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            scale_range: ScaleRange::default(),
+            display_plane: DisplayPlane::default(),
             feature_id: None,
         }
     }
@@ -421,11 +566,18 @@ impl AreaInstruction {
     }
 
     #[inline]
-    pub fn with_pattern_fill(mut self, symbol_ref: String, spacing_x: f32, spacing_y: f32) -> Self {
-        self.fill = AreaFillType::Pattern {
-            symbol_ref,
-            spacing_x,
-            spacing_y,
+    pub fn with_pattern_fill(mut self, symbol_ref: String, v1: (f32, f32), v2: (f32, f32)) -> Self {
+        self.fill = AreaFillType::Pattern { symbol_ref, v1, v2 };
+        self
+    }
+
+    #[inline]
+    pub fn with_hatch_fill(mut self, color: Color, width: f32, spacing: f32, angle: f32) -> Self {
+        self.fill = AreaFillType::HatchFill {
+            color,
+            width,
+            spacing,
+            angle,
         };
         self
     }
@@ -457,6 +609,18 @@ impl AreaInstruction {
     #[inline]
     pub fn with_feature_id(mut self, id: i64) -> Self {
         self.feature_id = Some(id);
+        self
+    }
+
+    #[inline]
+    pub fn with_scale_range(mut self, scale_range: ScaleRange) -> Self {
+        self.scale_range = scale_range;
+        self
+    }
+
+    #[inline]
+    pub fn with_display_plane(mut self, display_plane: DisplayPlane) -> Self {
+        self.display_plane = display_plane;
         self
     }
 }
@@ -492,6 +656,10 @@ pub struct TextInstruction {
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Scale-dependent visibility range
+    pub scale_range: ScaleRange,
+    /// Display plane (UnderRadar or OverRadar)
+    pub display_plane: DisplayPlane,
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
 }
@@ -514,6 +682,8 @@ impl TextInstruction {
             offset: ScreenPoint::zero(),
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            scale_range: ScaleRange::default(),
+            display_plane: DisplayPlane::default(),
             feature_id: None,
         }
     }
@@ -566,6 +736,18 @@ impl TextInstruction {
         self.feature_id = Some(id);
         self
     }
+
+    #[inline]
+    pub fn with_scale_range(mut self, scale_range: ScaleRange) -> Self {
+        self.scale_range = scale_range;
+        self
+    }
+
+    #[inline]
+    pub fn with_display_plane(mut self, display_plane: DisplayPlane) -> Self {
+        self.display_plane = display_plane;
+        self
+    }
 }
 
 /// All drawing instruction types
@@ -605,6 +787,24 @@ impl DrawingInstruction {
         }
     }
 
+    pub fn scale_range(&self) -> ScaleRange {
+        match self {
+            DrawingInstruction::Point(i) => i.scale_range,
+            DrawingInstruction::Line(i) => i.scale_range,
+            DrawingInstruction::Area(i) => i.scale_range,
+            DrawingInstruction::Text(i) => i.scale_range,
+        }
+    }
+
+    pub fn display_plane(&self) -> DisplayPlane {
+        match self {
+            DrawingInstruction::Point(i) => i.display_plane,
+            DrawingInstruction::Line(i) => i.display_plane,
+            DrawingInstruction::Area(i) => i.display_plane,
+            DrawingInstruction::Text(i) => i.display_plane,
+        }
+    }
+
     /// Get geometry type for S-101 render ordering
     pub fn geometry_type(&self) -> GeometryType {
         match self {
@@ -618,7 +818,29 @@ impl DrawingInstruction {
     /// Get S-101 compliant render order key
     /// Used for sorting: lower values rendered first (background)
     pub fn render_order(&self) -> RenderOrder {
-        RenderOrder::new(self.priority(), self.geometry_type(), self.feature_id())
+        let order = RenderOrder::new(self.priority(), self.geometry_type(), self.feature_id())
+            .with_render_category(self.viewing_group().0);
+        // For area features, sort by bounding box extent (larger areas first = background)
+        if let DrawingInstruction::Area(area) = self {
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for p in &area.exterior {
+                if p.x < x0 {
+                    x0 = p.x;
+                }
+                if p.y < y0 {
+                    y0 = p.y;
+                }
+                if p.x > x1 {
+                    x1 = p.x;
+                }
+                if p.y > y1 {
+                    y1 = p.y;
+                }
+            }
+            let extent = (x1 - x0) * (y1 - y0);
+            return order.with_extent(extent);
+        }
+        order
     }
 }
 
