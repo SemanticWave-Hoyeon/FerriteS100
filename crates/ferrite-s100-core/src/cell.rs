@@ -122,9 +122,10 @@ impl S101Cell {
         cell.shrink_to_fit();
 
         tracing::info!(
-            "Loaded cell: {} features, {} points, {} curves, {} surfaces (scale 1:{})",
+            "Loaded cell: {} features, {} points, {} multi-points, {} curves, {} surfaces (scale 1:{})",
             cell.features.len(),
             cell.points.len(),
+            cell.multi_points.len(),
             cell.curves.len(),
             cell.surfaces.len(),
             cell.compilation_scale
