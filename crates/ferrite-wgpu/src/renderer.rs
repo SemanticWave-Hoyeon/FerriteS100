@@ -1615,12 +1615,28 @@ impl WgpuRenderer {
         // CPU-side world→screen transform (f64 precision, no GPU artifacts)
         let (scale_x, scale_y, offset_x, offset_y, min_x, max_y) = transform;
 
+        // Clamp screen coordinates to a reasonable range to prevent GPU precision
+        // issues with extreme off-screen vertices at high zoom.
+        // Large triangles with vertices at ±50000px cause rasterizer artifacts ("rays").
+        // Clamping to ±8192px beyond viewport preserves visual correctness for on-screen
+        // triangles while eliminating extreme coordinates.
+        let clamp_margin = 8192.0_f32;
+        let (vp_w, vp_h) = self.state.viewport_size();
+        let clamp_min_x = -clamp_margin;
+        let clamp_min_y = -clamp_margin;
+        let clamp_max_x = vp_w + clamp_margin;
+        let clamp_max_y = vp_h + clamp_margin;
+
         self.area_vertices.extend((0..total_vertex_count).map(|i| {
             let wx = wv[i * 2];
             let wy = wv[i * 2 + 1];
             let sx = ((wx - min_x) * scale_x + offset_x) as f32;
             let sy = ((max_y - wy) * scale_y + offset_y) as f32;
-            Vertex2D::new(sx, sy, color)
+            Vertex2D::new(
+                sx.clamp(clamp_min_x, clamp_max_x),
+                sy.clamp(clamp_min_y, clamp_max_y),
+                color,
+            )
         }));
 
         self.area_indices
@@ -1706,12 +1722,19 @@ impl WgpuRenderer {
         let inv_ty = 1.0 / pat_tex.height as f32;
 
         // Triangulate the polygon (same approach as add_area_cached)
+        // Clamp screen coordinates to prevent GPU rasterizer artifacts at high zoom
+        let clamp_m = 8192.0_f32;
+        let (vpw, vph) = self.state.viewport_size();
+        let cl_lo_x = -clamp_m;
+        let cl_lo_y = -clamp_m;
+        let cl_hi_x = vpw + clamp_m;
+        let cl_hi_y = vph + clamp_m;
         let screen_points: Vec<(f32, f32)> = area
             .exterior
             .iter()
             .map(|p| {
                 let s = scaler.world_to_screen(*p);
-                (s.x, s.y)
+                (s.x.clamp(cl_lo_x, cl_hi_x), s.y.clamp(cl_lo_y, cl_hi_y))
             })
             .filter(|(x, y)| x.is_finite() && y.is_finite())
             .collect();
@@ -1733,7 +1756,7 @@ impl WgpuRenderer {
                 .iter()
                 .map(|p| {
                     let s = scaler.world_to_screen(*p);
-                    (s.x, s.y)
+                    (s.x.clamp(cl_lo_x, cl_hi_x), s.y.clamp(cl_lo_y, cl_hi_y))
                 })
                 .filter(|(x, y)| x.is_finite() && y.is_finite())
                 .collect();
@@ -1756,11 +1779,19 @@ impl WgpuRenderer {
         // shear = v2.x / v2.y: for each pixel of Y movement, X shifts by shear pixels.
         // The shader computes: u = (pos.x - shear * pos.y) * inv_tx
         let shear_screen = shear;
+        // Clamp screen coordinates to prevent GPU rasterizer artifacts
+        let clamp_margin = 8192.0_f32;
+        let (vp_w, vp_h) = self.state.viewport_size();
+        let cl_min_x = -clamp_margin;
+        let cl_min_y = -clamp_margin;
+        let cl_max_x = vp_w + clamp_margin;
+        let cl_max_y = vp_h + clamp_margin;
+
         let base_index = self.pattern_vertices.len() as u32;
         let total_points = coords.len() / 2;
         for i in 0..total_points {
-            let x = coords[i * 2] as f32;
-            let y = coords[i * 2 + 1] as f32;
+            let x = (coords[i * 2] as f32).clamp(cl_min_x, cl_max_x);
+            let y = (coords[i * 2 + 1] as f32).clamp(cl_min_y, cl_max_y);
             self.pattern_vertices
                 .push(PatternVertex::new(x, y, inv_tx, inv_ty, shear_screen));
         }
@@ -1803,13 +1834,19 @@ impl WgpuRenderer {
         let line_width = (width * SCREEN_PX_PER_MM * dpi_scale).max(0.5);
         let color_arr = color.to_array();
 
-        // Convert polygon exterior to screen coordinates
+        // Convert polygon exterior to screen coordinates (clamped to prevent extreme values)
+        let clamp_margin = 8192.0_f32;
+        let (vp_w, vp_h) = self.state.viewport_size();
+        let cl_min_x = -clamp_margin;
+        let cl_min_y = -clamp_margin;
+        let cl_max_x = vp_w + clamp_margin;
+        let cl_max_y = vp_h + clamp_margin;
         let screen_ring: Vec<(f32, f32)> = area
             .exterior
             .iter()
             .map(|p| {
                 let s = scaler.world_to_screen(*p);
-                (s.x, s.y)
+                (s.x.clamp(cl_min_x, cl_max_x), s.y.clamp(cl_min_y, cl_max_y))
             })
             .filter(|(x, y)| x.is_finite() && y.is_finite())
             .collect();
