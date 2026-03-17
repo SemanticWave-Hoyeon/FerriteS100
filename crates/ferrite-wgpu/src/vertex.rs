@@ -159,18 +159,39 @@ pub struct ViewUniforms {
     pub _padding: f32,
     /// Pan offset in screen coordinates (pixels)
     pub pan_offset: [f32; 2],
+    /// GPU zoom scale (1.0 = no zoom, >1 = zoomed in)
+    pub zoom_scale: f32,
+    /// Padding for alignment
+    pub _padding2: f32,
+    /// Zoom pivot point in screen coordinates
+    pub zoom_pivot: [f32; 2],
     /// Padding for 16-byte alignment
-    pub _padding2: [f32; 2],
+    pub _padding3: [f32; 2],
 }
 
 impl ViewUniforms {
     #[inline]
     pub fn new(width: f32, height: f32, scale: f32) -> Self {
-        Self::with_pan(width, height, scale, 0.0, 0.0)
+        Self::with_pan_zoom(width, height, scale, 0.0, 0.0, 1.0, 0.0, 0.0)
     }
 
     #[inline]
     pub fn with_pan(width: f32, height: f32, scale: f32, pan_x: f32, pan_y: f32) -> Self {
+        Self::with_pan_zoom(width, height, scale, pan_x, pan_y, 1.0, 0.0, 0.0)
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_pan_zoom(
+        width: f32,
+        height: f32,
+        scale: f32,
+        pan_x: f32,
+        pan_y: f32,
+        zoom_scale: f32,
+        zoom_pivot_x: f32,
+        zoom_pivot_y: f32,
+    ) -> Self {
         // Create orthographic projection for 2D rendering
         // Maps pixel coordinates to NDC (-1 to 1)
         let view_proj = Self::orthographic(0.0, width, height, 0.0, -1.0, 1.0);
@@ -181,7 +202,10 @@ impl ViewUniforms {
             scale,
             _padding: 0.0,
             pan_offset: [pan_x, pan_y],
-            _padding2: [0.0, 0.0],
+            zoom_scale,
+            _padding2: 0.0,
+            zoom_pivot: [zoom_pivot_x, zoom_pivot_y],
+            _padding3: [0.0, 0.0],
         }
     }
 

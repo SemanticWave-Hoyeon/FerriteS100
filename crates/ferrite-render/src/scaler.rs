@@ -304,6 +304,18 @@ impl Scaler {
         self.scale_y
     }
 
+    /// Get X offset (pixels)
+    #[inline]
+    pub fn offset_x(&self) -> f64 {
+        self.offset_x
+    }
+
+    /// Get Y offset (pixels)
+    #[inline]
+    pub fn offset_y(&self) -> f64 {
+        self.offset_y
+    }
+
     /// Get display scale as string (e.g., "1:50000")
     pub fn display_scale_string(&self) -> String {
         if self.display_scale >= 1_000_000.0 {

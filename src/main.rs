@@ -6,6 +6,10 @@
 //! This application loads and parses S-101 Electronic Navigational Charts
 //! using dynamically loaded Feature Catalogue (FC) and Portrayal Catalogue (PC).
 
+/// Use mimalloc for better allocation performance (fewer small-alloc stalls)
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Application version (from Cargo.toml)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -263,6 +267,23 @@ struct ChartApp {
     prev_cpu_times: Option<(u64, u64, std::time::Instant)>,
     /// Last debug stats update time (for throttling to 0.5s intervals)
     last_debug_update: std::time::Instant,
+    /// Zoom debounce: time of last scroll event (for deferred geometry rebuild)
+    zoom_last_scroll: std::time::Instant,
+    /// Zoom debounce: the zoom level at which geometry was last rebuilt
+    zoom_rebuilt_level: f64,
+    /// Zoom debounce phase: 0=none, 2=needs phase1, 1=phase1 done waiting for phase2
+    zoom_rebuild_phase: u8,
+    /// Zoom debounce: cursor position during zoom (for pivot)
+    zoom_cursor_screen: (f32, f32),
+    /// Pan rebuild pending: deferred rebuild after inertia/drag stops
+    /// 0 = none, 1 = phase 1 done (waiting for phase 2), 2 = needs phase 1
+    pan_rebuild_phase: u8,
+    /// Time when pan rebuild was requested
+    pan_rebuild_time: std::time::Instant,
+    /// Animated zoom: target zoom level (we interpolate zoom_level toward this)
+    zoom_target: f64,
+    /// Whether zoom animation is active
+    zoom_animating: bool,
 }
 
 impl ChartApp {
@@ -388,6 +409,14 @@ impl ChartApp {
             #[cfg(windows)]
             prev_cpu_times: None,
             last_debug_update: std::time::Instant::now(),
+            zoom_last_scroll: std::time::Instant::now(),
+            zoom_rebuilt_level: 1.0,
+            zoom_rebuild_phase: 0,
+            zoom_cursor_screen: (0.0, 0.0),
+            pan_rebuild_phase: 0,
+            pan_rebuild_time: std::time::Instant::now(),
+            zoom_target: 1.0,
+            zoom_animating: false,
         }
     }
 
@@ -431,6 +460,7 @@ impl ChartApp {
         if self.cells.is_empty() {
             return;
         }
+        let regen_start = std::time::Instant::now();
 
         let (width, height) = if let Some(renderer) = &self.renderer {
             let size = renderer.window().inner_size();
@@ -471,10 +501,17 @@ impl ChartApp {
             }
         }
 
+        let regen_elapsed = regen_start.elapsed();
         tracing::info!(
-            "Regenerated portrayal with {} profile",
-            self.current_profile_name
+            "Regenerated portrayal with {} profile ({:.2}ms)",
+            self.current_profile_name,
+            regen_elapsed.as_secs_f64() * 1000.0
         );
+        if let Some(renderer) = &mut self.renderer {
+            renderer
+                .cpu_profiler
+                .record("regenerate_portrayal", regen_elapsed);
+        }
     }
 
     /// Get available color profile names
@@ -782,6 +819,7 @@ impl ChartApp {
             // Apply zoom override if specified
             if let Some(zoom) = self.auto_zoom {
                 self.zoom_level = zoom;
+                self.zoom_target = zoom;
             }
             // Re-render with zoom applied
             self.update_view();
@@ -914,6 +952,8 @@ impl ChartApp {
         self.bounds = GeoBounds::default();
         self.chart_loaded = false;
         self.zoom_level = 1.0;
+        self.zoom_target = 1.0;
+        self.zoom_animating = false;
         self.pan_offset = (0.0, 0.0);
         self.rendered_symbols.clear();
         self.loaded_paths.clear();
@@ -941,6 +981,50 @@ impl ChartApp {
     }
 
     /// Regenerate drawing instructions from loaded cells
+    /// Compute instruction cache file path for the current chart set
+    fn instruction_cache_path(&self) -> Option<PathBuf> {
+        if self.cells.is_empty() {
+            return None;
+        }
+        // Use first chart's directory + combined hash as cache location
+        let first_path = &self.cells[0].file_path;
+        let cache_dir = first_path.parent()?;
+
+        // Build cache key from all chart file names + profile name
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for cell in &self.cells {
+            cell.file_path.to_string_lossy().hash(&mut hasher);
+        }
+        self.current_profile_name.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        Some(cache_dir.join(format!(".ferrite_cache_{:016x}.bin", hash)))
+    }
+
+    /// Check if instruction cache is valid (newer than all chart files)
+    fn is_cache_valid(&self, cache_path: &Path) -> bool {
+        let cache_meta = match fs::metadata(cache_path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let cache_mtime = match cache_meta.modified() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        // Cache must be newer than all chart files
+        for cell in &self.cells {
+            if let Ok(meta) = fs::metadata(&cell.file_path) {
+                if let Ok(chart_mtime) = meta.modified() {
+                    if chart_mtime > cache_mtime {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn regenerate_instructions(&mut self) -> Result<()> {
         if self.cells.is_empty() {
             return Ok(());
@@ -958,28 +1042,89 @@ impl ChartApp {
         self.render_context = RenderContext::new(Viewport::new(width, height));
         self.render_context.set_bounds(self.bounds);
 
-        // Get current settings from renderer
-        let current_settings = self.renderer.as_ref().map(|r| r.settings().clone());
+        // Try to load instructions from binary cache
+        let cache_path = self.instruction_cache_path();
+        let mut cache_loaded = false;
 
-        // Try Lua portrayal with current color profile and settings
-        let lua_result = try_lua_portrayal(
-            &self.cells,
-            &self.fc,
-            &self.pc,
-            &mut self.render_context,
-            &self.current_profile_name,
-            current_settings.as_ref(),
-        );
+        if let Some(ref cp) = cache_path {
+            if self.is_cache_valid(cp) {
+                let cache_start = std::time::Instant::now();
+                match fs::read(cp) {
+                    Ok(data) => {
+                        match bincode::deserialize::<Vec<ferrite_render::DrawingInstruction>>(&data)
+                        {
+                            Ok(instructions) => {
+                                let count = instructions.len();
+                                self.render_context
+                                    .set_instructions_from_cache(instructions);
+                                cache_loaded = true;
+                                info!(
+                                    "Loaded {} instructions from cache in {:.1}ms: {}",
+                                    count,
+                                    cache_start.elapsed().as_secs_f64() * 1000.0,
+                                    cp.display()
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Cache deserialization failed: {}. Regenerating.", e);
+                                let _ = fs::remove_file(cp);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Cache read failed: {}. Regenerating.", e);
+                    }
+                }
+            }
+        }
 
-        if let Err(e) = lua_result {
-            warn!("Lua portrayal failed: {}. Using default instructions.", e);
-            for cell in &self.cells {
-                generate_default_instructions(
-                    cell,
-                    &mut self.render_context,
-                    &self.pc,
-                    &self.current_profile_name,
-                );
+        if !cache_loaded {
+            // Get current settings from renderer
+            let current_settings = self.renderer.as_ref().map(|r| r.settings().clone());
+
+            // Try Lua portrayal with current color profile and settings
+            let lua_result = try_lua_portrayal(
+                &self.cells,
+                &self.fc,
+                &self.pc,
+                &mut self.render_context,
+                &self.current_profile_name,
+                current_settings.as_ref(),
+            );
+
+            if let Err(e) = lua_result {
+                warn!("Lua portrayal failed: {}. Using default instructions.", e);
+                for cell in &self.cells {
+                    generate_default_instructions(
+                        cell,
+                        &mut self.render_context,
+                        &self.pc,
+                        &self.current_profile_name,
+                    );
+                }
+            }
+
+            // Save instruction cache for next load
+            if let Some(ref cp) = cache_path {
+                let cache_start = std::time::Instant::now();
+                let instructions = self.render_context.raw_instructions();
+                match bincode::serialize(instructions) {
+                    Ok(data) => {
+                        let size_kb = data.len() / 1024;
+                        match fs::write(cp, &data) {
+                            Ok(_) => {
+                                info!(
+                                    "Saved instruction cache ({}KB) in {:.1}ms: {}",
+                                    size_kb,
+                                    cache_start.elapsed().as_secs_f64() * 1000.0,
+                                    cp.display()
+                                );
+                            }
+                            Err(e) => warn!("Failed to save instruction cache: {}", e),
+                        }
+                    }
+                    Err(e) => warn!("Failed to serialize instructions: {}", e),
+                }
             }
         }
 
@@ -1085,6 +1230,12 @@ impl ChartApp {
         if !self.chart_loaded {
             return;
         }
+        let profiling = ferrite_wgpu::profiler::is_profiling_enabled();
+        let update_view_start = if profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // Update viewport to use actual chart area (excluding UI panels)
         if let Some(renderer) = &self.renderer {
@@ -1148,13 +1299,64 @@ impl ChartApp {
 
         // Rebuild symbols for hit testing (skip during animation for performance)
         if rebuild_hit_test {
+            let hit_test_start = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             self.build_rendered_symbols();
+            if let Some(s) = hit_test_start {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.cpu_profiler.record("build_hit_test", s.elapsed());
+                }
+            }
+        }
+
+        if let Some(s) = update_view_start {
+            let elapsed = s.elapsed();
+            tracing::debug!(
+                "[PROFILER] update_view_ex: {:.2}ms (hit_test={})",
+                elapsed.as_secs_f64() * 1000.0,
+                rebuild_hit_test
+            );
+            if let Some(renderer) = &mut self.renderer {
+                renderer.cpu_profiler.record("update_view", elapsed);
+            }
         }
     }
 
     /// Update the view (rebuilds hit-test symbols, clears declutter grids)
     fn update_view(&mut self) {
         self.update_view_ex(true, false);
+        // Sync zoom rebuild level so GPU zoom delta resets to 1.0
+        self.zoom_rebuilt_level = self.zoom_level;
+    }
+
+    /// Recalculate view bounds/scaler without rebuilding geometry.
+    /// Used as a lightweight step before adjusting pan offset during zoom.
+    fn recalculate_view_bounds(&mut self) {
+        if !self.chart_loaded {
+            return;
+        }
+        if let Some(renderer) = &self.renderer {
+            let (x, y, w, h) = renderer.ui_state.chart_area;
+            if w > 0.0 && h > 0.0 {
+                self.render_context.set_viewport_rect(x, y, w, h);
+            }
+        }
+        let base_width = self.bounds.max_x - self.bounds.min_x;
+        let base_height = self.bounds.max_y - self.bounds.min_y;
+        let center_x = (self.bounds.min_x + self.bounds.max_x) / 2.0 + self.pan_offset.0;
+        let center_y = (self.bounds.min_y + self.bounds.max_y) / 2.0 + self.pan_offset.1;
+        let zoomed_width = base_width / self.zoom_level;
+        let zoomed_height = base_height / self.zoom_level;
+        let new_bounds = GeoBounds {
+            min_x: center_x - zoomed_width / 2.0,
+            max_x: center_x + zoomed_width / 2.0,
+            min_y: center_y - zoomed_height / 2.0,
+            max_y: center_y + zoomed_height / 2.0,
+        };
+        self.render_context.zoom_to_fit(new_bounds);
     }
 }
 
@@ -1193,6 +1395,11 @@ impl ApplicationHandler for ChartApp {
                             renderer.ui_state.pc_status = self.pc_status.clone();
                             renderer.ui_state.debug_mode = self.debug_mode;
                             renderer.set_color_profile(&self.current_profile_name);
+
+                            // Enable profiling only in debug mode
+                            if self.debug_mode {
+                                renderer.set_profiling_enabled(true);
+                            }
 
                             // Only add instructions if chart is loaded
                             if self.chart_loaded {
@@ -1272,6 +1479,10 @@ impl ApplicationHandler for ChartApp {
             WindowEvent::CloseRequested => {
                 #[cfg(debug_assertions)]
                 info!("Window close requested");
+                // Flush profiler report before exit
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.flush_profiler();
+                }
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
@@ -1301,7 +1512,17 @@ impl ApplicationHandler for ChartApp {
                 let dt = now.duration_since(self.last_frame_time).as_secs_f64();
                 self.last_frame_time = now;
 
-                // Apply pan velocity (inertia)
+                // Frame profiling: begin frame
+                let profiling_enabled = ferrite_wgpu::profiler::is_profiling_enabled();
+                if profiling_enabled {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.cpu_profiler.begin_frame();
+                    }
+                }
+
+                // Apply pan velocity (inertia) — iOS-style deceleration
+                // Uses exponential decay: v(t) = v0 * decel^t
+                // decel_rate ~0.998 per ms gives natural-feeling momentum
                 let velocity_magnitude =
                     (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
                 if velocity_magnitude > 0.0001 && self.chart_loaded && !self.is_dragging {
@@ -1316,8 +1537,12 @@ impl ApplicationHandler for ChartApp {
                         -self.pan_velocity.0 * self.render_context.scaler.scale_x() * dt;
                     let screen_vy = self.pan_velocity.1 * self.render_context.scaler.scale_y() * dt;
 
-                    // Decelerate (friction) - exponential decay for smooth stop
-                    let friction = 0.95_f64.powf(dt * 60.0); // ~5% decay per frame at 60fps
+                    // Decelerate: exponential decay (frame-rate independent)
+                    // 0.998^ms ≈ natural iOS-like scroll momentum
+                    // At 120Hz (8.33ms): friction = 0.998^8.33 ≈ 0.9834
+                    // At 60Hz (16.67ms): friction = 0.998^16.67 ≈ 0.9672
+                    let dt_ms = dt * 1000.0;
+                    let friction = 0.998_f64.powf(dt_ms);
                     self.pan_velocity.0 *= friction;
                     self.pan_velocity.1 *= friction;
 
@@ -1326,16 +1551,93 @@ impl ApplicationHandler for ChartApp {
                         (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
                     if new_magnitude < 0.00001 {
                         self.pan_velocity = (0.0, 0.0);
-                        // Motion stopped - reset pan offset and full rebuild
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.reset_pan_offset();
-                        }
-                        self.update_view();
+                        // Defer rebuild to avoid frame spike on stop frame
+                        self.pan_rebuild_phase = 2; // needs phase 1
+                        self.pan_rebuild_time = now;
                     } else {
                         // Still moving - use fast GPU pan path
                         if let Some(renderer) = &mut self.renderer {
                             renderer.add_pan_offset(screen_vx as f32, screen_vy as f32);
                         }
+                    }
+                }
+
+                // Animated zoom: smoothly interpolate toward zoom_target
+                if self.zoom_animating {
+                    let ratio = self.zoom_target / self.zoom_level;
+                    if ratio.abs() < 1e-6 || (ratio - 1.0).abs() < 0.001 {
+                        // Close enough — snap to target
+                        self.zoom_level = self.zoom_target;
+                        self.zoom_animating = false;
+                    } else {
+                        // Exponential interpolation: lerp in log-space for uniform feel
+                        // ~85% toward target per frame → reaches 99% in ~5 frames
+                        let t = 1.0 - 0.15_f64.powf(dt * 60.0);
+                        let log_current = self.zoom_level.ln();
+                        let log_target = self.zoom_target.ln();
+                        self.zoom_level = (log_current + (log_target - log_current) * t).exp();
+                        self.zoom_level = self.zoom_level.clamp(0.1, 50.0);
+                    }
+
+                    // Apply GPU fast-path zoom
+                    let (cursor_sx, cursor_sy) = self.zoom_cursor_screen;
+                    let gpu_zoom = (self.zoom_level / self.zoom_rebuilt_level) as f32;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_gpu_zoom(gpu_zoom, cursor_sx, cursor_sy);
+                        renderer.ui_state.zoom_level = self.zoom_level;
+                    }
+
+                    // Track world-space pan offset to keep cursor point stable
+                    let screen_pt = ferrite_render::ScreenPoint::new(cursor_sx, cursor_sy);
+                    let world_before = self.render_context.scaler.screen_to_world(screen_pt);
+                    self.recalculate_view_bounds();
+                    let world_after = self.render_context.scaler.screen_to_world(screen_pt);
+                    self.pan_offset.0 += world_before.x - world_after.x;
+                    self.pan_offset.1 += world_before.y - world_after.y;
+
+                    // Keep debounce timer fresh while animating
+                    if self.zoom_animating {
+                        self.zoom_last_scroll = now;
+                    }
+                }
+
+                // Zoom debounce: 2-phase rebuild when scrolling/animation stops
+                // Phase 2→1 (80ms): Rebuild geometry + declutter, skip hit-test
+                // Phase 1→0 (300ms): Rebuild hit-test only (geometry already correct)
+                if self.zoom_rebuild_phase == 2 {
+                    let elapsed = now.duration_since(self.zoom_last_scroll);
+                    if elapsed.as_millis() >= 80 && !self.zoom_animating {
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.reset_pan_offset();
+                        }
+                        self.update_view_ex(false, false);
+                        self.zoom_rebuilt_level = self.zoom_level;
+                        self.zoom_rebuild_phase = 1;
+                    }
+                } else if self.zoom_rebuild_phase == 1 {
+                    let elapsed = now.duration_since(self.zoom_last_scroll);
+                    if elapsed.as_millis() >= 300 {
+                        // Hit-test only (geometry unchanged since Phase 1)
+                        self.build_rendered_symbols();
+                        self.zoom_rebuild_phase = 0;
+                    }
+                }
+
+                // Deferred pan rebuild after inertia/drag stops
+                // Phase 2→1: Rebuild geometry + declutter, skip hit-test
+                // Phase 1→0 (150ms): Rebuild hit-test only
+                if self.pan_rebuild_phase == 2 {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.reset_pan_offset();
+                    }
+                    self.update_view_ex(false, false);
+                    self.pan_rebuild_phase = 1;
+                } else if self.pan_rebuild_phase == 1 {
+                    let elapsed = now.duration_since(self.pan_rebuild_time);
+                    if elapsed.as_millis() >= 150 {
+                        // Hit-test only (geometry unchanged since Phase 1)
+                        self.build_rendered_symbols();
+                        self.pan_rebuild_phase = 0;
                     }
                 }
 
@@ -1477,6 +1779,8 @@ impl ApplicationHandler for ChartApp {
                         renderer.reset_pan_offset();
                     }
                     self.zoom_level = (self.zoom_level * 1.5).min(50.0);
+                    self.zoom_target = self.zoom_level;
+                    self.zoom_animating = false;
                     self.update_view();
                 }
 
@@ -1485,6 +1789,8 @@ impl ApplicationHandler for ChartApp {
                         renderer.reset_pan_offset();
                     }
                     self.zoom_level = (self.zoom_level / 1.5).max(0.1);
+                    self.zoom_target = self.zoom_level;
+                    self.zoom_animating = false;
                     self.update_view();
                 }
 
@@ -1493,6 +1799,8 @@ impl ApplicationHandler for ChartApp {
                         renderer.reset_pan_offset();
                     }
                     self.zoom_level = 1.0;
+                    self.zoom_target = 1.0;
+                    self.zoom_animating = false;
                     self.pan_offset = (0.0, 0.0);
                     self.pan_velocity = (0.0, 0.0); // Stop inertia on reset
                     self.update_view();
@@ -1687,6 +1995,11 @@ impl ApplicationHandler for ChartApp {
                     if let Err(e) = renderer.render() {
                         error!("Render error: {}", e);
                     }
+
+                    // Frame profiling: end frame (logs periodic report)
+                    if profiling_enabled {
+                        renderer.cpu_profiler.end_frame();
+                    }
                 }
 
                 // Auto-screenshot: wait a few frames after load for rendering to stabilize
@@ -1709,9 +2022,32 @@ impl ApplicationHandler for ChartApp {
                     }
                 }
 
-                // Request next frame
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                // Request next frame only when needed (on-demand rendering)
+                // During drag/inertia: keep requesting frames at VSync rate for smooth motion
+                let needs_redraw = {
+                    let has_inertia =
+                        self.pan_velocity.0.abs() > 0.00001 || self.pan_velocity.1.abs() > 0.00001;
+                    let has_loading = self.loading_state.is_some();
+                    let has_screenshot_pending = self.frames_since_loaded.is_some();
+                    let has_zoom_pending = self.zoom_rebuild_phase > 0;
+                    let egui_needs = self
+                        .renderer
+                        .as_ref()
+                        .is_some_and(|r| r.egui_needs_repaint());
+                    let has_pan_rebuild = self.pan_rebuild_phase > 0;
+                    self.is_dragging
+                        || self.zoom_animating
+                        || has_inertia
+                        || has_loading
+                        || has_screenshot_pending
+                        || has_zoom_pending
+                        || has_pan_rebuild
+                        || egui_needs
+                };
+                if needs_redraw {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1745,6 +2081,7 @@ impl ApplicationHandler for ChartApp {
 
                     // Stop any existing inertia when actively dragging
                     self.pan_velocity = (0.0, 0.0);
+                    self.pan_rebuild_phase = 0;
 
                     // FAST PATH: Use GPU pan offset instead of rebuilding vertices
                     // This is much faster than update_view_ex which rebuilds all geometry
@@ -1754,6 +2091,11 @@ impl ApplicationHandler for ChartApp {
                 }
 
                 self.mouse_pos = new_pos;
+
+                // Request redraw for cursor updates and drag rendering
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } if !egui_consumed && self.chart_loaded => {
                 let scroll_amount = match delta {
@@ -1761,28 +2103,26 @@ impl ApplicationHandler for ChartApp {
                     MouseScrollDelta::PixelDelta(pos) => pos.y / 50.0,
                 };
 
-                // Reset GPU pan offset before zoom (we'll rebuild vertices)
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.reset_pan_offset();
+                // Accumulate into zoom target (animated zoom will interpolate toward it)
+                let zoom_factor = 1.0 + scroll_amount * 0.15;
+                if !self.zoom_animating {
+                    self.zoom_target = self.zoom_level;
                 }
+                self.zoom_target = (self.zoom_target * zoom_factor).clamp(0.1, 50.0);
+                self.zoom_animating = true;
 
-                let zoom_factor = 1.0 + scroll_amount * 0.1;
-                let screen_pt = ferrite_render::ScreenPoint::new(
-                    self.mouse_pos.0 as f32,
-                    self.mouse_pos.1 as f32,
-                );
-                let world_before = self.render_context.scaler.screen_to_world(screen_pt);
+                // Record cursor as zoom pivot
+                let cursor_sx = self.mouse_pos.0 as f32;
+                let cursor_sy = self.mouse_pos.1 as f32;
+                self.zoom_cursor_screen = (cursor_sx, cursor_sy);
 
-                let new_zoom = (self.zoom_level * zoom_factor).clamp(0.1, 50.0);
-                self.zoom_level = new_zoom;
+                // Mark rebuild pending — will execute when animation stops
+                self.zoom_last_scroll = std::time::Instant::now();
+                self.zoom_rebuild_phase = 2;
 
-                self.update_view();
-
-                let world_after = self.render_context.scaler.screen_to_world(screen_pt);
-                self.pan_offset.0 += world_before.x - world_after.x;
-                self.pan_offset.1 += world_before.y - world_after.y;
-
-                self.update_view();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::MouseInput {
                 state,
@@ -1823,19 +2163,18 @@ impl ApplicationHandler for ChartApp {
                                     let world_vy = vy / self.render_context.scaler.scale_y();
 
                                     // Apply velocity with damping factor for natural feel
-                                    self.pan_velocity = (world_vx * 0.5, world_vy * 0.5);
+                                    // 0.7 gives good momentum while preventing overshoot
+                                    self.pan_velocity = (world_vx * 0.7, world_vy * 0.7);
                                     inertia_applied = true;
                                 }
                             }
                             self.recent_positions.clear();
                         }
 
-                        // If drag ended without inertia, reset pan offset and do full rebuild
+                        // If drag ended without inertia, defer rebuild
                         if was_dragging && !inertia_applied && self.chart_loaded {
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.reset_pan_offset();
-                            }
-                            self.update_view();
+                            self.pan_rebuild_phase = 2;
+                            self.pan_rebuild_time = std::time::Instant::now();
                         }
 
                         if !was_dragging || drag_dist < 5.0 {
@@ -1934,6 +2273,11 @@ impl ApplicationHandler for ChartApp {
                         } // end if !egui_wants
                     }
                 }
+
+                // Request redraw after click/release events
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -1979,13 +2323,26 @@ impl ApplicationHandler for ChartApp {
                             renderer.reset_pan_offset();
                         }
                         self.zoom_level = 1.0;
+                        self.zoom_target = 1.0;
+                        self.zoom_animating = false;
                         self.pan_offset = (0.0, 0.0);
                         self.pan_velocity = (0.0, 0.0); // Stop inertia on reset
                         self.update_view();
                     }
                 } // end if !egui_wants
+
+                // Request redraw after right-click
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
-            _ => {}
+            _ => {
+                // For any other window event (keyboard, etc.), request redraw
+                // to ensure egui UI updates are rendered
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 }
@@ -2096,7 +2453,7 @@ fn run_app() -> Result<()> {
     }
 
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
-    event_loop.set_control_flow(ControlFlow::Poll); // Use Poll for smooth UI updates
+    event_loop.set_control_flow(ControlFlow::Wait); // Use Wait for lower CPU/GPU usage; request_redraw triggers frames on demand
 
     let mut app = ChartApp::new(
         symbol_cache,
@@ -3759,7 +4116,7 @@ fn init_logging(log_path: &Path) -> Result<()> {
     // Environment filter - default to info, debug for core modules
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "info,ferrite_s100=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug",
+            "info,ferrite_s100=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug,ferrite_wgpu=debug",
         )
     });
 

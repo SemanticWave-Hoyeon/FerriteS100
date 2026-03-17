@@ -17,6 +17,7 @@
 mod egui_integration;
 mod error;
 mod pipeline;
+pub mod profiler;
 mod renderer;
 mod state;
 mod symbol_cache;
@@ -25,6 +26,7 @@ mod vertex;
 pub use egui_integration::*;
 pub use error::*;
 pub use pipeline::*;
+pub use profiler::*;
 pub use renderer::*;
 pub use state::*;
 pub use symbol_cache::*;
