@@ -104,6 +104,8 @@ struct AppConfig {
     debug_rings: bool,
     /// Override zoom level for auto-screenshot (1.0 = fit to window)
     auto_zoom: Option<f64>,
+    /// Override center position for auto-screenshot (lat,lon in degrees)
+    auto_center: Option<(f64, f64)>,
 }
 
 impl AppConfig {
@@ -152,6 +154,17 @@ impl AppConfig {
             .find(|w| w[0] == "--zoom")
             .and_then(|w| w[1].parse::<f64>().ok());
 
+        // Parse --center <lat,lon> (e.g., --center 50.7908,-1.1135)
+        let auto_center = args.windows(2).find(|w| w[0] == "--center").and_then(|w| {
+            let parts: Vec<&str> = w[1].split(',').collect();
+            if parts.len() == 2 {
+                if let (Ok(lat), Ok(lon)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                    return Some((lat, lon));
+                }
+            }
+            None
+        });
+
         // Force debug mode if debug-rings or screenshot is set
         let debug_mode = debug_mode || debug_rings || auto_screenshot.is_some();
 
@@ -164,6 +177,7 @@ impl AppConfig {
             auto_screenshot,
             debug_rings,
             auto_zoom,
+            auto_center,
         }
     }
 }
@@ -258,6 +272,8 @@ struct ChartApp {
     debug_rings: bool,
     /// Override zoom level for auto-screenshot
     auto_zoom: Option<f64>,
+    /// Override center position for auto-screenshot (lat, lon)
+    auto_center: Option<(f64, f64)>,
     /// Frame count since load completed (for auto-screenshot timing)
     frames_since_loaded: Option<u32>,
     /// Frame times for FPS calculation
@@ -300,6 +316,7 @@ impl ChartApp {
         auto_screenshot: Option<PathBuf>,
         debug_rings: bool,
         auto_zoom: Option<f64>,
+        auto_center: Option<(f64, f64)>,
     ) -> Self {
         ChartApp {
             window: None,
@@ -404,6 +421,7 @@ impl ChartApp {
             auto_screenshot,
             debug_rings,
             auto_zoom,
+            auto_center,
             frames_since_loaded: None,
             frame_times: std::collections::VecDeque::with_capacity(60),
             #[cfg(windows)]
@@ -816,6 +834,13 @@ impl ChartApp {
 
         // Start auto-screenshot countdown (wait a few frames for rendering)
         if self.auto_screenshot.is_some() && self.chart_loaded {
+            // Apply center override if specified (lat,lon → pan_offset in world coords)
+            if let Some((lat, lon)) = self.auto_center {
+                let chart_center_x = (self.bounds.min_x + self.bounds.max_x) / 2.0;
+                let chart_center_y = (self.bounds.min_y + self.bounds.max_y) / 2.0;
+                self.pan_offset.0 = lon - chart_center_x;
+                self.pan_offset.1 = lat - chart_center_y;
+            }
             // Apply zoom override if specified
             if let Some(zoom) = self.auto_zoom {
                 self.zoom_level = zoom;
@@ -2467,6 +2492,7 @@ fn run_app() -> Result<()> {
         config.auto_screenshot,
         config.debug_rings,
         config.auto_zoom,
+        config.auto_center,
     );
 
     event_loop.run_app(&mut app).context("Event loop error")?;
