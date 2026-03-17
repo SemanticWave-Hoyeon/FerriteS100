@@ -55,12 +55,28 @@ impl GpuState {
         let gpu_name = adapter_info.name.clone();
         tracing::info!("Using GPU adapter: {:?}", gpu_name);
 
+        // Check which timestamp query features the adapter supports
+        let adapter_features = adapter.features();
+        let mut requested_features = wgpu::Features::empty();
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            requested_features |= wgpu::Features::TIMESTAMP_QUERY;
+            tracing::info!("GPU supports TIMESTAMP_QUERY");
+        }
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+            requested_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            tracing::info!("GPU supports TIMESTAMP_QUERY_INSIDE_ENCODERS");
+        }
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+            requested_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+            tracing::info!("GPU supports TIMESTAMP_QUERY_INSIDE_PASSES");
+        }
+
         // Request device
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ferrite-device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: requested_features,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: Default::default(),
                 },
@@ -80,15 +96,19 @@ impl GpuState {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        // Use Fifo (VSync) to match monitor refresh rate — no wasted frames.
+        // desired_maximum_frame_latency = 1 minimizes input-to-display latency:
+        // the CPU starts the next frame only after the GPU finishes the previous one,
+        // keeping the GPU queue shallow for the freshest possible input state.
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
 

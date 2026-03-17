@@ -31,7 +31,8 @@ const SCREEN_PX_PER_MM: f32 = 96.0 / 25.4;
 //    (which recovers the original user-unit size = physical mm size at 96 DPI)
 // The formula is: display_scale = instance.scale / tex.render_scale * self.symbol_scale
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::egui_integration;
+use crate::profiler::{CpuProfiler, GpuProfilerWrapper, ScopeTimer};
 use ferrite_portrayal_catalog::ColorProfile;
 use ferrite_render::{
     intern_symbol, Color, DrawingInstruction, RenderContext, ScreenPoint, SymbolId, WorldPoint,
@@ -68,14 +70,17 @@ fn point_in_ring(px: f32, py: f32, ring: &[(f32, f32)]) -> bool {
     inside
 }
 
-/// Cached triangulation for an area (optimization)
-#[derive(Clone)]
-#[allow(dead_code)]
+/// Cached triangulation result (world-coordinate earcut)
+/// Stores indices and cleaned world vertices so earcut runs only once per polygon shape.
 struct CachedTriangulation {
-    vertices: Vec<Vertex2D>,
-    indices: Vec<u32>,
-    /// Hash of the geometry for invalidation
-    geometry_hash: u64,
+    /// Earcut triangle indices (into world_vertices)
+    indices: Vec<usize>,
+    /// Cleaned world-coordinate vertices [x0, y0, x1, y1, ...] (exterior + holes)
+    world_vertices: Vec<f64>,
+    /// World-coordinate axis-aligned bounding box (min_x, min_y, max_x, max_y)
+    /// Used for O(1) viewport frustum culling — skip entire area if AABB is off-screen
+    #[allow(dead_code)]
+    world_aabb: (f64, f64, f64, f64),
 }
 
 /// Batched symbols grouped by texture for efficient rendering
@@ -182,6 +187,7 @@ struct TextLabel {
     text: String,
     font_size: f32,
     color: [f32; 4],
+    #[allow(dead_code)]
     bold: bool,
     italic: bool,
     h_align: ferrite_render::HAlign,
@@ -262,18 +268,13 @@ pub struct WgpuRenderer {
     /// Used to calculate viewing scale for S-101 feature filtering
     pub compilation_scale: u32,
     /// Grid for symbol decluttering (screen space) - for non-sounding symbols
-    symbol_grid: std::collections::HashSet<(i32, i32)>,
+    symbol_grid: FxHashSet<(i32, i32)>,
     /// Screen-space grid for sounding decluttering
-    /// Key: (screen_x / cell_size) as i32, (screen_y / cell_size) as i32
-    /// Value: (world_position_key, depth) - keeps the shallowest sounding for safety
-    sounding_screen_grid: std::collections::HashMap<(i32, i32), ((i64, i64), f64)>,
+    sounding_screen_grid: FxHashMap<(i32, i32), ((i64, i64), f64)>,
     /// Exact positions of soundings that have been allowed through (world coordinates)
-    /// Key: (world_x * 1000000) as i64, (world_y * 1000000) as i64
-    /// This ensures all digits of the same sounding value are rendered
-    sounding_exact_positions: std::collections::HashSet<(i64, i64)>,
+    sounding_exact_positions: FxHashSet<(i64, i64)>,
     /// World-coordinate deduplication (to remove exact duplicates from multiple charts)
-    /// Key: (world_x * 1000000) as i64, (world_y * 1000000) as i64, symbol_type_hash
-    world_dedup: std::collections::HashSet<(i64, i64, u64)>,
+    world_dedup: FxHashSet<(i64, i64, u64)>,
     /// Grid cell size in pixels (adjusted by zoom)
     grid_cell_size: f32,
     /// Sounding grid cell size in pixels (screen-space)
@@ -283,6 +284,10 @@ pub struct WgpuRenderer {
     skip_screen_declutter: bool,
     /// Screen-space pan offset (pixels) for fast panning during drag
     screen_pan_offset: (f32, f32),
+    /// GPU zoom scale for smooth zooming (1.0 = no zoom delta, rebuilt at this level)
+    screen_zoom_scale: f32,
+    /// Zoom pivot point in screen coordinates
+    screen_zoom_pivot: (f32, f32),
     /// egui integration for UI overlay
     egui: EguiIntegration,
     /// UI state shared with main app
@@ -291,7 +296,13 @@ pub struct WgpuRenderer {
     /// Cached triangulations by feature ID (optimization)
     triangulation_cache: HashMap<i64, CachedTriangulation>,
     /// Batched symbols by texture (optimization, keyed by interned SymbolId)
-    symbol_batches: HashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)>,
+    symbol_batches: FxHashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)>,
+    /// Packed symbol vertices for single-buffer rendering
+    packed_symbol_vertices: Vec<TextureVertex>,
+    /// Packed symbol indices for single-buffer rendering
+    packed_symbol_indices: Vec<u32>,
+    /// Ranges into packed arrays per symbol texture: (symbol_id, index_start, index_count)
+    packed_symbol_ranges: Vec<(SymbolId, u32, u32)>,
     /// Animation/drag mode - enables fast-path rendering
     pub animation_mode: bool,
     /// LOD level (0=full detail, 1=medium, 2=low)
@@ -318,6 +329,40 @@ pub struct WgpuRenderer {
     text_labels: Vec<TextLabel>,
     /// Grid for text collision avoidance
     text_collision_grid: TextCollisionGrid,
+    // === CACHED GPU BUFFERS (avoid recreating every frame) ===
+    /// Cached area vertex buffer (rebuilt only when geometry changes)
+    cached_area_vb: Option<wgpu::Buffer>,
+    cached_area_ib: Option<wgpu::Buffer>,
+    cached_area_index_count: u32,
+    /// Cached line vertex buffer
+    cached_line_vb: Option<wgpu::Buffer>,
+    cached_line_ib: Option<wgpu::Buffer>,
+    cached_line_index_count: u32,
+    /// Cached pattern vertex buffer
+    cached_pattern_vb: Option<wgpu::Buffer>,
+    cached_pattern_ib: Option<wgpu::Buffer>,
+    cached_pattern_index_count: u32,
+    /// Whether cached GPU buffers are stale and need rebuild
+    gpu_buffers_dirty: bool,
+    /// Cached symbol GPU buffers per priority range (avoid recreating every frame)
+    #[allow(clippy::type_complexity)]
+    cached_symbol_buffers: Vec<(
+        u8,
+        i32,
+        usize,
+        usize,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        Vec<(SymbolId, u32, u32)>,
+    )>,
+    // === INSTRUCTION CACHE (reused across rebuilds when only view changes) ===
+    /// Cached line suppression set (stable between rebuilds, only invalidated on chart reload)
+    cached_suppressed_lines: Option<(usize, usize, FxHashSet<usize>)>, // (ptr, len, set)
+    // === PROFILING ===
+    /// CPU-side performance profiler
+    pub cpu_profiler: CpuProfiler,
+    /// GPU-side profiler (wgpu-profiler)
+    gpu_profiler: GpuProfilerWrapper,
 }
 
 impl WgpuRenderer {
@@ -325,6 +370,7 @@ impl WgpuRenderer {
     pub async fn new(window: Arc<Window>) -> Result<Self> {
         let state = GpuState::new(window.clone()).await?;
         let pipelines = RenderPipelines::new(&state)?;
+        let gpu_profiler = GpuProfilerWrapper::new(&state.device);
 
         let (width, height) = state.viewport_size();
         let uniforms = ViewUniforms::new(width, height, 1.0);
@@ -356,20 +402,25 @@ impl WgpuRenderer {
             show_soundings: true, // Visibility controlled by S-101 viewing groups
             zoom_level: 1.0,
             compilation_scale: 22000, // Default compilation scale (1:22000)
-            symbol_grid: std::collections::HashSet::with_capacity(1000),
-            sounding_screen_grid: std::collections::HashMap::with_capacity(2000),
-            sounding_exact_positions: std::collections::HashSet::with_capacity(5000),
-            world_dedup: std::collections::HashSet::with_capacity(5000),
+            symbol_grid: FxHashSet::with_capacity_and_hasher(1000, Default::default()),
+            sounding_screen_grid: FxHashMap::with_capacity_and_hasher(2000, Default::default()),
+            sounding_exact_positions: FxHashSet::with_capacity_and_hasher(5000, Default::default()),
+            world_dedup: FxHashSet::with_capacity_and_hasher(5000, Default::default()),
 
             grid_cell_size: 30.0,         // Default grid cell size in pixels
             sounding_cell_size_px: 150.0, // Fixed pixel spacing between soundings
             skip_screen_declutter: false,
             screen_pan_offset: (0.0, 0.0),
+            screen_zoom_scale: 1.0,
+            screen_zoom_pivot: (0.0, 0.0),
             egui,
             ui_state: AppUiState::default(),
             // Optimization fields
             triangulation_cache: HashMap::with_capacity(500),
-            symbol_batches: HashMap::with_capacity(50),
+            symbol_batches: FxHashMap::with_capacity_and_hasher(50, Default::default()),
+            packed_symbol_vertices: Vec::with_capacity(4000),
+            packed_symbol_indices: Vec::with_capacity(6000),
+            packed_symbol_ranges: Vec::with_capacity(50),
             animation_mode: false,
             lod_level: 0,
             viewport_world_bounds: None,
@@ -384,7 +435,34 @@ impl WgpuRenderer {
             pattern_textures: HashMap::new(),
             text_labels: Vec::with_capacity(500),
             text_collision_grid: TextCollisionGrid::new(12.0),
+            // GPU buffer cache
+            cached_area_vb: None,
+            cached_area_ib: None,
+            cached_area_index_count: 0,
+            cached_line_vb: None,
+            cached_line_ib: None,
+            cached_line_index_count: 0,
+            cached_pattern_vb: None,
+            cached_pattern_ib: None,
+            cached_pattern_index_count: 0,
+            gpu_buffers_dirty: true,
+            cached_symbol_buffers: Vec::new(),
+            cached_suppressed_lines: None,
+            // Profiling
+            cpu_profiler: CpuProfiler::new(),
+            gpu_profiler,
         })
+    }
+
+    /// Enable or disable profiling (both CPU and GPU)
+    pub fn set_profiling_enabled(&mut self, enabled: bool) {
+        crate::profiler::set_profiling_enabled(enabled);
+        self.gpu_profiler.set_enabled(enabled);
+    }
+
+    /// Flush profiler reports (call on shutdown)
+    pub fn flush_profiler(&mut self) {
+        self.cpu_profiler.flush();
     }
 
     /// Set animation mode for fast-path rendering during drag/zoom
@@ -426,9 +504,69 @@ impl WgpuRenderer {
         }
     }
 
+    /// Check if a world-space AABB intersects the viewport (with margin for GPU pan/zoom)
+    #[inline]
+    fn is_aabb_visible(
+        &self,
+        aabb_min_x: f64,
+        aabb_min_y: f64,
+        aabb_max_x: f64,
+        aabb_max_y: f64,
+    ) -> bool {
+        if let Some((vp_min_x, vp_min_y, vp_max_x, vp_max_y)) = self.viewport_world_bounds {
+            let margin_x = (vp_max_x - vp_min_x) * 0.5;
+            let margin_y = (vp_max_y - vp_min_y) * 0.5;
+            // Standard AABB intersection test with margin
+            aabb_max_x >= vp_min_x - margin_x
+                && aabb_min_x <= vp_max_x + margin_x
+                && aabb_max_y >= vp_min_y - margin_y
+                && aabb_min_y <= vp_max_y + margin_y
+        } else {
+            true
+        }
+    }
+
+    /// Static frustum culling for a ring of world points against viewport bounds.
+    /// Used by tile_area_with_pattern/hatch where &self is already mutably borrowed.
+    #[inline]
+    fn is_ring_visible_static(
+        ring: &[WorldPoint],
+        viewport_world_bounds: Option<(f64, f64, f64, f64)>,
+    ) -> bool {
+        if let Some((vp_min_x, vp_min_y, vp_max_x, vp_max_y)) = viewport_world_bounds {
+            let margin_x = (vp_max_x - vp_min_x) * 0.5;
+            let margin_y = (vp_max_y - vp_min_y) * 0.5;
+            let mut ax = f64::MAX;
+            let mut ay = f64::MAX;
+            let mut bx = f64::MIN;
+            let mut by = f64::MIN;
+            for p in ring {
+                if p.x < ax {
+                    ax = p.x;
+                }
+                if p.y < ay {
+                    ay = p.y;
+                }
+                if p.x > bx {
+                    bx = p.x;
+                }
+                if p.y > by {
+                    by = p.y;
+                }
+            }
+            bx >= vp_min_x - margin_x
+                && ax <= vp_max_x + margin_x
+                && by >= vp_min_y - margin_y
+                && ay <= vp_max_y + margin_y
+        } else {
+            true
+        }
+    }
+
     /// Clear triangulation cache (call when chart data changes)
     pub fn clear_triangulation_cache(&mut self) {
         self.triangulation_cache.clear();
+        self.cached_suppressed_lines = None; // Invalidate when chart data changes
     }
 
     /// Clear symbol textures (call when color profile changes)
@@ -436,39 +574,26 @@ impl WgpuRenderer {
         self.symbol_textures.clear();
     }
 
-    /// Build symbol batches for efficient rendering
-    /// Groups symbol instances by texture and creates batched vertex/index arrays
-    /// Build symbol batches for a specific range of symbol instances (S-101 priority rendering)
-    /// Returns batches grouped by texture for efficient rendering
-    /// Note: Currently unused - we render symbols individually to maintain Z-order
-    #[allow(dead_code)]
-    fn build_symbol_batches_for_range(
-        &self,
-        start: usize,
-        end: usize,
-    ) -> HashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)> {
-        let mut batches: HashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)> = HashMap::new();
+    /// Pack symbol instances into contiguous vertex/index arrays for single-buffer rendering.
+    /// Produces packed_symbol_vertices, packed_symbol_indices, and packed_symbol_ranges.
+    fn pack_symbol_batch_range(&mut self, start: usize, end: usize) {
+        self.packed_symbol_vertices.clear();
+        self.packed_symbol_indices.clear();
+        self.packed_symbol_ranges.clear();
 
-        for instance in self.symbol_instances[start..end].iter() {
+        // First, group by symbol_id using the existing batches map
+        self.symbol_batches.clear();
+        for instance in &self.symbol_instances[start..end] {
             if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                // S-100 symbol display scaling:
-                // usvg converts SVG mm → user units at 96 DPI, then we render at
-                // render_scale for quality. display_scale = 1/render_scale recovers
-                // the original mm size on screen. instance.scale and self.symbol_scale
-                // are additional user/rule multipliers.
                 let display_scale = instance.scale / tex.render_scale * self.symbol_scale;
-
                 let half_w = (tex.width as f32 * display_scale) / 2.0;
                 let half_h = (tex.height as f32 * display_scale) / 2.0;
-
                 let pivot_x = tex.pivot_in_texture.0 * display_scale;
                 let pivot_y = tex.pivot_in_texture.1 * display_scale;
-
                 let rotation = instance.rotation.to_radians();
                 let cos_r = rotation.cos();
                 let sin_r = rotation.sin();
 
-                // Transform helper
                 let transform = |dx: f32, dy: f32| -> (f32, f32) {
                     let px = dx + half_w - pivot_x;
                     let py = dy + half_h - pivot_y;
@@ -482,30 +607,36 @@ impl WgpuRenderer {
                 let (x2, y2) = transform(half_w, half_h);
                 let (x3, y3) = transform(-half_w, half_h);
 
-                // Get or create batch for this symbol (SymbolId is Copy, no clone needed)
-                let batch = batches
+                let batch = self
+                    .symbol_batches
                     .entry(instance.symbol_id)
                     .or_insert_with(|| (Vec::new(), Vec::new()));
-
-                let base_idx = batch.0.len() as u32;
-
-                // Add vertices
+                let base = batch.0.len() as u32;
                 batch.0.push(TextureVertex::new(x0, y0, 0.0, 0.0));
                 batch.0.push(TextureVertex::new(x1, y1, 1.0, 0.0));
                 batch.0.push(TextureVertex::new(x2, y2, 1.0, 1.0));
                 batch.0.push(TextureVertex::new(x3, y3, 0.0, 1.0));
-
-                // Add indices (two triangles per quad)
-                batch.1.push(base_idx);
-                batch.1.push(base_idx + 1);
-                batch.1.push(base_idx + 2);
-                batch.1.push(base_idx);
-                batch.1.push(base_idx + 2);
-                batch.1.push(base_idx + 3);
+                batch
+                    .1
+                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }
         }
 
-        batches
+        // Now pack all batches into contiguous arrays
+        for (&sym_id, (verts, idxs)) in &self.symbol_batches {
+            let vertex_offset = self.packed_symbol_vertices.len() as u32;
+            let index_start = self.packed_symbol_indices.len() as u32;
+
+            self.packed_symbol_vertices.extend_from_slice(verts);
+            // Offset indices by vertex_offset
+            for &idx in idxs {
+                self.packed_symbol_indices.push(idx + vertex_offset);
+            }
+
+            let index_count = idxs.len() as u32;
+            self.packed_symbol_ranges
+                .push((sym_id, index_start, index_count));
+        }
     }
 
     /// Handle window resize
@@ -523,6 +654,12 @@ impl WgpuRenderer {
     /// Call this before handling clicks to avoid clicking through UI
     pub fn egui_wants_pointer(&self) -> bool {
         self.egui.wants_pointer_input()
+    }
+
+    /// Check if egui has requested a repaint (e.g., animations, hover effects)
+    #[inline]
+    pub fn egui_needs_repaint(&self) -> bool {
+        self.egui.ctx.has_requested_repaint()
     }
 
     /// Update cursor position in UI state (world coordinates)
@@ -668,12 +805,15 @@ impl WgpuRenderer {
     /// Update view uniforms after resize or zoom
     fn update_view_uniforms(&self) {
         let (width, height) = self.state.viewport_size();
-        let uniforms = ViewUniforms::with_pan(
+        let uniforms = ViewUniforms::with_pan_zoom(
             width,
             height,
             1.0,
             self.screen_pan_offset.0,
             self.screen_pan_offset.1,
+            self.screen_zoom_scale,
+            self.screen_zoom_pivot.0,
+            self.screen_zoom_pivot.1,
         );
         self.state
             .update_view_uniforms(&self.view_buffer, &uniforms);
@@ -706,7 +846,24 @@ impl WgpuRenderer {
     #[inline]
     pub fn reset_pan_offset(&mut self) {
         self.screen_pan_offset = (0.0, 0.0);
+        self.screen_zoom_scale = 1.0;
+        self.screen_zoom_pivot = (0.0, 0.0);
         self.update_view_uniforms();
+    }
+
+    /// Set GPU zoom scale for smooth zooming without geometry rebuild.
+    /// The shader scales all geometry around the pivot point.
+    #[inline]
+    pub fn set_gpu_zoom(&mut self, scale: f32, pivot_x: f32, pivot_y: f32) {
+        self.screen_zoom_scale = scale;
+        self.screen_zoom_pivot = (pivot_x, pivot_y);
+        self.update_view_uniforms();
+    }
+
+    /// Get current GPU zoom scale
+    #[inline]
+    pub fn gpu_zoom_scale(&self) -> f32 {
+        self.screen_zoom_scale
     }
 
     /// Begin a new frame - clears buffers
@@ -717,11 +874,36 @@ impl WgpuRenderer {
     /// Begin a new frame with optional preservation of declutter state
     /// If `preserve_declutter` is true, skip screen-space decluttering during animation
     pub fn begin_frame_ex(&mut self, preserve_declutter: bool) {
+        // Mark GPU buffers as needing rebuild
+        self.gpu_buffers_dirty = true;
+        // Invalidate cached symbol GPU buffers (geometry changed)
+        self.cached_symbol_buffers.clear();
+
+        // Preserve previous frame counts for pre-allocation (avoids realloc during build)
+        let prev_area_v = self.area_vertices.len();
+        let prev_area_i = self.area_indices.len();
+        let prev_line_v = self.line_vertices.len();
+        let prev_line_i = self.line_indices.len();
+
         self.area_vertices.clear();
         self.area_indices.clear();
         self.line_vertices.clear();
         self.line_indices.clear();
         self.symbol_instances.clear();
+
+        // Reserve capacity based on previous frame (amortized zero reallocs in steady state)
+        if prev_area_v > self.area_vertices.capacity() / 2 {
+            self.area_vertices.reserve(prev_area_v);
+        }
+        if prev_area_i > self.area_indices.capacity() / 2 {
+            self.area_indices.reserve(prev_area_i);
+        }
+        if prev_line_v > self.line_vertices.capacity() / 2 {
+            self.line_vertices.reserve(prev_line_v);
+        }
+        if prev_line_i > self.line_indices.capacity() / 2 {
+            self.line_indices.reserve(prev_line_i);
+        }
         // Clear symbol batches for new frame
         self.symbol_batches.clear();
         // Clear priority ranges for S-101 compliant rendering
@@ -806,14 +988,23 @@ impl WgpuRenderer {
         color_profile: Option<&ColorProfile>,
         visible_viewing_groups: Option<&std::collections::HashSet<u32>>,
     ) {
-        // Update viewport bounds for frustum culling
-        self.update_viewport_bounds(&context.scaler);
+        let profiling = crate::profiler::is_profiling_enabled();
+        let total_timer = if profiling {
+            Some(ScopeTimer::new("add_instructions_total"))
+        } else {
+            None
+        };
 
-        // Set animation mode on context
+        // Set animation mode and sort instructions, then extract what we need
         context.set_animation_mode(self.animation_mode);
+        // get_sorted_instructions() sorts in-place on first call, then returns &slice
+        // Clone scaler (cheap: a few f64 fields) to avoid borrow conflict with &mut self methods
+        let scaler = context.scaler.clone();
+        let instructions = context.get_sorted_instructions();
+        let _instruction_count = instructions.len();
 
-        // Clone the instructions to avoid borrow issues
-        let instructions: Vec<_> = context.get_sorted_instructions().to_vec();
+        // Update viewport bounds for frustum culling
+        self.update_viewport_bounds(&scaler);
 
         // =====================================================================
         // S-100 Part 9-11.1.9: Line suppression pre-pass
@@ -825,45 +1016,47 @@ impl WgpuRenderer {
         // Build a map from curve geometry hash -> highest priority that claims it.
         // A curve is identified by hashing all its world-coordinate points, so two
         // line instructions referencing the same spatial curve produce the same key.
-        let suppressed_lines: HashSet<usize> = {
-            // curve_key -> highest priority on that curve
-            let mut curve_max_priority: HashMap<u64, i32> = HashMap::new();
-
-            // First pass: find the highest priority for each curve
-            for inst in &instructions {
-                if let DrawingInstruction::Line(line) = inst {
-                    if line.points.len() < 2 {
-                        continue;
-                    }
-                    let key = Self::curve_geometry_hash(&line.points);
-                    let priority = line.priority.0;
-                    let entry = curve_max_priority.entry(key).or_insert(priority);
-                    if priority > *entry {
-                        *entry = priority;
-                    }
-                }
-            }
-
-            // Second pass: mark suppressible lines that are below the max priority
-            let mut suppressed = HashSet::new();
-            for (idx, inst) in instructions.iter().enumerate() {
-                if let DrawingInstruction::Line(line) = inst {
-                    if !line.suppressible || line.points.len() < 2 {
-                        continue;
-                    }
-                    let key = Self::curve_geometry_hash(&line.points);
-                    if let Some(&max_pri) = curve_max_priority.get(&key) {
-                        if line.priority.0 < max_pri {
-                            suppressed.insert(idx);
-                        }
-                    }
-                }
-            }
-            suppressed
+        // =====================================================================
+        // Line suppression: use cached set if instructions haven't changed
+        // =====================================================================
+        let suppression_timer = if profiling {
+            Some(ScopeTimer::new("line_suppression"))
+        } else {
+            None
         };
+        let inst_ptr = instructions.as_ptr() as usize;
+        let inst_len = instructions.len();
+
+        // Check if cached suppression set is still valid (same instruction slice)
+        let cache_hit = matches!(
+            &self.cached_suppressed_lines,
+            Some((cached_ptr, cached_len, _)) if *cached_ptr == inst_ptr && *cached_len == inst_len
+        );
+        if !cache_hit {
+            let set = Self::compute_line_suppression(instructions);
+            self.cached_suppressed_lines = Some((inst_ptr, inst_len, set));
+        }
+        // Clone the Arc-like reference for use in the loop (FxHashSet clone is cheap for small sets)
+        let suppressed_lines = self.cached_suppressed_lines.as_ref().unwrap().2.clone();
+        if let Some(t) = suppression_timer {
+            self.cpu_profiler.record("line_suppression", t.elapsed());
+        }
+
+        // Pre-compute world→screen transform once for all areas
+        let area_transform = Self::scaler_transform(&scaler);
 
         // Track skipped counts for debugging
         let mut _culled_count = 0usize;
+
+        // Per-type timing accumulators
+        let mut area_time = std::time::Duration::ZERO;
+        let mut line_time = std::time::Duration::ZERO;
+        let mut symbol_time = std::time::Duration::ZERO;
+        let mut text_time = std::time::Duration::ZERO;
+        let mut area_count = 0u32;
+        let mut line_count = 0u32;
+        let mut symbol_count = 0u32;
+        let mut text_count = 0u32;
 
         // S-101 Priority tracking: track index ranges per (display_plane, priority)
         let mut current_priority: Option<i32> = None;
@@ -938,6 +1131,12 @@ impl WgpuRenderer {
                 }
             }
 
+            let inst_start = if profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
             match instruction {
                 DrawingInstruction::Area(area) => {
                     // LOD: Skip small areas when zoomed out (animation mode)
@@ -966,7 +1165,7 @@ impl WgpuRenderer {
                                     &symbol_ref.clone(),
                                     v1,
                                     v2,
-                                    &context.scaler,
+                                    &scaler,
                                     cache,
                                     profile,
                                     inst_priority,
@@ -986,11 +1185,15 @@ impl WgpuRenderer {
                             *width,
                             *spacing,
                             *angle,
-                            &context.scaler,
+                            &scaler,
                             inst_priority,
                         );
                     } else {
-                        self.add_area_cached(area, &context.scaler);
+                        self.add_area_cached(area, area_transform);
+                    }
+                    if let Some(s) = inst_start {
+                        area_time += s.elapsed();
+                        area_count += 1;
                     }
                 }
                 DrawingInstruction::Line(line) => {
@@ -1005,7 +1208,11 @@ impl WgpuRenderer {
                         _culled_count += 1;
                         continue;
                     }
-                    self.add_line(line, &context.scaler);
+                    self.add_line(line, &scaler);
+                    if let Some(s) = inst_start {
+                        line_time += s.elapsed();
+                        line_count += 1;
+                    }
                 }
                 DrawingInstruction::Point(point) => {
                     // Frustum culling: skip points outside viewport
@@ -1038,14 +1245,18 @@ impl WgpuRenderer {
                     let rendered = if let (Some(cache), Some(profile)) =
                         (symbol_cache.as_mut(), color_profile)
                     {
-                        self.try_add_symbol(point, &context.scaler, cache, profile)
+                        self.try_add_symbol(point, &scaler, cache, profile)
                     } else {
                         false
                     };
 
                     // Fallback to placeholder if symbol not found
                     if !rendered {
-                        self.add_point_fallback(point, &context.scaler);
+                        self.add_point_fallback(point, &scaler);
+                    }
+                    if let Some(s) = inst_start {
+                        symbol_time += s.elapsed();
+                        symbol_count += 1;
                     }
                 }
                 DrawingInstruction::Text(text) => {
@@ -1060,7 +1271,7 @@ impl WgpuRenderer {
                     }
 
                     // Convert world position to screen coordinates
-                    let screen = context.scaler.world_to_screen(text.position);
+                    let screen = scaler.world_to_screen(text.position);
 
                     // S-100 Part 9a-11.2.2.4: FontSize is in typographic points (pt).
                     // S-101 Lua rules emit values like 10 (= 10pt standard body text).
@@ -1110,8 +1321,39 @@ impl WgpuRenderer {
                         h_align: text.h_align,
                         v_align: text.v_align,
                     });
+                    if let Some(s) = inst_start {
+                        text_time += s.elapsed();
+                        text_count += 1;
+                    }
                 }
             }
+        }
+
+        // Log per-type instruction timing
+        if profiling {
+            self.cpu_profiler.record("inst_area", area_time);
+            self.cpu_profiler.record("inst_line", line_time);
+            self.cpu_profiler.record("inst_symbol", symbol_time);
+            self.cpu_profiler.record("inst_text", text_time);
+            tracing::debug!(
+                "[PROFILER] Instructions: area={} ({:.2}ms), line={} ({:.2}ms), symbol={} ({:.2}ms), text={} ({:.2}ms)",
+                area_count, area_time.as_secs_f64() * 1000.0,
+                line_count, line_time.as_secs_f64() * 1000.0,
+                symbol_count, symbol_time.as_secs_f64() * 1000.0,
+                text_count, text_time.as_secs_f64() * 1000.0,
+            );
+        }
+
+        if let Some(t) = total_timer {
+            let elapsed = t.elapsed();
+            self.cpu_profiler.record("add_instructions_total", elapsed);
+            tracing::debug!(
+                "[PROFILER] add_instructions_total: {:.2}ms (areas: {}v/{}i, lines: {}v/{}i, symbols: {}, texts: {})",
+                elapsed.as_secs_f64() * 1000.0,
+                self.area_vertices.len(), self.area_indices.len(),
+                self.line_vertices.len(), self.line_indices.len(),
+                self.symbol_instances.len(), self.text_labels.len(),
+            );
         }
 
         // Record final priority ranges
@@ -1143,234 +1385,246 @@ impl WgpuRenderer {
         }
     }
 
-    /// Add area with triangulation caching (optimization)
+    /// Fast O(1) cache key for area geometry based on slice pointer + length.
+    /// Since instructions are borrowed from a stable slice, the exterior Vec's data pointer
+    /// uniquely identifies the polygon geometry (same data = same pointer).
+    fn area_geometry_key(area: &ferrite_render::AreaInstruction) -> i64 {
+        // Use data pointer as unique identifier (stable while instructions slice is alive)
+        let ptr = area.exterior.as_ptr() as usize;
+        let len = area.exterior.len();
+        // Combine pointer and length into a single i64 key
+        // Pointer is unique per allocation, length adds extra discrimination
+        (ptr as i64) ^ ((len as i64) << 48)
+    }
+
+    /// Clean a ring of world points: remove consecutive duplicates and closing duplicate
+    fn clean_world_ring(points: &[WorldPoint], epsilon: f64) -> Vec<f64> {
+        let mut cleaned: Vec<f64> = Vec::with_capacity(points.len() * 2);
+        for p in points {
+            if !p.x.is_finite() || !p.y.is_finite() {
+                continue;
+            }
+            // Skip consecutive duplicates
+            if cleaned.len() >= 2 {
+                let prev_x = cleaned[cleaned.len() - 2];
+                let prev_y = cleaned[cleaned.len() - 1];
+                if (p.x - prev_x).abs() <= epsilon && (p.y - prev_y).abs() <= epsilon {
+                    continue;
+                }
+            }
+            cleaned.push(p.x);
+            cleaned.push(p.y);
+        }
+        // Remove closing duplicate
+        if cleaned.len() >= 6 {
+            let n = cleaned.len();
+            if (cleaned[0] - cleaned[n - 2]).abs() < epsilon * 10.0
+                && (cleaned[1] - cleaned[n - 1]).abs() < epsilon * 10.0
+            {
+                cleaned.truncate(n - 2);
+            }
+        }
+        cleaned
+    }
+
+    /// Compute signed area of a ring stored as [x0,y0,x1,y1,...] pairs
+    fn ring_signed_area_flat(vertices: &[f64]) -> f64 {
+        let n = vertices.len() / 2;
+        if n < 3 {
+            return 0.0;
+        }
+        let mut area = 0.0;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            area +=
+                (vertices[j * 2] - vertices[i * 2]) * (vertices[j * 2 + 1] + vertices[i * 2 + 1]);
+        }
+        area
+    }
+
+    /// Get or compute cached triangulation for an area polygon.
+    /// Triangulation is done in world coordinates so it only needs to run once per unique polygon.
+    /// Ensure triangulation is cached for this area, returning the cache key.
+    /// Returns None if the area cannot be triangulated.
+    fn ensure_triangulated(&mut self, area: &ferrite_render::AreaInstruction) -> Option<i64> {
+        let cache_key = Self::area_geometry_key(area);
+
+        // Check cache first
+        if self.triangulation_cache.contains_key(&cache_key) {
+            return Some(cache_key);
+        }
+
+        // World-coordinate epsilon (degrees, ~0.01m precision)
+        let epsilon = 1e-8;
+
+        // Clean exterior ring in world coordinates
+        let ext_verts = Self::clean_world_ring(&area.exterior, epsilon);
+        if ext_verts.len() < 6 {
+            return None; // < 3 points
+        }
+
+        let exterior_area = Self::ring_signed_area_flat(&ext_verts);
+        let exterior_is_cw = exterior_area > 0.0;
+
+        let mut vertices = ext_verts;
+        let mut hole_indices: Vec<usize> = Vec::new();
+
+        // Handle interior rings (holes)
+        for hole in &area.interiors {
+            let mut hole_verts = Self::clean_world_ring(hole, epsilon);
+            if hole_verts.len() < 6 {
+                continue;
+            }
+
+            let hole_area = Self::ring_signed_area_flat(&hole_verts);
+            let hole_is_cw = hole_area > 0.0;
+            if hole_is_cw == exterior_is_cw {
+                // Reverse the hole ring
+                let n = hole_verts.len() / 2;
+                for i in 0..n / 2 {
+                    let j = n - 1 - i;
+                    hole_verts.swap(i * 2, j * 2);
+                    hole_verts.swap(i * 2 + 1, j * 2 + 1);
+                }
+            }
+
+            let hole_start = vertices.len() / 2;
+            hole_indices.push(hole_start);
+            vertices.extend_from_slice(&hole_verts);
+        }
+
+        // Triangulate in world coordinates
+        let total_vertex_count = vertices.len() / 2;
+        let indices = match earcutr::earcut(&vertices, &hole_indices, 2) {
+            Ok(idx) if idx.len() >= 3 => idx
+                .into_iter()
+                .filter(|&i| i < total_vertex_count)
+                .collect::<Vec<_>>(),
+            _ => {
+                // Fan triangulation fallback (exterior only)
+                let n = vertices.len().min(area.exterior.len() * 2) / 2;
+                if n < 3 {
+                    return None;
+                }
+                let mut fan = Vec::with_capacity((n - 2) * 3);
+                for i in 1..(n - 1) {
+                    fan.push(0);
+                    fan.push(i);
+                    fan.push(i + 1);
+                }
+                fan
+            }
+        };
+
+        if indices.len() < 3 {
+            return None;
+        }
+
+        // Compute world AABB for frustum culling
+        let mut aabb_min_x = f64::MAX;
+        let mut aabb_min_y = f64::MAX;
+        let mut aabb_max_x = f64::MIN;
+        let mut aabb_max_y = f64::MIN;
+        let vc = vertices.len() / 2;
+        for i in 0..vc {
+            let x = vertices[i * 2];
+            let y = vertices[i * 2 + 1];
+            if x < aabb_min_x {
+                aabb_min_x = x;
+            }
+            if y < aabb_min_y {
+                aabb_min_y = y;
+            }
+            if x > aabb_max_x {
+                aabb_max_x = x;
+            }
+            if y > aabb_max_y {
+                aabb_max_y = y;
+            }
+        }
+
+        let cached = CachedTriangulation {
+            indices,
+            world_vertices: vertices,
+            world_aabb: (aabb_min_x, aabb_min_y, aabb_max_x, aabb_max_y),
+        };
+
+        self.triangulation_cache.insert(cache_key, cached);
+        Some(cache_key)
+    }
+
+    /// Pre-computed world→screen transform parameters (avoids per-area scaler lookups)
+    #[inline]
+    fn scaler_transform(scaler: &ferrite_render::Scaler) -> (f64, f64, f64, f64, f64, f64) {
+        (
+            scaler.scale_x(),
+            scaler.scale_y(),
+            scaler.offset_x(),
+            scaler.offset_y(),
+            scaler.geo_bounds.min_x,
+            scaler.geo_bounds.max_y,
+        )
+    }
+
     fn add_area_cached(
         &mut self,
         area: &ferrite_render::AreaInstruction,
-        scaler: &ferrite_render::Scaler,
-    ) {
-        // Directly forward to add_area — the previous cache was storing only
-        // exterior world vertices but screen-space indices that referenced
-        // exterior+hole vertices, causing index mismatches and rendering corruption.
-        self.add_area(area, scaler);
-    }
-
-    /// Add area instruction - uses earcut for proper concave polygon triangulation
-    fn add_area(
-        &mut self,
-        area: &ferrite_render::AreaInstruction,
-        scaler: &ferrite_render::Scaler,
+        transform: (f64, f64, f64, f64, f64, f64),
     ) {
         // Get fill color — pattern/centroid/hatch fills are overlays, not solid fills
         let color = match &area.fill {
             ferrite_render::AreaFillType::Solid(c) => c.to_array(),
             ferrite_render::AreaFillType::Pattern { .. }
             | ferrite_render::AreaFillType::HatchFill { .. }
-            | ferrite_render::AreaFillType::CentroidSymbol(_) => {
-                // Pattern/hatch fills are overlays — don't fill the polygon with color.
-                // They are rendered separately via the pattern fill pipeline.
-                return;
-            }
+            | ferrite_render::AreaFillType::CentroidSymbol(_) => return,
         };
 
-        // Convert exterior ring to screen coordinates, filtering out invalid points
-        let screen_points: Vec<ScreenPoint> = area
-            .exterior
-            .iter()
-            .map(|p| scaler.world_to_screen(*p))
-            .filter(|p| p.x.is_finite() && p.y.is_finite())
-            .collect();
-
-        // Need at least 3 points for a polygon
-        if screen_points.len() < 3 {
+        // Early frustum culling from exterior ring AABB (BEFORE HashMap lookups).
+        // This avoids ensure_triangulated + cache lookup for fully off-screen areas.
+        if !Self::is_ring_visible_static(&area.exterior, self.viewport_world_bounds) {
             return;
         }
 
-        // Remove consecutive duplicate points (within small tolerance)
-        // Use very small tolerance - only remove truly duplicate points
-        let mut cleaned_points: Vec<ScreenPoint> = Vec::with_capacity(screen_points.len());
-        for point in &screen_points {
-            if cleaned_points.is_empty() {
-                cleaned_points.push(*point);
-            } else {
-                let last = cleaned_points.last().unwrap();
-                let dx = (point.x - last.x).abs();
-                let dy = (point.y - last.y).abs();
-                // Only remove truly identical points (< 0.01 pixel)
-                if dx > 0.01 || dy > 0.01 {
-                    cleaned_points.push(*point);
-                }
-            }
-        }
-
-        // Remove closing point if it duplicates the first point
-        if cleaned_points.len() > 3 {
-            let first = cleaned_points.first().unwrap();
-            let last = cleaned_points.last().unwrap();
-            let dx = (first.x - last.x).abs();
-            let dy = (first.y - last.y).abs();
-            if dx < 0.1 && dy < 0.1 {
-                cleaned_points.pop();
-            }
-        }
-
-        // Need at least 3 points after cleaning
-        if cleaned_points.len() < 3 {
-            return;
-        }
-
-        // Calculate signed area of exterior ring (for winding order)
-        let mut signed_area: f64 = 0.0;
-        for i in 0..cleaned_points.len() {
-            let j = (i + 1) % cleaned_points.len();
-            signed_area += (cleaned_points[j].x - cleaned_points[i].x) as f64
-                * (cleaned_points[j].y + cleaned_points[i].y) as f64;
-        }
-        let abs_area = signed_area.abs() / 2.0;
-        let exterior_is_cw = signed_area > 0.0; // positive = CW in screen-space (Y-down)
-
-        // Prepare data for earcutr triangulation
-        // Flatten coordinates to [x0, y0, x1, y1, ...] format
-        let mut vertices: Vec<f64> = Vec::with_capacity(cleaned_points.len() * 2);
-        for point in &cleaned_points {
-            vertices.push(point.x as f64);
-            vertices.push(point.y as f64);
-        }
-
-        // Helper: compute signed area for a ring of screen points
-        fn ring_signed_area(pts: &[ScreenPoint]) -> f64 {
-            let mut area = 0.0;
-            for i in 0..pts.len() {
-                let j = (i + 1) % pts.len();
-                area += (pts[j].x - pts[i].x) as f64 * (pts[j].y + pts[i].y) as f64;
-            }
-            area
-        }
-
-        // Handle interior rings (holes) for proper island/cutout rendering
-        // Earcut requires holes to have OPPOSITE winding from the exterior ring
-        let mut hole_indices: Vec<usize> = Vec::new();
-        for hole in &area.interiors {
-            let hole_screen: Vec<ScreenPoint> = hole
-                .iter()
-                .map(|p| scaler.world_to_screen(*p))
-                .filter(|p| p.x.is_finite() && p.y.is_finite())
-                .collect();
-
-            // Clean duplicate points in hole
-            let mut cleaned_hole: Vec<ScreenPoint> = Vec::with_capacity(hole_screen.len());
-            for point in &hole_screen {
-                if cleaned_hole.is_empty() {
-                    cleaned_hole.push(*point);
-                } else {
-                    let last = cleaned_hole.last().unwrap();
-                    if (point.x - last.x).abs() > 0.01 || (point.y - last.y).abs() > 0.01 {
-                        cleaned_hole.push(*point);
-                    }
-                }
-            }
-
-            // Remove closing duplicate
-            if cleaned_hole.len() > 3 {
-                let first = cleaned_hole.first().unwrap();
-                let last = cleaned_hole.last().unwrap();
-                if (first.x - last.x).abs() < 0.1 && (first.y - last.y).abs() < 0.1 {
-                    cleaned_hole.pop();
-                }
-            }
-
-            // Skip degenerate holes
-            if cleaned_hole.len() < 3 {
-                continue;
-            }
-
-            // Ensure hole has opposite winding from exterior
-            let hole_area = ring_signed_area(&cleaned_hole);
-            let hole_is_cw = hole_area > 0.0;
-            if hole_is_cw == exterior_is_cw {
-                // Same winding — reverse the hole
-                cleaned_hole.reverse();
-            }
-
-            let hole_start = vertices.len() / 2;
-            hole_indices.push(hole_start);
-
-            for p in &cleaned_hole {
-                vertices.push(p.x as f64);
-                vertices.push(p.y as f64);
-            }
-        }
-
-        // Triangulate using ear clipping (works for concave polygons with holes)
-        let indices = earcutr::earcut(&vertices, &hole_indices, 2);
-
-        let use_fallback = match &indices {
-            Ok(idx) => idx.is_empty() || idx.len() < 3,
-            Err(_) => true,
+        // Ensure triangulation is cached, get cache key
+        let cache_key = match self.ensure_triangulated(area) {
+            Some(k) => k,
+            None => return,
         };
 
-        if use_fallback {
-            // Fallback to fan triangulation for degenerate cases
-            // This works for convex polygons and simple concave ones
-            tracing::trace!(
-                "Earcut failed for {} points (area={:.1}), using fan triangulation",
-                cleaned_points.len(),
-                abs_area
-            );
-            let base_index = self.area_vertices.len() as u32;
-            for point in &cleaned_points {
-                self.area_vertices
-                    .push(Vertex2D::new(point.x, point.y, color));
-            }
-            // Fan triangulation from first vertex
-            for i in 1..(cleaned_points.len() - 1) {
-                self.area_indices.push(base_index);
-                self.area_indices.push(base_index + i as u32);
-                self.area_indices.push(base_index + i as u32 + 1);
-            }
-            return;
-        }
+        // Split borrow: access cache and output buffers as separate fields
+        let cached = match self.triangulation_cache.get(&cache_key) {
+            Some(c) => c,
+            None => return,
+        };
 
-        let indices = indices.unwrap();
+        let total_vertex_count = cached.world_vertices.len() / 2;
 
-        // Total vertex count includes exterior + all hole vertices
-        let total_vertex_count = vertices.len() / 2;
+        // Copy data we need to local variables to release the borrow on triangulation_cache
+        // We use raw slices to avoid cloning the Vecs
+        let wv_ptr = cached.world_vertices.as_ptr();
+        let wv_len = cached.world_vertices.len();
+        let idx_ptr = cached.indices.as_ptr();
+        let idx_len = cached.indices.len();
+        // SAFETY: triangulation_cache is not modified during the loops below,
+        // and these pointers remain valid because we don't mutate the cache.
+        let wv = unsafe { std::slice::from_raw_parts(wv_ptr, wv_len) };
+        let indices = unsafe { std::slice::from_raw_parts(idx_ptr, idx_len) };
 
-        // Validate indices against total vertex count
-        let valid_indices: Vec<usize> = indices
-            .into_iter()
-            .filter(|&idx| idx < total_vertex_count)
-            .collect();
-
-        if valid_indices.len() < 3 || !valid_indices.len().is_multiple_of(3) {
-            // Fallback: fan triangulation of exterior only (ignore holes)
-            let base_index = self.area_vertices.len() as u32;
-            for point in &cleaned_points {
-                self.area_vertices
-                    .push(Vertex2D::new(point.x, point.y, color));
-            }
-            for i in 1..(cleaned_points.len() - 1) {
-                self.area_indices.push(base_index);
-                self.area_indices.push(base_index + i as u32);
-                self.area_indices.push(base_index + i as u32 + 1);
-            }
-            return;
-        }
-
-        // Add ALL vertices (exterior + holes) from the flattened coords
         let base_index = self.area_vertices.len() as u32;
-        for i in 0..total_vertex_count {
-            self.area_vertices.push(Vertex2D::new(
-                vertices[i * 2] as f32,
-                vertices[i * 2 + 1] as f32,
-                color,
-            ));
-        }
 
-        // Add triangle indices from earcut result
-        for idx in valid_indices {
-            self.area_indices.push(base_index + idx as u32);
-        }
+        // CPU-side world→screen transform (f64 precision, no GPU artifacts)
+        let (scale_x, scale_y, offset_x, offset_y, min_x, max_y) = transform;
+
+        self.area_vertices.extend((0..total_vertex_count).map(|i| {
+            let wx = wv[i * 2];
+            let wy = wv[i * 2 + 1];
+            let sx = ((wx - min_x) * scale_x + offset_x) as f32;
+            let sy = ((max_y - wy) * scale_y + offset_y) as f32;
+            Vertex2D::new(sx, sy, color)
+        }));
+
+        self.area_indices
+            .extend(indices.iter().map(|&idx| base_index + idx as u32));
     }
 
     /// Fill an area polygon with a tiled pattern texture (S-100 standard).
@@ -1390,6 +1644,11 @@ impl WgpuRenderer {
         color_profile: &ColorProfile,
         priority: i32,
     ) {
+        // Frustum culling: quick AABB check on exterior ring
+        if !Self::is_ring_visible_static(&area.exterior, self.viewport_world_bounds) {
+            return;
+        }
+
         // Apply HiDPI scale factor so pattern matches physical mm on screen
         let dpi_scale = self.state.window.scale_factor() as f32;
         let mm_to_px = SCREEN_PX_PER_MM * dpi_scale;
@@ -1534,6 +1793,11 @@ impl WgpuRenderer {
         scaler: &ferrite_render::Scaler,
         _priority: i32,
     ) {
+        // Frustum culling: quick AABB check on exterior ring
+        if !Self::is_ring_visible_static(&area.exterior, self.viewport_world_bounds) {
+            return;
+        }
+
         let dpi_scale = self.state.window.scale_factor() as f32;
         let spacing_px = (spacing_mm * SCREEN_PX_PER_MM * dpi_scale).max(2.0);
         let line_width = (width * SCREEN_PX_PER_MM * dpi_scale).max(0.5);
@@ -1735,11 +1999,52 @@ impl WgpuRenderer {
         segments
     }
 
+    /// Compute line suppression set (S-100 Part 9-11.1.9).
+    /// When multiple features share the same curve geometry, only the
+    /// highest-priority LineInstruction is rendered.
+    fn compute_line_suppression(instructions: &[DrawingInstruction]) -> FxHashSet<usize> {
+        let mut curve_max_priority: FxHashMap<u64, i32> = FxHashMap::default();
+        let mut line_entries: Vec<(usize, u64, i32)> = Vec::new();
+        let mut has_suppressible = false;
+
+        for (idx, inst) in instructions.iter().enumerate() {
+            if let DrawingInstruction::Line(line) = inst {
+                if line.points.len() < 2 {
+                    continue;
+                }
+                let key = Self::curve_geometry_hash(&line.points);
+                let priority = line.priority.0;
+                let entry = curve_max_priority.entry(key).or_insert(priority);
+                if priority > *entry {
+                    *entry = priority;
+                }
+                if line.suppressible {
+                    line_entries.push((idx, key, priority));
+                    has_suppressible = true;
+                }
+            }
+        }
+
+        if has_suppressible {
+            let mut suppressed = FxHashSet::default();
+            for &(idx, key, priority) in &line_entries {
+                if let Some(&max_pri) = curve_max_priority.get(&key) {
+                    if priority < max_pri {
+                        suppressed.insert(idx);
+                    }
+                }
+            }
+            suppressed
+        } else {
+            FxHashSet::default()
+        }
+    }
+
     /// Compute a hash of curve geometry for S-100 line suppression.
     /// Two line instructions referencing the same spatial curve will have
     /// identical world-coordinate point sequences and thus the same hash.
     fn curve_geometry_hash(points: &[WorldPoint]) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = rustc_hash::FxHasher::default();
         for p in points {
             p.x.to_bits().hash(&mut hasher);
             p.y.to_bits().hash(&mut hasher);
@@ -1748,57 +2053,182 @@ impl WgpuRenderer {
     }
 
     /// Add line instruction
+    /// Cohen-Sutherland outcode for line clipping
+    #[inline]
+    fn cs_outcode(x: f32, y: f32, x_min: f32, y_min: f32, x_max: f32, y_max: f32) -> u8 {
+        let mut code = 0u8;
+        if x < x_min {
+            code |= 1;
+        }
+        // LEFT
+        else if x > x_max {
+            code |= 2;
+        } // RIGHT
+        if y < y_min {
+            code |= 4;
+        }
+        // TOP
+        else if y > y_max {
+            code |= 8;
+        } // BOTTOM
+        code
+    }
+
+    /// Clip a line segment to a rectangle using Cohen-Sutherland.
+    /// Returns Some((x0,y0,x1,y1)) if any portion is visible, None if fully outside.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn clip_line_segment(
+        mut x0: f32,
+        mut y0: f32,
+        mut x1: f32,
+        mut y1: f32,
+        x_min: f32,
+        y_min: f32,
+        x_max: f32,
+        y_max: f32,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let mut code0 = Self::cs_outcode(x0, y0, x_min, y_min, x_max, y_max);
+        let mut code1 = Self::cs_outcode(x1, y1, x_min, y_min, x_max, y_max);
+
+        loop {
+            if (code0 | code1) == 0 {
+                // Both inside
+                return Some((x0, y0, x1, y1));
+            }
+            if (code0 & code1) != 0 {
+                // Both on same outside side
+                return None;
+            }
+            // Pick the point that is outside
+            let code_out = if code0 != 0 { code0 } else { code1 };
+            let (x, y);
+            if code_out & 8 != 0 {
+                // Below
+                x = x0 + (x1 - x0) * (y_max - y0) / (y1 - y0);
+                y = y_max;
+            } else if code_out & 4 != 0 {
+                // Above
+                x = x0 + (x1 - x0) * (y_min - y0) / (y1 - y0);
+                y = y_min;
+            } else if code_out & 2 != 0 {
+                // Right
+                y = y0 + (y1 - y0) * (x_max - x0) / (x1 - x0);
+                x = x_max;
+            } else {
+                // Left
+                y = y0 + (y1 - y0) * (x_min - x0) / (x1 - x0);
+                x = x_min;
+            }
+            if code_out == code0 {
+                x0 = x;
+                y0 = y;
+                code0 = Self::cs_outcode(x0, y0, x_min, y_min, x_max, y_max);
+            } else {
+                x1 = x;
+                y1 = y;
+                code1 = Self::cs_outcode(x1, y1, x_min, y_min, x_max, y_max);
+            }
+        }
+    }
+
     fn add_line(
         &mut self,
         line: &ferrite_render::LineInstruction,
         scaler: &ferrite_render::Scaler,
     ) {
+        let points = &line.points;
+        if points.len() < 2 {
+            return;
+        }
+
+        // Frustum culling: compute world AABB and skip if entirely off-screen
+        {
+            let mut ax = f64::MAX;
+            let mut ay = f64::MAX;
+            let mut bx = f64::MIN;
+            let mut by = f64::MIN;
+            for p in points.iter() {
+                if p.x < ax {
+                    ax = p.x;
+                }
+                if p.y < ay {
+                    ay = p.y;
+                }
+                if p.x > bx {
+                    bx = p.x;
+                }
+                if p.y > by {
+                    by = p.y;
+                }
+            }
+            if !self.is_aabb_visible(ax, ay, bx, by) {
+                return;
+            }
+        }
+
         let color = line.style.color.to_array();
         let width = line.style.width;
 
-        // Convert points to screen coordinates
-        let screen_points: Vec<ScreenPoint> = line
-            .points
-            .iter()
-            .map(|p| scaler.world_to_screen(*p))
-            .collect();
+        // Screen-space clip bounds with generous margin for line width
+        let vw = scaler.viewport.width;
+        let vh = scaler.viewport.height;
+        let margin = width * 2.0 + 50.0; // extra margin for thick lines
+        let clip_x_min = -margin;
+        let clip_y_min = -margin;
+        let clip_x_max = vw + margin;
+        let clip_y_max = vh + margin;
 
-        // Generate line geometry (quads for each segment)
-        // Use windows iterator to avoid bounds checking overhead
-        for window in screen_points.windows(2) {
-            let (p0, p1) = (window[0], window[1]);
+        // Direct iteration: no Vec<ScreenPoint> allocation.
+        // Transform consecutive world points to screen, clip, and emit quads inline.
+        let mut prev = scaler.world_to_screen(points[0]);
+        for p in &points[1..] {
+            let curr = scaler.world_to_screen(*p);
 
-            // Calculate perpendicular direction
-            let dx = p1.x - p0.x;
-            let dy = p1.y - p0.y;
-            let len = (dx * dx + dy * dy).sqrt();
-
-            if len < 0.001 {
+            // Skip segments with NaN/Inf coordinates
+            if !prev.x.is_finite()
+                || !prev.y.is_finite()
+                || !curr.x.is_finite()
+                || !curr.y.is_finite()
+            {
+                prev = curr;
                 continue;
             }
 
-            let nx = -dy / len * width * 0.5;
-            let ny = dx / len * width * 0.5;
+            // Clip line segment to screen bounds to prevent GPU precision issues
+            // with extreme off-screen coordinates (ray artifacts at high zoom)
+            if let Some((cx0, cy0, cx1, cy1)) = Self::clip_line_segment(
+                prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
+            ) {
+                let dx = cx1 - cx0;
+                let dy = cy1 - cy0;
+                let len = (dx * dx + dy * dy).sqrt();
 
-            let base_index = self.line_vertices.len() as u32;
+                if len >= 0.001 {
+                    let nx = -dy / len * width * 0.5;
+                    let ny = dx / len * width * 0.5;
 
-            // Four corners of the line segment quad
-            self.line_vertices
-                .push(Vertex2D::new(p0.x - nx, p0.y - ny, color));
-            self.line_vertices
-                .push(Vertex2D::new(p0.x + nx, p0.y + ny, color));
-            self.line_vertices
-                .push(Vertex2D::new(p1.x + nx, p1.y + ny, color));
-            self.line_vertices
-                .push(Vertex2D::new(p1.x - nx, p1.y - ny, color));
+                    let base_index = self.line_vertices.len() as u32;
 
-            // Two triangles
-            self.line_indices.push(base_index);
-            self.line_indices.push(base_index + 1);
-            self.line_indices.push(base_index + 2);
-            self.line_indices.push(base_index);
-            self.line_indices.push(base_index + 2);
-            self.line_indices.push(base_index + 3);
+                    self.line_vertices
+                        .push(Vertex2D::new(cx0 - nx, cy0 - ny, color));
+                    self.line_vertices
+                        .push(Vertex2D::new(cx0 + nx, cy0 + ny, color));
+                    self.line_vertices
+                        .push(Vertex2D::new(cx1 + nx, cy1 + ny, color));
+                    self.line_vertices
+                        .push(Vertex2D::new(cx1 - nx, cy1 - ny, color));
+
+                    self.line_indices.push(base_index);
+                    self.line_indices.push(base_index + 1);
+                    self.line_indices.push(base_index + 2);
+                    self.line_indices.push(base_index);
+                    self.line_indices.push(base_index + 2);
+                    self.line_indices.push(base_index + 3);
+                }
+            }
+
+            prev = curr;
         }
     }
 
@@ -1817,14 +2247,6 @@ impl WgpuRenderer {
 
         // Intern the symbol ID once for cache-efficient lookups (u32 instead of String)
         let symbol_id = intern_symbol(symbol_str);
-
-        // Log first few symbol requests for debugging
-        static SYMBOL_DEBUG_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let debug_idx = SYMBOL_DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if debug_idx < 20 {
-            tracing::debug!("Symbol request [{}]: '{}'", debug_idx, symbol_str);
-        }
 
         // Get symbol geometry from cache (this will render via resvg if not cached)
         // Use reference to avoid cloning the pixel buffer
@@ -2046,11 +2468,23 @@ impl WgpuRenderer {
 
     /// Render the frame
     pub fn render(&mut self) -> Result<()> {
+        let profiling = crate::profiler::is_profiling_enabled();
+        let render_timer = if profiling {
+            Some(ScopeTimer::new("render_total"))
+        } else {
+            None
+        };
+
         let output = self.state.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let egui_timer = if profiling {
+            Some(ScopeTimer::new("render_egui"))
+        } else {
+            None
+        };
         // Begin egui frame
         self.egui.begin_frame(&self.state.window);
 
@@ -2058,7 +2492,13 @@ impl WgpuRenderer {
         self.egui.draw_ui(&mut self.ui_state);
 
         // Paint chart text labels via egui
+        // Apply the same GPU pan/zoom offset so text tracks with chart geometry during drag
         if !self.text_labels.is_empty() {
+            let pan_x = self.screen_pan_offset.0;
+            let pan_y = self.screen_pan_offset.1;
+            let zoom = self.screen_zoom_scale;
+            let (pivot_x, pivot_y) = self.screen_zoom_pivot;
+
             let painter = self.egui.ctx.layer_painter(egui::LayerId::background());
             for label in &self.text_labels {
                 let color = egui::Color32::from_rgba_unmultiplied(
@@ -2073,15 +2513,8 @@ impl WgpuRenderer {
                     label.text.clone(),
                     egui::TextFormat {
                         font_id: egui::FontId {
-                            size: label.font_size,
-                            family: if label.bold {
-                                // egui does not have a built-in bold family, but
-                                // Proportional is the only option; we can use
-                                // italics via the italics flag below.
-                                egui::FontFamily::Proportional
-                            } else {
-                                egui::FontFamily::Proportional
-                            },
+                            size: label.font_size * zoom,
+                            family: egui::FontFamily::Proportional,
                         },
                         color,
                         italics: label.italic,
@@ -2098,18 +2531,24 @@ impl WgpuRenderer {
                 let text_width = galley.rect.width();
                 let text_height = galley.rect.height();
 
+                // Transform label position: pan, then zoom around pivot (same as GPU shader)
+                let sx = label.screen_x + pan_x;
+                let sy = label.screen_y + pan_y;
+                let sx = (sx - pivot_x) * zoom + pivot_x;
+                let sy = (sy - pivot_y) * zoom + pivot_y;
+
                 // Apply horizontal alignment
                 let x = match label.h_align {
-                    ferrite_render::HAlign::Left => label.screen_x,
-                    ferrite_render::HAlign::Center => label.screen_x - text_width * 0.5,
-                    ferrite_render::HAlign::Right => label.screen_x - text_width,
+                    ferrite_render::HAlign::Left => sx,
+                    ferrite_render::HAlign::Center => sx - text_width * 0.5,
+                    ferrite_render::HAlign::Right => sx - text_width,
                 };
 
                 // Apply vertical alignment
                 let y = match label.v_align {
-                    ferrite_render::VAlign::Top => label.screen_y,
-                    ferrite_render::VAlign::Middle => label.screen_y - text_height * 0.5,
-                    ferrite_render::VAlign::Bottom => label.screen_y - text_height,
+                    ferrite_render::VAlign::Top => sy,
+                    ferrite_render::VAlign::Middle => sy - text_height * 0.5,
+                    ferrite_render::VAlign::Bottom => sy - text_height,
                 };
 
                 painter.galley(egui::pos2(x, y), galley, color);
@@ -2118,6 +2557,9 @@ impl WgpuRenderer {
 
         // End egui frame and get output
         let egui_output = self.egui.end_frame(&self.state.window);
+        if let Some(t) = egui_timer {
+            self.cpu_profiler.record("render_egui", t.elapsed());
+        }
 
         let mut encoder =
             self.state
@@ -2126,60 +2568,76 @@ impl WgpuRenderer {
                     label: Some("render_encoder"),
                 });
 
-        // Create buffers from collected vertices
-        let area_vertex_buffer = if !self.area_vertices.is_empty() {
-            Some(
-                self.state
-                    .create_vertex_buffer(&self.area_vertices, "area_vertices"),
-            )
+        // Rebuild GPU buffers only when geometry has changed (dirty flag)
+        // During GPU-only pan/zoom, we reuse the cached buffers.
+        let gpu_buf_timer = if profiling {
+            Some(ScopeTimer::new("gpu_buffer_create"))
         } else {
             None
         };
+        if self.gpu_buffers_dirty {
+            self.cached_area_vb = if !self.area_vertices.is_empty() {
+                Some(
+                    self.state
+                        .create_vertex_buffer(&self.area_vertices, "area_vertices"),
+                )
+            } else {
+                None
+            };
+            self.cached_area_ib = if !self.area_indices.is_empty() {
+                self.cached_area_index_count = self.area_indices.len() as u32;
+                Some(
+                    self.state
+                        .create_index_buffer(&self.area_indices, "area_indices"),
+                )
+            } else {
+                self.cached_area_index_count = 0;
+                None
+            };
 
-        let area_index_buffer = if !self.area_indices.is_empty() {
-            Some(
-                self.state
-                    .create_index_buffer(&self.area_indices, "area_indices"),
-            )
-        } else {
-            None
-        };
+            self.cached_line_vb = if !self.line_vertices.is_empty() {
+                Some(
+                    self.state
+                        .create_vertex_buffer(&self.line_vertices, "line_vertices"),
+                )
+            } else {
+                None
+            };
+            self.cached_line_ib = if !self.line_indices.is_empty() {
+                self.cached_line_index_count = self.line_indices.len() as u32;
+                Some(
+                    self.state
+                        .create_index_buffer(&self.line_indices, "line_indices"),
+                )
+            } else {
+                self.cached_line_index_count = 0;
+                None
+            };
 
-        let line_vertex_buffer = if !self.line_vertices.is_empty() {
-            Some(
-                self.state
-                    .create_vertex_buffer(&self.line_vertices, "line_vertices"),
-            )
-        } else {
-            None
-        };
+            self.cached_pattern_vb = if !self.pattern_vertices.is_empty() {
+                Some(
+                    self.state
+                        .create_vertex_buffer(&self.pattern_vertices, "pattern_vertices"),
+                )
+            } else {
+                None
+            };
+            self.cached_pattern_ib = if !self.pattern_indices.is_empty() {
+                self.cached_pattern_index_count = self.pattern_indices.len() as u32;
+                Some(
+                    self.state
+                        .create_index_buffer(&self.pattern_indices, "pattern_indices"),
+                )
+            } else {
+                self.cached_pattern_index_count = 0;
+                None
+            };
 
-        let line_index_buffer = if !self.line_indices.is_empty() {
-            Some(
-                self.state
-                    .create_index_buffer(&self.line_indices, "line_indices"),
-            )
-        } else {
-            None
-        };
-
-        // Pattern fill buffers (GPU texture-repeat tiling)
-        let pattern_vertex_buffer = if !self.pattern_vertices.is_empty() {
-            Some(
-                self.state
-                    .create_vertex_buffer(&self.pattern_vertices, "pattern_vertices"),
-            )
-        } else {
-            None
-        };
-        let pattern_index_buffer = if !self.pattern_indices.is_empty() {
-            Some(
-                self.state
-                    .create_index_buffer(&self.pattern_indices, "pattern_indices"),
-            )
-        } else {
-            None
-        };
+            self.gpu_buffers_dirty = false;
+        }
+        if let Some(t) = gpu_buf_timer {
+            self.cpu_profiler.record("gpu_buffer_create", t.elapsed());
+        }
 
         // NOTE: Symbol batches are now built per-priority in the render loop below
         // for S-101 compliant priority-based rendering
@@ -2193,6 +2651,11 @@ impl WgpuRenderer {
             (&view, None)
         };
 
+        let render_pass_timer = if profiling {
+            Some(ScopeTimer::new("render_pass"))
+        } else {
+            None
+        };
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
@@ -2217,37 +2680,29 @@ impl WgpuRenderer {
             // S-101 Priority-based rendering:
             // Collect all unique priorities and render in order
             // For each priority: Areas -> Lines -> Symbols
-            let mut all_priorities: Vec<(u8, i32)> = Vec::new();
+            let mut priority_set = FxHashSet::default();
             for &(plane, pri, _, _) in &self.area_priority_ranges {
-                let key = (plane, pri);
-                if !all_priorities.contains(&key) {
-                    all_priorities.push(key);
-                }
+                priority_set.insert((plane, pri));
             }
             for &(plane, pri, _, _) in &self.line_priority_ranges {
-                let key = (plane, pri);
-                if !all_priorities.contains(&key) {
-                    all_priorities.push(key);
-                }
+                priority_set.insert((plane, pri));
             }
             for &(plane, pri, _, _) in &self.symbol_priority_ranges {
-                let key = (plane, pri);
-                if !all_priorities.contains(&key) {
-                    all_priorities.push(key);
-                }
+                priority_set.insert((plane, pri));
             }
             for &(plane, pri, _, _, _) in &self.pattern_ranges {
-                let key = (plane, pri);
-                if !all_priorities.contains(&key) {
-                    all_priorities.push(key);
-                }
+                priority_set.insert((plane, pri));
             }
-            all_priorities.sort();
+            let mut all_priorities: Vec<(u8, i32)> = priority_set.into_iter().collect();
+            all_priorities.sort_unstable();
+
+            // Clone symbol priority ranges to avoid borrow conflict with pack_symbol_batch_range
+            let sym_priority_ranges = self.symbol_priority_ranges.to_vec();
 
             // Render by priority groups (display_plane, priority)
             for &(plane, priority) in &all_priorities {
                 // Render areas for this priority
-                if let (Some(vb), Some(ib)) = (&area_vertex_buffer, &area_index_buffer) {
+                if let (Some(vb), Some(ib)) = (&self.cached_area_vb, &self.cached_area_ib) {
                     for &(pl, pri, start, end) in &self.area_priority_ranges {
                         if pl == plane && pri == priority && end > start {
                             render_pass.set_pipeline(&self.pipelines.area_pipeline);
@@ -2260,7 +2715,7 @@ impl WgpuRenderer {
                 }
 
                 // Render pattern fills for this priority (GPU texture-repeat tiling)
-                if let (Some(vb), Some(ib)) = (&pattern_vertex_buffer, &pattern_index_buffer) {
+                if let (Some(vb), Some(ib)) = (&self.cached_pattern_vb, &self.cached_pattern_ib) {
                     for (pl, pri, start, end, pat_key) in &self.pattern_ranges {
                         if *pl == plane && *pri == priority && end > start {
                             if let Some(pat_tex) = self.pattern_textures.get(pat_key) {
@@ -2277,7 +2732,7 @@ impl WgpuRenderer {
                 }
 
                 // Render lines for this priority
-                if let (Some(vb), Some(ib)) = (&line_vertex_buffer, &line_index_buffer) {
+                if let (Some(vb), Some(ib)) = (&self.cached_line_vb, &self.cached_line_ib) {
                     for &(pl, pri, start, end) in &self.line_priority_ranges {
                         if pl == plane && pri == priority && end > start {
                             render_pass.set_pipeline(&self.pipelines.line_pipeline);
@@ -2289,64 +2744,58 @@ impl WgpuRenderer {
                     }
                 }
 
-                // Render symbols for this priority (in sorted order to prevent Z-fighting)
-                for &(pl, pri, start, end) in &self.symbol_priority_ranges {
+                // Render symbols for this priority (cached packed single-buffer approach)
+                for &(pl, pri, start, end) in &sym_priority_ranges {
                     if pl == plane && pri == priority && end > start {
+                        // Find or build cached symbol buffer for this priority range
+                        let cache_idx = self.cached_symbol_buffers.iter().position(
+                            |(cp, cpr, cs, ce, _, _, _)| {
+                                *cp == pl && *cpr == pri && *cs == start && *ce == end
+                            },
+                        );
+                        let buf_idx = if let Some(idx) = cache_idx {
+                            idx
+                        } else {
+                            // Build and cache
+                            self.pack_symbol_batch_range(start, end);
+                            if self.packed_symbol_indices.is_empty() {
+                                continue;
+                            }
+                            let sym_vb = self.state.create_vertex_buffer(
+                                &self.packed_symbol_vertices,
+                                "symbol_packed_vb",
+                            );
+                            let sym_ib = self.state.create_index_buffer(
+                                &self.packed_symbol_indices,
+                                "symbol_packed_ib",
+                            );
+                            let ranges: Vec<_> = self.packed_symbol_ranges.clone();
+                            self.cached_symbol_buffers
+                                .push((pl, pri, start, end, sym_vb, sym_ib, ranges));
+                            self.cached_symbol_buffers.len() - 1
+                        };
+
+                        let (_, _, _, _, ref sym_vb, ref sym_ib, ref ranges) =
+                            self.cached_symbol_buffers[buf_idx];
+
                         render_pass.set_pipeline(&self.pipelines.texture_pipeline);
                         render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                        render_pass.set_vertex_buffer(0, sym_vb.slice(..));
+                        render_pass.set_index_buffer(sym_ib.slice(..), wgpu::IndexFormat::Uint32);
 
-                        // Render symbols one by one in their sorted order to maintain Z-order
-                        for i in start..end {
-                            let instance = &self.symbol_instances[i];
-                            if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                                // S-101 compliant symbol scaling
-                                let display_scale =
-                                    instance.scale / tex.render_scale * self.symbol_scale;
-
-                                let half_w = (tex.width as f32 * display_scale) / 2.0;
-                                let half_h = (tex.height as f32 * display_scale) / 2.0;
-
-                                let pivot_x = tex.pivot_in_texture.0 * display_scale;
-                                let pivot_y = tex.pivot_in_texture.1 * display_scale;
-
-                                let rotation = instance.rotation.to_radians();
-                                let cos_r = rotation.cos();
-                                let sin_r = rotation.sin();
-
-                                let transform = |dx: f32, dy: f32| -> (f32, f32) {
-                                    let px = dx + half_w - pivot_x;
-                                    let py = dy + half_h - pivot_y;
-                                    let rx = px * cos_r - py * sin_r;
-                                    let ry = px * sin_r + py * cos_r;
-                                    (instance.screen_x + rx, instance.screen_y + ry)
-                                };
-
-                                let (x0, y0) = transform(-half_w, -half_h);
-                                let (x1, y1) = transform(half_w, -half_h);
-                                let (x2, y2) = transform(half_w, half_h);
-                                let (x3, y3) = transform(-half_w, half_h);
-
-                                let vertices = vec![
-                                    TextureVertex::new(x0, y0, 0.0, 0.0),
-                                    TextureVertex::new(x1, y1, 1.0, 0.0),
-                                    TextureVertex::new(x2, y2, 1.0, 1.0),
-                                    TextureVertex::new(x3, y3, 0.0, 1.0),
-                                ];
-                                let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
-
-                                let vb = self.state.create_vertex_buffer(&vertices, "symbol_vb");
-                                let ib = self.state.create_index_buffer(&indices, "symbol_ib");
-
+                        for &(sym_id, idx_start, idx_count) in ranges {
+                            if let Some(tex) = self.symbol_textures.get(&sym_id) {
                                 render_pass.set_bind_group(1, &tex.bind_group, &[]);
-                                render_pass.set_vertex_buffer(0, vb.slice(..));
-                                render_pass
-                                    .set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                                render_pass.draw_indexed(0..6, 0, 0..1);
+                                render_pass.draw_indexed(idx_start..idx_start + idx_count, 0, 0..1);
                             }
                         }
                     }
                 }
             }
+        }
+
+        if let Some(t) = render_pass_timer {
+            self.cpu_profiler.record("render_pass", t.elapsed());
         }
 
         // Render egui UI overlay (after chart rendering, to surface texture directly)
@@ -2365,8 +2814,32 @@ impl WgpuRenderer {
             egui_output,
         );
 
+        // GPU profiler: resolve queries before submit
+        if self.gpu_profiler.is_enabled() {
+            self.gpu_profiler.profiler.resolve_queries(&mut encoder);
+        }
+
+        let submit_timer = if profiling {
+            Some(ScopeTimer::new("queue_submit"))
+        } else {
+            None
+        };
         self.state.queue.submit(std::iter::once(encoder.finish()));
+        if let Some(t) = submit_timer {
+            self.cpu_profiler.record("queue_submit", t.elapsed());
+        }
+
+        // GPU profiler: end frame and process results
+        if self.gpu_profiler.is_enabled() {
+            let _ = self.gpu_profiler.profiler.end_frame();
+            self.gpu_profiler.process_and_log(&self.state.queue);
+        }
+
         output.present();
+
+        if let Some(t) = render_timer {
+            self.cpu_profiler.record("render_total", t.elapsed());
+        }
 
         Ok(())
     }
@@ -2562,60 +3035,28 @@ impl WgpuRenderer {
                 render_pass.draw_indexed(0..self.line_indices.len() as u32, 0, 0..1);
             }
 
-            // Render symbols
+            // Render symbols (packed single-buffer approach)
             if !self.symbol_instances.is_empty() {
-                render_pass.set_pipeline(&self.pipelines.texture_pipeline);
-                render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                self.pack_symbol_batch_range(0, self.symbol_instances.len());
 
-                // Iterate by index to avoid borrow conflicts with self.state
-                for i in 0..self.symbol_instances.len() {
-                    let instance = &self.symbol_instances[i];
-                    if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                        // S-101 compliant symbol scaling
-                        let display_scale = instance.scale / tex.render_scale * self.symbol_scale;
+                if !self.packed_symbol_indices.is_empty() {
+                    let sym_vb = self
+                        .state
+                        .create_vertex_buffer(&self.packed_symbol_vertices, "symbol_packed_vb");
+                    let sym_ib = self
+                        .state
+                        .create_index_buffer(&self.packed_symbol_indices, "symbol_packed_ib");
 
-                        let half_w = (tex.width as f32 * display_scale) / 2.0;
-                        let half_h = (tex.height as f32 * display_scale) / 2.0;
+                    render_pass.set_pipeline(&self.pipelines.texture_pipeline);
+                    render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, sym_vb.slice(..));
+                    render_pass.set_index_buffer(sym_ib.slice(..), wgpu::IndexFormat::Uint32);
 
-                        // Pivot offset (in screen pixels)
-                        // pivot_in_texture is in texture pixels (from top-left)
-                        // display_scale converts texture pixels to screen pixels
-                        let pivot_x = tex.pivot_in_texture.0 * display_scale;
-                        let pivot_y = tex.pivot_in_texture.1 * display_scale;
-
-                        let rotation = instance.rotation.to_radians();
-                        let cos_r = rotation.cos();
-                        let sin_r = rotation.sin();
-
-                        let transform = |dx: f32, dy: f32| -> (f32, f32) {
-                            // Offset from top-left, then shift so pivot aligns with origin
-                            let px = dx + half_w - pivot_x;
-                            let py = dy + half_h - pivot_y;
-                            let rx = px * cos_r - py * sin_r;
-                            let ry = px * sin_r + py * cos_r;
-                            (instance.screen_x + rx, instance.screen_y + ry)
-                        };
-
-                        let (x0, y0) = transform(-half_w, -half_h);
-                        let (x1, y1) = transform(half_w, -half_h);
-                        let (x2, y2) = transform(half_w, half_h);
-                        let (x3, y3) = transform(-half_w, half_h);
-
-                        let vertices = [
-                            TextureVertex::new(x0, y0, 0.0, 0.0),
-                            TextureVertex::new(x1, y1, 1.0, 0.0),
-                            TextureVertex::new(x2, y2, 1.0, 1.0),
-                            TextureVertex::new(x3, y3, 0.0, 1.0),
-                        ];
-                        let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
-
-                        let vb = self.state.create_vertex_buffer(&vertices, "symbol_quad_vb");
-                        let ib = self.state.create_index_buffer(&indices, "symbol_quad_ib");
-
-                        render_pass.set_bind_group(1, &tex.bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, vb.slice(..));
-                        render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        render_pass.draw_indexed(0..6, 0, 0..1);
+                    for &(sym_id, idx_start, idx_count) in &self.packed_symbol_ranges {
+                        if let Some(tex) = self.symbol_textures.get(&sym_id) {
+                            render_pass.set_bind_group(1, &tex.bind_group, &[]);
+                            render_pass.draw_indexed(idx_start..idx_start + idx_count, 0, 0..1);
+                        }
                     }
                 }
             }
