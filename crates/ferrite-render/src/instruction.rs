@@ -340,6 +340,8 @@ impl PointInstruction {
 pub struct LineStyle {
     /// Color
     pub color: Color,
+    /// Color token for profile remapping (e.g., "CSTLN", "DEPVS")
+    pub color_token: Option<String>,
     /// Width in pixels at nominal scale
     pub width: f32,
     /// Dash pattern (alternating on/off lengths)
@@ -354,6 +356,7 @@ impl Default for LineStyle {
     fn default() -> Self {
         LineStyle {
             color: Color::BLACK,
+            color_token: None,
             width: 1.0,
             dash_pattern: Vec::new(),
             cap: CapStyle::Butt,
@@ -366,6 +369,7 @@ impl LineStyle {
     pub fn solid(color: Color, width: f32) -> Self {
         LineStyle {
             color,
+            color_token: None,
             width,
             dash_pattern: Vec::new(),
             cap: CapStyle::Butt,
@@ -376,6 +380,7 @@ impl LineStyle {
     pub fn dashed(color: Color, width: f32, pattern: Vec<f32>) -> Self {
         LineStyle {
             color,
+            color_token: None,
             width,
             dash_pattern: pattern,
             cap: CapStyle::Butt,
@@ -391,6 +396,8 @@ pub struct LineInstruction {
     pub style_ref: Option<String>,
     /// Inline style (used if style_ref is None)
     pub style: LineStyle,
+    /// Color token for line color remapping
+    pub color_token: Option<String>,
     /// Line vertices in world coordinates
     pub points: Vec<WorldPoint>,
     /// Display priority
@@ -415,6 +422,7 @@ impl LineInstruction {
         LineInstruction {
             style_ref: None,
             style: LineStyle::default(),
+            color_token: None,
             points,
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
@@ -519,6 +527,10 @@ pub struct AreaInstruction {
     pub fill_ref: Option<String>,
     /// Fill type
     pub fill: AreaFillType,
+    /// Color token for solid fill remapping (e.g., "DEPVS", "LANDA")
+    pub fill_color_token: Option<String>,
+    /// Color token for hatch fill line color
+    pub hatch_color_token: Option<String>,
     /// Exterior ring vertices
     pub exterior: Vec<WorldPoint>,
     /// Interior rings (holes)
@@ -543,6 +555,8 @@ impl AreaInstruction {
         AreaInstruction {
             fill_ref: None,
             fill: AreaFillType::default(),
+            fill_color_token: None,
+            hatch_color_token: None,
             exterior,
             interiors: Vec::new(),
             outline: None,
@@ -567,6 +581,13 @@ impl AreaInstruction {
     }
 
     #[inline]
+    pub fn with_solid_fill_token(mut self, color: Color, token: &str) -> Self {
+        self.fill = AreaFillType::Solid(color);
+        self.fill_color_token = Some(token.to_string());
+        self
+    }
+
+    #[inline]
     pub fn with_pattern_fill(mut self, symbol_ref: String, v1: (f32, f32), v2: (f32, f32)) -> Self {
         self.fill = AreaFillType::Pattern { symbol_ref, v1, v2 };
         self
@@ -580,6 +601,25 @@ impl AreaInstruction {
             spacing,
             angle,
         };
+        self
+    }
+
+    #[inline]
+    pub fn with_hatch_fill_token(
+        mut self,
+        color: Color,
+        token: &str,
+        width: f32,
+        spacing: f32,
+        angle: f32,
+    ) -> Self {
+        self.fill = AreaFillType::HatchFill {
+            color,
+            width,
+            spacing,
+            angle,
+        };
+        self.hatch_color_token = Some(token.to_string());
         self
     }
 
@@ -643,6 +683,8 @@ pub struct TextInstruction {
     pub italic: bool,
     /// Text color
     pub color: Color,
+    /// Color token for text color remapping
+    pub color_token: Option<String>,
     /// Background color (None = transparent)
     pub background: Option<Color>,
     /// Horizontal alignment
@@ -686,6 +728,7 @@ impl TextInstruction {
             scale_range: ScaleRange::default(),
             display_plane: DisplayPlane::default(),
             feature_id: None,
+            color_token: None,
         }
     }
 
@@ -842,6 +885,44 @@ impl DrawingInstruction {
             return order.with_extent(extent);
         }
         order
+    }
+
+    /// Remap resolved colors using a token-to-color lookup function.
+    /// Used for color profile switch (Day/Dusk/Night) without re-running Lua.
+    pub fn remap_colors(&mut self, lookup: &dyn Fn(&str) -> Color) {
+        match self {
+            DrawingInstruction::Area(area) => {
+                if let Some(token) = &area.fill_color_token {
+                    if let AreaFillType::Solid(ref mut color) = area.fill {
+                        *color = lookup(token);
+                    }
+                }
+                if let Some(token) = &area.hatch_color_token {
+                    if let AreaFillType::HatchFill { ref mut color, .. } = area.fill {
+                        *color = lookup(token);
+                    }
+                }
+                if let Some(ref mut outline) = area.outline {
+                    if let Some(token) = &outline.color_token {
+                        outline.color = lookup(token);
+                    }
+                }
+            }
+            DrawingInstruction::Line(line) => {
+                if let Some(token) = &line.color_token {
+                    line.style.color = lookup(token);
+                }
+            }
+            DrawingInstruction::Text(text) => {
+                if let Some(token) = &text.color_token {
+                    text.color = lookup(token);
+                }
+            }
+            DrawingInstruction::Point(_) => {
+                // Point symbols use SVG rendering with color overrides;
+                // handled by clearing symbol_cache on profile switch
+            }
+        }
     }
 }
 
