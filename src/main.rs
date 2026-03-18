@@ -228,6 +228,8 @@ struct ChartApp {
     mouse_pos: (f64, f64),
     /// Rendered symbols for hit testing
     rendered_symbols: Vec<RenderedSymbol>,
+    /// Pending async hit-test build result
+    pending_hit_test: Option<Receiver<Vec<RenderedSymbol>>>,
     /// Is mouse being dragged for panning
     is_dragging: bool,
     /// Last drag position
@@ -327,6 +329,7 @@ impl ChartApp {
             current_profile_name: initial_profile,
             mouse_pos: (0.0, 0.0),
             rendered_symbols: Vec::new(),
+            pending_hit_test: None,
             is_dragging: false,
             drag_start: (0.0, 0.0),
             zoom_level: 1.0,
@@ -461,10 +464,12 @@ impl ChartApp {
                 }
                 tracing::info!("Switched to color profile: {}", profile_name);
 
-                // Re-run portrayal with new color profile to update Area/Line colors
-                // The Lua results convert color tokens to RGB values, so we need to regenerate
+                // Fast path: remap color tokens to new RGB values without re-running Lua
                 if self.chart_loaded {
-                    self.regenerate_portrayal();
+                    let pc = &self.pc;
+                    let pname = self.current_profile_name.clone();
+                    self.render_context
+                        .remap_colors(&|token: &str| lookup_pc_color(pc, token, &pname));
                 }
             }
         } else {
@@ -781,6 +786,11 @@ impl ChartApp {
             // Generate drawing instructions for all cells
             if let Err(e) = self.regenerate_instructions() {
                 error!("Failed to generate instructions: {}", e);
+            }
+
+            // Pre-compute area triangulations to avoid cold-path stall on first render
+            if let Some(renderer) = &mut self.renderer {
+                renderer.precompute_triangulations(self.render_context.raw_instructions());
             }
         }
 
@@ -1187,32 +1197,62 @@ impl ChartApp {
     }
 
     /// Build rendered symbols list for hit testing
+    /// Build rendered symbols asynchronously on a background thread.
+    /// Results are polled via `poll_hit_test`.
     fn build_rendered_symbols(&mut self) {
-        self.rendered_symbols.clear();
+        // Collect point data needed for building symbols
+        let points: Vec<_> = self
+            .render_context
+            .get_sorted_instructions()
+            .iter()
+            .filter_map(|instr| {
+                if let ferrite_render::DrawingInstruction::Point(point) = instr {
+                    Some((
+                        point.symbol_ref.clone(),
+                        point.feature_id.unwrap_or(0),
+                        point.position,
+                        point.priority.0,
+                        point.cell_index,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        // Clone instructions to avoid borrow issues
-        let instructions: Vec<_> = self.render_context.get_sorted_instructions().to_vec();
+        let scaler = self.render_context.scaler.clone();
+        let (tx, rx) = mpsc::channel();
+        self.pending_hit_test = Some(rx);
 
-        for instr in &instructions {
-            if let ferrite_render::DrawingInstruction::Point(point) = instr {
-                let screen = self.render_context.scaler.world_to_screen(point.position);
-                self.rendered_symbols.push(RenderedSymbol {
-                    symbol_ref: point.symbol_ref.clone(),
-                    feature_id: point.feature_id.unwrap_or(0),
-                    screen_x: screen.x,
-                    screen_y: screen.y,
-                    world_x: point.position.x,
-                    world_y: point.position.y,
-                    priority: point.priority.0,
-                    cell_index: point.cell_index,
-                });
+        std::thread::spawn(move || {
+            let symbols: Vec<RenderedSymbol> = points
+                .into_iter()
+                .map(|(symbol_ref, feature_id, position, priority, cell_index)| {
+                    let screen = scaler.world_to_screen(position);
+                    RenderedSymbol {
+                        symbol_ref,
+                        feature_id,
+                        screen_x: screen.x,
+                        screen_y: screen.y,
+                        world_x: position.x,
+                        world_y: position.y,
+                        priority,
+                        cell_index,
+                    }
+                })
+                .collect();
+            let _ = tx.send(symbols);
+        });
+    }
+
+    /// Poll for completed async hit-test build. Call this each frame.
+    fn poll_hit_test(&mut self) {
+        if let Some(rx) = &self.pending_hit_test {
+            if let Ok(symbols) = rx.try_recv() {
+                self.rendered_symbols = symbols;
+                self.pending_hit_test = None;
             }
         }
-
-        info!(
-            "Built {} rendered symbols for hit testing",
-            self.rendered_symbols.len()
-        );
     }
 
     /// Find symbols near the click position
@@ -1532,6 +1572,9 @@ impl ApplicationHandler for ChartApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Poll for completed async hit-test build
+                self.poll_hit_test();
+
                 // Process inertia/momentum
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(self.last_frame_time).as_secs_f64();
@@ -1853,6 +1896,11 @@ impl ApplicationHandler for ChartApp {
                     tracing::info!("Settings changed, regenerating portrayal");
                     if self.chart_loaded {
                         self.regenerate_portrayal();
+                        // Pre-compute triangulations for new instructions
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer
+                                .precompute_triangulations(self.render_context.raw_instructions());
+                        }
                     }
                 }
 
@@ -3190,36 +3238,47 @@ fn convert_lua_results_for_cell(
 
                         line_count += 1;
                         // Determine line color and width from PC (no hardcoding)
-                        let (color, width) = if let Some((w, token)) = simple_style {
-                            (lookup_color(token), *w)
-                        } else if let Some(ref_name) = style_refs.first() {
-                            // Look up from PC line styles
-                            if let Some(style) = pc.line_styles.get(ref_name) {
-                                match style {
-                                    ferrite_portrayal_catalog::LineStyle::Simple(s) => {
-                                        (lookup_color(&s.pen.color_token), s.pen.width as f32)
-                                    }
-                                    ferrite_portrayal_catalog::LineStyle::Complex(c) => {
-                                        if let Some(s) = c.strokes.first() {
-                                            (lookup_color(&s.pen.color_token), s.pen.width as f32)
-                                        } else {
-                                            (lookup_color("CSTLN"), 1.0)
+                        let (color, width, line_color_token) =
+                            if let Some((w, token)) = simple_style {
+                                (lookup_color(token), *w, token.to_string())
+                            } else if let Some(ref_name) = style_refs.first() {
+                                // Look up from PC line styles
+                                if let Some(style) = pc.line_styles.get(ref_name) {
+                                    match style {
+                                        ferrite_portrayal_catalog::LineStyle::Simple(s) => (
+                                            lookup_color(&s.pen.color_token),
+                                            s.pen.width as f32,
+                                            s.pen.color_token.clone(),
+                                        ),
+                                        ferrite_portrayal_catalog::LineStyle::Complex(c) => {
+                                            if let Some(s) = c.strokes.first() {
+                                                (
+                                                    lookup_color(&s.pen.color_token),
+                                                    s.pen.width as f32,
+                                                    s.pen.color_token.clone(),
+                                                )
+                                            } else {
+                                                (lookup_color("CSTLN"), 1.0, "CSTLN".to_string())
+                                            }
+                                        }
+                                        ferrite_portrayal_catalog::LineStyle::Composite(c) => {
+                                            if let Some(s) = c.components.first() {
+                                                (
+                                                    lookup_color(&s.pen.color_token),
+                                                    s.pen.width as f32,
+                                                    s.pen.color_token.clone(),
+                                                )
+                                            } else {
+                                                (lookup_color("CSTLN"), 1.0, "CSTLN".to_string())
+                                            }
                                         }
                                     }
-                                    ferrite_portrayal_catalog::LineStyle::Composite(c) => {
-                                        if let Some(s) = c.components.first() {
-                                            (lookup_color(&s.pen.color_token), s.pen.width as f32)
-                                        } else {
-                                            (lookup_color("CSTLN"), 1.0)
-                                        }
-                                    }
+                                } else {
+                                    (lookup_color("CSTLN"), 1.0, "CSTLN".to_string())
                                 }
                             } else {
-                                (lookup_color("CSTLN"), 1.0)
-                            }
-                        } else {
-                            (lookup_color("CSTLN"), 1.0)
-                        };
+                                (lookup_color("CSTLN"), 1.0, "CSTLN".to_string())
+                            };
 
                         // S-100 Part 9a-11.2.15: AugmentedRay — a line from the point
                         // feature's position in a given direction for a given length.
@@ -3281,6 +3340,7 @@ fn convert_lua_results_for_cell(
                                     .with_scale_range(make_scale_range(visibility))
                                     .with_display_plane(make_display_plane(visibility))
                                     .with_feature_id(feature_id.unwrap_or(0));
+                                line_inst.color_token = Some(line_color_token.clone());
 
                                 if unsuppressed {
                                     line_inst = line_inst.with_unsuppressed();
@@ -3320,6 +3380,7 @@ fn convert_lua_results_for_cell(
                                                 .with_scale_range(make_scale_range(visibility))
                                                 .with_display_plane(make_display_plane(visibility))
                                                 .with_feature_id(feature_id.unwrap_or(0));
+                                            line_inst.color_token = Some(line_color_token.clone());
                                             if unsuppressed {
                                                 line_inst = line_inst.with_unsuppressed();
                                             }
@@ -3382,6 +3443,8 @@ fn convert_lua_results_for_cell(
                                                         visibility,
                                                     ))
                                                     .with_feature_id(feature_id.unwrap_or(0));
+                                                line_inst.color_token =
+                                                    Some(line_color_token.clone());
                                                 if unsuppressed {
                                                     line_inst = line_inst.with_unsuppressed();
                                                 }
@@ -3408,6 +3471,7 @@ fn convert_lua_results_for_cell(
                                             .with_scale_range(make_scale_range(visibility))
                                             .with_display_plane(make_display_plane(visibility))
                                             .with_feature_id(feature_id.unwrap_or(0));
+                                        line_inst.color_token = Some(line_color_token.clone());
                                         if unsuppressed {
                                             line_inst = line_inst.with_unsuppressed();
                                         }
@@ -3453,6 +3517,7 @@ fn convert_lua_results_for_cell(
                                             .with_scale_range(make_scale_range(visibility))
                                             .with_display_plane(make_display_plane(visibility))
                                             .with_feature_id(feature_id.unwrap_or(0));
+                                        line_inst.color_token = Some(line_color_token.clone());
 
                                         if unsuppressed {
                                             line_inst = line_inst.with_unsuppressed();
@@ -3485,7 +3550,7 @@ fn convert_lua_results_for_cell(
                                         area_rendered += 1;
                                         let area_inst = AreaInstruction::new(exterior)
                                             .with_interiors(interiors)
-                                            .with_solid_fill(color)
+                                            .with_solid_fill_token(color, color_token)
                                             .with_priority(draw_priority)
                                             .with_viewing_group(make_viewing_group(visibility))
                                             .with_scale_range(make_scale_range(visibility))
@@ -3530,11 +3595,12 @@ fn convert_lua_results_for_cell(
                                         let area_inst = if let Some(fill) = fill {
                                             match &fill.fill_type {
                                                 ferrite_portrayal_catalog::AreaFillType::Color(c) => {
-                                                    area_inst.with_solid_fill(lookup_color(&c.color_token))
+                                                    area_inst.with_solid_fill_token(lookup_color(&c.color_token), &c.color_token)
                                                 }
                                                 ferrite_portrayal_catalog::AreaFillType::Hatch(h) => {
-                                                    area_inst.with_hatch_fill(
+                                                    area_inst.with_hatch_fill_token(
                                                         lookup_color(&h.line_color),
+                                                        &h.line_color,
                                                         h.line_width as f32,
                                                         h.spacing as f32,
                                                         h.angle as f32,
@@ -3556,11 +3622,14 @@ fn convert_lua_results_for_cell(
                                                 }
                                                 ferrite_portrayal_catalog::AreaFillType::Pixmap(px) => {
                                                     tracing::warn!("AreaFillReference: raster pixmap fill not yet renderable (image: {:?}), falling back to NODTA", px.image_ref);
-                                                    area_inst.with_solid_fill(lookup_color("NODTA"))
+                                                    area_inst.with_solid_fill_token(lookup_color("NODTA"), "NODTA")
                                                 }
                                             }
                                         } else {
-                                            area_inst.with_solid_fill(lookup_color("NODTA"))
+                                            area_inst.with_solid_fill_token(
+                                                lookup_color("NODTA"),
+                                                "NODTA",
+                                            )
                                         };
 
                                         context.add_instruction(
@@ -3601,11 +3670,12 @@ fn convert_lua_results_for_cell(
                                         let area_inst = if let Some(fill) = fill {
                                             match &fill.fill_type {
                                                 ferrite_portrayal_catalog::AreaFillType::Color(c) => {
-                                                    area_inst.with_solid_fill(lookup_color(&c.color_token))
+                                                    area_inst.with_solid_fill_token(lookup_color(&c.color_token), &c.color_token)
                                                 }
                                                 ferrite_portrayal_catalog::AreaFillType::Hatch(h) => {
-                                                    area_inst.with_hatch_fill(
+                                                    area_inst.with_hatch_fill_token(
                                                         lookup_color(&h.line_color),
+                                                        &h.line_color,
                                                         h.line_width as f32,
                                                         h.spacing as f32,
                                                         h.angle as f32,
@@ -3627,11 +3697,14 @@ fn convert_lua_results_for_cell(
                                                 }
                                                 ferrite_portrayal_catalog::AreaFillType::Pixmap(px) => {
                                                     tracing::warn!("PixmapFill: raster pixmap fill not yet renderable (image: {:?}), falling back to NODTA", px.image_ref);
-                                                    area_inst.with_solid_fill(lookup_color("NODTA"))
+                                                    area_inst.with_solid_fill_token(lookup_color("NODTA"), "NODTA")
                                                 }
                                             }
                                         } else {
-                                            area_inst.with_solid_fill(lookup_color("NODTA"))
+                                            area_inst.with_solid_fill_token(
+                                                lookup_color("NODTA"),
+                                                "NODTA",
+                                            )
                                         };
 
                                         context.add_instruction(
@@ -3687,41 +3760,57 @@ fn convert_lua_results_for_cell(
                     } => {
                         area_count += 1;
                         // Look up first line style from PC for color and width
-                        let (color, line_width_mm) = line_styles
+                        let (color, line_width_mm, hatch_token) = line_styles
                             .first()
                             .and_then(|name| pc.line_styles.get(name.as_str()))
                             .map(|style| match style {
-                                ferrite_portrayal_catalog::LineStyle::Simple(s) => {
-                                    (lookup_color(&s.pen.color_token), s.pen.width as f32)
-                                }
+                                ferrite_portrayal_catalog::LineStyle::Simple(s) => (
+                                    lookup_color(&s.pen.color_token),
+                                    s.pen.width as f32,
+                                    s.pen.color_token.clone(),
+                                ),
                                 ferrite_portrayal_catalog::LineStyle::Complex(c) => {
-                                    let col = c
+                                    let (col, tok) = c
                                         .strokes
                                         .first()
-                                        .map(|s| lookup_color(&s.pen.color_token))
-                                        .unwrap_or_else(|| lookup_color("CSTLN"));
+                                        .map(|s| {
+                                            (
+                                                lookup_color(&s.pen.color_token),
+                                                s.pen.color_token.clone(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|| {
+                                            (lookup_color("CSTLN"), "CSTLN".to_string())
+                                        });
                                     let w = c
                                         .strokes
                                         .first()
                                         .map(|s| s.pen.width as f32)
                                         .unwrap_or(0.32);
-                                    (col, w)
+                                    (col, w, tok)
                                 }
                                 ferrite_portrayal_catalog::LineStyle::Composite(c) => {
-                                    let col = c
+                                    let (col, tok) = c
                                         .components
                                         .first()
-                                        .map(|s| lookup_color(&s.pen.color_token))
-                                        .unwrap_or_else(|| lookup_color("CSTLN"));
+                                        .map(|s| {
+                                            (
+                                                lookup_color(&s.pen.color_token),
+                                                s.pen.color_token.clone(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|| {
+                                            (lookup_color("CSTLN"), "CSTLN".to_string())
+                                        });
                                     let w = c
                                         .components
                                         .first()
                                         .map(|s| s.pen.width as f32)
                                         .unwrap_or(0.32);
-                                    (col, w)
+                                    (col, w, tok)
                                 }
                             })
-                            .unwrap_or_else(|| (lookup_color("CSTLN"), 0.32));
+                            .unwrap_or_else(|| (lookup_color("CSTLN"), 0.32, "CSTLN".to_string()));
                         // Compute angle from direction vector (dirX, dirY) in degrees
                         let angle = (direction.1.atan2(direction.0).to_degrees()) as f32;
                         // distance is in mm per S-100 spec
@@ -3737,8 +3826,9 @@ fn convert_lua_results_for_cell(
                                         area_rendered += 1;
                                         let area_inst = AreaInstruction::new(exterior)
                                             .with_interiors(interiors)
-                                            .with_hatch_fill(
+                                            .with_hatch_fill_token(
                                                 color,
+                                                &hatch_token,
                                                 line_width_mm,
                                                 spacing_mm,
                                                 angle,
@@ -3773,7 +3863,7 @@ fn convert_lua_results_for_cell(
                         let color = lookup_color(color_token);
                         // If explicit position from AugmentedPoint, use it
                         if let Some((x, y)) = position {
-                            let text_inst =
+                            let mut text_inst =
                                 RenderTextInstruction::new(text.clone(), WorldPoint::new(*x, *y))
                                     .with_font_size(*font_size)
                                     .with_color(color)
@@ -3785,6 +3875,7 @@ fn convert_lua_results_for_cell(
                                     .with_scale_range(make_scale_range(visibility))
                                     .with_display_plane(make_display_plane(visibility))
                                     .with_feature_id(feature_id.unwrap_or(0));
+                            text_inst.color_token = Some(color_token.clone());
                             context.add_instruction(ferrite_render::DrawingInstruction::Text(
                                 text_inst,
                             ));
@@ -3813,6 +3904,7 @@ fn convert_lua_results_for_cell(
                                     .with_feature_id(feature_id.unwrap_or(0));
                                     ti.bold = *bold;
                                     ti.italic = *italic;
+                                    ti.color_token = Some(color_token.clone());
                                     context.add_instruction(
                                         ferrite_render::DrawingInstruction::Text(ti),
                                     );
@@ -3871,6 +3963,7 @@ fn convert_lua_results_for_cell(
                                             .with_feature_id(feature_id.unwrap_or(0));
                                             ti.bold = *bold;
                                             ti.italic = *italic;
+                                            ti.color_token = Some(color_token.clone());
                                             context.add_instruction(
                                                 ferrite_render::DrawingInstruction::Text(ti),
                                             );

@@ -606,6 +606,23 @@ impl WgpuRenderer {
         self.cached_suppressed_lines = None; // Invalidate when chart data changes
     }
 
+    /// Pre-compute triangulations for all area instructions.
+    /// Call after chart load to avoid cold-path stalls during first render frame.
+    pub fn precompute_triangulations(
+        &mut self,
+        instructions: &[ferrite_render::DrawingInstruction],
+    ) {
+        let mut count = 0;
+        for instr in instructions {
+            if let ferrite_render::DrawingInstruction::Area(area) = instr {
+                if self.ensure_triangulated(area).is_some() {
+                    count += 1;
+                }
+            }
+        }
+        tracing::info!("Pre-computed {} area triangulations", count);
+    }
+
     /// Clear symbol textures (call when color profile changes)
     pub fn clear_symbol_textures(&mut self) {
         self.symbol_textures.clear();
