@@ -159,7 +159,6 @@ pub struct AppUiState {
     /// Settings were changed (triggers Lua re-run + re-render)
     pub settings_changed: bool,
     /// Settings are dirty (waiting for pointer release to apply)
-    pub settings_dirty: bool,
     /// Pending settings (edited but not yet applied)
     pub pending_settings: Option<SettingsState>,
     /// Actual chart area after UI panels (x, y, width, height)
@@ -1421,34 +1420,18 @@ impl EguiIntegration {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // Auto-apply: immediately apply any changes
+                // Non-Lua settings (show_shallow_pattern) apply immediately for responsiveness
                 if let Some(pending) = ui_state.pending_settings.as_ref() {
-                    if *pending != ui_state.settings {
-                        let needs_lua = pending.safety_depth != ui_state.settings.safety_depth
-                            || pending.safety_contour != ui_state.settings.safety_contour
-                            || pending.shallow_contour != ui_state.settings.shallow_contour
-                            || pending.deep_contour != ui_state.settings.deep_contour
-                            || pending.two_shades != ui_state.settings.two_shades
-                            || pending.simplified_symbols != ui_state.settings.simplified_symbols
-                            || pending.isolated_dangers != ui_state.settings.isolated_dangers
-                            || pending.full_light_sectors != ui_state.settings.full_light_sectors
-                            || pending.ignore_scale_minimum != ui_state.settings.ignore_scale_minimum
-                            || pending.plain_boundaries != ui_state.settings.plain_boundaries
-                            || pending.display_mode != ui_state.settings.display_mode;
-
-                        ui_state.settings = pending.clone();
-                        if needs_lua {
-                            // Lua-affecting settings: apply on pointer release (debounce drag)
-                            ui_state.settings_dirty = true;
-                        }
-                        // show_shallow_pattern takes effect immediately via renderer (no Lua)
+                    if pending.show_shallow_pattern != ui_state.settings.show_shallow_pattern {
+                        ui_state.settings.show_shallow_pattern = pending.show_shallow_pattern;
                     }
                 }
-                // Flush dirty settings when pointer is released
-                if ui_state.settings_dirty && !ctx.input(|i| i.pointer.any_down()) {
-                    ui_state.settings_dirty = false;
-                    ui_state.settings_changed = true;
-                }
+
+                // Check if pending settings differ from applied (for Apply button highlight)
+                let has_pending_changes = ui_state
+                    .pending_settings
+                    .as_ref()
+                    .is_some_and(|p| *p != ui_state.settings);
 
                 // Buttons
                 ui.horizontal(|ui| {
@@ -1460,6 +1443,20 @@ impl EguiIntegration {
                         if ui.button("Close").clicked() {
                             ui_state.pending_settings = None;
                             ui_state.show_settings = false;
+                        }
+
+                        // Apply button: commits pending settings and triggers Lua regeneration
+                        let apply_btn = egui::Button::new("Apply");
+                        let apply_resp = if has_pending_changes {
+                            ui.add(apply_btn)
+                        } else {
+                            ui.add_enabled(false, apply_btn)
+                        };
+                        if apply_resp.clicked() {
+                            if let Some(pending) = ui_state.pending_settings.as_ref() {
+                                ui_state.settings = pending.clone();
+                                ui_state.settings_changed = true;
+                            }
                         }
                     });
                 });

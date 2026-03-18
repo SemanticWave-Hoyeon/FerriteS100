@@ -45,7 +45,7 @@ rayon = "1.10"
 rustc-hash = "2"  # FxHashMap/FxHashSet: faster hashing for integer keys
 
 # Logging
-tracing = { version = "0.1", features = ["release_max_level_off"] }
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 
