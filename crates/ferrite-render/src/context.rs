@@ -226,6 +226,14 @@ impl RenderContext {
         }
     }
 
+    /// Remap all instruction colors using a token-to-color lookup function.
+    /// Used for color profile switch (Day/Dusk/Night) without re-running Lua.
+    pub fn remap_colors(&mut self, lookup: &dyn Fn(&str) -> Color) {
+        for inst in &mut self.instructions {
+            inst.remap_colors(lookup);
+        }
+    }
+
     /// Get raw instructions slice for cache serialization
     pub fn raw_instructions(&self) -> &[DrawingInstruction] {
         &self.instructions
