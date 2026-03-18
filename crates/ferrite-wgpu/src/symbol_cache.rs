@@ -14,7 +14,7 @@
 //! A higher render_scale produces sharper textures but uses more memory.
 //! The actual display size is calculated at render time using S100_PX_PER_MM.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ferrite_portrayal_catalog::ColorProfile;
@@ -64,6 +64,8 @@ impl SymbolGeometry {
 pub struct SymbolCache {
     /// Cached symbol geometry (keyed by symbol ID)
     symbols: HashMap<String, SymbolGeometry>,
+    /// Symbol IDs that failed to load (avoid re-attempting every frame)
+    missing_symbols: HashSet<String>,
     /// Base path for symbol SVG files
     symbols_path: std::path::PathBuf,
     /// Render scale (pixels per mm) - higher = better quality but more memory
@@ -85,33 +87,49 @@ impl SymbolCache {
     pub fn new<P: AsRef<Path>>(symbols_path: P) -> Self {
         SymbolCache {
             symbols: HashMap::new(),
+            missing_symbols: HashSet::new(),
             symbols_path: symbols_path.as_ref().to_path_buf(),
             render_scale: BASE_PX_PER_MM * RENDER_QUALITY_MULTIPLIER,
         }
     }
 
-    /// Get or load symbol geometry
+    /// Get or load symbol geometry.
+    /// Hot path: single HashMap::get (no contains_key + get double lookup).
+    /// Cold path (first load): runs once per unique symbol, not per frame.
     pub fn get_symbol(
         &mut self,
         symbol_id: &str,
         color_profile: &ColorProfile,
     ) -> Option<&SymbolGeometry> {
-        // Return cached if exists
+        // Hot path: already cached → single lookup
         if self.symbols.contains_key(symbol_id) {
             return self.symbols.get(symbol_id);
         }
 
+        // Already known to be missing → skip file I/O
+        if self.missing_symbols.contains(symbol_id) {
+            return None;
+        }
+
+        // Cold path: first-time load
+        self.load_symbol(symbol_id, color_profile);
+        self.symbols.get(symbol_id)
+    }
+
+    /// Load a symbol from SVG file into cache (cold path, called once per symbol)
+    #[cold]
+    fn load_symbol(&mut self, symbol_id: &str, color_profile: &ColorProfile) {
         tracing::debug!(
             "Loading symbol: '{}' from {}",
             symbol_id,
             self.symbols_path.display()
         );
 
-        // Try to load from file
         let svg_path = self.symbols_path.join(format!("{}.svg", symbol_id));
         if !svg_path.exists() {
             tracing::debug!("Symbol SVG not found: {}", svg_path.display());
-            return None;
+            self.missing_symbols.insert(symbol_id.to_string());
+            return;
         }
 
         match self.render_svg(&svg_path, symbol_id, color_profile) {
@@ -123,11 +141,10 @@ impl SymbolCache {
                     geometry.height
                 );
                 self.symbols.insert(symbol_id.to_string(), geometry);
-                self.symbols.get(symbol_id)
             }
             Err(e) => {
                 tracing::warn!("Failed to render SVG '{}': {}", symbol_id, e);
-                None
+                self.missing_symbols.insert(symbol_id.to_string());
             }
         }
     }

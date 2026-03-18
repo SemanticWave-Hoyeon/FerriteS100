@@ -50,6 +50,41 @@ use crate::egui_integration::{AppUiState, EguiIntegration, SettingsState};
 use crate::pipeline::{PatternVertex, TextureVertex};
 use crate::{GpuState, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError};
 
+// === Symbol Classification Flags ===
+// Cached per SymbolId to avoid repeated starts_with() string matching in hot paths.
+// Computed once per unique symbol, reused across all frames.
+const SYM_SOUNDING: u8 = 1 << 0; // starts_with("SOUND")
+const SYM_NAV_AID: u8 = 1 << 1; // LIGHTS, BUOY, BCN, TOPMAR
+const SYM_SAFETY: u8 = 1 << 2; // ISODGR, DANGER, WRECKS, OBSTRN, UWTROC, FOULAR
+
+/// Classify a symbol string into bitflags (called once per unique symbol)
+#[inline]
+fn classify_symbol(s: &str) -> u8 {
+    let mut flags = 0u8;
+    if s.starts_with("SOUND") {
+        flags |= SYM_SOUNDING;
+    }
+    if s.starts_with("LIGHTS")
+        || s.starts_with("BUOY")
+        || s.starts_with("BCN")
+        || s.starts_with("TOPMAR")
+    {
+        flags |= SYM_NAV_AID;
+    }
+    if s == "ISODGR01"
+        || s == "DANGER02"
+        || s == "DANGER01"
+        || s == "DANGER03"
+        || s.starts_with("WRECKS")
+        || s.starts_with("OBSTRN")
+        || s.starts_with("UWTROC")
+        || s.starts_with("FOULAR")
+    {
+        flags |= SYM_SAFETY;
+    }
+    flags
+}
+
 /// Ray-casting point-in-polygon test.
 /// Returns true if point (px, py) is inside the given ring (list of (x,y) vertices).
 fn point_in_ring(px: f32, py: f32, ring: &[(f32, f32)]) -> bool {
@@ -79,7 +114,6 @@ struct CachedTriangulation {
     world_vertices: Vec<f64>,
     /// World-coordinate axis-aligned bounding box (min_x, min_y, max_x, max_y)
     /// Used for O(1) viewport frustum culling — skip entire area if AABB is off-screen
-    #[allow(dead_code)]
     world_aabb: (f64, f64, f64, f64),
 }
 
@@ -275,6 +309,8 @@ pub struct WgpuRenderer {
     sounding_exact_positions: FxHashSet<(i64, i64)>,
     /// World-coordinate deduplication (to remove exact duplicates from multiple charts)
     world_dedup: FxHashSet<(i64, i64, u64)>,
+    /// Cached symbol classification flags (computed once per unique SymbolId, never cleared)
+    symbol_class_cache: FxHashMap<SymbolId, u8>,
     /// Grid cell size in pixels (adjusted by zoom)
     grid_cell_size: f32,
     /// Sounding grid cell size in pixels (screen-space)
@@ -397,7 +433,7 @@ impl WgpuRenderer {
             line_indices: Vec::with_capacity(15000),
             symbol_textures: HashMap::with_capacity(100),
             symbol_instances: Vec::with_capacity(2000),
-            background_color: Color::from_hex("#DEEBF7").unwrap_or(Color::WHITE),
+            background_color: Color::from_u8(201, 237, 255, 255), // DEPDW (deep water) — matches S-101 default
             symbol_scale: 1.0, // S-100 standard: 1.0 = nominal symbol size at 0.3mm/pixel
             show_soundings: true, // Visibility controlled by S-101 viewing groups
             zoom_level: 1.0,
@@ -406,6 +442,7 @@ impl WgpuRenderer {
             sounding_screen_grid: FxHashMap::with_capacity_and_hasher(2000, Default::default()),
             sounding_exact_positions: FxHashSet::with_capacity_and_hasher(5000, Default::default()),
             world_dedup: FxHashSet::with_capacity_and_hasher(5000, Default::default()),
+            symbol_class_cache: FxHashMap::with_capacity_and_hasher(256, Default::default()),
 
             grid_cell_size: 30.0,         // Default grid cell size in pixels
             sounding_cell_size_px: 150.0, // Fixed pixel spacing between soundings
@@ -1084,6 +1121,9 @@ impl WgpuRenderer {
         let mut line_start_idx = 0usize;
         let mut symbol_start_idx = 0usize;
 
+        // Pre-compute viewing scale once (constant during entire instruction loop)
+        let viewing_scale = self.viewing_scale();
+
         for (inst_idx, instruction) in instructions.iter().enumerate() {
             // Display Mode filtering: skip instructions not in visible viewing groups
             if let Some(visible) = visible_viewing_groups {
@@ -1143,11 +1183,8 @@ impl WgpuRenderer {
             current_plane = inst_plane;
 
             // S-100 Scale-dependent visibility: skip instructions outside their scale range
-            {
-                let viewing_scale = self.viewing_scale();
-                if !instruction.scale_range().is_visible_at(viewing_scale) {
-                    continue;
-                }
+            if !instruction.scale_range().is_visible_at(viewing_scale) {
+                continue;
             }
 
             let inst_start = if profiling {
@@ -1181,7 +1218,7 @@ impl WgpuRenderer {
                             {
                                 self.tile_area_with_pattern(
                                     area,
-                                    &symbol_ref.clone(),
+                                    symbol_ref,
                                     v1,
                                     v2,
                                     &scaler,
@@ -1240,21 +1277,20 @@ impl WgpuRenderer {
                         continue;
                     }
 
+                    // Pre-classify via cached flags (intern is fast: read-lock only)
+                    let sym_id = intern_symbol(&point.symbol_ref);
+                    let flags = self.get_symbol_flags(sym_id, &point.symbol_ref);
+                    let is_sounding = flags & SYM_SOUNDING != 0;
+
                     // Soundings: respect show_soundings toggle
-                    let is_sounding = point.symbol_ref.starts_with("SOUNDG")
-                        || point.symbol_ref.starts_with("SOUNDS");
                     if is_sounding && !self.show_soundings {
                         continue;
                     }
 
                     // LOD: Skip non-essential symbols during animation
                     if self.animation_mode && self.lod_level > 0 {
-                        // Keep only important symbols during animation
-                        if !is_sounding
-                            && !point.symbol_ref.starts_with("LIGHTS")
-                            && !point.symbol_ref.starts_with("BUOY")
-                            && !point.symbol_ref.starts_with("BCNLAT")
-                        {
+                        // Keep only important symbols (soundings, nav aids)
+                        if !is_sounding && (flags & SYM_NAV_AID == 0) {
                             _culled_count += 1;
                             continue;
                         }
@@ -1264,7 +1300,7 @@ impl WgpuRenderer {
                     let rendered = if let (Some(cache), Some(profile)) =
                         (symbol_cache.as_mut(), color_profile)
                     {
-                        self.try_add_symbol(point, &scaler, cache, profile)
+                        self.try_add_symbol(point, &scaler, cache, profile, sym_id)
                     } else {
                         false
                     };
@@ -1598,93 +1634,66 @@ impl WgpuRenderer {
             | ferrite_render::AreaFillType::CentroidSymbol(_) => return,
         };
 
-        // Early frustum culling from exterior ring AABB (BEFORE HashMap lookups).
-        // This avoids ensure_triangulated + cache lookup for fully off-screen areas.
+        let cache_key = Self::area_geometry_key(area);
+
+        // Fast path: triangulation already cached — use cached AABB for O(1) frustum culling
+        // (avoids re-scanning entire exterior ring just to compute AABB)
+        if let Some(cached) = self.triangulation_cache.get(&cache_key) {
+            // Frustum culling with cached AABB
+            if let Some((vp_min_x, vp_min_y, vp_max_x, vp_max_y)) = self.viewport_world_bounds {
+                let (ax, ay, bx, by) = cached.world_aabb;
+                let margin_x = (vp_max_x - vp_min_x) * 0.5;
+                let margin_y = (vp_max_y - vp_min_y) * 0.5;
+                if bx < vp_min_x - margin_x
+                    || ax > vp_max_x + margin_x
+                    || by < vp_min_y - margin_y
+                    || ay > vp_max_y + margin_y
+                {
+                    return;
+                }
+            }
+
+            let total_vertex_count = cached.world_vertices.len() / 2;
+            let wv_ptr = cached.world_vertices.as_ptr();
+            let wv_len = cached.world_vertices.len();
+            let idx_ptr = cached.indices.as_ptr();
+            let idx_len = cached.indices.len();
+            // SAFETY: triangulation_cache is not modified during the loops below,
+            // and these pointers remain valid because we don't mutate the cache.
+            let wv = unsafe { std::slice::from_raw_parts(wv_ptr, wv_len) };
+            let indices = unsafe { std::slice::from_raw_parts(idx_ptr, idx_len) };
+
+            let base_index = self.area_vertices.len() as u32;
+            let (scale_x, scale_y, offset_x, offset_y, min_x, max_y) = transform;
+
+            self.area_vertices.reserve(total_vertex_count);
+            self.area_vertices.extend((0..total_vertex_count).map(|i| {
+                let wx = wv[i * 2];
+                let wy = wv[i * 2 + 1];
+                let sx = ((wx - min_x) * scale_x + offset_x) as f32;
+                let sy = ((max_y - wy) * scale_y + offset_y) as f32;
+                Vertex2D::new(sx, sy, color)
+            }));
+
+            self.area_indices.reserve(idx_len);
+            self.area_indices
+                .extend(indices.iter().map(|&i| base_index + i as u32));
+
+            return;
+        }
+
+        // Cold path: first-time triangulation — fall back to ring-scan culling
         if !Self::is_ring_visible_static(&area.exterior, self.viewport_world_bounds) {
             return;
         }
 
-        // Ensure triangulation is cached, get cache key
-        let cache_key = match self.ensure_triangulated(area) {
-            Some(k) => k,
-            None => return,
-        };
-
-        // Split borrow: access cache and output buffers as separate fields
-        let cached = match self.triangulation_cache.get(&cache_key) {
-            Some(c) => c,
-            None => return,
-        };
-
-        let total_vertex_count = cached.world_vertices.len() / 2;
-
-        // Copy data we need to local variables to release the borrow on triangulation_cache
-        // We use raw slices to avoid cloning the Vecs
-        let wv_ptr = cached.world_vertices.as_ptr();
-        let wv_len = cached.world_vertices.len();
-        let idx_ptr = cached.indices.as_ptr();
-        let idx_len = cached.indices.len();
-        // SAFETY: triangulation_cache is not modified during the loops below,
-        // and these pointers remain valid because we don't mutate the cache.
-        let wv = unsafe { std::slice::from_raw_parts(wv_ptr, wv_len) };
-        let indices = unsafe { std::slice::from_raw_parts(idx_ptr, idx_len) };
-
-        let base_index = self.area_vertices.len() as u32;
-
-        // CPU-side world→screen transform (f64 precision, no GPU artifacts)
-        let (scale_x, scale_y, offset_x, offset_y, min_x, max_y) = transform;
-
-        // Screen-space bounds for triangle culling: skip triangles with any vertex
-        // beyond extreme range to prevent f32 precision artifacts in the GPU rasterizer.
-        // Must be large enough to cover nearby off-screen triangles (needed for complete fills)
-        // but small enough to reject extreme coordinates (±50000px at 50x zoom).
-        let extreme_guard = 16000.0_f32;
-        let bound_min_x = -extreme_guard;
-        let bound_min_y = -extreme_guard;
-        let bound_max_x = extreme_guard;
-        let bound_max_y = extreme_guard;
-
-        // Transform all vertices to screen space (store raw coordinates)
-        let vertex_start = self.area_vertices.len();
-        self.area_vertices.extend((0..total_vertex_count).map(|i| {
-            let wx = wv[i * 2];
-            let wy = wv[i * 2 + 1];
-            let sx = ((wx - min_x) * scale_x + offset_x) as f32;
-            let sy = ((max_y - wy) * scale_y + offset_y) as f32;
-            Vertex2D::new(sx, sy, color)
-        }));
-
-        // Add triangle indices, but SKIP triangles where any vertex is far off-screen.
-        // This prevents the GPU rasterizer from creating ray artifacts when interpolating
-        // across extremely large triangles (e.g. 50000px span at 50x zoom).
-        let verts = &self.area_vertices[vertex_start..];
-        for tri in indices.chunks(3) {
-            if tri.len() < 3 {
-                break;
-            }
-            let (i0, i1, i2) = (tri[0], tri[1], tri[2]);
-            let v0 = &verts[i0];
-            let v1 = &verts[i1];
-            let v2 = &verts[i2];
-            // Skip triangle if ANY vertex is far outside the viewport
-            let all_in_bounds = v0.position[0] >= bound_min_x
-                && v0.position[0] <= bound_max_x
-                && v0.position[1] >= bound_min_y
-                && v0.position[1] <= bound_max_y
-                && v1.position[0] >= bound_min_x
-                && v1.position[0] <= bound_max_x
-                && v1.position[1] >= bound_min_y
-                && v1.position[1] <= bound_max_y
-                && v2.position[0] >= bound_min_x
-                && v2.position[0] <= bound_max_x
-                && v2.position[1] >= bound_min_y
-                && v2.position[1] <= bound_max_y;
-            if all_in_bounds {
-                self.area_indices.push(base_index + i0 as u32);
-                self.area_indices.push(base_index + i1 as u32);
-                self.area_indices.push(base_index + i2 as u32);
-            }
+        // Ensure triangulation is cached
+        if self.ensure_triangulated(area).is_none() {
+            return;
         }
+
+        // Recurse once: now the cache is populated, fast path will handle it
+        self.add_area_cached(area, transform);
     }
 
     /// Fill an area polygon with a tiled pattern texture (S-100 standard).
@@ -1765,44 +1774,40 @@ impl WgpuRenderer {
         let inv_tx = 1.0 / pat_tex.width as f32;
         let inv_ty = 1.0 / pat_tex.height as f32;
 
-        // Triangulate the polygon (same approach as add_area_cached)
-        let screen_points: Vec<(f32, f32)> = area
-            .exterior
-            .iter()
-            .map(|p| {
-                let s = scaler.world_to_screen(*p);
-                (s.x, s.y)
-            })
-            .filter(|(x, y)| x.is_finite() && y.is_finite())
-            .collect();
-
-        if screen_points.len() < 3 {
+        // Triangulate the polygon — build earcut coords directly (no intermediate Vec)
+        let mut coords: Vec<f64> = Vec::with_capacity(
+            (area.exterior.len() + area.interiors.iter().map(|h| h.len()).sum::<usize>()) * 2,
+        );
+        let mut exterior_count = 0usize;
+        for p in &area.exterior {
+            let s = scaler.world_to_screen(*p);
+            if s.x.is_finite() && s.y.is_finite() {
+                coords.push(s.x as f64);
+                coords.push(s.y as f64);
+                exterior_count += 1;
+            }
+        }
+        if exterior_count < 3 {
             return;
         }
 
-        // Build earcut input
-        let mut coords: Vec<f64> = Vec::with_capacity(screen_points.len() * 2);
-        for &(x, y) in &screen_points {
-            coords.push(x as f64);
-            coords.push(y as f64);
-        }
-
-        let mut hole_indices: Vec<usize> = Vec::new();
+        let mut hole_indices: Vec<usize> = Vec::with_capacity(area.interiors.len());
         for hole in &area.interiors {
-            let hole_screen: Vec<(f32, f32)> = hole
-                .iter()
-                .map(|p| {
-                    let s = scaler.world_to_screen(*p);
-                    (s.x, s.y)
-                })
-                .filter(|(x, y)| x.is_finite() && y.is_finite())
-                .collect();
-            if hole_screen.len() >= 3 {
-                hole_indices.push(coords.len() / 2);
-                for &(x, y) in &hole_screen {
-                    coords.push(x as f64);
-                    coords.push(y as f64);
+            let hole_start = coords.len() / 2;
+            let mut hole_count = 0usize;
+            for p in hole {
+                let s = scaler.world_to_screen(*p);
+                if s.x.is_finite() && s.y.is_finite() {
+                    coords.push(s.x as f64);
+                    coords.push(s.y as f64);
+                    hole_count += 1;
                 }
+            }
+            if hole_count >= 3 {
+                hole_indices.push(hole_start);
+            } else {
+                // Remove invalid hole points
+                coords.truncate(hole_start * 2);
             }
         }
 
@@ -1914,22 +1919,12 @@ impl WgpuRenderer {
         }
 
         // Compute bounding box
-        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
-        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
-        for &(x, y) in &screen_ring {
-            if x < min_x {
-                min_x = x;
-            }
-            if y < min_y {
-                min_y = y;
-            }
-            if x > max_x {
-                max_x = x;
-            }
-            if y > max_y {
-                max_y = y;
-            }
-        }
+        let (min_x, min_y, max_x, max_y) = screen_ring.iter().fold(
+            (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
+            |(mn_x, mn_y, mx_x, mx_y), &(x, y)| {
+                (mn_x.min(x), mn_y.min(y), mx_x.max(x), mx_y.max(y))
+            },
+        );
 
         // Angle in radians (S-100: 0 = horizontal, CCW positive)
         let angle_rad = angle_deg.to_radians();
@@ -1962,6 +1957,15 @@ impl WgpuRenderer {
         // Diagonal length for extending lines across the entire bounding box
         let diag = ((max_x - min_x).powi(2) + (max_y - min_y).powi(2)).sqrt();
 
+        // Pre-compute viewport bounds for segment culling (hoisted out of loop)
+        let hatch_margin = line_width * 2.0 + 50.0;
+        let (vp_w, vp_h) = self.state.viewport_size();
+        let hatch_clip_min_x = -hatch_margin;
+        let hatch_clip_min_y = -hatch_margin;
+        let hatch_clip_max_x = vp_w + hatch_margin;
+        let hatch_clip_max_y = vp_h + hatch_margin;
+        let half_line_width = line_width * 0.5;
+
         // Generate hatch lines at regular spacing
         let mut d = proj_min;
         while d <= proj_max {
@@ -1978,31 +1982,27 @@ impl WgpuRenderer {
             // Clip this line segment to the polygon using intersection tests
             let segments = Self::clip_line_to_polygon(lx0, ly0, lx1, ly1, &screen_ring);
             for (sx, sy, ex, ey) in segments {
-                // Reject hatch segments where either endpoint is outside viewport + margin.
-                // Polygon can extend far off-screen at high zoom; clip_line_to_polygon
-                // produces segments within the polygon, but those can be far off-screen.
-                let hatch_margin = line_width * 2.0 + 50.0;
-                let (vp_w, vp_h) = self.state.viewport_size();
-                if sx < -hatch_margin
-                    || sx > vp_w + hatch_margin
-                    || sy < -hatch_margin
-                    || sy > vp_h + hatch_margin
-                    || ex < -hatch_margin
-                    || ex > vp_w + hatch_margin
-                    || ey < -hatch_margin
-                    || ey > vp_h + hatch_margin
+                // Reject hatch segments outside viewport + margin
+                if sx < hatch_clip_min_x
+                    || sx > hatch_clip_max_x
+                    || sy < hatch_clip_min_y
+                    || sy > hatch_clip_max_y
+                    || ex < hatch_clip_min_x
+                    || ex > hatch_clip_max_x
+                    || ey < hatch_clip_min_y
+                    || ey > hatch_clip_max_y
                 {
                     continue;
                 }
-                // Render as a line quad (same approach as add_line)
+                // Render as a line quad
                 let ldx = ex - sx;
                 let ldy = ey - sy;
                 let len = (ldx * ldx + ldy * ldy).sqrt();
                 if len < 0.001 {
                     continue;
                 }
-                let nx = -ldy / len * line_width * 0.5;
-                let ny = ldx / len * line_width * 0.5;
+                let nx = -ldy / len * half_line_width;
+                let ny = ldx / len * half_line_width;
 
                 let base_index = self.line_vertices.len() as u32;
                 self.line_vertices
@@ -2044,7 +2044,7 @@ impl WgpuRenderer {
         }
 
         // Find parametric t values where line intersects each polygon edge
-        let mut t_values: Vec<f32> = Vec::new();
+        let mut t_values: Vec<f32> = Vec::with_capacity(8);
         let n = ring.len();
         for i in 0..n {
             let j = (i + 1) % n;
@@ -2077,12 +2077,12 @@ impl WgpuRenderer {
             return Vec::new();
         }
 
-        t_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        t_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         // Remove near-duplicates
         t_values.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
 
         // Emit segments between consecutive intersection pairs that are inside
-        let mut segments = Vec::new();
+        let mut segments = Vec::with_capacity(t_values.len() / 2 + 1);
         let start_inside = point_in_ring(x0, y0, ring);
 
         let mut prev_t = 0.0_f32;
@@ -2290,6 +2290,25 @@ impl WgpuRenderer {
         let clip_x_max = vw + margin;
         let clip_y_max = vh + margin;
 
+        // Screen-space length limit for short polylines (≤10 points).
+        // Light sector/bearing/route lines are few-vertex features that become enormous
+        // "rays" at high zoom. If any single segment exceeds 25% of viewport height,
+        // skip the entire line. Dense polylines (coastlines, contours with many vertices)
+        // are unaffected since they represent real geometry.
+        if points.len() <= 10 {
+            let max_seg = vh.min(vw) * 0.25;
+            let max_seg_sq = max_seg * max_seg;
+            for i in 0..points.len() - 1 {
+                let s0 = scaler.world_to_screen(points[i]);
+                let s1 = scaler.world_to_screen(points[i + 1]);
+                let dx = s1.x - s0.x;
+                let dy = s1.y - s0.y;
+                if dx * dx + dy * dy > max_seg_sq {
+                    return;
+                }
+            }
+        }
+
         // Direct iteration: no Vec<ScreenPoint> allocation.
         // Transform consecutive world points to screen, clip, and emit quads inline.
         let mut prev = scaler.world_to_screen(points[0]);
@@ -2306,25 +2325,7 @@ impl WgpuRenderer {
                 continue;
             }
 
-            // Two-stage line culling:
-            // 1) Reject segments where EITHER endpoint is extremely far off-screen.
-            //    At high zoom, polyline vertices can be thousands of pixels apart.
-            //    Clipping these would create "ray" stubs from on-screen to viewport edge.
-            let far_limit = 16000.0_f32;
-            if prev.x < -far_limit
-                || prev.x > far_limit
-                || prev.y < -far_limit
-                || prev.y > far_limit
-                || curr.x < -far_limit
-                || curr.x > far_limit
-                || curr.y < -far_limit
-                || curr.y > far_limit
-            {
-                prev = curr;
-                continue;
-            }
-
-            // 2) Clip to viewport bounds for clean edges (both endpoints are now reasonable)
+            // Clip to viewport bounds for clean edges
             if let Some((cx0, cy0, cx1, cy1)) = Self::clip_line_segment(
                 prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
             ) {
@@ -2361,20 +2362,33 @@ impl WgpuRenderer {
     }
 
     /// Try to render point as SVG symbol, returns true if successful
+    /// Get or compute symbol classification flags for a SymbolId.
+    /// Cached permanently (symbol names never change).
+    #[inline]
+    fn get_symbol_flags(&mut self, symbol_id: SymbolId, symbol_str: &str) -> u8 {
+        if let Some(&flags) = self.symbol_class_cache.get(&symbol_id) {
+            return flags;
+        }
+        let flags = classify_symbol(symbol_str);
+        self.symbol_class_cache.insert(symbol_id, flags);
+        flags
+    }
+
     fn try_add_symbol(
         &mut self,
         point: &ferrite_render::PointInstruction,
         scaler: &ferrite_render::Scaler,
         symbol_cache: &mut SymbolCache,
         color_profile: &ColorProfile,
+        pre_interned_id: SymbolId,
     ) -> bool {
         let symbol_str = &point.symbol_ref;
         if symbol_str.is_empty() {
             return false;
         }
 
-        // Intern the symbol ID once for cache-efficient lookups (u32 instead of String)
-        let symbol_id = intern_symbol(symbol_str);
+        // Use pre-interned SymbolId (avoids redundant read-lock)
+        let symbol_id = pre_interned_id;
 
         // Get symbol geometry from cache (this will render via resvg if not cached)
         // Use reference to avoid cloning the pixel buffer
@@ -2445,21 +2459,11 @@ impl WgpuRenderer {
         // Cell sizes are computed as: screen_cell_size_px / scale_factor
         // This gives the same visual density as screen-space but is pan-stable.
 
-        // Classify symbol types (using original string for pattern matching)
-        let is_nav_aid = symbol_str.starts_with("LIGHTS")
-            || symbol_str.starts_with("BUOY")
-            || symbol_str.starts_with("BCN")
-            || symbol_str.starts_with("TOPMAR");
-
-        let is_safety_hazard = symbol_str == "ISODGR01"
-            || symbol_str == "DANGER02"
-            || symbol_str == "DANGER01"
-            || symbol_str == "DANGER03"
-            || symbol_str.starts_with("WRECKS")
-            || symbol_str.starts_with("OBSTRN")
-            || symbol_str.starts_with("UWTROC")
-            || symbol_str.starts_with("FOULAR");
-        let is_sounding = symbol_str.starts_with("SOUND");
+        // Classify symbol types via cached bitflags (O(1) lookup vs repeated starts_with)
+        let flags = self.get_symbol_flags(symbol_id, symbol_str);
+        let is_nav_aid = flags & SYM_NAV_AID != 0;
+        let is_safety_hazard = flags & SYM_SAFETY != 0;
+        let is_sounding = flags & SYM_SOUNDING != 0;
 
         // Compute world-space cell sizes from screen-space pixel sizes
         let scale_x = scaler.scale_x().abs();
@@ -2597,16 +2601,27 @@ impl WgpuRenderer {
     /// Render the frame
     pub fn render(&mut self) -> Result<()> {
         let profiling = crate::profiler::is_profiling_enabled();
+
+        // get_current_texture includes VSync wait — measure separately
+        let get_tex_timer = if profiling {
+            Some(ScopeTimer::new("get_texture"))
+        } else {
+            None
+        };
+        let output = self.state.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        if let Some(t) = get_tex_timer {
+            self.cpu_profiler.record("get_texture", t.elapsed());
+        }
+
+        // render_total starts AFTER VSync wait for accurate CPU render cost
         let render_timer = if profiling {
             Some(ScopeTimer::new("render_total"))
         } else {
             None
         };
-
-        let output = self.state.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let egui_timer = if profiling {
             Some(ScopeTimer::new("render_egui"))
@@ -2933,6 +2948,11 @@ impl WgpuRenderer {
             pixels_per_point: self.state.window.scale_factor() as f32,
         };
 
+        let egui_render_timer = if profiling {
+            Some(ScopeTimer::new("egui_gpu_render"))
+        } else {
+            None
+        };
         self.egui.render(
             &self.state.device,
             &self.state.queue,
@@ -2941,6 +2961,9 @@ impl WgpuRenderer {
             screen_descriptor,
             egui_output,
         );
+        if let Some(t) = egui_render_timer {
+            self.cpu_profiler.record("egui_gpu_render", t.elapsed());
+        }
 
         // GPU profiler: resolve queries before submit
         if self.gpu_profiler.is_enabled() {
@@ -2963,7 +2986,15 @@ impl WgpuRenderer {
             self.gpu_profiler.process_and_log(&self.state.queue);
         }
 
+        let present_timer = if profiling {
+            Some(ScopeTimer::new("present"))
+        } else {
+            None
+        };
         output.present();
+        if let Some(t) = present_timer {
+            self.cpu_profiler.record("present", t.elapsed());
+        }
 
         if let Some(t) = render_timer {
             self.cpu_profiler.record("render_total", t.elapsed());
@@ -2989,24 +3020,30 @@ impl WgpuRenderer {
         // Use the same format as the surface for pipeline compatibility
         let screenshot_format = self.state.format();
 
-        // Create MSAA texture for rendering (pipelines are configured for MSAA)
-        let msaa_texture = self.state.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("screenshot_msaa_texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: MSAA_SAMPLE_COUNT,
-            dimension: wgpu::TextureDimension::D2,
-            format: screenshot_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Create MSAA texture for rendering (only if MSAA is enabled)
+        let msaa_texture = if MSAA_SAMPLE_COUNT > 1 {
+            Some(self.state.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("screenshot_msaa_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: MSAA_SAMPLE_COUNT,
+                dimension: wgpu::TextureDimension::D2,
+                format: screenshot_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            }))
+        } else {
+            None
+        };
+        let msaa_view = msaa_texture
+            .as_ref()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
 
-        // Create resolve texture (non-MSAA, COPY_SRC for screenshot)
+        // Create resolve/output texture (non-MSAA, COPY_SRC for screenshot)
         let resolve_texture = self.state.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot_resolve_texture"),
             size: wgpu::Extent3d {
@@ -3106,14 +3143,19 @@ impl WgpuRenderer {
             None
         };
 
-        // Render to MSAA texture, resolve to screenshot texture
+        // Render to MSAA texture (resolve to output) or directly to output texture
         {
             let bg = self.background_color.to_array();
+            let (target_view, resolve_target) = if let Some(ref mv) = msaa_view {
+                (mv, Some(&resolve_view))
+            } else {
+                (&resolve_view, None)
+            };
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("screenshot_render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &msaa_view,
-                    resolve_target: Some(&resolve_view),
+                    view: target_view,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: bg[0] as f64,
