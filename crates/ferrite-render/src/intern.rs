@@ -66,6 +66,15 @@ impl SymbolInterner {
         id
     }
 
+    /// Read-only lookup: returns None if not yet interned
+    #[inline]
+    pub fn lookup(&self, s: &str) -> Option<SymbolId> {
+        if s.is_empty() {
+            return Some(SymbolId::NONE);
+        }
+        self.str_to_id.get(s).copied()
+    }
+
     /// Get string for an ID
     #[inline]
     pub fn resolve(&self, id: SymbolId) -> &str {
@@ -100,9 +109,20 @@ fn global_interner() -> &'static RwLock<SymbolInterner> {
     GLOBAL_INTERNER.get_or_init(|| RwLock::new(SymbolInterner::new()))
 }
 
-/// Intern a symbol string globally
+/// Intern a symbol string globally.
+/// Fast path: read lock for already-interned strings (vast majority of calls).
+/// Slow path: write lock only for first-time interning.
 #[inline]
 pub fn intern_symbol(s: &str) -> SymbolId {
+    // Fast path: read lock (shared, no contention)
+    if let Some(id) = global_interner()
+        .read()
+        .expect("interner read lock")
+        .lookup(s)
+    {
+        return id;
+    }
+    // Slow path: write lock (only for new strings)
     global_interner()
         .write()
         .expect("interner write lock")
