@@ -21,6 +21,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 /// Show a native Windows error dialog (release mode only, no-op on other platforms)
 #[cfg(all(windows, not(debug_assertions)))]
@@ -69,6 +70,104 @@ use ferrite_s100_core::{S101Cell, SpatialPrimitiveType};
 use ferrite_wgpu::{
     CatalogueStatus, DisplayMode, SelectedFeature, SettingsState, SymbolCache, WgpuRenderer,
 };
+
+/// Embedded Natural Earth 110m coastline GeoJSON (~140KB)
+/// Source: https://www.naturalearthdata.com/ (Public Domain)
+const WORLD_MAP_GEOJSON: &str = include_str!("../assets/ne_110m_coastline.geojson");
+
+/// Parse Natural Earth GeoJSON coastlines into line segments.
+/// Returns Vec of line strings, each being a list of [longitude, latitude] pairs.
+fn parse_world_map_coastlines() -> Vec<Vec<[f64; 2]>> {
+    let parsed: serde_json::Value = match serde_json::from_str(WORLD_MAP_GEOJSON) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to parse world map GeoJSON: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut coastlines = Vec::new();
+
+    if let Some(features) = parsed.get("features").and_then(|f| f.as_array()) {
+        for feature in features {
+            let geometry = match feature.get("geometry") {
+                Some(g) => g,
+                None => continue,
+            };
+            let geo_type = geometry.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let coords = match geometry.get("coordinates") {
+                Some(c) => c,
+                None => continue,
+            };
+
+            match geo_type {
+                "LineString" => {
+                    if let Some(line) = parse_coord_array(coords) {
+                        if line.len() >= 2 {
+                            coastlines.push(line);
+                        }
+                    }
+                }
+                "MultiLineString" => {
+                    if let Some(lines) = coords.as_array() {
+                        for line_coords in lines {
+                            if let Some(line) = parse_coord_array(line_coords) {
+                                if line.len() >= 2 {
+                                    coastlines.push(line);
+                                }
+                            }
+                        }
+                    }
+                }
+                "Polygon" => {
+                    // Extract exterior ring as a line
+                    if let Some(rings) = coords.as_array() {
+                        if let Some(exterior) = rings.first() {
+                            if let Some(line) = parse_coord_array(exterior) {
+                                if line.len() >= 2 {
+                                    coastlines.push(line);
+                                }
+                            }
+                        }
+                    }
+                }
+                "MultiPolygon" => {
+                    if let Some(polygons) = coords.as_array() {
+                        for polygon in polygons {
+                            if let Some(rings) = polygon.as_array() {
+                                if let Some(exterior) = rings.first() {
+                                    if let Some(line) = parse_coord_array(exterior) {
+                                        if line.len() >= 2 {
+                                            coastlines.push(line);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    coastlines
+}
+
+/// Parse a GeoJSON coordinate array [[lon, lat], ...] into Vec<[f64; 2]>
+fn parse_coord_array(value: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
+    let arr = value.as_array()?;
+    let mut points = Vec::with_capacity(arr.len());
+    for coord in arr {
+        let pair = coord.as_array()?;
+        if pair.len() >= 2 {
+            let lon = pair[0].as_f64()?;
+            let lat = pair[1].as_f64()?;
+            points.push([lon, lat]);
+        }
+    }
+    Some(points)
+}
 
 /// Get the application base directory.
 /// Prefers the executable's directory if it contains Catalogues/,
@@ -302,6 +401,10 @@ struct ChartApp {
     zoom_target: f64,
     /// Whether zoom animation is active
     zoom_animating: bool,
+    /// Anchor world point: the world position under cursor at zoom start.
+    /// Used for drift-free zoom by directly computing pan_offset each frame
+    /// instead of accumulating floating-point deltas.
+    zoom_anchor_world: (f64, f64),
 }
 
 impl ChartApp {
@@ -438,6 +541,7 @@ impl ChartApp {
             pan_rebuild_time: std::time::Instant::now(),
             zoom_target: 1.0,
             zoom_animating: false,
+            zoom_anchor_world: (0.0, 0.0),
         }
     }
 
@@ -825,6 +929,51 @@ impl ChartApp {
                     .min()
                     .unwrap_or(22000);
                 renderer.set_compilation_scale(min_scale);
+
+                // Compute per-cell bounding boxes for world map masking
+                let mut chart_boxes = Vec::with_capacity(self.cells.len());
+                for cell in &self.cells {
+                    let mut cmin_x = f64::MAX;
+                    let mut cmin_y = f64::MAX;
+                    let mut cmax_x = f64::MIN;
+                    let mut cmax_y = f64::MIN;
+                    for point in cell.points.values() {
+                        let x = point.position.x;
+                        let y = point.position.y;
+                        if x < cmin_x {
+                            cmin_x = x;
+                        }
+                        if y < cmin_y {
+                            cmin_y = y;
+                        }
+                        if x > cmax_x {
+                            cmax_x = x;
+                        }
+                        if y > cmax_y {
+                            cmax_y = y;
+                        }
+                    }
+                    for curve in cell.curves.values() {
+                        for pos in curve.all_positions() {
+                            if pos.x < cmin_x {
+                                cmin_x = pos.x;
+                            }
+                            if pos.y < cmin_y {
+                                cmin_y = pos.y;
+                            }
+                            if pos.x > cmax_x {
+                                cmax_x = pos.x;
+                            }
+                            if pos.y > cmax_y {
+                                cmax_y = pos.y;
+                            }
+                        }
+                    }
+                    if cmin_x < cmax_x && cmin_y < cmax_y {
+                        chart_boxes.push((cmin_x, cmin_y, cmax_x, cmax_y));
+                    }
+                }
+                renderer.set_world_map_chart_boxes(chart_boxes);
             }
         }
 
@@ -1010,6 +1159,8 @@ impl ChartApp {
 
             // Clear renderer frame
             renderer.begin_frame();
+            renderer.set_lon_wrap_pixels(360.0 * self.render_context.scaler.scale_x() as f32);
+            renderer.add_world_map_lines(&self.render_context.scaler);
         }
 
         info!("All charts cleared");
@@ -1060,6 +1211,60 @@ impl ChartApp {
         true
     }
 
+    /// Cache file format:
+    /// `[4B magic "FRC\x01"][4B schema version][32B SHA-256 hash][payload]`
+    ///
+    /// The schema version is incremented whenever `DrawingInstruction` struct
+    /// layout changes, ensuring stale caches are rejected instead of producing
+    /// corrupted rendering data.
+    const CACHE_MAGIC: &'static [u8; 4] = b"FRC\x01";
+    /// Bump this version whenever DrawingInstruction fields change.
+    const CACHE_SCHEMA_VERSION: u32 = 2;
+
+    /// Wrap a bincode payload with magic + schema version + SHA-256 integrity hash.
+    fn sign_cache(payload: &[u8]) -> Vec<u8> {
+        let hash = Sha256::digest(payload);
+        let mut out = Vec::with_capacity(4 + 4 + 32 + payload.len());
+        out.extend_from_slice(Self::CACHE_MAGIC);
+        out.extend_from_slice(&Self::CACHE_SCHEMA_VERSION.to_le_bytes());
+        out.extend_from_slice(&hash);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Verify integrity and deserialize a cache file.
+    /// Returns Err if magic/version mismatch or SHA-256 hash doesn't match.
+    fn verify_and_deserialize_cache(
+        data: &[u8],
+    ) -> std::result::Result<Vec<ferrite_render::DrawingInstruction>, String> {
+        const HEADER_LEN: usize = 4 + 4 + 32; // magic + version + hash
+        if data.len() < HEADER_LEN {
+            return Err("cache file too small".into());
+        }
+        // Check magic
+        if &data[..4] != Self::CACHE_MAGIC {
+            return Err("invalid cache magic (legacy or corrupted file)".into());
+        }
+        // Check schema version
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != Self::CACHE_SCHEMA_VERSION {
+            return Err(format!(
+                "schema version mismatch: file={}, expected={}",
+                version,
+                Self::CACHE_SCHEMA_VERSION
+            ));
+        }
+        // Verify SHA-256 hash
+        let stored_hash = &data[8..40];
+        let payload = &data[HEADER_LEN..];
+        let computed_hash = Sha256::digest(payload);
+        if computed_hash.as_slice() != stored_hash {
+            return Err("SHA-256 integrity check failed (file tampered or corrupted)".into());
+        }
+        // Deserialize
+        bincode::deserialize(payload).map_err(|e| format!("deserialization failed: {}", e))
+    }
+
     fn regenerate_instructions(&mut self) -> Result<()> {
         if self.cells.is_empty() {
             return Ok(());
@@ -1085,27 +1290,24 @@ impl ChartApp {
             if self.is_cache_valid(cp) {
                 let cache_start = std::time::Instant::now();
                 match fs::read(cp) {
-                    Ok(data) => {
-                        match bincode::deserialize::<Vec<ferrite_render::DrawingInstruction>>(&data)
-                        {
-                            Ok(instructions) => {
-                                let count = instructions.len();
-                                self.render_context
-                                    .set_instructions_from_cache(instructions);
-                                cache_loaded = true;
-                                info!(
-                                    "Loaded {} instructions from cache in {:.1}ms: {}",
-                                    count,
-                                    cache_start.elapsed().as_secs_f64() * 1000.0,
-                                    cp.display()
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Cache deserialization failed: {}. Regenerating.", e);
-                                let _ = fs::remove_file(cp);
-                            }
+                    Ok(data) => match Self::verify_and_deserialize_cache(&data) {
+                        Ok(instructions) => {
+                            let count = instructions.len();
+                            self.render_context
+                                .set_instructions_from_cache(instructions);
+                            cache_loaded = true;
+                            info!(
+                                "Loaded {} instructions from cache in {:.1}ms: {}",
+                                count,
+                                cache_start.elapsed().as_secs_f64() * 1000.0,
+                                cp.display()
+                            );
                         }
-                    }
+                        Err(e) => {
+                            warn!("Cache rejected: {}. Regenerating.", e);
+                            let _ = fs::remove_file(cp);
+                        }
+                    },
                     Err(e) => {
                         warn!("Cache read failed: {}. Regenerating.", e);
                     }
@@ -1144,9 +1346,10 @@ impl ChartApp {
                 let cache_start = std::time::Instant::now();
                 let instructions = self.render_context.raw_instructions();
                 match bincode::serialize(instructions) {
-                    Ok(data) => {
-                        let size_kb = data.len() / 1024;
-                        match fs::write(cp, &data) {
+                    Ok(payload) => {
+                        let signed = Self::sign_cache(&payload);
+                        let size_kb = signed.len() / 1024;
+                        match fs::write(cp, &signed) {
                             Ok(_) => {
                                 info!(
                                     "Saved instruction cache ({}KB) in {:.1}ms: {}",
@@ -1182,6 +1385,8 @@ impl ChartApp {
             self.render_context.zoom_to_fit(self.bounds);
 
             renderer.begin_frame();
+            renderer.set_lon_wrap_pixels(360.0 * self.render_context.scaler.scale_x() as f32);
+            renderer.add_world_map_lines(&self.render_context.scaler);
             renderer.add_instructions_with_symbols(
                 &mut self.render_context,
                 Some(&mut self.symbol_cache),
@@ -1311,9 +1516,13 @@ impl ChartApp {
         }
 
         // Calculate the zoomed and panned bounds
+        // Wrap horizontal pan offset modulo 360° so the viewport always stays near
+        // the chart data. Combined with ±360° rendering copies, this enables
+        // seamless infinite horizontal panning (Earth is round).
         let base_width = self.bounds.max_x - self.bounds.min_x;
         let base_height = self.bounds.max_y - self.bounds.min_y;
-        let center_x = (self.bounds.min_x + self.bounds.max_x) / 2.0 + self.pan_offset.0;
+        let wrapped_pan_x = self.pan_offset.0 - (self.pan_offset.0 / 360.0).round() * 360.0;
+        let center_x = (self.bounds.min_x + self.bounds.max_x) / 2.0 + wrapped_pan_x;
         let center_y = (self.bounds.min_y + self.bounds.max_y) / 2.0 + self.pan_offset.1;
 
         let zoomed_width = base_width / self.zoom_level;
@@ -1343,6 +1552,10 @@ impl ChartApp {
             renderer.ui_state.zoom_level = self.zoom_level;
             // During animation, preserve declutter state to avoid flickering
             renderer.begin_frame_ex(preserve_declutter);
+
+            // Draw world map coastlines as the lowest layer (before chart data)
+            renderer.set_lon_wrap_pixels(360.0 * self.render_context.scaler.scale_x() as f32);
+            renderer.add_world_map_lines(&self.render_context.scaler);
 
             // Remove old plugin instructions (keep only chart instructions)
             self.render_context
@@ -1411,7 +1624,8 @@ impl ChartApp {
         }
         let base_width = self.bounds.max_x - self.bounds.min_x;
         let base_height = self.bounds.max_y - self.bounds.min_y;
-        let center_x = (self.bounds.min_x + self.bounds.max_x) / 2.0 + self.pan_offset.0;
+        let wrapped_pan_x = self.pan_offset.0 - (self.pan_offset.0 / 360.0).round() * 360.0;
+        let center_x = (self.bounds.min_x + self.bounds.max_x) / 2.0 + wrapped_pan_x;
         let center_y = (self.bounds.min_y + self.bounds.max_y) / 2.0 + self.pan_offset.1;
         let zoomed_width = base_width / self.zoom_level;
         let zoomed_height = base_height / self.zoom_level;
@@ -1476,6 +1690,10 @@ impl ApplicationHandler for ChartApp {
                                 let visible_vgs = self.get_visible_viewing_groups();
                                 self.render_context.zoom_to_fit(self.bounds);
                                 renderer.begin_frame();
+                                renderer.set_lon_wrap_pixels(
+                                    360.0 * self.render_context.scaler.scale_x() as f32,
+                                );
+                                renderer.add_world_map_lines(&self.render_context.scaler);
                                 renderer.add_instructions_with_symbols(
                                     &mut self.render_context,
                                     Some(&mut self.symbol_cache),
@@ -1484,6 +1702,10 @@ impl ApplicationHandler for ChartApp {
                                 );
                                 self.build_rendered_symbols();
                             }
+
+                            // Load Natural Earth world map for background rendering
+                            let coastlines = parse_world_map_coastlines();
+                            renderer.set_world_map(coastlines);
 
                             let stats = renderer.statistics();
                             info!(
@@ -1644,7 +1866,7 @@ impl ApplicationHandler for ChartApp {
                         let log_current = self.zoom_level.ln();
                         let log_target = self.zoom_target.ln();
                         self.zoom_level = (log_current + (log_target - log_current) * t).exp();
-                        self.zoom_level = self.zoom_level.clamp(0.1, 50.0);
+                        self.zoom_level = self.zoom_level.clamp(0.005, 100.0);
                     }
 
                     // Apply GPU fast-path zoom
@@ -1655,13 +1877,18 @@ impl ApplicationHandler for ChartApp {
                         renderer.ui_state.zoom_level = self.zoom_level;
                     }
 
-                    // Track world-space pan offset to keep cursor point stable
-                    let screen_pt = ferrite_render::ScreenPoint::new(cursor_sx, cursor_sy);
-                    let world_before = self.render_context.scaler.screen_to_world(screen_pt);
+                    // Drift-free zoom: directly compute pan_offset from anchor
+                    // Step 1: Temporarily zero pan_offset to get the "unshifted" view
+                    self.pan_offset = (0.0, 0.0);
                     self.recalculate_view_bounds();
-                    let world_after = self.render_context.scaler.screen_to_world(screen_pt);
-                    self.pan_offset.0 += world_before.x - world_after.x;
-                    self.pan_offset.1 += world_before.y - world_after.y;
+                    // Step 2: Find where cursor maps to world in the unshifted view
+                    let screen_pt = ferrite_render::ScreenPoint::new(cursor_sx, cursor_sy);
+                    let unshifted_world = self.render_context.scaler.screen_to_world(screen_pt);
+                    // Step 3: Set pan_offset so anchor stays under cursor
+                    self.pan_offset.0 = self.zoom_anchor_world.0 - unshifted_world.x;
+                    self.pan_offset.1 = self.zoom_anchor_world.1 - unshifted_world.y;
+                    // Step 4: Re-apply bounds with correct offset
+                    self.recalculate_view_bounds();
 
                     // Keep debounce timer fresh while animating
                     if self.zoom_animating {
@@ -2181,13 +2408,19 @@ impl ApplicationHandler for ChartApp {
                 if !self.zoom_animating {
                     self.zoom_target = self.zoom_level;
                 }
-                self.zoom_target = (self.zoom_target * zoom_factor).clamp(0.1, 50.0);
+                self.zoom_target = (self.zoom_target * zoom_factor).clamp(0.005, 100.0);
                 self.zoom_animating = true;
 
-                // Record cursor as zoom pivot
+                // Record cursor as zoom pivot + anchor world point
                 let cursor_sx = self.mouse_pos.0 as f32;
                 let cursor_sy = self.mouse_pos.1 as f32;
                 self.zoom_cursor_screen = (cursor_sx, cursor_sy);
+                // Capture the world point under cursor — used for drift-free zoom
+                let anchor = self
+                    .render_context
+                    .scaler
+                    .screen_to_world(ferrite_render::ScreenPoint::new(cursor_sx, cursor_sy));
+                self.zoom_anchor_world = (anchor.x, anchor.y);
 
                 // Mark rebuild pending — will execute when animation stops
                 self.zoom_last_scroll = std::time::Instant::now();

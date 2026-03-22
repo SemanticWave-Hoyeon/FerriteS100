@@ -42,6 +42,17 @@ impl PluginVerifier {
         }
     }
 
+    /// Create a verifier that rejects ALL plugins unconditionally.
+    /// Use this in production when no signing key is configured —
+    /// prevents loading unsigned/untrusted code.
+    pub fn reject_all() -> Self {
+        warn!("Plugin verifier in reject-all mode — no plugins will load");
+        Self {
+            public_key: None,
+            require_signature: true, // require_signature=true + no key = always reject
+        }
+    }
+
     /// Verify plugin DLL signature
     ///
     /// 1. Compute SHA-256 hash of DLL
