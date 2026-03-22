@@ -230,14 +230,14 @@ struct TextLabel {
 
 /// Grid-based text collision avoidance (S-100 Part 9: overplot removal)
 struct TextCollisionGrid {
-    occupied: std::collections::HashSet<(i32, i32)>,
+    occupied: FxHashSet<(i32, i32)>,
     cell_size: f32,
 }
 
 impl TextCollisionGrid {
     fn new(cell_size: f32) -> Self {
         Self {
-            occupied: std::collections::HashSet::with_capacity(2000),
+            occupied: FxHashSet::with_capacity_and_hasher(2000, Default::default()),
             cell_size: cell_size.max(1.0),
         }
     }
@@ -399,6 +399,35 @@ pub struct WgpuRenderer {
     pub cpu_profiler: CpuProfiler,
     /// GPU-side profiler (wgpu-profiler)
     gpu_profiler: GpuProfilerWrapper,
+    // === BACKGROUND WORLD MAP (Natural Earth) ===
+    /// Pre-parsed coastline segments from Natural Earth 110m GeoJSON
+    /// Each inner Vec is a line string: list of [longitude, latitude] pairs
+    world_map_coastlines: Vec<Vec<[f64; 2]>>,
+    /// Bounding boxes of loaded chart cells (world coords).
+    /// Used to draw opaque background rectangles that mask world map under charts.
+    world_map_chart_boxes: Vec<(f64, f64, f64, f64)>,
+    /// World map line vertices (separate from chart line_vertices)
+    world_map_line_vertices: Vec<Vertex2D>,
+    world_map_line_indices: Vec<u32>,
+    /// Opaque background rectangles over chart bboxes (mask world map under charts)
+    world_map_mask_vertices: Vec<Vertex2D>,
+    world_map_mask_indices: Vec<u32>,
+    /// Cached GPU buffers for world map
+    cached_wm_line_vb: Option<wgpu::Buffer>,
+    cached_wm_line_ib: Option<wgpu::Buffer>,
+    cached_wm_mask_vb: Option<wgpu::Buffer>,
+    cached_wm_mask_ib: Option<wgpu::Buffer>,
+    // === LONGITUDE WRAPPING (infinite horizontal panning) ===
+    /// Screen pixels corresponding to 360° of longitude (0 = wrapping disabled)
+    lon_wrap_screen_px: f32,
+    /// View uniform buffer for left (-360°) wrapping copy
+    view_buffer_left: wgpu::Buffer,
+    /// View uniform buffer for right (+360°) wrapping copy
+    view_buffer_right: wgpu::Buffer,
+    /// Bind group for left wrapping view
+    view_bind_group_left: wgpu::BindGroup,
+    /// Bind group for right wrapping view
+    view_bind_group_right: wgpu::BindGroup,
 }
 
 impl WgpuRenderer {
@@ -412,6 +441,14 @@ impl WgpuRenderer {
         let uniforms = ViewUniforms::new(width, height, 1.0);
         let view_buffer = state.create_uniform_buffer(&uniforms, "view_uniforms");
         let view_bind_group = pipelines.create_view_bind_group(&state.device, &view_buffer);
+
+        // Create wrapping view buffers for ±360° longitude copies
+        let view_buffer_left = state.create_uniform_buffer(&uniforms, "view_uniforms_left");
+        let view_bind_group_left =
+            pipelines.create_view_bind_group(&state.device, &view_buffer_left);
+        let view_buffer_right = state.create_uniform_buffer(&uniforms, "view_uniforms_right");
+        let view_bind_group_right =
+            pipelines.create_view_bind_group(&state.device, &view_buffer_right);
 
         // Create egui integration (render without MSAA for crisp text)
         let egui = EguiIntegration::new(
@@ -488,6 +525,23 @@ impl WgpuRenderer {
             // Profiling
             cpu_profiler: CpuProfiler::new(),
             gpu_profiler,
+            // Background world map (empty until set_world_map is called)
+            world_map_coastlines: Vec::new(),
+            world_map_chart_boxes: Vec::new(),
+            world_map_line_vertices: Vec::with_capacity(2000),
+            world_map_line_indices: Vec::with_capacity(6000),
+            world_map_mask_vertices: Vec::new(),
+            world_map_mask_indices: Vec::new(),
+            cached_wm_line_vb: None,
+            cached_wm_line_ib: None,
+            cached_wm_mask_vb: None,
+            cached_wm_mask_ib: None,
+            // Longitude wrapping
+            lon_wrap_screen_px: 0.0,
+            view_buffer_left,
+            view_buffer_right,
+            view_bind_group_left,
+            view_bind_group_right,
         })
     }
 
@@ -890,6 +944,35 @@ impl WgpuRenderer {
         );
         self.state
             .update_view_uniforms(&self.view_buffer, &uniforms);
+
+        // Update wrapping view uniforms for ±360° longitude copies
+        if self.lon_wrap_screen_px > 0.0 {
+            let left = ViewUniforms::with_pan_zoom(
+                width,
+                height,
+                1.0,
+                self.screen_pan_offset.0 - self.lon_wrap_screen_px,
+                self.screen_pan_offset.1,
+                self.screen_zoom_scale,
+                self.screen_zoom_pivot.0,
+                self.screen_zoom_pivot.1,
+            );
+            self.state
+                .update_view_uniforms(&self.view_buffer_left, &left);
+
+            let right = ViewUniforms::with_pan_zoom(
+                width,
+                height,
+                1.0,
+                self.screen_pan_offset.0 + self.lon_wrap_screen_px,
+                self.screen_pan_offset.1,
+                self.screen_zoom_scale,
+                self.screen_zoom_pivot.0,
+                self.screen_zoom_pivot.1,
+            );
+            self.state
+                .update_view_uniforms(&self.view_buffer_right, &right);
+        }
     }
 
     /// Set screen-space pan offset for fast panning during drag.
@@ -988,6 +1071,11 @@ impl WgpuRenderer {
         self.pattern_ranges.clear();
         self.text_labels.clear();
         self.text_collision_grid.clear();
+        // World map separate buffers
+        self.world_map_line_vertices.clear();
+        self.world_map_line_indices.clear();
+        self.world_map_mask_vertices.clear();
+        self.world_map_mask_indices.clear();
 
         // During animation (preserve_declutter=true), skip screen-space declutter
         // to prevent symbols from disappearing due to changed screen coordinates
@@ -1038,6 +1126,191 @@ impl WgpuRenderer {
     #[inline]
     pub fn viewing_scale(&self) -> u32 {
         ((self.compilation_scale as f64) / self.zoom_level.max(0.01)) as u32
+    }
+
+    /// Set Natural Earth world map coastlines for background rendering.
+    /// Each inner Vec is a line string: list of [longitude, latitude] pairs.
+    pub fn set_world_map(&mut self, coastlines: Vec<Vec<[f64; 2]>>) {
+        tracing::info!("World map loaded: {} coastline segments", coastlines.len());
+        self.world_map_coastlines = coastlines;
+    }
+
+    /// Set chart coverage bounding boxes so world map is masked
+    /// where chart data exists (opaque background rectangles).
+    pub fn set_world_map_chart_boxes(&mut self, boxes: Vec<(f64, f64, f64, f64)>) {
+        self.world_map_chart_boxes = boxes;
+    }
+
+    /// Set the screen pixel width of 360° longitude for wrapping.
+    /// Call this after scaler is configured: `renderer.set_lon_wrap_pixels(360.0 * scaler.scale_x as f32)`
+    pub fn set_lon_wrap_pixels(&mut self, px: f32) {
+        self.lon_wrap_screen_px = px;
+        // Update left/right view uniform buffers immediately so wrapping draws
+        // use the correct offset from the very first frame after chart load.
+        self.update_view_uniforms();
+    }
+
+    /// Add world map coastline lines and chart-coverage mask rectangles.
+    /// Uses separate buffers (not chart line_vertices) so they render
+    /// independently in the correct draw order:
+    ///   1. World map coastlines (lowest layer)
+    ///   2. Opaque background rectangles over chart bboxes (mask coastlines)
+    ///   3. Chart data on top (priority-based rendering)
+    ///
+    /// Renders at lon offsets -360°, 0°, +360° for seamless wrapping.
+    pub fn add_world_map_lines(&mut self, scaler: &ferrite_render::Scaler) {
+        if self.world_map_coastlines.is_empty() {
+            return;
+        }
+
+        // Subtle gray color for background coastlines
+        let color: [f32; 4] = [0.65, 0.65, 0.65, 1.0];
+        let width: f32 = 1.0;
+
+        let vw = scaler.viewport.width;
+        let vh = scaler.viewport.height;
+        let margin: f32 = 100.0;
+        let clip_x_min = -margin;
+        let clip_y_min = -margin;
+        let clip_x_max = vw + margin;
+        let clip_y_max = vh + margin;
+
+        // Render at 3 longitude offsets for seamless wrapping
+        let lon_offsets: [f64; 3] = [-360.0, 0.0, 360.0];
+
+        for &lon_offset in &lon_offsets {
+            for coastline in &self.world_map_coastlines {
+                if coastline.len() < 2 {
+                    continue;
+                }
+
+                // Quick AABB frustum cull per coastline (shifted by lon_offset)
+                let mut ax = f64::MAX;
+                let mut ay = f64::MAX;
+                let mut bx = f64::MIN;
+                let mut by = f64::MIN;
+                for pt in coastline.iter() {
+                    let lon = pt[0] + lon_offset;
+                    if lon < ax {
+                        ax = lon;
+                    }
+                    if pt[1] < ay {
+                        ay = pt[1];
+                    }
+                    if lon > bx {
+                        bx = lon;
+                    }
+                    if pt[1] > by {
+                        by = pt[1];
+                    }
+                }
+                if !self.is_aabb_visible(ax, ay, bx, by) {
+                    continue;
+                }
+
+                let first_lon = coastline[0][0] + lon_offset;
+                let mut prev = scaler.world_to_screen(WorldPoint::new(first_lon, coastline[0][1]));
+
+                for pt in &coastline[1..] {
+                    let cur_lon = pt[0] + lon_offset;
+                    let cur_lat = pt[1];
+                    let curr = scaler.world_to_screen(WorldPoint::new(cur_lon, cur_lat));
+
+                    if !prev.x.is_finite()
+                        || !prev.y.is_finite()
+                        || !curr.x.is_finite()
+                        || !curr.y.is_finite()
+                    {
+                        prev = curr;
+                        continue;
+                    }
+
+                    if let Some((cx0, cy0, cx1, cy1)) = Self::clip_line_segment(
+                        prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max,
+                        clip_y_max,
+                    ) {
+                        let dx = cx1 - cx0;
+                        let dy = cy1 - cy0;
+                        let len = (dx * dx + dy * dy).sqrt();
+
+                        if len >= 0.5 {
+                            let nx = -dy / len * width * 0.5;
+                            let ny = dx / len * width * 0.5;
+
+                            let base_index = self.world_map_line_vertices.len() as u32;
+
+                            self.world_map_line_vertices.push(Vertex2D::new(
+                                cx0 - nx,
+                                cy0 - ny,
+                                color,
+                            ));
+                            self.world_map_line_vertices.push(Vertex2D::new(
+                                cx0 + nx,
+                                cy0 + ny,
+                                color,
+                            ));
+                            self.world_map_line_vertices.push(Vertex2D::new(
+                                cx1 + nx,
+                                cy1 + ny,
+                                color,
+                            ));
+                            self.world_map_line_vertices.push(Vertex2D::new(
+                                cx1 - nx,
+                                cy1 - ny,
+                                color,
+                            ));
+
+                            self.world_map_line_indices.push(base_index);
+                            self.world_map_line_indices.push(base_index + 1);
+                            self.world_map_line_indices.push(base_index + 2);
+                            self.world_map_line_indices.push(base_index);
+                            self.world_map_line_indices.push(base_index + 2);
+                            self.world_map_line_indices.push(base_index + 3);
+                        }
+                    }
+
+                    prev = curr;
+                }
+            }
+
+            // Add opaque background rectangles over chart bboxes at this lon offset.
+            // These mask world map coastlines under loaded chart areas.
+            let bg = self.background_color.to_array();
+            for &(min_x, min_y, max_x, max_y) in &self.world_map_chart_boxes {
+                let shifted_min_x = min_x + lon_offset;
+                let shifted_max_x = max_x + lon_offset;
+
+                // Frustum cull
+                if !self.is_aabb_visible(shifted_min_x, min_y, shifted_max_x, max_y) {
+                    continue;
+                }
+
+                let tl = scaler.world_to_screen(WorldPoint::new(shifted_min_x, max_y));
+                let br = scaler.world_to_screen(WorldPoint::new(shifted_max_x, min_y));
+
+                if !tl.x.is_finite() || !tl.y.is_finite() || !br.x.is_finite() || !br.y.is_finite()
+                {
+                    continue;
+                }
+
+                let base = self.world_map_mask_vertices.len() as u32;
+                self.world_map_mask_vertices
+                    .push(Vertex2D::new(tl.x, tl.y, bg));
+                self.world_map_mask_vertices
+                    .push(Vertex2D::new(br.x, tl.y, bg));
+                self.world_map_mask_vertices
+                    .push(Vertex2D::new(br.x, br.y, bg));
+                self.world_map_mask_vertices
+                    .push(Vertex2D::new(tl.x, br.y, bg));
+
+                self.world_map_mask_indices.push(base);
+                self.world_map_mask_indices.push(base + 1);
+                self.world_map_mask_indices.push(base + 2);
+                self.world_map_mask_indices.push(base);
+                self.world_map_mask_indices.push(base + 2);
+                self.world_map_mask_indices.push(base + 3);
+            }
+        }
     }
 
     /// Add drawing instructions from render context
@@ -2793,14 +3066,79 @@ impl WgpuRenderer {
                 None
             };
 
+            // World map separate GPU buffers
+            self.cached_wm_line_vb = if !self.world_map_line_vertices.is_empty() {
+                Some(
+                    self.state
+                        .create_vertex_buffer(&self.world_map_line_vertices, "wm_line_vb"),
+                )
+            } else {
+                None
+            };
+            self.cached_wm_line_ib = if !self.world_map_line_indices.is_empty() {
+                Some(
+                    self.state
+                        .create_index_buffer(&self.world_map_line_indices, "wm_line_ib"),
+                )
+            } else {
+                None
+            };
+            self.cached_wm_mask_vb = if !self.world_map_mask_vertices.is_empty() {
+                Some(
+                    self.state
+                        .create_vertex_buffer(&self.world_map_mask_vertices, "wm_mask_vb"),
+                )
+            } else {
+                None
+            };
+            self.cached_wm_mask_ib = if !self.world_map_mask_indices.is_empty() {
+                Some(
+                    self.state
+                        .create_index_buffer(&self.world_map_mask_indices, "wm_mask_ib"),
+                )
+            } else {
+                None
+            };
+
             self.gpu_buffers_dirty = false;
         }
         if let Some(t) = gpu_buf_timer {
             self.cpu_profiler.record("gpu_buffer_create", t.elapsed());
         }
 
-        // NOTE: Symbol batches are now built per-priority in the render loop below
-        // for S-101 compliant priority-based rendering
+        // Pre-build all symbol GPU buffers before the render pass.
+        // This avoids mutable self borrows inside the render pass where view bind groups
+        // are held as immutable references (for longitude wrapping multi-pass rendering).
+        {
+            let sym_ranges = self.symbol_priority_ranges.to_vec();
+            for &(pl, pri, start, end) in &sym_ranges {
+                if end <= start {
+                    continue;
+                }
+                let already_cached =
+                    self.cached_symbol_buffers
+                        .iter()
+                        .any(|(cp, cpr, cs, ce, _, _, _)| {
+                            *cp == pl && *cpr == pri && *cs == start && *ce == end
+                        });
+                if already_cached {
+                    continue;
+                }
+                self.pack_symbol_batch_range(start, end);
+                if self.packed_symbol_indices.is_empty() {
+                    continue;
+                }
+                let sym_vb = self
+                    .state
+                    .create_vertex_buffer(&self.packed_symbol_vertices, "symbol_packed_vb");
+                let sym_ib = self
+                    .state
+                    .create_index_buffer(&self.packed_symbol_indices, "symbol_packed_ib");
+                let ranges: Vec<_> = self.packed_symbol_ranges.clone();
+                self.cached_symbol_buffers
+                    .push((pl, pri, start, end, sym_vb, sym_ib, ranges));
+            }
+        }
 
         let bg = self.background_color.to_array();
 
@@ -2837,9 +3175,32 @@ impl WgpuRenderer {
                 timestamp_writes: None,
             });
 
-            // S-101 Priority-based rendering:
-            // Collect all unique priorities and render in order
-            // For each priority: Areas -> Lines -> Symbols
+            // === LAYER 1: World map coastlines (lowest layer) ===
+            if let (Some(vb), Some(ib)) = (&self.cached_wm_line_vb, &self.cached_wm_line_ib) {
+                let idx_count = self.world_map_line_indices.len() as u32;
+                if idx_count > 0 {
+                    render_pass.set_pipeline(&self.pipelines.line_pipeline);
+                    render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, vb.slice(..));
+                    render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..idx_count, 0, 0..1);
+                }
+            }
+
+            // === LAYER 2: Opaque background rectangles over chart bboxes (mask coastlines) ===
+            if let (Some(vb), Some(ib)) = (&self.cached_wm_mask_vb, &self.cached_wm_mask_ib) {
+                let idx_count = self.world_map_mask_indices.len() as u32;
+                if idx_count > 0 {
+                    render_pass.set_pipeline(&self.pipelines.area_pipeline);
+                    render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, vb.slice(..));
+                    render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..idx_count, 0, 0..1);
+                }
+            }
+
+            // === LAYER 3: Chart data (S-101 priority-based rendering) ===
+            // Drawn at center, left (-360°), and right (+360°) offsets for wrapping.
             let mut priority_set = FxHashSet::default();
             for &(plane, pri, _, _) in &self.area_priority_ranges {
                 priority_set.insert((plane, pri));
@@ -2859,94 +3220,94 @@ impl WgpuRenderer {
             // Clone symbol priority ranges to avoid borrow conflict with pack_symbol_batch_range
             let sym_priority_ranges = self.symbol_priority_ranges.to_vec();
 
-            // Render by priority groups (display_plane, priority)
-            for &(plane, priority) in &all_priorities {
-                // Render areas for this priority
-                if let (Some(vb), Some(ib)) = (&self.cached_area_vb, &self.cached_area_ib) {
-                    for &(pl, pri, start, end) in &self.area_priority_ranges {
-                        if pl == plane && pri == priority && end > start {
-                            render_pass.set_pipeline(&self.pipelines.area_pipeline);
-                            render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                            render_pass.set_vertex_buffer(0, vb.slice(..));
-                            render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            render_pass.draw_indexed(start as u32..end as u32, 0, 0..1);
-                        }
-                    }
-                }
+            // Number of wrapping passes: center (always) + left/right if wrapping
+            let wrap_pass_count: u8 = if self.lon_wrap_screen_px > 0.0 { 3 } else { 1 };
 
-                // Render pattern fills for this priority (GPU texture-repeat tiling)
-                if let (Some(vb), Some(ib)) = (&self.cached_pattern_vb, &self.cached_pattern_ib) {
-                    for (pl, pri, start, end, pat_key) in &self.pattern_ranges {
-                        if *pl == plane && *pri == priority && end > start {
-                            if let Some(pat_tex) = self.pattern_textures.get(pat_key) {
-                                render_pass.set_pipeline(&self.pipelines.pattern_fill_pipeline);
-                                render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                                render_pass.set_bind_group(1, &pat_tex.bind_group, &[]);
+            for wrap_pass in 0..wrap_pass_count {
+                // Select view bind group for this pass: 0=center, 1=left, 2=right
+                let view_bg = match wrap_pass {
+                    1 => &self.view_bind_group_left,
+                    2 => &self.view_bind_group_right,
+                    _ => &self.view_bind_group,
+                };
+
+                // Render by priority groups (display_plane, priority)
+                for &(plane, priority) in &all_priorities {
+                    // Render areas for this priority
+                    if let (Some(vb), Some(ib)) = (&self.cached_area_vb, &self.cached_area_ib) {
+                        for &(pl, pri, start, end) in &self.area_priority_ranges {
+                            if pl == plane && pri == priority && end > start {
+                                render_pass.set_pipeline(&self.pipelines.area_pipeline);
+                                render_pass.set_bind_group(0, view_bg, &[]);
                                 render_pass.set_vertex_buffer(0, vb.slice(..));
                                 render_pass
                                     .set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                                render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
+                                render_pass.draw_indexed(start as u32..end as u32, 0, 0..1);
                             }
                         }
                     }
-                }
 
-                // Render lines for this priority
-                if let (Some(vb), Some(ib)) = (&self.cached_line_vb, &self.cached_line_ib) {
-                    for &(pl, pri, start, end) in &self.line_priority_ranges {
+                    // Render pattern fills for this priority
+                    if let (Some(vb), Some(ib)) = (&self.cached_pattern_vb, &self.cached_pattern_ib)
+                    {
+                        for (pl, pri, start, end, pat_key) in &self.pattern_ranges {
+                            if *pl == plane && *pri == priority && end > start {
+                                if let Some(pat_tex) = self.pattern_textures.get(pat_key) {
+                                    render_pass.set_pipeline(&self.pipelines.pattern_fill_pipeline);
+                                    render_pass.set_bind_group(0, view_bg, &[]);
+                                    render_pass.set_bind_group(1, &pat_tex.bind_group, &[]);
+                                    render_pass.set_vertex_buffer(0, vb.slice(..));
+                                    render_pass
+                                        .set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                    render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
+                                }
+                            }
+                        }
+                    }
+
+                    // Render lines for this priority
+                    if let (Some(vb), Some(ib)) = (&self.cached_line_vb, &self.cached_line_ib) {
+                        for &(pl, pri, start, end) in &self.line_priority_ranges {
+                            if pl == plane && pri == priority && end > start {
+                                render_pass.set_pipeline(&self.pipelines.line_pipeline);
+                                render_pass.set_bind_group(0, view_bg, &[]);
+                                render_pass.set_vertex_buffer(0, vb.slice(..));
+                                render_pass
+                                    .set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                render_pass.draw_indexed(start as u32..end as u32, 0, 0..1);
+                            }
+                        }
+                    }
+
+                    // Render symbols for this priority (pre-built GPU buffers)
+                    for &(pl, pri, start, end) in &sym_priority_ranges {
                         if pl == plane && pri == priority && end > start {
-                            render_pass.set_pipeline(&self.pipelines.line_pipeline);
-                            render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                            render_pass.set_vertex_buffer(0, vb.slice(..));
-                            render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            render_pass.draw_indexed(start as u32..end as u32, 0, 0..1);
-                        }
-                    }
-                }
-
-                // Render symbols for this priority (cached packed single-buffer approach)
-                for &(pl, pri, start, end) in &sym_priority_ranges {
-                    if pl == plane && pri == priority && end > start {
-                        // Find or build cached symbol buffer for this priority range
-                        let cache_idx = self.cached_symbol_buffers.iter().position(
-                            |(cp, cpr, cs, ce, _, _, _)| {
-                                *cp == pl && *cpr == pri && *cs == start && *ce == end
-                            },
-                        );
-                        let buf_idx = if let Some(idx) = cache_idx {
-                            idx
-                        } else {
-                            // Build and cache
-                            self.pack_symbol_batch_range(start, end);
-                            if self.packed_symbol_indices.is_empty() {
-                                continue;
-                            }
-                            let sym_vb = self.state.create_vertex_buffer(
-                                &self.packed_symbol_vertices,
-                                "symbol_packed_vb",
+                            // Find pre-built buffer (built before render pass)
+                            let cache_idx = self.cached_symbol_buffers.iter().position(
+                                |(cp, cpr, cs, ce, _, _, _)| {
+                                    *cp == pl && *cpr == pri && *cs == start && *ce == end
+                                },
                             );
-                            let sym_ib = self.state.create_index_buffer(
-                                &self.packed_symbol_indices,
-                                "symbol_packed_ib",
-                            );
-                            let ranges: Vec<_> = self.packed_symbol_ranges.clone();
-                            self.cached_symbol_buffers
-                                .push((pl, pri, start, end, sym_vb, sym_ib, ranges));
-                            self.cached_symbol_buffers.len() - 1
-                        };
+                            if let Some(buf_idx) = cache_idx {
+                                let (_, _, _, _, ref sym_vb, ref sym_ib, ref ranges) =
+                                    self.cached_symbol_buffers[buf_idx];
 
-                        let (_, _, _, _, ref sym_vb, ref sym_ib, ref ranges) =
-                            self.cached_symbol_buffers[buf_idx];
+                                render_pass.set_pipeline(&self.pipelines.texture_pipeline);
+                                render_pass.set_bind_group(0, view_bg, &[]);
+                                render_pass.set_vertex_buffer(0, sym_vb.slice(..));
+                                render_pass
+                                    .set_index_buffer(sym_ib.slice(..), wgpu::IndexFormat::Uint32);
 
-                        render_pass.set_pipeline(&self.pipelines.texture_pipeline);
-                        render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, sym_vb.slice(..));
-                        render_pass.set_index_buffer(sym_ib.slice(..), wgpu::IndexFormat::Uint32);
-
-                        for &(sym_id, idx_start, idx_count) in ranges {
-                            if let Some(tex) = self.symbol_textures.get(&sym_id) {
-                                render_pass.set_bind_group(1, &tex.bind_group, &[]);
-                                render_pass.draw_indexed(idx_start..idx_start + idx_count, 0, 0..1);
+                                for &(sym_id, idx_start, idx_count) in ranges {
+                                    if let Some(tex) = self.symbol_textures.get(&sym_id) {
+                                        render_pass.set_bind_group(1, &tex.bind_group, &[]);
+                                        render_pass.draw_indexed(
+                                            idx_start..idx_start + idx_count,
+                                            0,
+                                            0..1,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

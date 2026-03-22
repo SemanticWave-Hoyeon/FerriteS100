@@ -633,11 +633,16 @@ impl PortrayalCatalogue {
         })
     }
 
-    /// Load symbols from directory
+    /// Load symbols from directory.
+    /// Security: rejects symlinks to prevent loading files from outside the catalogue tree.
     fn load_symbols(&mut self, dir: &Path) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            if entry.file_type().is_ok_and(|ft| ft.is_symlink()) {
+                tracing::warn!("Security: rejecting symlink: {}", path.display());
+                continue;
+            }
             if path.extension().is_some_and(|e| e == "svg") {
                 let id = path
                     .file_stem()
@@ -653,11 +658,16 @@ impl PortrayalCatalogue {
         Ok(())
     }
 
-    /// Load line styles from directory (dynamic XML parsing)
+    /// Load line styles from directory (dynamic XML parsing).
+    /// Security: rejects symlinks.
     fn load_line_styles(&mut self, dir: &Path) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            if entry.file_type().is_ok_and(|ft| ft.is_symlink()) {
+                tracing::warn!("Security: rejecting symlink: {}", path.display());
+                continue;
+            }
             if path.extension().is_some_and(|e| e == "xml") {
                 let id = path
                     .file_stem()

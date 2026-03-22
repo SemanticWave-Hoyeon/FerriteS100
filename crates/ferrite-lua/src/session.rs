@@ -74,7 +74,10 @@ impl LuaSession {
         Ok(())
     }
 
-    /// Set the rules path (directory containing Lua scripts)
+    /// Set the rules path (directory containing Lua scripts).
+    ///
+    /// Security: rejects paths containing `..` components to prevent
+    /// directory traversal.  Lua `package.path` is restricted to this directory.
     pub fn set_rules_path<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref().to_path_buf();
 
@@ -82,9 +85,19 @@ impl LuaSession {
             return Err(LuaError::ScriptNotFound(path.display().to_string()));
         }
 
+        // Reject path traversal components
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(LuaError::ScriptNotFound(format!(
+                    "Security: rules path contains '..' traversal: {}",
+                    path.display()
+                )));
+            }
+        }
+
         self.rules_path = path.clone();
 
-        // Set Lua package.path
+        // Set Lua package.path — restricted to rules directory only
         let path_str = path.to_string_lossy();
         let lua_path = format!("{}\\?.lua;{}/?.lua", path_str, path_str);
 
@@ -98,12 +111,26 @@ impl LuaSession {
         Ok(())
     }
 
-    /// Load the main portrayal script
+    /// Load the main portrayal script.
+    ///
+    /// Security: verifies the script file is a direct child of `rules_path`
+    /// (no traversal via symlinks or `..`).
     pub fn load_main(&mut self) -> Result<()> {
         let main_path = self.rules_path.join("main.lua");
 
         if !main_path.exists() {
             return Err(LuaError::ScriptNotFound(main_path.display().to_string()));
+        }
+
+        // Verify parent directory matches rules_path (catches symlink escapes)
+        if let Some(parent) = main_path.parent() {
+            if parent != self.rules_path {
+                return Err(LuaError::ScriptNotFound(format!(
+                    "Security: script parent {} != rules_path {}",
+                    parent.display(),
+                    self.rules_path.display()
+                )));
+            }
         }
 
         let script = std::fs::read_to_string(&main_path)

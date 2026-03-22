@@ -43,10 +43,10 @@ impl PluginManager {
         let verifier = if development_mode {
             PluginVerifier::development_mode()
         } else {
-            // In production, load public key from embedded resource
-            // For now, use development mode
-            warn!("Production signature verification not yet implemented, using development mode");
-            PluginVerifier::development_mode()
+            // In production with no embedded signing key, reject all plugins
+            // to prevent loading unsigned/untrusted code.
+            // When a signing key is provisioned, use PluginVerifier::new(Some(&key)).
+            PluginVerifier::reject_all()
         };
 
         let loader = PluginLoader::new(verifier, host_version);

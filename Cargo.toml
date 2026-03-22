@@ -126,6 +126,8 @@ rfd.workspace = true
 image.workspace = true
 rayon.workspace = true
 bincode.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
 mimalloc = "0.1"
 
 # Windows system APIs (for debug info)
