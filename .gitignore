@@ -51,5 +51,15 @@ Thumbs.db
 # Markdown documents (planning, notes, etc.)
 *.md
 
+# S-1XX standard specification documents
+/S1*.md
+/S-1*.md
+
+# S-1XX Catalogues (FC/PC for S-124, S-129, etc.)
+/Catalogues/FC/S-124/
+/Catalogues/FC/S-129/
+/Catalogues/PC/S-124/
+/Catalogues/PC/S-129/
+
 # Planning documents
 /plan/

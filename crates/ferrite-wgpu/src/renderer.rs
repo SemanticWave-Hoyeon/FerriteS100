@@ -1414,6 +1414,13 @@ impl WgpuRenderer {
         // Pre-compute viewing scale once (constant during entire instruction loop)
         let viewing_scale = self.viewing_scale();
 
+        // When zoomed out far beyond the chart's compilation scale, point symbols
+        // and text become visually meaningless (the entire chart covers only a few
+        // pixels). Suppress them to avoid stray symbols on the world map view.
+        // Threshold: 5× the compilation scale (e.g., 1:22000 chart → hide symbols
+        // beyond 1:110000).
+        let suppress_point_text = viewing_scale > self.compilation_scale.saturating_mul(5);
+
         for (inst_idx, instruction) in instructions.iter().enumerate() {
             // Display Mode filtering: skip instructions not in visible viewing groups
             if let Some(visible) = visible_viewing_groups {
@@ -1561,6 +1568,11 @@ impl WgpuRenderer {
                     }
                 }
                 DrawingInstruction::Point(point) => {
+                    // Suppress point symbols when zoomed out far beyond chart scale
+                    if suppress_point_text {
+                        continue;
+                    }
+
                     // Frustum culling: skip points outside viewport
                     if !self.is_point_visible(point.position.x, point.position.y) {
                         _culled_count += 1;
@@ -1605,6 +1617,11 @@ impl WgpuRenderer {
                     }
                 }
                 DrawingInstruction::Text(text) => {
+                    // Suppress text when zoomed out far beyond chart scale
+                    if suppress_point_text {
+                        continue;
+                    }
+
                     // LOD: Skip text during animation for performance
                     if self.animation_mode {
                         continue;

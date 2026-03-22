@@ -23,8 +23,8 @@ pub struct PluginSystem {
 impl PluginSystem {
     /// Create a new plugin system
     pub fn new(plugins_dir: PathBuf, host_version: &str) -> Self {
-        // Development mode for now (no signature verification)
-        let manager = PluginManager::new(plugins_dir, host_version, true);
+        let development_mode = cfg!(debug_assertions);
+        let manager = PluginManager::new(plugins_dir, host_version, development_mode);
         let host_context = manager.host_context_mut();
 
         Self {
