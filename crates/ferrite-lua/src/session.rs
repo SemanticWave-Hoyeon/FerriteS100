@@ -58,11 +58,14 @@ impl LuaSession {
             package.set("loadlib", mlua::Value::Nil)?;
             package.set("cpath", "")?;
 
-            // Clear searchers except for preload and Lua file loader
-            // This prevents searching system paths for modules
+            // Replace all searchers with only preload (searcher #1).
+            // Searcher #2 (Lua file loader) uses simple string substitution
+            // on package.path and could allow path traversal via module names
+            // containing ".." or path separators.
+            // We add a custom safe searcher that validates the resolved path.
             if let Ok(searchers) = package.get::<mlua::Table>("searchers") {
-                // Keep only first two searchers (preload, lua loader)
-                // Remove C loader and all-in-one loader
+                // Remove searchers #2, #3, #4 (lua file, C loader, all-in-one)
+                searchers.set(2, mlua::Value::Nil)?;
                 searchers.set(3, mlua::Value::Nil)?;
                 searchers.set(4, mlua::Value::Nil)?;
             }
@@ -97,16 +100,69 @@ impl LuaSession {
 
         self.rules_path = path.clone();
 
-        // Set Lua package.path — restricted to rules directory only
-        let path_str = path.to_string_lossy();
-        let lua_path = format!("{}\\?.lua;{}/?.lua", path_str, path_str);
-
-        self.lua
-            .globals()
-            .get::<mlua::Table>("package")?
-            .set("path", lua_path)?;
+        // Install a custom safe searcher that validates resolved paths
+        // stay within the rules directory (prevents require("../../evil") escapes)
+        Self::install_safe_searcher(&self.lua, &path)?;
 
         tracing::debug!("Lua rules path set to: {}", path.display());
+
+        Ok(())
+    }
+
+    /// Install a custom Lua searcher that validates resolved file paths
+    /// stay within the allowed rules directory. This prevents `require("../../evil")`
+    /// from escaping the sandbox via path traversal in module names.
+    fn install_safe_searcher(lua: &Lua, rules_dir: &Path) -> Result<()> {
+        let canonical_rules = rules_dir.canonicalize().map_err(|e| {
+            LuaError::ScriptNotFound(format!("Cannot canonicalize rules path: {}", e))
+        })?;
+
+        let searcher = lua.create_function(move |lua, module_name: String| {
+            // Replace Lua module separator '.' with OS path separator
+            let rel_path = module_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+            let file_path = canonical_rules.join(format!("{}.lua", rel_path));
+
+            // Canonicalize to resolve any ".." or symlinks, then verify prefix
+            let canonical = match file_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    // File doesn't exist — return nil + message (standard Lua searcher protocol)
+                    return Ok(mlua::Value::Nil);
+                }
+            };
+
+            if !canonical.starts_with(&canonical_rules) {
+                tracing::warn!(
+                    "Security: require('{}') resolved to '{}' outside rules directory, blocked",
+                    module_name,
+                    canonical.display()
+                );
+                return Ok(mlua::Value::Nil);
+            }
+
+            // Read and return a loader function
+            let source = match std::fs::read_to_string(&canonical) {
+                Ok(s) => s,
+                Err(_) => return Ok(mlua::Value::Nil),
+            };
+
+            let chunk_name = format!("@{}", canonical.display());
+            let func = lua
+                .load(&source)
+                .set_name(chunk_name)
+                .into_function()
+                .map_err(mlua::Error::external)?;
+
+            Ok(mlua::Value::Function(func))
+        })?;
+
+        // Add as searcher #2
+        let package: mlua::Table = lua.globals().get("package")?;
+        let searchers: mlua::Table = package.get("searchers")?;
+        searchers.set(2, searcher)?;
+
+        // Clear package.path since our custom searcher doesn't use it
+        package.set("path", "")?;
 
         Ok(())
     }
@@ -231,15 +287,9 @@ impl LuaSession {
         // Reset initialized flag
         self.initialized = false;
 
-        // Re-set package path
+        // Re-install safe searcher
         if !self.rules_path.as_os_str().is_empty() {
-            let path_str = self.rules_path.to_string_lossy();
-            let lua_path = format!("{}\\?.lua;{}/?.lua", path_str, path_str);
-
-            self.lua
-                .globals()
-                .get::<mlua::Table>("package")?
-                .set("path", lua_path)?;
+            Self::install_safe_searcher(&self.lua, &self.rules_path.clone())?;
         }
 
         // Re-load main script

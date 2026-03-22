@@ -427,7 +427,7 @@ impl ChartApp {
             window: None,
             renderer: None,
             render_context: RenderContext::new(Viewport::new(1920.0, 1080.0)),
-            bounds: GeoBounds::default(),
+            bounds: GeoBounds::new(-180.0, -90.0, 180.0, 90.0),
             symbol_cache,
             current_profile_name: initial_profile,
             mouse_pos: (0.0, 0.0),
@@ -1221,8 +1221,9 @@ impl ChartApp {
     /// Bump this version whenever DrawingInstruction fields change.
     const CACHE_SCHEMA_VERSION: u32 = 2;
 
-    /// Wrap a bincode payload with magic + schema version + SHA-256 integrity hash.
-    fn sign_cache(payload: &[u8]) -> Vec<u8> {
+    /// Wrap a bincode payload with magic + schema version + SHA-256 corruption-detection hash.
+    /// NOTE: This is NOT cryptographic authentication — it detects accidental corruption only.
+    fn wrap_cache(payload: &[u8]) -> Vec<u8> {
         let hash = Sha256::digest(payload);
         let mut out = Vec::with_capacity(4 + 4 + 32 + payload.len());
         out.extend_from_slice(Self::CACHE_MAGIC);
@@ -1347,7 +1348,7 @@ impl ChartApp {
                 let instructions = self.render_context.raw_instructions();
                 match bincode::serialize(instructions) {
                     Ok(payload) => {
-                        let signed = Self::sign_cache(&payload);
+                        let signed = Self::wrap_cache(&payload);
                         let size_kb = signed.len() / 1024;
                         match fs::write(cp, &signed) {
                             Ok(_) => {
@@ -1497,9 +1498,6 @@ impl ChartApp {
     /// - `rebuild_hit_test`: if false, skip rebuilding the hit-test symbol list
     /// - `preserve_declutter`: if true, preserve symbol declutter grids to avoid flickering
     fn update_view_ex(&mut self, rebuild_hit_test: bool, preserve_declutter: bool) {
-        if !self.chart_loaded {
-            return;
-        }
         let profiling = ferrite_wgpu::profiler::is_profiling_enabled();
         let update_view_start = if profiling {
             Some(std::time::Instant::now())
@@ -1537,14 +1535,22 @@ impl ChartApp {
 
         self.render_context.zoom_to_fit(new_bounds);
 
-        // Re-render with new view
-        // Get color profile and visible viewing groups before mutable borrows
+        // Pre-compute color profile and viewing groups before mutable borrow of renderer
         let color_profile = self
             .pc
             .color_profiles
             .profiles
             .get(&self.current_profile_name);
         let visible_vgs = self.get_visible_viewing_groups();
+
+        // Prepare plugin instructions before renderer borrow
+        if self.chart_loaded {
+            self.render_context
+                .truncate_instructions(self.base_instruction_count);
+            for instr in self.plugin_system.get_render_instructions() {
+                self.render_context.add_instruction(instr);
+            }
+        }
 
         if let Some(renderer) = &mut self.renderer {
             // Update zoom level for symbol decluttering and UI
@@ -1557,26 +1563,19 @@ impl ChartApp {
             renderer.set_lon_wrap_pixels(360.0 * self.render_context.scaler.scale_x() as f32);
             renderer.add_world_map_lines(&self.render_context.scaler);
 
-            // Remove old plugin instructions (keep only chart instructions)
-            self.render_context
-                .truncate_instructions(self.base_instruction_count);
-
-            // Add plugin drawing instructions BEFORE building geometry
-            // (they need to be in render_context before add_instructions_with_symbols clones them)
-            for instr in self.plugin_system.get_render_instructions() {
-                self.render_context.add_instruction(instr);
+            // Chart data rendering (only when charts are loaded)
+            if self.chart_loaded {
+                renderer.add_instructions_with_symbols(
+                    &mut self.render_context,
+                    Some(&mut self.symbol_cache),
+                    color_profile,
+                    visible_vgs.as_ref(),
+                );
             }
-
-            renderer.add_instructions_with_symbols(
-                &mut self.render_context,
-                Some(&mut self.symbol_cache),
-                color_profile,
-                visible_vgs.as_ref(),
-            );
         }
 
         // Rebuild symbols for hit testing (skip during animation for performance)
-        if rebuild_hit_test {
+        if rebuild_hit_test && self.chart_loaded {
             let hit_test_start = if profiling {
                 Some(std::time::Instant::now())
             } else {
@@ -1613,9 +1612,6 @@ impl ChartApp {
     /// Recalculate view bounds/scaler without rebuilding geometry.
     /// Used as a lightweight step before adjusting pan offset during zoom.
     fn recalculate_view_bounds(&mut self) {
-        if !self.chart_loaded {
-            return;
-        }
         if let Some(renderer) = &self.renderer {
             let (x, y, w, h) = renderer.ui_state.chart_area;
             if w > 0.0 && h > 0.0 {
@@ -1706,6 +1702,16 @@ impl ApplicationHandler for ChartApp {
                             // Load Natural Earth world map for background rendering
                             let coastlines = parse_world_map_coastlines();
                             renderer.set_world_map(coastlines);
+
+                            // Draw world map immediately (visible even without charts)
+                            if !self.chart_loaded {
+                                self.render_context.zoom_to_fit(self.bounds);
+                                renderer.begin_frame();
+                                renderer.set_lon_wrap_pixels(
+                                    360.0 * self.render_context.scaler.scale_x() as f32,
+                                );
+                                renderer.add_world_map_lines(&self.render_context.scaler);
+                            }
 
                             let stats = renderer.statistics();
                             info!(
@@ -1815,7 +1821,7 @@ impl ApplicationHandler for ChartApp {
                 // decel_rate ~0.998 per ms gives natural-feeling momentum
                 let velocity_magnitude =
                     (self.pan_velocity.0.powi(2) + self.pan_velocity.1.powi(2)).sqrt();
-                if velocity_magnitude > 0.0001 && self.chart_loaded && !self.is_dragging {
+                if velocity_magnitude > 0.0001 && !self.is_dragging {
                     // Apply velocity to pan offset (using current velocity BEFORE friction)
                     self.pan_offset.0 += self.pan_velocity.0 * dt;
                     self.pan_offset.1 += self.pan_velocity.1 * dt;
@@ -2364,7 +2370,7 @@ impl ApplicationHandler for ChartApp {
                 }
 
                 // Handle panning when dragging (only if egui didn't consume)
-                if !egui_consumed && self.is_dragging && self.chart_loaded {
+                if !egui_consumed && self.is_dragging {
                     let dx = new_pos.0 - self.mouse_pos.0;
                     let dy = new_pos.1 - self.mouse_pos.1;
 
@@ -2397,7 +2403,7 @@ impl ApplicationHandler for ChartApp {
                     window.request_redraw();
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !egui_consumed && self.chart_loaded => {
+            WindowEvent::MouseWheel { delta, .. } if !egui_consumed => {
                 let scroll_amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(pos) => pos.y / 50.0,
@@ -2478,7 +2484,7 @@ impl ApplicationHandler for ChartApp {
                         }
 
                         // If drag ended without inertia, defer rebuild
-                        if was_dragging && !inertia_applied && self.chart_loaded {
+                        if was_dragging && !inertia_applied {
                             self.pan_rebuild_phase = 2;
                             self.pan_rebuild_time = std::time::Instant::now();
                         }
