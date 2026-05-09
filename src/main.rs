@@ -238,6 +238,11 @@ struct AppConfig {
     auto_zoom: Option<f64>,
     /// Override center position for auto-screenshot (lat,lon in degrees)
     auto_center: Option<(f64, f64)>,
+    /// Allow unsigned plugins to load even in release builds.
+    /// Set via `--dev-plugins` or `FERRITE_DEV_PLUGINS=1`.
+    /// Use only for local testing; production distributions should
+    /// ship signed plugins instead.
+    dev_plugins: bool,
 }
 
 impl AppConfig {
@@ -246,6 +251,8 @@ impl AppConfig {
         let args: Vec<String> = std::env::args().collect();
         let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "--DEBUG");
         let debug_rings = args.iter().any(|arg| arg == "--debug-rings");
+        let dev_plugins = args.iter().any(|arg| arg == "--dev-plugins")
+            || std::env::var("FERRITE_DEV_PLUGINS").is_ok_and(|v| v == "1" || v == "true");
 
         // Parse --chart <path> (can appear multiple times or use glob)
         let mut auto_chart = Vec::new();
@@ -310,6 +317,7 @@ impl AppConfig {
             debug_rings,
             auto_zoom,
             auto_center,
+            dev_plugins,
         }
     }
 }
@@ -455,6 +463,7 @@ impl ChartApp {
         debug_rings: bool,
         auto_zoom: Option<f64>,
         auto_center: Option<(f64, f64)>,
+        dev_plugins: bool,
     ) -> Self {
         ChartApp {
             window: None,
@@ -483,17 +492,43 @@ impl ChartApp {
             loading_state: None,
             plugin_system: {
                 let base = get_app_base_dir();
-                // Check both plugin directory names:
-                // - "plugins_out" for dev builds (cargo run)
-                // - "plugins" for distribution packages
-                let plugins_path = if base.join("plugins_out").exists() {
-                    base.join("plugins_out")
-                } else {
-                    base.join("plugins")
-                };
+                // Resolution order — first hit wins:
+                //   1. <exe_dir>/plugins         distribution next to the exe
+                //                                (e.g. `target/release/plugins/`)
+                //   2. <exe_dir>/plugins_out     same idea but the dev name
+                //   3. <base>/plugins_out        path-walked project root, dev
+                //   4. <base>/plugins            path-walked project root, dist
+                //
+                // Putting exe-adjacent first lets `target/release/` be a
+                // self-contained dist directory that ships its own plugins
+                // even when the project root upstream still has its own
+                // `plugins_out/`.
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let plugins_path = exe_dir
+                    .as_ref()
+                    .and_then(|d| {
+                        let p1 = d.join("plugins");
+                        if p1.exists() {
+                            return Some(p1);
+                        }
+                        let p2 = d.join("plugins_out");
+                        if p2.exists() {
+                            return Some(p2);
+                        }
+                        None
+                    })
+                    .unwrap_or_else(|| {
+                        if base.join("plugins_out").exists() {
+                            base.join("plugins_out")
+                        } else {
+                            base.join("plugins")
+                        }
+                    });
                 info!("Plugin directory: {}", plugins_path.display());
 
-                let mut ps = plugins::PluginSystem::new(plugins_path, VERSION);
+                let mut ps = plugins::PluginSystem::new(plugins_path, VERSION, dev_plugins);
                 ps.load_all();
 
                 // Set up file dialog callbacks for plugins
@@ -2875,6 +2910,7 @@ fn run_app() -> Result<()> {
         config.debug_rings,
         config.auto_zoom,
         config.auto_center,
+        config.dev_plugins,
     );
 
     event_loop.run_app(&mut app).context("Event loop error")?;

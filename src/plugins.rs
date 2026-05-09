@@ -21,9 +21,17 @@ pub struct PluginSystem {
 }
 
 impl PluginSystem {
-    /// Create a new plugin system
-    pub fn new(plugins_dir: PathBuf, host_version: &str) -> Self {
-        let development_mode = cfg!(debug_assertions);
+    /// Create a new plugin system. `dev_plugins_override` forces development
+    /// (signature-not-required) mode even in release builds — used for
+    /// local self-contained dist testing via `--dev-plugins`.
+    pub fn new(plugins_dir: PathBuf, host_version: &str, dev_plugins_override: bool) -> Self {
+        let development_mode = cfg!(debug_assertions) || dev_plugins_override;
+        if dev_plugins_override && !cfg!(debug_assertions) {
+            warn!(
+                "Plugin signature verification disabled by --dev-plugins / FERRITE_DEV_PLUGINS — \
+                 do not use this for production distributions."
+            );
+        }
         let manager = PluginManager::new(plugins_dir, host_version, development_mode);
         let host_context = manager.host_context_mut();
 
