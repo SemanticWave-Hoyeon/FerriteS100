@@ -192,6 +192,12 @@ pub struct AppUiState {
     pub debug_instruction_count: usize,
     /// Debug stats: Symbol count
     pub debug_symbol_count: usize,
+    /// S-101 explorer panel: in-progress catalogue search term.
+    pub s101_explorer_search: Option<String>,
+    /// S-101 explorer panel: in-progress feature lookup id (raw text).
+    pub s101_explorer_feature_id: Option<String>,
+    /// S-101 explorer panel: in-progress nearby radius (raw text, metres).
+    pub s101_explorer_radius_m: Option<String>,
 }
 
 /// Information about a selected feature
@@ -527,6 +533,10 @@ impl EguiIntegration {
 
         // Route panel (left side) - shown when route plugin is active
         Self::draw_route_panel(&self.ctx, ui_state);
+
+        // S-101 explorer panel — in-process index browser exposed via HostApi
+        // chart-data queries. Shown when its plugin button is active.
+        Self::draw_s101_explorer_panel(&self.ctx, ui_state);
 
         // Status bar
         egui::TopBottomPanel::bottom("status_bar")
@@ -1263,6 +1273,170 @@ impl EguiIntegration {
                     });
                     ui.separator();
                     ui.label("Loading plugin...");
+                }
+            });
+    }
+
+    /// Draw the S-101 Explorer side panel.
+    ///
+    /// The plugin emits `PanelData` JSON via `get_ui_data`; the host renders
+    /// it here as a tabbed panel (Catalogue search / Feature lookup / Bbox
+    /// query / Nearby query / Dataset metadata). Each tab posts a UI event
+    /// back to the plugin describing what was clicked + any inputs; the
+    /// plugin then calls `HostApi::chart_*` and returns the result on the
+    /// next `get_ui_data` cycle.
+    fn draw_s101_explorer_panel(ctx: &egui::Context, ui_state: &mut AppUiState) {
+        let active = ui_state
+            .plugin_buttons
+            .iter()
+            .any(|b| b.plugin_id.contains("s101-explorer") && b.active);
+        if !active {
+            return;
+        }
+        let panel_data = ui_state
+            .plugin_ui_data
+            .iter()
+            .find(|(id, _)| id.contains("s101-explorer"))
+            .map(|(_, data)| data.clone());
+
+        egui::SidePanel::left("s101_explorer_panel")
+            .default_width(360.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("S-101 Explorer");
+                ui.label(
+                    egui::RichText::new("In-process index browser (read-only)")
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(150, 150, 160)),
+                );
+                ui.separator();
+
+                let Some(data) = panel_data else {
+                    ui.label("Plugin loading...");
+                    return;
+                };
+                let Ok(panel) = serde_json::from_str::<serde_json::Value>(&data) else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 100, 100),
+                        "Plugin sent malformed UI data",
+                    );
+                    return;
+                };
+
+                let chart_loaded = panel
+                    .get("chart_loaded")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !chart_loaded {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 160, 80),
+                        "Load a chart first to enable explorer queries.",
+                    );
+                    return;
+                }
+
+                if let Some(meta) = panel.get("metadata_summary").and_then(|v| v.as_str()) {
+                    ui.label(meta);
+                    ui.separator();
+                }
+
+                // Search input
+                let search_term_default = panel
+                    .get("input_search")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                ui.label(egui::RichText::new("Catalogue search").strong());
+                let mut search_term = ui_state
+                    .s101_explorer_search
+                    .clone()
+                    .unwrap_or_else(|| search_term_default.to_string());
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut search_term)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. buoy, anchor, depth"),
+                );
+                ui_state.s101_explorer_search = Some(search_term.clone());
+                let do_search = ui.button("Search").clicked()
+                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if do_search {
+                    ui_state.plugin_ui_events.push((
+                        "com.ferrite.s101-explorer".to_string(),
+                        serde_json::json!({
+                            "kind": "catalogue_search",
+                            "term": search_term
+                        })
+                        .to_string(),
+                    ));
+                }
+                ui.separator();
+
+                // Feature lookup
+                ui.label(egui::RichText::new("Feature lookup").strong());
+                let mut id_str = ui_state
+                    .s101_explorer_feature_id
+                    .clone()
+                    .unwrap_or_default();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut id_str)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Feature ID (numeric)"),
+                );
+                ui_state.s101_explorer_feature_id = Some(id_str.clone());
+                let do_lookup = ui.button("Lookup").clicked()
+                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if do_lookup {
+                    if let Ok(id) = id_str.trim().parse::<i64>() {
+                        ui_state.plugin_ui_events.push((
+                            "com.ferrite.s101-explorer".to_string(),
+                            serde_json::json!({"kind": "feature_get", "id": id}).to_string(),
+                        ));
+                    }
+                }
+                ui.separator();
+
+                // Nearby (uses last clicked world position)
+                ui.label(egui::RichText::new("Nearby (uses cursor position)").strong());
+                let mut radius_str = ui_state
+                    .s101_explorer_radius_m
+                    .clone()
+                    .unwrap_or_else(|| "500".to_string());
+                ui.horizontal(|ui| {
+                    ui.label("Radius (m):");
+                    ui.add(egui::TextEdit::singleline(&mut radius_str).desired_width(80.0));
+                });
+                ui_state.s101_explorer_radius_m = Some(radius_str.clone());
+                if ui.button("Find nearby (cursor)").clicked() {
+                    if let Ok(radius) = radius_str.trim().parse::<f64>() {
+                        let (lon, lat) = ui_state.cursor_world;
+                        ui_state.plugin_ui_events.push((
+                            "com.ferrite.s101-explorer".to_string(),
+                            serde_json::json!({
+                                "kind": "feature_nearby",
+                                "lat": lat,
+                                "lon": lon,
+                                "radius_m": radius
+                            })
+                            .to_string(),
+                        ));
+                    }
+                }
+                ui.separator();
+
+                // Result area
+                ui.label(egui::RichText::new("Result").strong());
+                if let Some(result) = panel.get("last_result").and_then(|v| v.as_str()) {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut result.to_string())
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(20)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        });
+                } else {
+                    ui.label("(no query run yet)");
                 }
             });
     }

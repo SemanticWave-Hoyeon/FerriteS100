@@ -102,6 +102,25 @@ impl PluginSystem {
         });
     }
 
+    /// Register the chart-data query callbacks plugins read via HostApi.
+    /// `loaded_flag` mirrors the host's chart-loaded state and is updated by
+    /// the host directly via `set_chart_loaded`.
+    pub fn set_chart_query_callbacks(&self, callbacks: ferrite_plugin_loader::ChartQueryCallbacks) {
+        let arc = std::sync::Arc::new(callbacks);
+        self.manager.update_context(|ctx| {
+            ctx.chart_queries = Some(arc.clone());
+        });
+    }
+
+    /// Flip the host's chart-loaded indicator. Plugins read this via
+    /// `HostApi::chart_loaded()` to gate their UI.
+    pub fn set_chart_loaded(&self, loaded: bool) {
+        self.manager.update_context(|ctx| {
+            ctx.chart_loaded_flag
+                .store(loaded, std::sync::atomic::Ordering::Release);
+        });
+    }
+
     /// Handle mouse click from main app
     /// Returns true if any plugin consumed the event
     pub fn handle_click(

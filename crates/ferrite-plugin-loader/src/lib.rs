@@ -12,7 +12,7 @@ mod manager;
 mod verifier;
 
 pub use error::PluginError;
-pub use host_impl::{create_host_api, HostContext, SharedHostContext};
+pub use host_impl::{create_host_api, ChartQueryCallbacks, HostContext, SharedHostContext};
 pub use loader::PluginLoader;
 pub use manager::PluginManager;
 pub use verifier::PluginVerifier;

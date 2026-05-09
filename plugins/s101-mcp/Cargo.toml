@@ -1,0 +1,40 @@
+[package]
+name = "s101-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only MCP server exposing S-101 ENC data for catalogue-aware LLM QA research (plan2)"
+authors = ["FerriteS100 Team"]
+
+## Now part of the FerriteS100 workspace — see root Cargo.toml `members`.
+## (Was gitignored / standalone earlier; promoted because the host needs to
+## reuse the index types.)
+
+[lib]
+name = "s101_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "s101-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse FerriteS100's parsing crates as libraries — keeps the index a pure
+# function of the same data path the GUI uses.
+ferrite-iso8211 = { path = "../../crates/ferrite-iso8211" }
+ferrite-s100-core = { path = "../../crates/ferrite-s100-core" }
+ferrite-feature-catalog = { path = "../../crates/ferrite-feature-catalog" }
+ferrite-portrayal-catalog = { path = "../../crates/ferrite-portrayal-catalog" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rstar = "0.12"  # R-tree for spatial index
+rustc-hash = "2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

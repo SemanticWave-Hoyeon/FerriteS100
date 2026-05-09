@@ -17,8 +17,14 @@ pub mod types;
 pub use host_api::*;
 pub use types::*;
 
-/// Plugin API version - increment when breaking changes are made
-pub const PLUGIN_API_VERSION: u32 = 1;
+/// Plugin API version - increment when breaking changes are made.
+///
+/// History:
+/// - 1: Initial release (route-plugin baseline).
+/// - 2: Added `HostApi::chart_*` methods for in-process chart-data queries
+///   (used by the s101-explorer plugin). Existing v1 plugins must be
+///   rebuilt — adding fn-pointer fields changes `HostApi` layout.
+pub const PLUGIN_API_VERSION: u32 = 2;
 
 /// ABI-stable coordinate position
 #[repr(C)]
