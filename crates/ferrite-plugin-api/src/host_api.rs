@@ -81,6 +81,45 @@ pub struct HostApi {
 
     /// Show a toast notification
     pub show_toast: extern "C" fn(ctx: *const (), message: RStr<'_>, is_error: bool),
+
+    // === Chart-data queries (PLUGIN_API_VERSION ≥ 2) =====================
+    //
+    // These let in-process plugins read the loaded S-101 cell + Feature
+    // Catalogue without re-parsing the chart file. Each returns JSON in an
+    // owned `RString` — small per-call allocation, no full-data copy. The
+    // host owns the underlying indices; plugins are pure read clients.
+    //
+    // `chart_loaded` is the gate: every other method returns an empty/error
+    // payload until the host reports a chart is ready.
+    /// True when an S-101 cell is loaded and indices are built.
+    pub chart_loaded: extern "C" fn(ctx: *const ()) -> bool,
+
+    /// Mirror of `dataset_metadata` from the MCP server: chart identification,
+    /// extent, feature-type histogram, catalogue summary. JSON.
+    pub chart_dataset_metadata: extern "C" fn(ctx: *const ()) -> RString,
+
+    /// Substring search across catalogue entries. Returns JSON list capped
+    /// at `limit`. Empty term returns `[]`.
+    pub chart_catalogue_search:
+        extern "C" fn(ctx: *const (), term: RStr<'_>, limit: u32) -> RString,
+
+    /// Catalogue definition for a feature type code.
+    pub chart_catalogue_describe_feature: extern "C" fn(ctx: *const (), code: RStr<'_>) -> RString,
+
+    /// Catalogue definition for an attribute (simple or complex).
+    pub chart_catalogue_describe_attribute:
+        extern "C" fn(ctx: *const (), code: RStr<'_>) -> RString,
+
+    /// Geometry summary + attributes for a feature id.
+    pub chart_feature_get: extern "C" fn(ctx: *const (), id: i64) -> RString,
+
+    /// Features whose bbox intersects (w, s, e, n).
+    pub chart_feature_query_bbox:
+        extern "C" fn(ctx: *const (), w: f64, s: f64, e: f64, n: f64, limit: u32) -> RString,
+
+    /// Features within `radius_m` of (lat, lon), nearest first.
+    pub chart_feature_nearby:
+        extern "C" fn(ctx: *const (), lat: f64, lon: f64, radius_m: f64, limit: u32) -> RString,
 }
 
 // SAFETY: HostApi contains only function pointers and a context pointer
@@ -177,6 +216,44 @@ impl HostApi {
     pub fn toast_error(&self, message: &str) {
         (self.show_toast)(self.context, RStr::from(message), true);
     }
+
+    // ── Chart-data queries ────────────────────────────────────────────
+
+    /// True when an S-101 cell + Feature Catalogue are loaded and indexed.
+    pub fn chart_loaded(&self) -> bool {
+        (self.chart_loaded)(self.context)
+    }
+
+    /// JSON metadata for the loaded cell (extent, feature-type histogram,
+    /// catalogue summary). Empty object when no chart is loaded.
+    pub fn chart_dataset_metadata(&self) -> String {
+        (self.chart_dataset_metadata)(self.context).into_string()
+    }
+
+    /// Substring search across the Feature Catalogue. Returns JSON.
+    pub fn chart_catalogue_search(&self, term: &str, limit: u32) -> String {
+        (self.chart_catalogue_search)(self.context, RStr::from(term), limit).into_string()
+    }
+
+    pub fn chart_catalogue_describe_feature(&self, code: &str) -> String {
+        (self.chart_catalogue_describe_feature)(self.context, RStr::from(code)).into_string()
+    }
+
+    pub fn chart_catalogue_describe_attribute(&self, code: &str) -> String {
+        (self.chart_catalogue_describe_attribute)(self.context, RStr::from(code)).into_string()
+    }
+
+    pub fn chart_feature_get(&self, id: i64) -> String {
+        (self.chart_feature_get)(self.context, id).into_string()
+    }
+
+    pub fn chart_feature_query_bbox(&self, w: f64, s: f64, e: f64, n: f64, limit: u32) -> String {
+        (self.chart_feature_query_bbox)(self.context, w, s, e, n, limit).into_string()
+    }
+
+    pub fn chart_feature_nearby(&self, lat: f64, lon: f64, radius_m: f64, limit: u32) -> String {
+        (self.chart_feature_nearby)(self.context, lat, lon, radius_m, limit).into_string()
+    }
 }
 
 /// Create a dummy HostApi for testing
@@ -207,6 +284,27 @@ pub fn dummy_host_api() -> HostApi {
     extern "C" fn dummy_refresh(_: *const ()) {}
     extern "C" fn dummy_redraw(_: *const ()) {}
     extern "C" fn dummy_toast(_: *const (), _: RStr<'_>, _: bool) {}
+    extern "C" fn dummy_chart_loaded(_: *const ()) -> bool {
+        false
+    }
+    extern "C" fn dummy_empty_string(_: *const ()) -> RString {
+        RString::new()
+    }
+    extern "C" fn dummy_search(_: *const (), _: RStr<'_>, _: u32) -> RString {
+        RString::new()
+    }
+    extern "C" fn dummy_describe(_: *const (), _: RStr<'_>) -> RString {
+        RString::new()
+    }
+    extern "C" fn dummy_feature_get(_: *const (), _: i64) -> RString {
+        RString::new()
+    }
+    extern "C" fn dummy_bbox(_: *const (), _: f64, _: f64, _: f64, _: f64, _: u32) -> RString {
+        RString::new()
+    }
+    extern "C" fn dummy_nearby(_: *const (), _: f64, _: f64, _: f64, _: u32) -> RString {
+        RString::new()
+    }
 
     HostApi {
         context: std::ptr::null(),
@@ -221,5 +319,13 @@ pub fn dummy_host_api() -> HostApi {
         request_ui_refresh: dummy_refresh,
         request_chart_redraw: dummy_redraw,
         show_toast: dummy_toast,
+        chart_loaded: dummy_chart_loaded,
+        chart_dataset_metadata: dummy_empty_string,
+        chart_catalogue_search: dummy_search,
+        chart_catalogue_describe_feature: dummy_describe,
+        chart_catalogue_describe_attribute: dummy_describe,
+        chart_feature_get: dummy_feature_get,
+        chart_feature_query_bbox: dummy_bbox,
+        chart_feature_nearby: dummy_nearby,
     }
 }
