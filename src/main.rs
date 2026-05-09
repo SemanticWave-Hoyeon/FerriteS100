@@ -170,19 +170,52 @@ fn parse_coord_array(value: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
 }
 
 /// Get the application base directory.
-/// Prefers the executable's directory if it contains Catalogues/,
-/// otherwise falls back to the current working directory (for dev builds).
+/// Searches for a directory containing `Catalogues/` in this order:
+/// 1. Executable's directory (Windows dist, Linux)
+/// 2. macOS .app bundle Resources: `../Resources/` relative to executable
+/// 3. Ancestors of the executable's directory (handles `target/release/` exe
+///    launched from Explorer where CWD also lacks `Catalogues/`)
+/// 4. Current working directory (typical for `cargo run`)
+/// 5. Ancestors of the current working directory
 fn get_app_base_dir() -> PathBuf {
-    if let Some(exe_dir) = std::env::current_exe()
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    {
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    if let Some(ref exe_dir) = exe_dir {
+        // Check next to executable (Windows/Linux dist)
         if exe_dir.join("Catalogues").exists() {
-            return exe_dir;
+            return exe_dir.clone();
+        }
+        // Check macOS .app bundle: Contents/MacOS/../Resources/ = Contents/Resources/
+        let resources_dir = exe_dir.join("../Resources");
+        if resources_dir.join("Catalogues").exists() {
+            if let Ok(canonical) = resources_dir.canonicalize() {
+                return canonical;
+            }
+            return resources_dir;
+        }
+        // Walk up from exe_dir looking for Catalogues/. Covers the case of
+        // running the dev/release exe directly from `target/release/` via
+        // File Explorer, where CWD = exe_dir and neither contains Catalogues.
+        for ancestor in exe_dir.ancestors().skip(1) {
+            if ancestor.join("Catalogues").exists() {
+                return ancestor.to_path_buf();
+            }
         }
     }
-    // Fallback: current working directory (typical for `cargo run`)
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if cwd.join("Catalogues").exists() {
+        return cwd;
+    }
+    // Walk up from CWD as a last resort.
+    for ancestor in cwd.ancestors().skip(1) {
+        if ancestor.join("Catalogues").exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    cwd
 }
 
 /// Application configuration
@@ -449,7 +482,15 @@ impl ChartApp {
             loaded_paths: std::collections::HashSet::new(),
             loading_state: None,
             plugin_system: {
-                let plugins_path = get_app_base_dir().join("plugins_out");
+                let base = get_app_base_dir();
+                // Check both plugin directory names:
+                // - "plugins_out" for dev builds (cargo run)
+                // - "plugins" for distribution packages
+                let plugins_path = if base.join("plugins_out").exists() {
+                    base.join("plugins_out")
+                } else {
+                    base.join("plugins")
+                };
                 info!("Plugin directory: {}", plugins_path.display());
 
                 let mut ps = plugins::PluginSystem::new(plugins_path, VERSION);
@@ -684,6 +725,9 @@ impl ChartApp {
             visible_vgs.extend(vgs);
         }
 
+        // Always include plugin viewing group (21010) so overlays are never filtered out
+        visible_vgs.insert(21010);
+
         // If no viewing groups found, return None to show all (safety fallback)
         if visible_vgs.is_empty() {
             tracing::warn!(
@@ -712,6 +756,11 @@ impl ChartApp {
         if self.loading_state.is_some() {
             warn!("Loading already in progress, ignoring new load request");
             return Ok(());
+        }
+
+        // Reset bounds from world extent to empty so expand() calculates from chart data
+        if !self.chart_loaded {
+            self.bounds = GeoBounds::default();
         }
 
         // Filter out already loaded files
@@ -1133,7 +1182,7 @@ impl ChartApp {
         info!("Clearing all charts");
 
         self.cells.clear();
-        self.bounds = GeoBounds::default();
+        self.bounds = GeoBounds::new(-180.0, -90.0, 180.0, 90.0);
         self.chart_loaded = false;
         self.zoom_level = 1.0;
         self.zoom_target = 1.0;
@@ -1167,20 +1216,32 @@ impl ChartApp {
     }
 
     /// Regenerate drawing instructions from loaded cells
-    /// Compute instruction cache file path for the current chart set
+    /// Compute instruction cache file path for the current chart set.
+    ///
+    /// The cache key is built from the canonical (absolute, symlink-resolved)
+    /// path of each chart so the same chart loaded via different working
+    /// directories — e.g. `cargo run` vs running the exe from `target/release/`
+    /// — yields the same cache hash. Without canonicalization, every distinct
+    /// CWD spawned a parallel cache file for identical chart content.
     fn instruction_cache_path(&self) -> Option<PathBuf> {
         if self.cells.is_empty() {
             return None;
         }
-        // Use first chart's directory + combined hash as cache location
         let first_path = &self.cells[0].file_path;
         let cache_dir = first_path.parent()?;
 
-        // Build cache key from all chart file names + profile name
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for cell in &self.cells {
-            cell.file_path.to_string_lossy().hash(&mut hasher);
+            let canonical =
+                std::fs::canonicalize(&cell.file_path).unwrap_or_else(|_| cell.file_path.clone());
+            // Lowercase on Windows: NTFS is case-insensitive but path strings
+            // can vary in case, which would otherwise produce different hashes.
+            #[cfg(windows)]
+            let key = canonical.to_string_lossy().to_lowercase();
+            #[cfg(not(windows))]
+            let key = canonical.to_string_lossy().into_owned();
+            key.hash(&mut hasher);
         }
         self.current_profile_name.hash(&mut hasher);
         let hash = hasher.finish();
@@ -1544,12 +1605,11 @@ impl ChartApp {
         let visible_vgs = self.get_visible_viewing_groups();
 
         // Prepare plugin instructions before renderer borrow
-        if self.chart_loaded {
-            self.render_context
-                .truncate_instructions(self.base_instruction_count);
-            for instr in self.plugin_system.get_render_instructions() {
-                self.render_context.add_instruction(instr);
-            }
+        // Always add plugin instructions (route overlays should render even without charts)
+        self.render_context
+            .truncate_instructions(self.base_instruction_count);
+        for instr in self.plugin_system.get_render_instructions() {
+            self.render_context.add_instruction(instr);
         }
 
         if let Some(renderer) = &mut self.renderer {
@@ -1563,15 +1623,13 @@ impl ChartApp {
             renderer.set_lon_wrap_pixels(360.0 * self.render_context.scaler.scale_x() as f32);
             renderer.add_world_map_lines(&self.render_context.scaler);
 
-            // Chart data rendering (only when charts are loaded)
-            if self.chart_loaded {
-                renderer.add_instructions_with_symbols(
-                    &mut self.render_context,
-                    Some(&mut self.symbol_cache),
-                    color_profile,
-                    visible_vgs.as_ref(),
-                );
-            }
+            // Chart data + plugin overlay rendering
+            renderer.add_instructions_with_symbols(
+                &mut self.render_context,
+                Some(&mut self.symbol_cache),
+                color_profile,
+                visible_vgs.as_ref(),
+            );
         }
 
         // Rebuild symbols for hit testing (skip during animation for performance)
@@ -1761,6 +1819,29 @@ impl ApplicationHandler for ChartApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Intercept Tab key before egui (egui uses Tab for focus navigation)
+        if let WindowEvent::KeyboardInput {
+            event:
+                winit::event::KeyEvent {
+                    physical_key: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Tab),
+                    state: winit::event::ElementState::Pressed,
+                    repeat: false,
+                    ..
+                },
+            ..
+        } = &event
+        {
+            self.debug_mode = !self.debug_mode;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.ui_state.debug_mode = self.debug_mode;
+                renderer.set_profiling_enabled(self.debug_mode);
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
+
         // Forward events to egui first
         let egui_consumed = if let Some(renderer) = &mut self.renderer {
             renderer.handle_egui_event(&event)
@@ -1793,10 +1874,9 @@ impl ApplicationHandler for ChartApp {
                     self.render_context
                         .set_viewport(physical_size.width as f32, physical_size.height as f32);
 
-                    if self.chart_loaded {
-                        // Re-apply current view (zoom + pan) instead of resetting
-                        self.update_view();
-                    }
+                    // Re-apply current view (zoom + pan) instead of resetting
+                    // Must always update — world map lines need rebuild with new viewport
+                    self.update_view();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -2443,11 +2523,22 @@ impl ApplicationHandler for ChartApp {
             } if !egui_consumed => {
                 match state {
                     ElementState::Pressed => {
+                        // If inertia was active, stop it and rebuild view immediately
+                        // so the scaler reflects the actual pan offset (not the stale GPU offset)
+                        let had_inertia =
+                            self.pan_velocity.0.abs() > 0.001 || self.pan_velocity.1.abs() > 0.001;
                         self.is_dragging = true;
                         self.drag_start = self.mouse_pos;
                         // Clear recent positions and velocity on new drag
                         self.recent_positions.clear();
                         self.pan_velocity = (0.0, 0.0);
+                        if had_inertia {
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.reset_pan_offset();
+                            }
+                            self.update_view();
+                            self.pan_rebuild_phase = 0;
+                        }
                     }
                     ElementState::Released => {
                         let was_dragging = self.is_dragging;
@@ -2489,7 +2580,11 @@ impl ApplicationHandler for ChartApp {
                             self.pan_rebuild_time = std::time::Instant::now();
                         }
 
-                        if !was_dragging || drag_dist < 5.0 {
+                        // Suppress click during inertia — coordinates are stale while map is moving
+                        let has_inertia =
+                            self.pan_velocity.0.abs() > 0.001 || self.pan_velocity.1.abs() > 0.001;
+
+                        if (!was_dragging || drag_dist < 5.0) && !has_inertia {
                             // Check if egui wants the pointer (click is on UI)
                             let egui_wants = self
                                 .renderer
@@ -4471,10 +4566,13 @@ fn init_logging(log_path: &Path) -> Result<()> {
         .with_ansi(false)
         .with_writer(file_appender);
 
-    // Environment filter - default to info, debug for core modules
+    // Environment filter - default to info, debug for core modules.
+    // wgpu_hal::vulkan::conv emits a benign "Unrecognized present mode 1000361000"
+    // warning at startup on some Vulkan drivers; downgrade it to error so it
+    // doesn't drown out the log on every adapter probe.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "info,ferrite_s100=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug,ferrite_wgpu=debug",
+            "info,ferrite_s100=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug,ferrite_wgpu=debug,wgpu_hal::vulkan::conv=error",
         )
     });
 
@@ -4588,19 +4686,13 @@ fn load_feature_catalogue(path: &Path) -> Result<FeatureCatalogue> {
     info!("Loading Feature Catalogue: {}", path.display());
 
     if !path.exists() {
-        warn!("Feature Catalogue not found at: {}", path.display());
-        warn!("Creating empty catalogue...");
-        return Ok(FeatureCatalogue {
-            name: String::new(),
-            scope: String::new(),
-            version: String::new(),
-            version_date: String::new(),
-            product_id: String::new(),
-            simple_attributes: Default::default(),
-            complex_attributes: Default::default(),
-            feature_types: Default::default(),
-            information_types: Default::default(),
-        });
+        anyhow::bail!(
+            "Feature Catalogue directory not found: {}\n\
+             Expected layout: <app>/Catalogues/FC/S-101/*Feature_Catalogue*.xml.\n\
+             If you launched the executable from a build/output directory, ensure the \
+             Catalogues/ folder is present alongside it.",
+            path.display()
+        );
     }
 
     // If path is a directory, scan for FC XML file
@@ -4640,30 +4732,42 @@ fn load_feature_catalogue(path: &Path) -> Result<FeatureCatalogue> {
     Ok(fc)
 }
 
-/// Load Portrayal Catalogue from directory
+/// Load Portrayal Catalogue from directory.
+///
+/// Failure here is fatal: an empty PC means no color profiles and no symbols,
+/// which would silently degrade every chart render to placeholder fallbacks.
+/// Surfacing the error early forces the user to fix the install/path instead
+/// of seeing a broken render.
 fn load_portrayal_catalogue(path: &Path) -> Result<PortrayalCatalogue> {
     info!("Loading Portrayal Catalogue: {}", path.display());
 
     if !path.exists() {
-        warn!("Portrayal Catalogue not found at: {}", path.display());
-        warn!("Creating empty catalogue...");
-        return Ok(PortrayalCatalogue {
-            root_path: path.to_path_buf(),
-            product_id: String::new(),
-            version: String::new(),
-            color_profiles: Default::default(),
-            symbols: ferrite_portrayal_catalog::Symbols::new(path.join("Symbols")),
-            line_styles: Default::default(),
-            area_fills: Default::default(),
-            viewing_groups: Default::default(),
-            viewing_group_layers: Default::default(),
-            display_modes: Default::default(),
-            rules: ferrite_portrayal_catalog::PortrayalRules::new(path.join("Rules")),
-        });
+        anyhow::bail!(
+            "Portrayal Catalogue directory not found: {}\n\
+             Expected layout: <app>/Catalogues/PC/S-101/ with ColorProfiles/, Symbols/, Rules/.\n\
+             If you launched the executable from a build/output directory, ensure the \
+             Catalogues/ folder is present alongside it.",
+            path.display()
+        );
     }
 
     let pc = PortrayalCatalogue::load(path)
         .with_context(|| format!("Failed to load Portrayal Catalogue: {}", path.display()))?;
+
+    if pc.color_profiles.profiles.is_empty() {
+        anyhow::bail!(
+            "Portrayal Catalogue at {} contains no color profiles. \
+             Check that ColorProfiles/*.xml exists and is well-formed.",
+            path.display()
+        );
+    }
+    if pc.symbols.symbols.is_empty() {
+        anyhow::bail!(
+            "Portrayal Catalogue at {} contains no symbols. \
+             Check that Symbols/*.svg exists.",
+            path.display()
+        );
+    }
 
     info!("PC loaded successfully");
     debug!("  Product: {}", pc.product_id);

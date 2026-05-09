@@ -1,8 +1,9 @@
 # This file
 .gitignore
 
-# Rust build output
+# Rust build output (root + any nested workspace such as plugins/*/target)
 /target/
+**/target/
 
 # Old catalogue location
 /ProgramData/
@@ -20,6 +21,13 @@
 # Logs
 /logs/
 *.log
+
+# Instruction caches generated next to chart files
+.ferrite_cache_*.bin
+
+# Screenshot dumps from --screenshot
+test_*.png
+symbol_test.png
 
 # Executables
 *.exe
@@ -63,3 +71,6 @@ Thumbs.db
 
 # Planning documents
 /plan/
+
+# Standard specification documents (S-100, S-101, etc.)
+/docs/

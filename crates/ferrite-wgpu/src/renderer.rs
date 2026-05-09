@@ -311,6 +311,14 @@ pub struct WgpuRenderer {
     world_dedup: FxHashSet<(i64, i64, u64)>,
     /// Cached symbol classification flags (computed once per unique SymbolId, never cleared)
     symbol_class_cache: FxHashMap<SymbolId, u8>,
+    /// Set of SymbolIds that could not be rendered (missing SVG, color profile, etc).
+    /// Used to log each missing symbol exactly once instead of every frame, and to
+    /// surface a "N symbols missing" count to the debug HUD/logs.
+    missing_symbol_ids: FxHashSet<SymbolId>,
+    /// Count of point instructions that arrived with an empty symbol_ref. Indicates a
+    /// portrayal-rules bug (Lua emitted a Point without a symbol). Tracked but not
+    /// rendered — silently swallowing this would hide chart-data quality issues.
+    empty_symbol_ref_count: u32,
     /// Grid cell size in pixels (adjusted by zoom)
     grid_cell_size: f32,
     /// Sounding grid cell size in pixels (screen-space)
@@ -480,6 +488,8 @@ impl WgpuRenderer {
             sounding_exact_positions: FxHashSet::with_capacity_and_hasher(5000, Default::default()),
             world_dedup: FxHashSet::with_capacity_and_hasher(5000, Default::default()),
             symbol_class_cache: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            missing_symbol_ids: FxHashSet::with_capacity_and_hasher(32, Default::default()),
+            empty_symbol_ref_count: 0,
 
             grid_cell_size: 30.0,         // Default grid cell size in pixels
             sounding_cell_size_px: 150.0, // Fixed pixel spacing between soundings
@@ -1598,18 +1608,21 @@ impl WgpuRenderer {
                         }
                     }
 
-                    // Try to render as symbol if cache is available
-                    let rendered = if let (Some(cache), Some(profile)) =
-                        (symbol_cache.as_mut(), color_profile)
-                    {
-                        self.try_add_symbol(point, &scaler, cache, profile, sym_id)
-                    } else {
-                        false
+                    // Try to render the symbol. We require both the cache and an
+                    // active color profile — without a profile, SVG color tokens
+                    // cannot be resolved and the rendered symbol would be wrong.
+                    let rendered = match (symbol_cache.as_mut(), color_profile) {
+                        (Some(cache), Some(profile)) => {
+                            self.try_add_symbol(point, &scaler, cache, profile, sym_id)
+                        }
+                        _ => false,
                     };
 
-                    // Fallback to placeholder if symbol not found
+                    // CLAUDE.md: "no placeholder colors, no fallbacks". If the symbol
+                    // cannot render, surface it as a real error (logged once per id)
+                    // and skip — never paint a hardcoded red square.
                     if !rendered {
-                        self.add_point_fallback(point, &scaler);
+                        self.note_unrendered_symbol(sym_id, &point.symbol_ref);
                     }
                     if let Some(s) = inst_start {
                         symbol_time += s.elapsed();
@@ -2875,34 +2888,33 @@ impl WgpuRenderer {
         true
     }
 
-    /// Fallback point rendering (small square) when symbol not available
-    fn add_point_fallback(
-        &mut self,
-        point: &ferrite_render::PointInstruction,
-        scaler: &ferrite_render::Scaler,
-    ) {
-        let screen = scaler.world_to_screen(point.position);
-        let size = 4.0 * point.scale;
-        let color = [1.0, 0.0, 0.0, 1.0]; // Red for missing symbols
+    /// Record a point instruction that could not be rendered as a symbol.
+    /// Empty `symbol_ref` indicates a portrayal-rule bug; missing/un-renderable
+    /// symbols indicate a Portrayal Catalogue gap. Both are logged once per id
+    /// so they surface in normal logs without spamming every frame.
+    fn note_unrendered_symbol(&mut self, sym_id: SymbolId, symbol_ref: &str) {
+        if symbol_ref.is_empty() {
+            self.empty_symbol_ref_count = self.empty_symbol_ref_count.saturating_add(1);
+            return;
+        }
+        if self.missing_symbol_ids.insert(sym_id) {
+            tracing::warn!(
+                "Symbol '{}' could not be rendered (missing SVG or unresolved color tokens) — \
+                 check Portrayal Catalogue completeness",
+                symbol_ref
+            );
+        }
+    }
 
-        let base_index = self.area_vertices.len() as u32;
+    /// Number of unique symbol ids that failed to render this session.
+    pub fn missing_symbol_count(&self) -> usize {
+        self.missing_symbol_ids.len()
+    }
 
-        // Small square
-        self.area_vertices
-            .push(Vertex2D::new(screen.x - size, screen.y - size, color));
-        self.area_vertices
-            .push(Vertex2D::new(screen.x + size, screen.y - size, color));
-        self.area_vertices
-            .push(Vertex2D::new(screen.x + size, screen.y + size, color));
-        self.area_vertices
-            .push(Vertex2D::new(screen.x - size, screen.y + size, color));
-
-        self.area_indices.push(base_index);
-        self.area_indices.push(base_index + 1);
-        self.area_indices.push(base_index + 2);
-        self.area_indices.push(base_index);
-        self.area_indices.push(base_index + 2);
-        self.area_indices.push(base_index + 3);
+    /// Number of point instructions emitted without a symbol_ref this session.
+    /// A non-zero count indicates a portrayal-rule bug.
+    pub fn empty_symbol_ref_count(&self) -> u32 {
+        self.empty_symbol_ref_count
     }
 
     /// Render the frame
