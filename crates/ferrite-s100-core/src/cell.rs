@@ -802,12 +802,27 @@ impl S101Cell {
         Ok(())
     }
 
-    /// Parse spatial associations from SPAS field
+    /// Parse spatial associations from SPAS field.
+    ///
+    /// Each entry is RCNM(1) + RCID(4) + ORNT(1) + USAG(1) + MASK(1) = 8 bytes.
+    /// The field is terminated by `FIELD_TERMINATOR` (0x1E), but some encoders
+    /// pad the trailing bytes with zeros — without a stricter check those
+    /// zero-padded chunks parsed as ghost associations with `rcnm=0,
+    /// rcid=0xFFFFFF00`, which silently dropped at every `cell.points.get(&key)`
+    /// call site. Half of the spatial-association records in the Portsmouth
+    /// sample were these phantoms before this guard.
+    ///
+    /// Valid spatial RCNMs in S-101 are 110/115/120/125/130 (point /
+    /// multi-point / curve / composite curve / surface). Anything else is
+    /// rejected as padding — the entries don't reference a real record and
+    /// only confuse downstream consumers (and LLMs, which is why the
+    /// s101-mcp `--validate` self-check caught this).
     fn parse_spatial_associations(
         &self,
         data: &[u8],
         assocs: &mut Vec<SpatialAssociation>,
     ) -> Result<()> {
+        const VALID_SPATIAL_RCNMS: [u8; 5] = [110, 115, 120, 125, 130];
         let mut offset = 0;
 
         while offset + 8 <= data.len() {
@@ -825,6 +840,13 @@ impl S101Cell {
             let ornt = data[offset + 5] as i8;
             let usag = data[offset + 6];
             let mask = data[offset + 7];
+
+            // Reject padding / no-record sentinels rather than emitting a
+            // phantom association that no later lookup can resolve.
+            if !VALID_SPATIAL_RCNMS.contains(&rcnm) {
+                offset += 8;
+                continue;
+            }
 
             assocs.push(SpatialAssociation {
                 spatial_id: RecordId::new(rcnm, rcid),

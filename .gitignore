@@ -74,3 +74,9 @@ Thumbs.db
 
 # Standard specification documents (S-100, S-101, etc.)
 /docs/
+
+# S-101 MCP research-plugin (kept local; see ../SJLEE_SCIE/plan/plan2.md)
+/plugins/s101-mcp/
+/plugins/s101-mcp-launcher/
+/plugins_out/s101-mcp-launcher/
+/config/plugins/com.ferrite.s101-mcp-launcher.json
