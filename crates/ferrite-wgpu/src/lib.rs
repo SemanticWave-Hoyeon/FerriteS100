@@ -19,6 +19,7 @@ mod error;
 mod pipeline;
 pub mod profiler;
 mod renderer;
+mod renderer_internals;
 mod state;
 mod symbol_cache;
 mod vertex;
