@@ -180,9 +180,10 @@ impl PluginSystem {
                         let a = (color & 0xFF) as u8;
                         let line_color = Color::from_u8(r, g, b, a);
                         let line_style = LineStyle::solid(line_color, width);
-                        let line = LineInstruction::new(coords)
+                        let mut line = LineInstruction::new(coords)
                             .with_style(line_style)
                             .with_priority(priority);
+                        line.viewing_group = ViewingGroup(21010); // Always displayed
                         instructions.push(ferrite_render::DrawingInstruction::Line(line));
                     }
                 }
@@ -198,13 +199,14 @@ impl PluginSystem {
                     let b = ((color >> 8) & 0xFF) as u8;
                     let a = (color & 0xFF) as u8;
                     let text_color = Color::from_u8(r, g, b, a);
-                    let text_instr = TextInstruction::new(
+                    let mut text_instr = TextInstruction::new(
                         text.to_string(),
                         WorldPoint::new(position.lon, position.lat),
                     )
                     .with_font_size(font_size)
                     .with_color(text_color)
                     .with_priority(priority);
+                    text_instr.viewing_group = ViewingGroup(21010); // Always displayed
                     instructions.push(ferrite_render::DrawingInstruction::Text(text_instr));
                 }
                 DrawingInstruction::Circle {
@@ -238,9 +240,10 @@ impl PluginSystem {
                     let line_color = Color::from_u8(r, g, b, a);
                     let line_style = LineStyle::solid(line_color, width);
 
-                    let line = LineInstruction::new(points)
+                    let mut line = LineInstruction::new(points)
                         .with_style(line_style)
                         .with_priority(priority);
+                    line.viewing_group = ViewingGroup(21010); // Always displayed
                     instructions.push(ferrite_render::DrawingInstruction::Line(line));
                 }
             }

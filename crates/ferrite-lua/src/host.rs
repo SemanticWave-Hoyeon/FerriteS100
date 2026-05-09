@@ -5,10 +5,33 @@
 //!
 //! Based on S-100 standard's host_functions.cpp
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use mlua::{Lua, MultiValue, Result as LuaResult, Value};
+
+/// Lua portrayal scripts emit the same warning per-feature (e.g. "Neither
+/// valueOfSounding or defaultClearanceDepth have a value" repeated for every
+/// Wreck/Obstruction with missing depth). The textual content is identical or
+/// trivially varies only by feature ID, so logging every occurrence floods the
+/// log and buries genuine warnings. Track normalized message bodies and emit
+/// each at warn level only once per process; subsequent identical messages
+/// drop to trace level.
+fn lua_warning_seen(message: &str) -> bool {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    // Normalize: strip variable-looking suffixes such as " ID=429497158756"
+    // so messages that differ only by feature ID dedup together.
+    let key: String = match message.find(" ID=") {
+        Some(idx) => message[..idx].to_string(),
+        None => message.to_string(),
+    };
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    !guard.insert(key)
+}
 
 use crate::{
     AttributeValue, CellData, ComplexAttribute, ContextParameters, FeatureInfo, InformationInfo,
@@ -1681,9 +1704,15 @@ impl HostFunctions {
                         tracing::debug!("[Lua Debug] Break point");
                     }
                     "trace" => {
-                        // Check if this is an error message (from main.lua error handling)
+                        // Error messages (from main.lua error handling) are emitted per
+                        // feature and frequently identical — dedup so each unique error
+                        // body only logs at warn once per process.
                         if message.starts_with("Error:") {
-                            tracing::warn!("[Lua Debug] {}", message);
+                            if lua_warning_seen(&message) {
+                                tracing::trace!("[Lua Debug] (repeat) {}", message);
+                            } else {
+                                tracing::warn!("[Lua Debug] {}", message);
+                            }
                         } else {
                             tracing::debug!("[Lua Debug] {}", message);
                         }
@@ -1698,8 +1727,13 @@ impl HostFunctions {
                         tracing::trace!("[Lua Perf] Reset: {}", message);
                     }
                     "first_chance_error" => {
-                        // Log Lua errors at warn level
-                        tracing::warn!("[Lua Error] {}", message);
+                        // Lua first_chance_error is emitted per-feature; dedup so each
+                        // unique error body only escalates to warn once per process.
+                        if lua_warning_seen(&message) {
+                            tracing::trace!("[Lua Error] (repeat) {}", message);
+                        } else {
+                            tracing::warn!("[Lua Error] {}", message);
+                        }
                     }
                     _ => {
                         tracing::debug!("[Lua Debug] {}: {}", action, message);
