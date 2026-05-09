@@ -29,6 +29,9 @@
 test_*.png
 symbol_test.png
 
+# Diff artifacts from failed golden_image tests
+tests/goldens/*.actual.png
+
 # Executables
 *.exe
 *.dll
