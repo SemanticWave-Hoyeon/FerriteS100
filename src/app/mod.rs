@@ -7,10 +7,12 @@
 //! restructuring of `ChartApp` itself is out of scope for this split.
 
 pub mod catalogue;
+pub mod chartapp;
 pub mod config;
 pub mod error_dialog;
 pub mod icon;
 pub mod logging;
+pub mod lua_runtime;
 pub mod path_resolution;
 pub mod portrayal;
 pub mod world_map;
