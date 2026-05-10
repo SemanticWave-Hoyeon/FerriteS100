@@ -1427,16 +1427,115 @@ impl EguiIntegration {
                 if let Some(result) = panel.get("last_result").and_then(|v| v.as_str()) {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
+                        .max_height(280.0)
                         .show(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::multiline(&mut result.to_string())
                                     .desired_width(f32::INFINITY)
-                                    .desired_rows(20)
+                                    .desired_rows(14)
                                     .font(egui::TextStyle::Monospace),
                             );
                         });
                 } else {
                     ui.label("(no query run yet)");
+                }
+
+                ui.separator();
+
+                // MCP server connection — for registering the same tools
+                // with an external LLM client (Claude Desktop / ChatGPT / …).
+                if let Some(conn) = panel.get("connection_info") {
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new("MCP server registration").strong(),
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let binary_path = conn
+                            .get("binary_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let binary_found = conn
+                            .get("binary_found")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let chart_path = conn
+                            .get("chart_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let catalogue_path = conn
+                            .get("catalogue_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let command_line = conn
+                            .get("command_line")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let snippet = conn
+                            .get("config_snippet")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        if !binary_found {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 160, 70),
+                                format!(
+                                    "s101-mcp not found at {} — build with `cargo build --release -p s101-mcp` first.",
+                                    binary_path
+                                ),
+                            );
+                        }
+                        ui.label(format!("Binary:    {}", binary_path));
+                        ui.label(format!("Chart:     {}", chart_path));
+                        ui.label(format!("Catalogue: {}", catalogue_path));
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("Shell command")
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(160, 170, 200)),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy").clicked() {
+                                ui.ctx().copy_text(command_line.to_string());
+                            }
+                        });
+                        ui.add(
+                            egui::TextEdit::multiline(&mut command_line.to_string())
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(2)
+                                .font(egui::TextStyle::Monospace),
+                        );
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("claude_desktop_config.json snippet")
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(160, 170, 200)),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy").clicked() {
+                                ui.ctx().copy_text(snippet.to_string());
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Same JSON works in any MCP-aware client (ChatGPT, OpenRouter, etc).",
+                                )
+                                .size(10.0)
+                                .color(egui::Color32::GRAY),
+                            );
+                        });
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut snippet.to_string())
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(10)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                            });
+                    });
                 }
             });
     }

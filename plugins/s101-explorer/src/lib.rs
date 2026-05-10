@@ -124,6 +124,131 @@ struct PanelData {
     input_search: String,
     /// Cap visible to the user.
     max_results: u32,
+    /// MCP server registration info so users can register the same
+    /// in-process tools with an external LLM client (Claude Desktop,
+    /// ChatGPT, etc). `None` until a chart is loaded — without an
+    /// active chart there's nothing to register.
+    connection_info: Option<ConnectionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectionInfo {
+    /// Path to the s101-mcp executable that the LLM client will spawn.
+    /// `binary_found` is true if the path exists on disk; false means
+    /// the user needs to build the binary or edit settings.
+    binary_path: String,
+    binary_found: bool,
+    /// Chart file the server should pre-load.
+    chart_path: String,
+    /// Feature catalogue (file or directory).
+    catalogue_path: String,
+    /// Full command-line as a copy-pasteable shell string.
+    command_line: String,
+    /// `claude_desktop_config.json` snippet — the canonical MCP-client
+    /// configuration shape. Same JSON works for OpenAI / OpenRouter / etc.
+    config_snippet: String,
+}
+
+/// Find the s101-mcp executable. Probed in order:
+///   1. `s101-mcp.exe` next to the host (self-contained dist)
+///   2. `plugins/s101-mcp/target/debug/s101-mcp.exe` (cargo run dev)
+///   3. `plugins/s101-mcp/target/release/s101-mcp.exe` (release source)
+///
+/// Returns the first existing candidate, or candidate #1 as the best
+/// guess if none are found (so the panel still has something to show).
+fn probe_binary_path() -> (String, bool) {
+    let candidates: &[&str] = if cfg!(windows) {
+        &[
+            "s101-mcp.exe",
+            "plugins/s101-mcp/target/release/s101-mcp.exe",
+            "plugins/s101-mcp/target/debug/s101-mcp.exe",
+        ]
+    } else {
+        &[
+            "s101-mcp",
+            "plugins/s101-mcp/target/release/s101-mcp",
+            "plugins/s101-mcp/target/debug/s101-mcp",
+        ]
+    };
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            // Canonicalize so the snippet shows an absolute path that
+            // will resolve from any CWD an LLM client launches us in.
+            let abs = std::fs::canonicalize(c)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| c.to_string());
+            return (strip_unc_prefix(&abs), true);
+        }
+    }
+    (candidates[0].to_string(), false)
+}
+
+/// On Windows, `canonicalize` returns paths with a `\\?\` UNC prefix
+/// that confuses some LLM client config parsers. Strip it.
+fn strip_unc_prefix(s: &str) -> String {
+    s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() || s.contains(char::is_whitespace) || s.contains('"') {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Build the `ConnectionInfo` from a `dataset_metadata` JSON response and
+/// a probed binary path. Returns None if either chart_path or
+/// catalogue_path are missing (i.e. the host hasn't fully wired things up
+/// yet — defensive against partial state).
+fn build_connection_info(metadata: &serde_json::Value) -> Option<ConnectionInfo> {
+    let chart_path = metadata
+        .get("dataset")
+        .and_then(|d| d.get("file"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let catalogue_path = metadata
+        .get("catalogue_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Catalogues/FC/S-101")
+        .to_string();
+    let (binary_path, binary_found) = probe_binary_path();
+
+    let command_line = format!(
+        "{} --chart {} --catalogue {}",
+        shell_quote(&binary_path),
+        shell_quote(&chart_path),
+        shell_quote(&catalogue_path)
+    );
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "s101": {
+                "command": binary_path,
+                "args": [
+                    "--chart", chart_path,
+                    "--catalogue", catalogue_path
+                ]
+            }
+        }
+    });
+    let config_snippet = serde_json::to_string_pretty(&config).unwrap_or_default();
+
+    Some(ConnectionInfo {
+        binary_path: shell_quote_inner(&binary_path),
+        binary_found,
+        chart_path,
+        catalogue_path,
+        command_line,
+        config_snippet,
+    })
+}
+
+// shell_quote, but we use it for storing the raw binary path back into
+// the struct unquoted (UI shows it as plain text). Keeping a separate
+// helper so the call site stays honest about which is which.
+fn shell_quote_inner(s: &str) -> String {
+    s.to_string()
 }
 
 impl Plugin for ExplorerPlugin {
@@ -167,33 +292,39 @@ impl Plugin for ExplorerPlugin {
             .map(|h| h.chart_loaded())
             .unwrap_or(false);
 
-        // Metadata summary — short one-liner so the panel header has
-        // something useful before any query runs.
-        let metadata_summary = if chart_loaded {
+        // Pull metadata once and reuse for the summary line + connection
+        // info. Avoids a second HostApi round-trip per redraw.
+        let metadata: Option<serde_json::Value> = if chart_loaded {
             self.host_api
                 .as_ref()
-                .map(|h| {
-                    let raw = h.chart_dataset_metadata();
-                    serde_json::from_str::<serde_json::Value>(&raw)
-                        .ok()
-                        .and_then(|v| {
-                            let count = v.get("feature_count")?.as_u64()?;
-                            let extent = v.get("extent")?;
-                            let w = extent.get("w")?.as_f64()?;
-                            let s = extent.get("s")?.as_f64()?;
-                            let e = extent.get("e")?.as_f64()?;
-                            let n = extent.get("n")?.as_f64()?;
-                            Some(format!(
-                                "{} features · extent [lon {:.4}…{:.4}, lat {:.4}…{:.4}]",
-                                count, w, e, s, n
-                            ))
-                        })
-                        .unwrap_or_else(|| "indices ready".to_string())
-                })
-                .unwrap_or_default()
+                .and_then(|h| serde_json::from_str(&h.chart_dataset_metadata()).ok())
         } else {
-            String::new()
+            None
         };
+
+        let metadata_summary = metadata
+            .as_ref()
+            .and_then(|v| {
+                let count = v.get("feature_count")?.as_u64()?;
+                let extent = v.get("extent")?;
+                let w = extent.get("w")?.as_f64()?;
+                let s = extent.get("s")?.as_f64()?;
+                let e = extent.get("e")?.as_f64()?;
+                let n = extent.get("n")?.as_f64()?;
+                Some(format!(
+                    "{} features · extent [lon {:.4}…{:.4}, lat {:.4}…{:.4}]",
+                    count, w, e, s, n
+                ))
+            })
+            .unwrap_or_else(|| {
+                if chart_loaded {
+                    "indices ready".to_string()
+                } else {
+                    String::new()
+                }
+            });
+
+        let connection_info = metadata.as_ref().and_then(build_connection_info);
 
         let panel = PanelData {
             chart_loaded,
@@ -202,6 +333,7 @@ impl Plugin for ExplorerPlugin {
             last_result: self.last_result.clone(),
             input_search: String::new(),
             max_results: self.settings.max_results,
+            connection_info,
         };
         match serde_json::to_vec(&panel) {
             Ok(b) => RVec::from(b),
