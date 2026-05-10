@@ -560,9 +560,18 @@ fn feature_to_json(idx: &Indices, id: FeatureId, f: &FeatureRecord) -> Value {
                     )
                 })
                 .unwrap_or(false);
+            // Prefer the FC-resolved typed value (handles enumeration
+            // label lookup); fall back to raw atvl so the JSON never
+            // shows an empty value when the cell did encode something.
+            let rendered = format_attribute_value(&a.value);
+            let value_str = if rendered.is_empty() && !a.atvl.is_empty() {
+                a.atvl.clone()
+            } else {
+                rendered
+            };
             json!({
                 "code": a.code,
-                "value": format_attribute_value(&a.value),
+                "value": value_str,
                 "is_bound_in_catalogue": bound,
             })
         })
