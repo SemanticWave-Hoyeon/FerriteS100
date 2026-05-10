@@ -1334,10 +1334,23 @@ impl ChartApp {
         // closure captures an Arc<Indices> so the host (and through it, any
         // plugin) can call queries on a stable snapshot regardless of what
         // ChartApp does next.
+        // Capture the catalogue path so the dataset_metadata closure can
+        // inject it. Plugins use this to assemble the
+        // claude_desktop_config.json snippet without needing a separate
+        // HostApi method.
+        let catalogue_path = self.fc_status.path.clone();
         let q_dataset = {
             let i = indices.clone();
-            Box::new(move || s101_mcp_chart_dataset_metadata(&i))
-                as Box<dyn Fn() -> String + Send + Sync>
+            let cat = catalogue_path.clone();
+            Box::new(move || {
+                let raw = s101_mcp_chart_dataset_metadata(&i);
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("catalogue_path".to_string(), serde_json::json!(cat.clone()));
+                }
+                serde_json::to_string(&v).unwrap_or(raw)
+            }) as Box<dyn Fn() -> String + Send + Sync>
         };
         let q_search = {
             let i = indices.clone();
