@@ -13,9 +13,11 @@ authors = ["FerriteS100 Team"]
 name = "s101_mcp"
 path = "src/lib.rs"
 
-[[bin]]
-name = "s101-mcp"
-path = "src/main.rs"
+# Library-only crate. Used by the FerriteS100 host (in-process HTTP MCP)
+# and by SJLee_SCIE research scripts (questgen / baselines / eval). The
+# previous standalone `s101-mcp` binary (stdio MCP server, then validate
+# CLI) has been removed — both roles moved into the host or the research
+# repo's scripts.
 
 [dependencies]
 # Reuse FerriteS100's parsing crates as libraries — keeps the index a pure
@@ -29,10 +31,8 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rstar = "0.12"  # R-tree for spatial index
 rustc-hash = "2"
-clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 opt-level = 3
