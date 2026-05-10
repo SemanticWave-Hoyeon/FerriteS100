@@ -918,6 +918,9 @@ impl ChartApp {
                     Ok(mut cell) => {
                         // Normalize feature codes
                         cell.normalize_feature_codes(&fc_feature_codes);
+                        // Resolve raw attribute strings to typed values
+                        // (enumerations get their catalogue labels here).
+                        cell.resolve_attribute_values(&fc);
 
                         #[cfg(debug_assertions)]
                         {
@@ -1319,6 +1322,10 @@ impl ChartApp {
             }
         };
         cell.normalize_feature_codes(&self.fc.feature_type_codes());
+        // Resolve raw atvl strings into typed AttributeValues (enums
+        // get their catalogue labels resolved here too). Without this
+        // every feature_get tool call returns "" for every value.
+        cell.resolve_attribute_values(&self.fc);
         // FeatureCatalogue owns its data so we deep-clone via serde rather
         // than re-parsing the XML.
         let fc_clone: ferrite_feature_catalog::FeatureCatalogue = (*self.fc).clone();

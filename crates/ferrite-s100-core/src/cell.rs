@@ -1458,6 +1458,129 @@ impl S101Cell {
                 .insert(num, fc_code);
         }
     }
+
+    /// Resolve raw `atvl` strings into typed `AttributeValue`s using the
+    /// Feature Catalogue's per-attribute `value_type`.
+    ///
+    /// The ISO 8211 parser only knows how to read the raw text bytes
+    /// from each ATTR field — it has no schema knowledge. After
+    /// `apply_code_mappings` set `attr.code` (numeric → string), we
+    /// can look that code up in the FC and learn what the bytes mean
+    /// (Boolean / Integer / Real / Enumeration / Date / …). For
+    /// enumerations we additionally resolve the numeric code to its
+    /// catalogue label so callers see "Port-Hand Lateral Mark(1)"
+    /// instead of "1".
+    ///
+    /// Empty `atvl` stays `None` (no value present). Unparseable values
+    /// fall back to `Text(atvl)` so callers see *something* — a parse
+    /// failure is more useful surfaced than silently dropped.
+    pub fn resolve_attribute_values(&mut self, fc: &ferrite_feature_catalog::FeatureCatalogue) {
+        use ferrite_feature_catalog::AttributeValueType;
+
+        let mut resolved_count: u64 = 0;
+        let mut unmapped: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let resolve_one = |code: &str, atvl: &str| -> Option<crate::AttributeValue> {
+            if atvl.is_empty() {
+                return None;
+            }
+            // Look up the simple-attribute definition. ComplexAttribute
+            // value containers carry no atvl themselves — their children
+            // (which appear as separate ATTR rows with a higher PAIX) do.
+            let sa = fc.simple_attributes.get(code)?;
+            Some(match sa.value_type {
+                AttributeValueType::Boolean => {
+                    let lo = atvl.trim().to_ascii_lowercase();
+                    crate::AttributeValue::Boolean(matches!(
+                        lo.as_str(),
+                        "1" | "true" | "yes" | "y" | "t"
+                    ))
+                }
+                AttributeValueType::Integer => atvl
+                    .trim()
+                    .parse::<i64>()
+                    .map(crate::AttributeValue::Integer)
+                    .unwrap_or_else(|_| crate::AttributeValue::Text(atvl.to_string())),
+                AttributeValueType::Real => atvl
+                    .trim()
+                    .parse::<f64>()
+                    .map(crate::AttributeValue::Real)
+                    .unwrap_or_else(|_| crate::AttributeValue::Text(atvl.to_string())),
+                AttributeValueType::Enumeration | AttributeValueType::S100CodeList => {
+                    // S-101 encodes enumerations as the listed-value
+                    // numeric code, written out as ASCII digits in atvl.
+                    match atvl.trim().parse::<u32>() {
+                        Ok(num) => {
+                            let label = sa
+                                .listed_values
+                                .iter()
+                                .find(|lv| lv.code == num)
+                                .map(|lv| lv.label.clone())
+                                .unwrap_or_else(|| format!("unknown_{}", num));
+                            crate::AttributeValue::Enumeration(num, label)
+                        }
+                        Err(_) => crate::AttributeValue::Text(atvl.to_string()),
+                    }
+                }
+                AttributeValueType::Date => crate::AttributeValue::Date(atvl.to_string()),
+                AttributeValueType::Time => crate::AttributeValue::Time(atvl.to_string()),
+                AttributeValueType::DateTime => crate::AttributeValue::DateTime(atvl.to_string()),
+                AttributeValueType::Text
+                | AttributeValueType::Uri
+                | AttributeValueType::Url
+                | AttributeValueType::Urn
+                | AttributeValueType::TruncatedDate
+                | AttributeValueType::S100TruncatedDate => {
+                    crate::AttributeValue::Text(atvl.to_string())
+                }
+            })
+        };
+
+        // Walk all features + information records; populate
+        // `attr.value` if we can. Skip already-resolved attributes so
+        // calling this twice is idempotent.
+        for feature in self.features.values_mut() {
+            for attr in &mut feature.attributes {
+                if attr.value.is_some() {
+                    continue;
+                }
+                let Some(code) = attr.code.as_deref() else {
+                    continue;
+                };
+                if let Some(v) = resolve_one(code, &attr.atvl) {
+                    attr.value = Some(v);
+                    resolved_count += 1;
+                } else if !attr.atvl.is_empty() && !fc.simple_attributes.contains_key(code) {
+                    unmapped.insert(code.to_string());
+                }
+            }
+        }
+        for info in self.information.values_mut() {
+            for attr in &mut info.attributes {
+                if attr.value.is_some() {
+                    continue;
+                }
+                let Some(code) = attr.code.as_deref() else {
+                    continue;
+                };
+                if let Some(v) = resolve_one(code, &attr.atvl) {
+                    attr.value = Some(v);
+                    resolved_count += 1;
+                } else if !attr.atvl.is_empty() && !fc.simple_attributes.contains_key(code) {
+                    unmapped.insert(code.to_string());
+                }
+            }
+        }
+
+        tracing::info!(
+            "Resolved {} attribute values via FC ({} attribute codes were not in the catalogue)",
+            resolved_count,
+            unmapped.len()
+        );
+        if !unmapped.is_empty() {
+            tracing::debug!("Unmapped attribute codes: {:?}", unmapped);
+        }
+    }
 }
 
 /// Cell statistics summary
