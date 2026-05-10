@@ -120,6 +120,26 @@ pub struct HostApi {
     /// Features within `radius_m` of (lat, lon), nearest first.
     pub chart_feature_nearby:
         extern "C" fn(ctx: *const (), lat: f64, lon: f64, radius_m: f64, limit: u32) -> RString,
+
+    // === MCP server info (PLUGIN_API_VERSION ≥ 3) ========================
+    //
+    // The host runs an in-process HTTP MCP server and (optionally) exposes
+    // it through a cloudflared tunnel. Plugins read the registration
+    // metadata so they can render a copy-paste config snippet for Claude
+    // Desktop / ChatGPT / OpenRouter etc.
+    //
+    // Returns a JSON object:
+    //   {
+    //     "running":    bool,            // server is listening
+    //     "local_url":  "http://127.0.0.1:PORT/mcp",
+    //     "public_url": "https://….trycloudflare.com/mcp" | null,
+    //     "tunnel_state": "ready"|"starting"|"unavailable"|"disabled",
+    //     "tunnel_message": string,      // "" or human-readable status
+    //     "bearer_token": "…64 chars…",  // present even when not running
+    //     "transport":  "streamable-http"
+    //   }
+    /// JSON-encoded MCP server registration info.
+    pub mcp_server_info: extern "C" fn(ctx: *const ()) -> RString,
 }
 
 // SAFETY: HostApi contains only function pointers and a context pointer
@@ -254,6 +274,12 @@ impl HostApi {
     pub fn chart_feature_nearby(&self, lat: f64, lon: f64, radius_m: f64, limit: u32) -> String {
         (self.chart_feature_nearby)(self.context, lat, lon, radius_m, limit).into_string()
     }
+
+    /// JSON describing the MCP server registration (URL, token, tunnel
+    /// state). Empty string if the host hasn't initialised the server.
+    pub fn mcp_server_info(&self) -> String {
+        (self.mcp_server_info)(self.context).into_string()
+    }
 }
 
 /// Create a dummy HostApi for testing
@@ -327,5 +353,6 @@ pub fn dummy_host_api() -> HostApi {
         chart_feature_get: dummy_feature_get,
         chart_feature_query_bbox: dummy_bbox,
         chart_feature_nearby: dummy_nearby,
+        mcp_server_info: dummy_empty_string,
     }
 }
