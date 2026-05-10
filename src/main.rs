@@ -13,6 +13,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Application version (from Cargo.toml)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+mod http_mcp;
+mod oauth;
 mod plugins;
 
 use std::fs;
@@ -22,6 +24,77 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+
+/// Wrapper around `s101_mcp::mcp::tools::dispatch` that converts the
+/// per-tool result into the JSON string shape the plugin HostApi forwards.
+/// `tool` and `args` mirror what an LLM-with-MCP would send via
+/// `tools/call`. Errors are surfaced as `{"error": "..."}` so the plugin
+/// side never has to guard against missing data.
+fn dispatch_chart_query(
+    indices: &s101_mcp::Indices,
+    tool: &str,
+    args: serde_json::Value,
+) -> String {
+    match s101_mcp::mcp::tools::dispatch(indices, tool, args) {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e)),
+        Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+    }
+}
+
+fn s101_mcp_chart_dataset_metadata(idx: &s101_mcp::Indices) -> String {
+    dispatch_chart_query(idx, "dataset_metadata", serde_json::json!({}))
+}
+fn s101_mcp_catalogue_search(idx: &s101_mcp::Indices, term: &str, limit: u32) -> String {
+    dispatch_chart_query(
+        idx,
+        "catalogue_search",
+        serde_json::json!({"term": term, "limit": limit as usize}),
+    )
+}
+fn s101_mcp_catalogue_describe_feature(idx: &s101_mcp::Indices, code: &str) -> String {
+    dispatch_chart_query(
+        idx,
+        "catalogue_describe_feature",
+        serde_json::json!({"code": code}),
+    )
+}
+fn s101_mcp_catalogue_describe_attribute(idx: &s101_mcp::Indices, code: &str) -> String {
+    dispatch_chart_query(
+        idx,
+        "catalogue_describe_attribute",
+        serde_json::json!({"code": code}),
+    )
+}
+fn s101_mcp_feature_get(idx: &s101_mcp::Indices, id: i64) -> String {
+    dispatch_chart_query(idx, "feature_get", serde_json::json!({"id": id}))
+}
+fn s101_mcp_feature_query_bbox(
+    idx: &s101_mcp::Indices,
+    w: f64,
+    s: f64,
+    e: f64,
+    n: f64,
+    limit: u32,
+) -> String {
+    dispatch_chart_query(
+        idx,
+        "feature_query_bbox",
+        serde_json::json!({"w": w, "s": s, "e": e, "n": n, "limit": limit as usize}),
+    )
+}
+fn s101_mcp_feature_nearby(
+    idx: &s101_mcp::Indices,
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+    limit: u32,
+) -> String {
+    dispatch_chart_query(
+        idx,
+        "feature_nearby",
+        serde_json::json!({"lat": lat, "lon": lon, "radius_m": radius_m, "limit": limit as usize}),
+    )
+}
 
 /// Show a native Windows error dialog (release mode only, no-op on other platforms)
 #[cfg(all(windows, not(debug_assertions)))]
@@ -238,6 +311,17 @@ struct AppConfig {
     auto_zoom: Option<f64>,
     /// Override center position for auto-screenshot (lat,lon in degrees)
     auto_center: Option<(f64, f64)>,
+    /// Allow unsigned plugins to load even in release builds.
+    /// Set via `--dev-plugins` or `FERRITE_DEV_PLUGINS=1`.
+    /// Use only for local testing; production distributions should
+    /// ship signed plugins instead.
+    dev_plugins: bool,
+    /// Run the in-process HTTP MCP server. `--no-mcp` disables it
+    /// entirely (no port bound, no tunnel). Default true.
+    mcp_enabled: bool,
+    /// Spawn `ngrok http` to expose the MCP server publicly.
+    /// `--no-tunnel` keeps the server on localhost only. Default true.
+    mcp_tunnel: bool,
 }
 
 impl AppConfig {
@@ -246,6 +330,10 @@ impl AppConfig {
         let args: Vec<String> = std::env::args().collect();
         let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "--DEBUG");
         let debug_rings = args.iter().any(|arg| arg == "--debug-rings");
+        let dev_plugins = args.iter().any(|arg| arg == "--dev-plugins")
+            || std::env::var("FERRITE_DEV_PLUGINS").is_ok_and(|v| v == "1" || v == "true");
+        let mcp_enabled = !args.iter().any(|arg| arg == "--no-mcp");
+        let mcp_tunnel = mcp_enabled && !args.iter().any(|arg| arg == "--no-tunnel");
 
         // Parse --chart <path> (can appear multiple times or use glob)
         let mut auto_chart = Vec::new();
@@ -310,6 +398,9 @@ impl AppConfig {
             debug_rings,
             auto_zoom,
             auto_center,
+            dev_plugins,
+            mcp_enabled,
+            mcp_tunnel,
         }
     }
 }
@@ -388,6 +479,11 @@ struct ChartApp {
     cells: Vec<S101Cell>,
     /// Whether chart data is loaded
     chart_loaded: bool,
+    /// In-process S-101 indices (catalogue / feature / geometry) for the
+    /// loaded cell. Populated in `finalize_loading` from cell[0] + the FC,
+    /// shared with plugins via the `HostApi::chart_*` methods. Built only
+    /// when at least one cell is loaded; reset in `clear_charts`.
+    indices: Option<Arc<s101_mcp::Indices>>,
     /// Paths of already loaded chart files (to prevent duplicates)
     loaded_paths: std::collections::HashSet<PathBuf>,
     /// Background loading state (Some if loading in progress)
@@ -438,6 +534,11 @@ struct ChartApp {
     /// Used for drift-free zoom by directly computing pan_offset each frame
     /// instead of accumulating floating-point deltas.
     zoom_anchor_world: (f64, f64),
+    /// In-process HTTP MCP server + ngrok tunnel. `None` when the
+    /// user disabled it via `--no-mcp`. The handle owns its tokio runtime;
+    /// dropping it would shut everything down (we keep it alive for the
+    /// process lifetime).
+    mcp_server: Option<http_mcp::McpServerHandle>,
 }
 
 impl ChartApp {
@@ -455,7 +556,32 @@ impl ChartApp {
         debug_rings: bool,
         auto_zoom: Option<f64>,
         auto_center: Option<(f64, f64)>,
+        dev_plugins: bool,
+        mcp_enabled: bool,
+        mcp_tunnel: bool,
     ) -> Self {
+        // Start the in-process HTTP MCP server before we build the plugin
+        // system, so the server-info provider closure (registered against
+        // the PluginSystem) can capture the live handle.
+        let mcp_server = if mcp_enabled {
+            match http_mcp::start(mcp_tunnel) {
+                Ok(handle) => {
+                    info!(
+                        "HTTP MCP server initialised (tunnel: {})",
+                        if mcp_tunnel { "ngrok" } else { "disabled" }
+                    );
+                    Some(handle)
+                }
+                Err(e) => {
+                    warn!("Failed to start HTTP MCP server: {}", e);
+                    None
+                }
+            }
+        } else {
+            info!("HTTP MCP server disabled by --no-mcp");
+            None
+        };
+
         ChartApp {
             window: None,
             renderer: None,
@@ -479,21 +605,48 @@ impl ChartApp {
             pc_status,
             cells: Vec::new(),
             chart_loaded: false,
+            indices: None,
             loaded_paths: std::collections::HashSet::new(),
             loading_state: None,
             plugin_system: {
                 let base = get_app_base_dir();
-                // Check both plugin directory names:
-                // - "plugins_out" for dev builds (cargo run)
-                // - "plugins" for distribution packages
-                let plugins_path = if base.join("plugins_out").exists() {
-                    base.join("plugins_out")
-                } else {
-                    base.join("plugins")
-                };
+                // Resolution order — first hit wins:
+                //   1. <exe_dir>/plugins         distribution next to the exe
+                //                                (e.g. `target/release/plugins/`)
+                //   2. <exe_dir>/plugins_out     same idea but the dev name
+                //   3. <base>/plugins_out        path-walked project root, dev
+                //   4. <base>/plugins            path-walked project root, dist
+                //
+                // Putting exe-adjacent first lets `target/release/` be a
+                // self-contained dist directory that ships its own plugins
+                // even when the project root upstream still has its own
+                // `plugins_out/`.
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let plugins_path = exe_dir
+                    .as_ref()
+                    .and_then(|d| {
+                        let p1 = d.join("plugins");
+                        if p1.exists() {
+                            return Some(p1);
+                        }
+                        let p2 = d.join("plugins_out");
+                        if p2.exists() {
+                            return Some(p2);
+                        }
+                        None
+                    })
+                    .unwrap_or_else(|| {
+                        if base.join("plugins_out").exists() {
+                            base.join("plugins_out")
+                        } else {
+                            base.join("plugins")
+                        }
+                    });
                 info!("Plugin directory: {}", plugins_path.display());
 
-                let mut ps = plugins::PluginSystem::new(plugins_path, VERSION);
+                let mut ps = plugins::PluginSystem::new(plugins_path, VERSION, dev_plugins);
                 ps.load_all();
 
                 // Set up file dialog callbacks for plugins
@@ -560,6 +713,19 @@ impl ChartApp {
                     }
                 });
 
+                // Wire the MCP server-info provider so plugins reading
+                // `HostApi::mcp_server_info()` get up-to-date URL + tunnel
+                // state. We clone the `Arc<ServerState>` so the closure
+                // doesn't outlive the handle (the handle owns its tokio
+                // runtime; the closure only reads the snapshot mutex).
+                if let Some(ref handle) = mcp_server {
+                    let state = handle.state.clone();
+                    ps.set_mcp_server_info_provider(move || {
+                        serde_json::to_string(&state.snapshot())
+                            .unwrap_or_else(|_| "{}".to_string())
+                    });
+                }
+
                 ps
             },
             base_instruction_count: 0,
@@ -583,6 +749,7 @@ impl ChartApp {
             zoom_target: 1.0,
             zoom_animating: false,
             zoom_anchor_world: (0.0, 0.0),
+            mcp_server,
         }
     }
 
@@ -806,6 +973,9 @@ impl ChartApp {
                     Ok(mut cell) => {
                         // Normalize feature codes
                         cell.normalize_feature_codes(&fc_feature_codes);
+                        // Resolve raw attribute strings to typed values
+                        // (enumerations get their catalogue labels here).
+                        cell.resolve_attribute_values(&fc);
 
                         #[cfg(debug_assertions)]
                         {
@@ -945,6 +1115,13 @@ impl ChartApp {
             if let Some(renderer) = &mut self.renderer {
                 renderer.precompute_triangulations(self.render_context.raw_instructions());
             }
+
+            // Build the s101-mcp indices for the first loaded cell so
+            // in-process plugins (s101-explorer) can query catalogue +
+            // feature + geometry data via HostApi without re-parsing the
+            // file. Single-chart only — plan2 doesn't yet cover merging
+            // indices across cells.
+            self.rebuild_chart_indices();
         }
 
         // Update UI state
@@ -1177,6 +1354,119 @@ impl ChartApp {
         info!("=== END INTERIOR RING DEBUG ===");
     }
 
+    /// Rebuild the s101-mcp `Indices` from `cells[0]` + the loaded FC, then
+    /// register the JSON-emitting query callbacks plugins use through
+    /// `HostApi::chart_*`. Called from `finalize_loading` after a chart set
+    /// is ready. Skips silently when no cell is loaded.
+    fn rebuild_chart_indices(&mut self) {
+        let Some(first) = self.cells.first() else {
+            return;
+        };
+        // We need owned `S101Cell` + `FeatureCatalogue` for `Indices::build`.
+        // The host keeps Vec<S101Cell> for rendering, so re-parse only when
+        // necessary. For now we clone via re-load of the source file —
+        // cheap enough (sub-100ms) and sidesteps the question of whether
+        // S101Cell should be Clone.
+        use ferrite_s100_core::S101Cell;
+        let path = first.file_path.clone();
+        let mut cell = match S101Cell::load(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to re-load cell for index build: {}", e);
+                return;
+            }
+        };
+        cell.normalize_feature_codes(&self.fc.feature_type_codes());
+        // Resolve raw atvl strings into typed AttributeValues (enums
+        // get their catalogue labels resolved here too). Without this
+        // every feature_get tool call returns "" for every value.
+        cell.resolve_attribute_values(&self.fc);
+        // FeatureCatalogue owns its data so we deep-clone via serde rather
+        // than re-parsing the XML.
+        let fc_clone: ferrite_feature_catalog::FeatureCatalogue = (*self.fc).clone();
+        let indices = Arc::new(s101_mcp::Indices::build(cell, fc_clone));
+        info!(
+            "Chart indices ready for plugins: {} features, {} catalogue feature types",
+            indices.feature.len(),
+            indices.catalogue.feature_count()
+        );
+        self.indices = Some(indices.clone());
+
+        // Register JSON-emitting query closures with the plugin host. Each
+        // closure captures an Arc<Indices> so the host (and through it, any
+        // plugin) can call queries on a stable snapshot regardless of what
+        // ChartApp does next.
+        // Capture the catalogue path so the dataset_metadata closure can
+        // inject it. Plugins use this to assemble the
+        // claude_desktop_config.json snippet without needing a separate
+        // HostApi method.
+        let catalogue_path = self.fc_status.path.clone();
+        let q_dataset = {
+            let i = indices.clone();
+            let cat = catalogue_path.clone();
+            Box::new(move || {
+                let raw = s101_mcp_chart_dataset_metadata(&i);
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("catalogue_path".to_string(), serde_json::json!(cat.clone()));
+                }
+                serde_json::to_string(&v).unwrap_or(raw)
+            }) as Box<dyn Fn() -> String + Send + Sync>
+        };
+        let q_search = {
+            let i = indices.clone();
+            Box::new(move |term: &str, limit: u32| s101_mcp_catalogue_search(&i, term, limit))
+                as Box<dyn Fn(&str, u32) -> String + Send + Sync>
+        };
+        let q_desc_feat = {
+            let i = indices.clone();
+            Box::new(move |code: &str| s101_mcp_catalogue_describe_feature(&i, code))
+                as Box<dyn Fn(&str) -> String + Send + Sync>
+        };
+        let q_desc_attr = {
+            let i = indices.clone();
+            Box::new(move |code: &str| s101_mcp_catalogue_describe_attribute(&i, code))
+                as Box<dyn Fn(&str) -> String + Send + Sync>
+        };
+        let q_get = {
+            let i = indices.clone();
+            Box::new(move |id: i64| s101_mcp_feature_get(&i, id))
+                as Box<dyn Fn(i64) -> String + Send + Sync>
+        };
+        let q_bbox = {
+            let i = indices.clone();
+            Box::new(move |w: f64, s: f64, e: f64, n: f64, limit: u32| {
+                s101_mcp_feature_query_bbox(&i, w, s, e, n, limit)
+            }) as Box<dyn Fn(f64, f64, f64, f64, u32) -> String + Send + Sync>
+        };
+        let q_nearby = {
+            let i = indices.clone();
+            Box::new(move |lat: f64, lon: f64, r: f64, limit: u32| {
+                s101_mcp_feature_nearby(&i, lat, lon, r, limit)
+            }) as Box<dyn Fn(f64, f64, f64, u32) -> String + Send + Sync>
+        };
+
+        self.plugin_system
+            .set_chart_query_callbacks(ferrite_plugin_loader::ChartQueryCallbacks {
+                dataset_metadata: q_dataset,
+                catalogue_search: q_search,
+                catalogue_describe_feature: q_desc_feat,
+                catalogue_describe_attribute: q_desc_attr,
+                feature_get: q_get,
+                feature_query_bbox: q_bbox,
+                feature_nearby: q_nearby,
+            });
+        self.plugin_system.set_chart_loaded(true);
+
+        // Hand the same Indices snapshot to the in-process HTTP MCP server
+        // so external LLM clients can run tools/call against the loaded
+        // chart.
+        if let Some(ref mcp) = self.mcp_server {
+            mcp.set_indices(indices);
+        }
+    }
+
     fn clear_charts(&mut self) {
         #[cfg(debug_assertions)]
         info!("Clearing all charts");
@@ -1184,6 +1474,11 @@ impl ChartApp {
         self.cells.clear();
         self.bounds = GeoBounds::new(-180.0, -90.0, 180.0, 90.0);
         self.chart_loaded = false;
+        self.indices = None;
+        self.plugin_system.set_chart_loaded(false);
+        if let Some(ref mcp) = self.mcp_server {
+            mcp.clear_indices();
+        }
         self.zoom_level = 1.0;
         self.zoom_target = 1.0;
         self.zoom_animating = false;
@@ -2875,6 +3170,9 @@ fn run_app() -> Result<()> {
         config.debug_rings,
         config.auto_zoom,
         config.auto_center,
+        config.dev_plugins,
+        config.mcp_enabled,
+        config.mcp_tunnel,
     );
 
     event_loop.run_app(&mut app).context("Event loop error")?;

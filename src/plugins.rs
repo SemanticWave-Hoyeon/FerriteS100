@@ -21,9 +21,17 @@ pub struct PluginSystem {
 }
 
 impl PluginSystem {
-    /// Create a new plugin system
-    pub fn new(plugins_dir: PathBuf, host_version: &str) -> Self {
-        let development_mode = cfg!(debug_assertions);
+    /// Create a new plugin system. `dev_plugins_override` forces development
+    /// (signature-not-required) mode even in release builds — used for
+    /// local self-contained dist testing via `--dev-plugins`.
+    pub fn new(plugins_dir: PathBuf, host_version: &str, dev_plugins_override: bool) -> Self {
+        let development_mode = cfg!(debug_assertions) || dev_plugins_override;
+        if dev_plugins_override && !cfg!(debug_assertions) {
+            warn!(
+                "Plugin signature verification disabled by --dev-plugins / FERRITE_DEV_PLUGINS — \
+                 do not use this for production distributions."
+            );
+        }
         let manager = PluginManager::new(plugins_dir, host_version, development_mode);
         let host_context = manager.host_context_mut();
 
@@ -91,6 +99,39 @@ impl PluginSystem {
     {
         self.manager.update_context(|ctx| {
             ctx.on_toast = Some(Box::new(callback));
+        });
+    }
+
+    /// Register the chart-data query callbacks plugins read via HostApi.
+    /// `loaded_flag` mirrors the host's chart-loaded state and is updated by
+    /// the host directly via `set_chart_loaded`.
+    pub fn set_chart_query_callbacks(&self, callbacks: ferrite_plugin_loader::ChartQueryCallbacks) {
+        let arc = std::sync::Arc::new(callbacks);
+        self.manager.update_context(|ctx| {
+            ctx.chart_queries = Some(arc.clone());
+        });
+    }
+
+    /// Flip the host's chart-loaded indicator. Plugins read this via
+    /// `HostApi::chart_loaded()` to gate their UI.
+    pub fn set_chart_loaded(&self, loaded: bool) {
+        self.manager.update_context(|ctx| {
+            ctx.chart_loaded_flag
+                .store(loaded, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    /// Register the MCP-server-info provider. Plugins call
+    /// `HostApi::mcp_server_info()` and the host returns whatever this
+    /// closure produces — typically a JSON string with `local_url`,
+    /// `public_url`, `bearer_token`, etc.
+    pub fn set_mcp_server_info_provider<F>(&self, provider: F)
+    where
+        F: Fn() -> String + Send + Sync + 'static,
+    {
+        let arc: std::sync::Arc<dyn Fn() -> String + Send + Sync> = std::sync::Arc::new(provider);
+        self.manager.update_context(|ctx| {
+            ctx.mcp_server_info = Some(arc.clone());
         });
     }
 

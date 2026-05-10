@@ -5,12 +5,27 @@
 #![allow(clippy::type_complexity)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use abi_stable::std_types::{ROption, RStr, RString};
 use tracing::{debug, error, info, trace, warn};
 
 use ferrite_plugin_api::{FileFilter, GeoBounds, HostApi, LogLevel};
+
+/// Chart-data query callbacks the host registers so plugins can read the
+/// loaded S-101 cell + Feature Catalogue without re-parsing the file.
+/// Each returns JSON in a `String`. None means "not wired" — the API
+/// returns an empty string and `chart_loaded` stays false.
+pub struct ChartQueryCallbacks {
+    pub dataset_metadata: Box<dyn Fn() -> String + Send + Sync>,
+    pub catalogue_search: Box<dyn Fn(&str, u32) -> String + Send + Sync>,
+    pub catalogue_describe_feature: Box<dyn Fn(&str) -> String + Send + Sync>,
+    pub catalogue_describe_attribute: Box<dyn Fn(&str) -> String + Send + Sync>,
+    pub feature_get: Box<dyn Fn(i64) -> String + Send + Sync>,
+    pub feature_query_bbox: Box<dyn Fn(f64, f64, f64, f64, u32) -> String + Send + Sync>,
+    pub feature_nearby: Box<dyn Fn(f64, f64, f64, u32) -> String + Send + Sync>,
+}
 
 /// Host context that holds shared state
 pub struct HostContext {
@@ -32,6 +47,15 @@ pub struct HostContext {
     pub on_file_open: Option<Box<dyn Fn(&str) -> Option<String> + Send + Sync>>,
     /// Callback for toast notifications
     pub on_toast: Option<Box<dyn Fn(&str, bool) + Send + Sync>>,
+    /// True once the host has built the S-101 indices for the current cell.
+    /// `AtomicBool` so plugin-side reads don't need to take the mutex.
+    pub chart_loaded_flag: Arc<AtomicBool>,
+    /// Chart-data query callbacks. None until the host wires them.
+    pub chart_queries: Option<Arc<ChartQueryCallbacks>>,
+    /// MCP server info provider. Returns a pre-serialized JSON string so
+    /// the host can update tunnel state asynchronously without taking a
+    /// lock on every plugin read. None until the server task initialises.
+    pub mcp_server_info: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl Default for HostContext {
@@ -46,6 +70,9 @@ impl Default for HostContext {
             on_file_save: None,
             on_file_open: None,
             on_toast: None,
+            chart_loaded_flag: Arc::new(AtomicBool::new(false)),
+            chart_queries: None,
+            mcp_server_info: None,
         }
     }
 }
@@ -70,6 +97,15 @@ pub fn create_host_api(context: SharedHostContext) -> HostApi {
         request_ui_refresh: host_request_ui_refresh,
         request_chart_redraw: host_request_chart_redraw,
         show_toast: host_show_toast,
+        chart_loaded: host_chart_loaded,
+        chart_dataset_metadata: host_chart_dataset_metadata,
+        chart_catalogue_search: host_chart_catalogue_search,
+        chart_catalogue_describe_feature: host_chart_catalogue_describe_feature,
+        chart_catalogue_describe_attribute: host_chart_catalogue_describe_attribute,
+        chart_feature_get: host_chart_feature_get,
+        chart_feature_query_bbox: host_chart_feature_query_bbox,
+        chart_feature_nearby: host_chart_feature_nearby,
+        mcp_server_info: host_mcp_server_info,
     }
 }
 
@@ -241,5 +277,98 @@ extern "C" fn host_show_toast(ctx: *const (), message: RStr<'_>, is_error: bool)
         error!("Toast (no handler): {}", message.as_str());
     } else {
         info!("Toast (no handler): {}", message.as_str());
+    }
+}
+
+// ── Chart-data query forwarders ──────────────────────────────────────
+//
+// Each forwarder reads the queries Arc out of the locked context and
+// then drops the lock before calling the user-supplied closure. The
+// closures take a long time (catalogue search walks the index) and we
+// don't want to block other plugin calls behind them.
+
+fn snapshot_queries(ctx: *const ()) -> Option<Arc<ChartQueryCallbacks>> {
+    let context = unsafe { get_context(ctx) };
+    let guard = context.lock().unwrap();
+    guard.chart_queries.clone()
+}
+
+extern "C" fn host_chart_loaded(ctx: *const ()) -> bool {
+    let context = unsafe { get_context(ctx) };
+    let guard = context.lock().unwrap();
+    guard.chart_loaded_flag.load(Ordering::Acquire)
+}
+
+extern "C" fn host_chart_dataset_metadata(ctx: *const ()) -> RString {
+    match snapshot_queries(ctx) {
+        Some(q) => RString::from((q.dataset_metadata)()),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_chart_catalogue_search(ctx: *const (), term: RStr<'_>, limit: u32) -> RString {
+    match snapshot_queries(ctx) {
+        Some(q) => RString::from((q.catalogue_search)(term.as_str(), limit)),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_chart_catalogue_describe_feature(ctx: *const (), code: RStr<'_>) -> RString {
+    match snapshot_queries(ctx) {
+        Some(q) => RString::from((q.catalogue_describe_feature)(code.as_str())),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_chart_catalogue_describe_attribute(ctx: *const (), code: RStr<'_>) -> RString {
+    match snapshot_queries(ctx) {
+        Some(q) => RString::from((q.catalogue_describe_attribute)(code.as_str())),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_chart_feature_get(ctx: *const (), id: i64) -> RString {
+    match snapshot_queries(ctx) {
+        Some(q) => RString::from((q.feature_get)(id)),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_chart_feature_query_bbox(
+    ctx: *const (),
+    w: f64,
+    s: f64,
+    e: f64,
+    n: f64,
+    limit: u32,
+) -> RString {
+    match snapshot_queries(ctx) {
+        Some(q) => RString::from((q.feature_query_bbox)(w, s, e, n, limit)),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_chart_feature_nearby(
+    ctx: *const (),
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+    limit: u32,
+) -> RString {
+    match snapshot_queries(ctx) {
+        Some(q) => RString::from((q.feature_nearby)(lat, lon, radius_m, limit)),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_mcp_server_info(ctx: *const ()) -> RString {
+    let context = unsafe { get_context(ctx) };
+    let provider = {
+        let guard = context.lock().unwrap();
+        guard.mcp_server_info.clone()
+    };
+    match provider {
+        Some(f) => RString::from(f()),
+        None => RString::new(),
     }
 }

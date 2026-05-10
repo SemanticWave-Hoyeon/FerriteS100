@@ -10,9 +10,11 @@ members = [
     "crates/ferrite-lua",
     "crates/ferrite-plugin-api",
     "crates/ferrite-plugin-loader",
+    "plugins/s101-mcp",
 ]
 exclude = [
-    "plugins/*",
+    "plugins/route-plugin",
+    "plugins/s101-explorer",
 ]
 
 [workspace.package]
@@ -78,6 +80,19 @@ sha2 = "0.10"
 serde_json = "1"
 bincode = "1"
 
+# Networking (HTTP MCP server)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tower-log", "form", "query"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = "1"
+rand = "0.8"
+
+# OAuth 2.1 (MCP authorization spec)
+jsonwebtoken = "9"
+urlencoding = "2"
+base64 = "0.22"
+
 # Internal crates
 ferrite-iso8211 = { path = "crates/ferrite-iso8211" }
 ferrite-s100-core = { path = "crates/ferrite-s100-core" }
@@ -88,6 +103,7 @@ ferrite-wgpu = { path = "crates/ferrite-wgpu" }
 ferrite-lua = { path = "crates/ferrite-lua" }
 ferrite-plugin-api = { path = "crates/ferrite-plugin-api" }
 ferrite-plugin-loader = { path = "crates/ferrite-plugin-loader" }
+s101-mcp = { path = "plugins/s101-mcp" }
 
 [package]
 name = "ferrite-s100"
@@ -112,6 +128,7 @@ ferrite-wgpu.workspace = true
 ferrite-lua.workspace = true
 ferrite-plugin-api.workspace = true
 ferrite-plugin-loader.workspace = true
+s101-mcp.workspace = true
 abi_stable.workspace = true
 winit.workspace = true
 pollster.workspace = true
@@ -127,7 +144,16 @@ image.workspace = true
 rayon.workspace = true
 bincode.workspace = true
 sha2.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+rand.workspace = true
+jsonwebtoken.workspace = true
+urlencoding.workspace = true
+base64.workspace = true
 mimalloc = "0.1"
 
 # Windows system APIs (for debug info)
