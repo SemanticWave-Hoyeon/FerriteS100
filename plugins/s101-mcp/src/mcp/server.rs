@@ -1,8 +1,12 @@
-//! MCP stdio loop.
+//! MCP JSON-RPC method dispatcher.
 //!
-//! Reads newline-delimited JSON-RPC 2.0 frames from stdin, dispatches to
-//! tools, writes responses to stdout. Logs (which would corrupt the
-//! protocol if mixed with frames) go to stderr.
+//! Maps the four MCP methods (`initialize`, `tools/list`, `tools/call`,
+//! `ping`) onto the read-only tool dispatcher in [`super::tools`].
+//! Transport-agnostic: the caller frames the JSON-RPC bytes however
+//! it needs.
+//!
+//! Used by FerriteS100's [`crate::http_mcp`](../../../../../src/http_mcp.rs)
+//! to serve OAuth-authenticated JSON-RPC over HTTP/1.1.
 //!
 //! Methods supported:
 //! - `initialize`: handshake, returns serverInfo + capabilities
@@ -10,10 +14,7 @@
 //! - `tools/call`: invokes a tool by name with JSON arguments
 //! - `ping`: keepalive (returns `{}`)
 //!
-//! All other methods reply with JSON-RPC error code -32601 (Method not found).
-
-use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
+//! Anything else replies with JSON-RPC error code -32601 (Method not found).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -24,95 +25,36 @@ use crate::indices::Indices;
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 #[derive(Deserialize)]
-struct JsonRpcRequest {
+pub struct JsonRpcRequest {
     #[allow(dead_code)]
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
+    pub jsonrpc: String,
+    pub id: Option<Value>,
+    pub method: String,
     #[serde(default)]
-    params: Value,
+    pub params: Value,
 }
 
 #[derive(Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
+pub struct JsonRpcResponse {
+    pub jsonrpc: &'static str,
+    pub id: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
+    pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
+    pub error: Option<JsonRpcError>,
 }
 
 #[derive(Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
+    pub data: Option<Value>,
 }
 
-pub fn run(indices: Arc<Indices>) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            // EOF — client closed stdin. Normal shutdown.
-            tracing::info!("Client closed stdin; shutting down");
-            return Ok(());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Malformed JSON-RPC frame: {}", e);
-                let resp = JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700, // Parse error
-                        message: format!("Parse error: {}", e),
-                        data: None,
-                    }),
-                };
-                write_frame(&stdout, &resp)?;
-                continue;
-            }
-        };
-
-        // Notifications (no id) get no reply.
-        let id = match req.id.clone() {
-            Some(v) => v,
-            None => {
-                tracing::trace!("Notification {}: no reply expected", req.method);
-                continue;
-            }
-        };
-
-        let resp = dispatch(&indices, &req.method, req.params, id);
-        write_frame(&stdout, &resp)?;
-    }
-}
-
-fn write_frame(stdout: &std::io::Stdout, resp: &JsonRpcResponse) -> Result<()> {
-    let mut out = stdout.lock();
-    let payload = serde_json::to_string(resp)?;
-    out.write_all(payload.as_bytes())?;
-    out.write_all(b"\n")?;
-    out.flush()?;
-    Ok(())
-}
-
-fn dispatch(idx: &Indices, method: &str, params: Value, id: Value) -> JsonRpcResponse {
+/// JSON-RPC dispatcher. The caller is responsible for framing
+/// (HTTP body, SSE chunks, etc.).
+pub fn dispatch(idx: &Indices, method: &str, params: Value, id: Value) -> JsonRpcResponse {
     match method {
         "initialize" => ok(id, initialize_result()),
         "ping" => ok(id, json!({})),

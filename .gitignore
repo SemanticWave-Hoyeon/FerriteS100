@@ -77,8 +77,10 @@ Thumbs.db
 
 # s101-mcp / s101-explorer source ARE tracked — they live in FerriteS100
 # proper now. Only their build artefacts and saved per-user plugin config
-# are local.
+# are local. s101-mcp is a workspace member so the root Cargo.lock is the
+# authoritative one — its in-tree Cargo.lock is local-only.
 /plugins/s101-mcp/target/
+/plugins/s101-mcp/Cargo.lock
 /plugins/s101-explorer/target/
 /plugins_out/s101-explorer/
 /config/plugins/com.ferrite.s101-explorer.json
