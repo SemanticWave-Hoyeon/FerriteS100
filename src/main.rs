@@ -13,6 +13,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Application version (from Cargo.toml)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+mod http_mcp;
+mod oauth;
 mod plugins;
 
 use std::fs;
@@ -314,6 +316,12 @@ struct AppConfig {
     /// Use only for local testing; production distributions should
     /// ship signed plugins instead.
     dev_plugins: bool,
+    /// Run the in-process HTTP MCP server. `--no-mcp` disables it
+    /// entirely (no port bound, no tunnel). Default true.
+    mcp_enabled: bool,
+    /// Spawn `ngrok http` to expose the MCP server publicly.
+    /// `--no-tunnel` keeps the server on localhost only. Default true.
+    mcp_tunnel: bool,
 }
 
 impl AppConfig {
@@ -324,6 +332,8 @@ impl AppConfig {
         let debug_rings = args.iter().any(|arg| arg == "--debug-rings");
         let dev_plugins = args.iter().any(|arg| arg == "--dev-plugins")
             || std::env::var("FERRITE_DEV_PLUGINS").is_ok_and(|v| v == "1" || v == "true");
+        let mcp_enabled = !args.iter().any(|arg| arg == "--no-mcp");
+        let mcp_tunnel = mcp_enabled && !args.iter().any(|arg| arg == "--no-tunnel");
 
         // Parse --chart <path> (can appear multiple times or use glob)
         let mut auto_chart = Vec::new();
@@ -389,6 +399,8 @@ impl AppConfig {
             auto_zoom,
             auto_center,
             dev_plugins,
+            mcp_enabled,
+            mcp_tunnel,
         }
     }
 }
@@ -522,6 +534,11 @@ struct ChartApp {
     /// Used for drift-free zoom by directly computing pan_offset each frame
     /// instead of accumulating floating-point deltas.
     zoom_anchor_world: (f64, f64),
+    /// In-process HTTP MCP server + ngrok tunnel. `None` when the
+    /// user disabled it via `--no-mcp`. The handle owns its tokio runtime;
+    /// dropping it would shut everything down (we keep it alive for the
+    /// process lifetime).
+    mcp_server: Option<http_mcp::McpServerHandle>,
 }
 
 impl ChartApp {
@@ -540,7 +557,31 @@ impl ChartApp {
         auto_zoom: Option<f64>,
         auto_center: Option<(f64, f64)>,
         dev_plugins: bool,
+        mcp_enabled: bool,
+        mcp_tunnel: bool,
     ) -> Self {
+        // Start the in-process HTTP MCP server before we build the plugin
+        // system, so the server-info provider closure (registered against
+        // the PluginSystem) can capture the live handle.
+        let mcp_server = if mcp_enabled {
+            match http_mcp::start(mcp_tunnel) {
+                Ok(handle) => {
+                    info!(
+                        "HTTP MCP server initialised (tunnel: {})",
+                        if mcp_tunnel { "ngrok" } else { "disabled" }
+                    );
+                    Some(handle)
+                }
+                Err(e) => {
+                    warn!("Failed to start HTTP MCP server: {}", e);
+                    None
+                }
+            }
+        } else {
+            info!("HTTP MCP server disabled by --no-mcp");
+            None
+        };
+
         ChartApp {
             window: None,
             renderer: None,
@@ -672,6 +713,19 @@ impl ChartApp {
                     }
                 });
 
+                // Wire the MCP server-info provider so plugins reading
+                // `HostApi::mcp_server_info()` get up-to-date URL + tunnel
+                // state. We clone the `Arc<ServerState>` so the closure
+                // doesn't outlive the handle (the handle owns its tokio
+                // runtime; the closure only reads the snapshot mutex).
+                if let Some(ref handle) = mcp_server {
+                    let state = handle.state.clone();
+                    ps.set_mcp_server_info_provider(move || {
+                        serde_json::to_string(&state.snapshot())
+                            .unwrap_or_else(|_| "{}".to_string())
+                    });
+                }
+
                 ps
             },
             base_instruction_count: 0,
@@ -695,6 +749,7 @@ impl ChartApp {
             zoom_target: 1.0,
             zoom_animating: false,
             zoom_anchor_world: (0.0, 0.0),
+            mcp_server,
         }
     }
 
@@ -1403,6 +1458,13 @@ impl ChartApp {
                 feature_nearby: q_nearby,
             });
         self.plugin_system.set_chart_loaded(true);
+
+        // Hand the same Indices snapshot to the in-process HTTP MCP server
+        // so external LLM clients can run tools/call against the loaded
+        // chart.
+        if let Some(ref mcp) = self.mcp_server {
+            mcp.set_indices(indices);
+        }
     }
 
     fn clear_charts(&mut self) {
@@ -1414,6 +1476,9 @@ impl ChartApp {
         self.chart_loaded = false;
         self.indices = None;
         self.plugin_system.set_chart_loaded(false);
+        if let Some(ref mcp) = self.mcp_server {
+            mcp.clear_indices();
+        }
         self.zoom_level = 1.0;
         self.zoom_target = 1.0;
         self.zoom_animating = false;
@@ -3106,6 +3171,8 @@ fn run_app() -> Result<()> {
         config.auto_zoom,
         config.auto_center,
         config.dev_plugins,
+        config.mcp_enabled,
+        config.mcp_tunnel,
     );
 
     event_loop.run_app(&mut app).context("Event loop error")?;

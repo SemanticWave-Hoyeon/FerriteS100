@@ -121,6 +121,20 @@ impl PluginSystem {
         });
     }
 
+    /// Register the MCP-server-info provider. Plugins call
+    /// `HostApi::mcp_server_info()` and the host returns whatever this
+    /// closure produces — typically a JSON string with `local_url`,
+    /// `public_url`, `bearer_token`, etc.
+    pub fn set_mcp_server_info_provider<F>(&self, provider: F)
+    where
+        F: Fn() -> String + Send + Sync + 'static,
+    {
+        let arc: std::sync::Arc<dyn Fn() -> String + Send + Sync> = std::sync::Arc::new(provider);
+        self.manager.update_context(|ctx| {
+            ctx.mcp_server_info = Some(arc.clone());
+        });
+    }
+
     /// Handle mouse click from main app
     /// Returns true if any plugin consumed the event
     pub fn handle_click(

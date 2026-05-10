@@ -124,131 +124,135 @@ struct PanelData {
     input_search: String,
     /// Cap visible to the user.
     max_results: u32,
-    /// MCP server registration info so users can register the same
-    /// in-process tools with an external LLM client (Claude Desktop,
-    /// ChatGPT, etc). `None` until a chart is loaded — without an
-    /// active chart there's nothing to register.
+    /// HTTP MCP server registration info. Always present when the host
+    /// has the server enabled — the chart-loaded gate is at the tool
+    /// level, not the registration level, so users can register Claude
+    /// before opening a chart and tools start responding the moment
+    /// they do.
     connection_info: Option<ConnectionInfo>,
 }
 
 #[derive(Debug, Serialize)]
 struct ConnectionInfo {
-    /// Path to the s101-mcp executable that the LLM client will spawn.
-    /// `binary_found` is true if the path exists on disk; false means
-    /// the user needs to build the binary or edit settings.
-    binary_path: String,
-    binary_found: bool,
-    /// Chart file the server should pre-load.
-    chart_path: String,
-    /// Feature catalogue (file or directory).
-    catalogue_path: String,
-    /// Full command-line as a copy-pasteable shell string.
-    command_line: String,
-    /// `claude_desktop_config.json` snippet — the canonical MCP-client
-    /// configuration shape. Same JSON works for OpenAI / OpenRouter / etc.
+    /// Server lifecycle state from the host.
+    running: bool,
+    /// `http://127.0.0.1:PORT/mcp` for clients on the same machine.
+    local_url: String,
+    /// `https://*.ngrok-free.app/mcp` (or paid-plan domain) once the
+    /// ngrok tunnel is up.
+    public_url: Option<String>,
+    /// "ready" | "starting" | "unavailable" | "disabled"
+    tunnel_state: String,
+    /// User-facing message — install/authtoken hint when ngrok is
+    /// missing, timeout note when the tunnel didn't come up, etc.
+    tunnel_message: String,
+    /// Auth scheme advertised by the server; always "oauth2" now.
+    auth: String,
+    /// Number of OAuth Dynamic Client Registrations performed so far.
+    /// Surfaces in the UI as "1 client registered" / etc.
+    registered_clients: u64,
+    /// Discovery URL clients hit to learn how to authenticate. Used in
+    /// the panel's troubleshooting section (paste in a browser → JSON).
+    discovery_url: String,
+    /// `claude_desktop_config.json` snippet for the HTTP transport with
+    /// OAuth. Modern MCP clients auto-discover OAuth via the 401 on
+    /// `/mcp`; the snippet has no `Authorization` header — the client
+    /// fetches one itself.
     config_snippet: String,
+    /// Raw cURL command demonstrating the 401-with-resource_metadata
+    /// response. Useful for verifying the discovery flow without
+    /// running a full OAuth client.
+    curl_example: String,
 }
 
-/// Find the s101-mcp executable. Probed in order:
-///   1. `s101-mcp.exe` next to the host (self-contained dist)
-///   2. `plugins/s101-mcp/target/debug/s101-mcp.exe` (cargo run dev)
-///   3. `plugins/s101-mcp/target/release/s101-mcp.exe` (release source)
-///
-/// Returns the first existing candidate, or candidate #1 as the best
-/// guess if none are found (so the panel still has something to show).
-fn probe_binary_path() -> (String, bool) {
-    let candidates: &[&str] = if cfg!(windows) {
-        &[
-            "s101-mcp.exe",
-            "plugins/s101-mcp/target/release/s101-mcp.exe",
-            "plugins/s101-mcp/target/debug/s101-mcp.exe",
-        ]
-    } else {
-        &[
-            "s101-mcp",
-            "plugins/s101-mcp/target/release/s101-mcp",
-            "plugins/s101-mcp/target/debug/s101-mcp",
-        ]
-    };
-    for c in candidates {
-        if std::path::Path::new(c).exists() {
-            // Canonicalize so the snippet shows an absolute path that
-            // will resolve from any CWD an LLM client launches us in.
-            let abs = std::fs::canonicalize(c)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| c.to_string());
-            return (strip_unc_prefix(&abs), true);
-        }
-    }
-    (candidates[0].to_string(), false)
-}
-
-/// On Windows, `canonicalize` returns paths with a `\\?\` UNC prefix
-/// that confuses some LLM client config parsers. Strip it.
-fn strip_unc_prefix(s: &str) -> String {
-    s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
-}
-
-fn shell_quote(s: &str) -> String {
-    if s.is_empty() || s.contains(char::is_whitespace) || s.contains('"') {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        s.to_string()
-    }
-}
-
-/// Build the `ConnectionInfo` from a `dataset_metadata` JSON response and
-/// a probed binary path. Returns None if either chart_path or
-/// catalogue_path are missing (i.e. the host hasn't fully wired things up
-/// yet — defensive against partial state).
-fn build_connection_info(metadata: &serde_json::Value) -> Option<ConnectionInfo> {
-    let chart_path = metadata
-        .get("dataset")
-        .and_then(|d| d.get("file"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let catalogue_path = metadata
-        .get("catalogue_path")
+/// Build the HTTP-based `ConnectionInfo` from the JSON returned by
+/// `HostApi::mcp_server_info()`. Returns `None` when the server hasn't
+/// reported `running: true` yet — the panel renders a "starting…"
+/// placeholder in that case.
+fn build_connection_info(server_info: &serde_json::Value) -> Option<ConnectionInfo> {
+    let running = server_info.get("running").and_then(|v| v.as_bool())?;
+    let local_url = server_info
+        .get("local_url")
         .and_then(|v| v.as_str())
-        .unwrap_or("Catalogues/FC/S-101")
+        .unwrap_or("")
         .to_string();
-    let (binary_path, binary_found) = probe_binary_path();
+    if local_url.is_empty() {
+        return None;
+    }
+    let public_url = server_info
+        .get("public_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let tunnel_state = server_info
+        .get("tunnel_state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let tunnel_message = server_info
+        .get("tunnel_message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let auth = server_info
+        .get("auth")
+        .and_then(|v| v.as_str())
+        .unwrap_or("oauth2")
+        .to_string();
+    let registered_clients = server_info
+        .get("registered_clients")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
-    let command_line = format!(
-        "{} --chart {} --catalogue {}",
-        shell_quote(&binary_path),
-        shell_quote(&chart_path),
-        shell_quote(&catalogue_path)
-    );
+    // Prefer the public URL for the snippet — that's the URL Claude
+    // running elsewhere actually needs. Fall back to local when the
+    // tunnel isn't up yet (still works for same-machine clients).
+    let registration_url = public_url.clone().unwrap_or_else(|| local_url.clone());
 
+    // Strip trailing /mcp to derive the AS base — discovery endpoints
+    // sit at the root of the issuer, not under /mcp.
+    let base_url = registration_url
+        .strip_suffix("/mcp")
+        .unwrap_or(&registration_url)
+        .to_string();
+    let discovery_url = format!("{}/.well-known/oauth-authorization-server", base_url);
+
+    // claude_desktop_config.json shape for the HTTP MCP transport with
+    // OAuth: no headers — the client auto-discovers OAuth from the 401
+    // response and runs the auth-code flow itself.
     let config = serde_json::json!({
         "mcpServers": {
             "s101": {
-                "command": binary_path,
-                "args": [
-                    "--chart", chart_path,
-                    "--catalogue", catalogue_path
-                ]
+                "transport": "http",
+                "url": registration_url
             }
         }
     });
     let config_snippet = serde_json::to_string_pretty(&config).unwrap_or_default();
 
-    Some(ConnectionInfo {
-        binary_path: shell_quote_inner(&binary_path),
-        binary_found,
-        chart_path,
-        catalogue_path,
-        command_line,
-        config_snippet,
-    })
-}
+    let curl_example = format!(
+        "# 1. Discovery probe — should return 401 with WWW-Authenticate \
+         pointing to the protected-resource metadata.\n\
+         curl -i -X POST {url} \\\n  \
+         -H \"Content-Type: application/json\" \\\n  \
+         -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}}'\n\n\
+         # 2. Read AS metadata (open in browser too):\n\
+         curl {disco}",
+        url = registration_url,
+        disco = discovery_url
+    );
 
-// shell_quote, but we use it for storing the raw binary path back into
-// the struct unquoted (UI shows it as plain text). Keeping a separate
-// helper so the call site stays honest about which is which.
-fn shell_quote_inner(s: &str) -> String {
-    s.to_string()
+    Some(ConnectionInfo {
+        running,
+        local_url,
+        public_url,
+        tunnel_state,
+        tunnel_message,
+        auth,
+        registered_clients,
+        discovery_url,
+        config_snippet,
+        curl_example,
+    })
 }
 
 impl Plugin for ExplorerPlugin {
@@ -292,8 +296,6 @@ impl Plugin for ExplorerPlugin {
             .map(|h| h.chart_loaded())
             .unwrap_or(false);
 
-        // Pull metadata once and reuse for the summary line + connection
-        // info. Avoids a second HostApi round-trip per redraw.
         let metadata: Option<serde_json::Value> = if chart_loaded {
             self.host_api
                 .as_ref()
@@ -324,7 +326,20 @@ impl Plugin for ExplorerPlugin {
                 }
             });
 
-        let connection_info = metadata.as_ref().and_then(build_connection_info);
+        // The HTTP MCP server runs from app startup; its registration
+        // info is independent of whether a chart is loaded.
+        let server_info: Option<serde_json::Value> = self
+            .host_api
+            .as_ref()
+            .and_then(|h| {
+                let raw = h.mcp_server_info();
+                if raw.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(&raw).ok()
+                }
+            });
+        let connection_info = server_info.as_ref().and_then(build_connection_info);
 
         let panel = PanelData {
             chart_loaded,
