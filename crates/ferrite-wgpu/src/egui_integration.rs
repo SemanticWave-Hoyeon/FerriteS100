@@ -1327,10 +1327,17 @@ impl EguiIntegration {
                     .get("chart_loaded")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+
+                // MCP server connection panel renders before the chart-
+                // gated tools so the user can register a client at any
+                // time — the HTTP server runs from app start.
+                Self::draw_mcp_connection_block(ui, &panel);
+
                 if !chart_loaded {
                     ui.colored_label(
                         egui::Color32::from_rgb(200, 160, 80),
-                        "Load a chart first to enable explorer queries.",
+                        "Load a chart to enable explorer queries (the MCP server is running and \
+                         will start serving tools as soon as a chart is loaded).",
                     );
                     return;
                 }
@@ -1439,105 +1446,236 @@ impl EguiIntegration {
                 } else {
                     ui.label("(no query run yet)");
                 }
-
-                ui.separator();
-
-                // MCP server connection — for registering the same tools
-                // with an external LLM client (Claude Desktop / ChatGPT / …).
-                if let Some(conn) = panel.get("connection_info") {
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new("MCP server registration").strong(),
-                    )
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        let binary_path = conn
-                            .get("binary_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let binary_found = conn
-                            .get("binary_found")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let chart_path = conn
-                            .get("chart_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let catalogue_path = conn
-                            .get("catalogue_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let command_line = conn
-                            .get("command_line")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let snippet = conn
-                            .get("config_snippet")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        if !binary_found {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 160, 70),
-                                format!(
-                                    "s101-mcp not found at {} — build with `cargo build --release -p s101-mcp` first.",
-                                    binary_path
-                                ),
-                            );
-                        }
-                        ui.label(format!("Binary:    {}", binary_path));
-                        ui.label(format!("Chart:     {}", chart_path));
-                        ui.label(format!("Catalogue: {}", catalogue_path));
-
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new("Shell command")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(160, 170, 200)),
-                        );
-                        ui.horizontal(|ui| {
-                            if ui.button("Copy").clicked() {
-                                ui.ctx().copy_text(command_line.to_string());
-                            }
-                        });
-                        ui.add(
-                            egui::TextEdit::multiline(&mut command_line.to_string())
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(2)
-                                .font(egui::TextStyle::Monospace),
-                        );
-
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new("claude_desktop_config.json snippet")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(160, 170, 200)),
-                        );
-                        ui.horizontal(|ui| {
-                            if ui.button("Copy").clicked() {
-                                ui.ctx().copy_text(snippet.to_string());
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "Same JSON works in any MCP-aware client (ChatGPT, OpenRouter, etc).",
-                                )
-                                .size(10.0)
-                                .color(egui::Color32::GRAY),
-                            );
-                        });
-                        egui::ScrollArea::vertical()
-                            .max_height(200.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut snippet.to_string())
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(10)
-                                        .font(egui::TextStyle::Monospace),
-                                );
-                            });
-                    });
-                }
             });
+    }
+
+    /// Render the HTTP MCP server registration block.
+    ///
+    /// Shows the URL the client should register, the OAuth discovery
+    /// endpoint, and a copy-paste `claude_desktop_config.json` snippet
+    /// (no headers — modern MCP clients run the OAuth flow themselves
+    /// after seeing the 401 from `/mcp`).
+    fn draw_mcp_connection_block(ui: &mut egui::Ui, panel: &serde_json::Value) {
+        let Some(conn) = panel.get("connection_info") else {
+            return;
+        };
+        let running = conn
+            .get("running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !running {
+            return;
+        }
+        let local_url = conn.get("local_url").and_then(|v| v.as_str()).unwrap_or("");
+        let public_url = conn.get("public_url").and_then(|v| v.as_str());
+        let tunnel_state = conn
+            .get("tunnel_state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let tunnel_message = conn
+            .get("tunnel_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let auth_scheme = conn
+            .get("auth")
+            .and_then(|v| v.as_str())
+            .unwrap_or("oauth2");
+        let registered_clients = conn
+            .get("registered_clients")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let discovery_url = conn
+            .get("discovery_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let snippet = conn
+            .get("config_snippet")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let curl_example = conn
+            .get("curl_example")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Default-open when the public URL is ready so the user sees the
+        // copy-paste fields the moment they activate the panel.
+        let default_open = public_url.is_some();
+
+        egui::CollapsingHeader::new(
+            egui::RichText::new("MCP server registration (HTTP + OAuth 2.1)").strong(),
+        )
+        .default_open(default_open)
+        .show(ui, |ui| {
+            // Tunnel + auth status line
+            let (badge_color, badge_text) = match tunnel_state {
+                "ready" => (egui::Color32::from_rgb(80, 200, 110), "● Tunnel ready"),
+                "starting" => (egui::Color32::from_rgb(220, 200, 100), "● Tunnel starting…"),
+                "unavailable" => (
+                    egui::Color32::from_rgb(220, 120, 110),
+                    "● Tunnel unavailable",
+                ),
+                "disabled" => (egui::Color32::GRAY, "● Tunnel disabled (--no-tunnel)"),
+                _ => (egui::Color32::GRAY, "● Tunnel: unknown"),
+            };
+            ui.horizontal(|ui| {
+                ui.colored_label(badge_color, badge_text);
+                ui.colored_label(
+                    egui::Color32::from_rgb(160, 200, 230),
+                    format!("● Auth: {}", auth_scheme),
+                );
+                ui.label(
+                    egui::RichText::new(format!("({} client registered)", registered_clients))
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                );
+            });
+            if !tunnel_message.is_empty() {
+                // tunnel_message can be a multi-line dump from
+                // ngrok's last few log lines — show it in a
+                // scrollable monospace box so the user can actually
+                // read why the tunnel failed.
+                if tunnel_message.contains('\n') {
+                    egui::ScrollArea::vertical()
+                        .id_salt("mcp_tunnel_msg_scroll")
+                        .max_height(140.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut tunnel_message.to_string())
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(6)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        });
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(200, 170, 100), tunnel_message);
+                }
+            }
+
+            ui.add_space(4.0);
+
+            // URL fields. Public first when present.
+            if let Some(public) = public_url {
+                ui.label(
+                    egui::RichText::new("Public URL (Claude/ChatGPT)")
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(160, 200, 160)),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(public.to_string());
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut public.to_string())
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+            }
+
+            ui.label(
+                egui::RichText::new("Local URL (same machine)")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(160, 170, 200)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(local_url.to_string());
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut local_url.to_string())
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("OAuth discovery")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(160, 170, 200)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(discovery_url.to_string());
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut discovery_url.to_string())
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Modern MCP clients (Claude Desktop, ChatGPT Custom Connectors) read this \
+                     metadata, register themselves dynamically, and walk you through a browser \
+                     consent screen — no token to copy by hand.",
+                )
+                .size(10.0)
+                .color(egui::Color32::GRAY),
+            );
+
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("claude_desktop_config.json")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(160, 170, 200)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(snippet.to_string());
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Same JSON shape works in ChatGPT custom connectors, OpenRouter, etc.",
+                    )
+                    .size(10.0)
+                    .color(egui::Color32::GRAY),
+                );
+            });
+            egui::ScrollArea::vertical()
+                .id_salt("mcp_snippet_scroll")
+                .max_height(160.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut snippet.to_string())
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(7)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+
+            ui.add_space(6.0);
+            ui.collapsing(
+                egui::RichText::new("cURL discovery probe").size(11.0),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(curl_example.to_string());
+                        }
+                    });
+                    ui.add(
+                        egui::TextEdit::multiline(&mut curl_example.to_string())
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(6)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                },
+            );
+
+            if tunnel_state == "unavailable" {
+                ui.add_space(4.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(180, 180, 200),
+                    "Tip: install ngrok from https://ngrok.com/download, run \
+                     `ngrok config add-authtoken <your-token>` once, then restart \
+                     FerriteS100. Or set NGROK_BIN to ngrok's full path. The local \
+                     URL above keeps working in the meantime for same-machine clients.",
+                );
+            }
+        });
+        ui.separator();
     }
 
     /// Draw the Settings dialog

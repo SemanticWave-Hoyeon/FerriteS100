@@ -52,6 +52,10 @@ pub struct HostContext {
     pub chart_loaded_flag: Arc<AtomicBool>,
     /// Chart-data query callbacks. None until the host wires them.
     pub chart_queries: Option<Arc<ChartQueryCallbacks>>,
+    /// MCP server info provider. Returns a pre-serialized JSON string so
+    /// the host can update tunnel state asynchronously without taking a
+    /// lock on every plugin read. None until the server task initialises.
+    pub mcp_server_info: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl Default for HostContext {
@@ -68,6 +72,7 @@ impl Default for HostContext {
             on_toast: None,
             chart_loaded_flag: Arc::new(AtomicBool::new(false)),
             chart_queries: None,
+            mcp_server_info: None,
         }
     }
 }
@@ -100,6 +105,7 @@ pub fn create_host_api(context: SharedHostContext) -> HostApi {
         chart_feature_get: host_chart_feature_get,
         chart_feature_query_bbox: host_chart_feature_query_bbox,
         chart_feature_nearby: host_chart_feature_nearby,
+        mcp_server_info: host_mcp_server_info,
     }
 }
 
@@ -351,6 +357,18 @@ extern "C" fn host_chart_feature_nearby(
 ) -> RString {
     match snapshot_queries(ctx) {
         Some(q) => RString::from((q.feature_nearby)(lat, lon, radius_m, limit)),
+        None => RString::new(),
+    }
+}
+
+extern "C" fn host_mcp_server_info(ctx: *const ()) -> RString {
+    let context = unsafe { get_context(ctx) };
+    let provider = {
+        let guard = context.lock().unwrap();
+        guard.mcp_server_info.clone()
+    };
+    match provider {
+        Some(f) => RString::from(f()),
         None => RString::new(),
     }
 }
