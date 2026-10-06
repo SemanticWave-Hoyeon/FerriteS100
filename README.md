@@ -591,8 +591,8 @@ Mac native pointer/menu/keyboard tests loaded the signed SHOM four-cell set and 
 
 ### Current integration validation (macOS, 2D)
 
-The current 320-file integration removes the globe/sphere camera, UI mode, CLI
-path and rendering modules and retains the 2D S-101/S-102 chart view. General
+The qualified 322-file viewer source retains only the 2D S-101/S-102 chart view;
+the globe/sphere camera, UI mode, CLI path and rendering modules are removed. General
 WGS84 geodesy and Mercator navigation remain. Historical globe reports in
 `TestResults/` describe the older implementation.
 
@@ -708,12 +708,68 @@ The candidate passed 297 CPU tests and the all-targets check. Six paired hidden
 palette-change poses, including a centred official Wreck symbol at 200x, matched
 full chart pixels, ordered instructions, raw GPU buffers and symbol attributes.
 Failed staging retained the old frame; successful publication retained the relation
-epoch while issuing a fresh geometry ownership revision. Independent sixteen-run
+epoch while issuing a fresh geometry ownership revision. In the preceding static-line-only benchmark, independent sixteen-run
 same-binary OFF/ON ABBA/BAAB measurements over the signed SHOM 5,059-feature chain
 reduced warm palette-change commit medians from about 323ms to 169ms (47.5–47.6%).
-Preparation stayed near 230ms; preparation plus commit medians fell by about
+Preparation in that preceding benchmark stayed near 230ms; preparation plus commit medians fell by about
 27.6–27.7%. These timings exclude subsequent render/present and describe the
 retry path after rejected staging, not startup, continuous navigation or displayed
 FPS. Separate signed loading/profile checks cover Debug, Release and Release-fast.
 The transaction-local Lua stroke cache remains uninstalled because its timing
 results were mixed.
+
+### Exact Area triangulation reuse qualification (macOS, 2D)
+
+The qualified source enables bounded exact Area topology reuse by default.
+`FERRITE_AREA_TRIANGULATION_REUSE=0` opts out; `1` enables it explicitly. An
+unset variable enables reuse, while other values, including non-Unicode values,
+disable it. The policy is selected at process startup and shared by renderer
+retention and publication admission. Source ownership revisions remain fresh.
+Inheritance requires exact directed exterior/hole coordinate bits, hole order,
+sorted source ordinals/provenance, priority and display plane; projection must
+match at rebind. Palette and view-dependent visibility, date, scale, groups,
+Parent dependencies, coverage and picking follow their existing evaluation paths.
+Rejected triangulations remain rejected; declined admission uses original cold
+geometry. No approximate geometry, quality reduction or omitted ENC objects are
+introduced.
+
+Retention is bounded to 4,096 records and 32 MiB of logical retained capacity.
+This is not a limit on the existing active triangulation cache, allocator overhead
+or process RSS. The measured large-chain retained payload was 24,596,184 bytes.
+
+CPU contracts, the all-targets check and fresh Lua 5.4 builds passed. The opt-in
+qualification passed 12 hidden native controls against protected original
+shipping over two official signed SHOM update chains. Full chart RGBA, ordered
+instructions, all eight exported raw GPU buffers, geometry/source metadata and
+symbols matched. Full selected attributes and indexed/original picking matched
+at 1x. The 200x centred official Wreck camera covered rendering and rollback;
+it did not provide a pick-query comparison because the protected original had
+no visible line probes. The shipping default policy subsequently passed 16
+controls comparing protected original, explicit OFF, default ON and explicit ON.
+Debug, Release and Release-fast then passed 12 default-ON loading/palette-recovery
+controls, with exact images, instructions, raw buffers and symbols against the
+Release-fast control. Shipping profile checks do not add full-attribute-value
+or hardware-DPI coverage beyond the earlier qualification. Failed publication
+retained the previous frame in the tested recovery paths. All native windows
+were hidden and unfocused.
+
+A separate 16-run same-binary OFF/ON ABBA/BAAB experiment on the signed
+5,059-feature chain measured successful palette-retry commit medians of
+450.390 to 14.863 ms for Dusk (96.70% reduction) and 497.268 to 17.419 ms for
+Night (96.50%). All ON commits were below all OFF commits in both palettes
+and both order directions. The measured commit includes exact epoch comparison
+and retained-payload recapture. These are different measurements from the
+preceding static-line-only benchmark. Preparation was mixed: its medians fell
+from 623.179 to 571.234 ms in Dusk but rose from 545.070 to 675.701 ms in Night;
+the cause is not established. Same-row preparation plus commit medians fell
+by 44.56% and 33.11%, respectively. Initial loading, subsequent render/present,
+continuous navigation and physical display cadence were not measured by this
+commit experiment. It establishes a scoped palette-publication CPU improvement,
+not foreground 60 FPS or current Windows qualification; the Windows PC remains
+offline.
+
+The source and three executable profiles are qualified. Installing these
+artifacts is a separate guarded step performed by the integration owner; this
+qualification does not itself assert that the Desktop installation was updated.
+The installer preserves historical TestResults, TestData, Trust, local catalogues,
+unchanged launchers and other unmanaged assets.

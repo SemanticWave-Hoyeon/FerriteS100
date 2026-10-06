@@ -1891,6 +1891,7 @@ impl ChartApp {
                 "viewport": renderer.chart_viewport_pixels(),
                 "zoom": self.zoom_level,
                 "render_stats": format!("{:?}",renderer.statistics()),
+                "area_triangulation_reuse": renderer.area_triangulation_reuse_statistics(),
                 "flat_coverage_binding_cache": self.coverage_inventory.as_ref().map(|i|i.flat_binding_cache_statistics()),
                 "source_cells": self.cells.iter().map(|c| &c.file_path).collect::<Vec<_>>(),
                 "native_physical_input_verified": false,
@@ -3106,6 +3107,9 @@ impl ChartApp {
             // Context comparison requires existing stable sorting. Do not sort or
             // mutate the retained context, especially during failed preparation.
             next.inherit_static_line_relations_from(&self.render_context);
+        }
+        if ferrite_render::area_triangulation_reuse_enabled() {
+            next.inherit_static_area_geometry_from(&self.render_context);
         }
         self.render_context=next;
         self.coverage_inventory=Some(coverage);

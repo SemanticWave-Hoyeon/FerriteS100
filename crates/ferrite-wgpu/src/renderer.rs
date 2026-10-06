@@ -127,6 +127,97 @@ struct CachedTriangulation {
     world_aabb: (f64, f64, f64, f64),
 }
 
+// Default OFF keeps the original by-value cache allocation behavior.
+enum TriangulationStorage {Owned(CachedTriangulation),Shared(Arc<CachedTriangulation>)}
+impl std::ops::Deref for TriangulationStorage {type Target=CachedTriangulation;fn deref(&self)->&Self::Target {match self {Self::Owned(v)=>v,Self::Shared(v)=>v}}}
+enum AreaRetainedResult {Ready(Arc<CachedTriangulation>),Rejected}
+struct AreaRetainedRecord {ordinal:usize,projection:ferrite_render::FlatProjection,result:AreaRetainedResult}
+struct AreaTriangulationRetention {
+    epoch:Option<ferrite_render::StaticAreaGeometryEpoch>,records:Vec<AreaRetainedRecord>,
+    payload_bytes:usize,retained_bytes:usize,rebind_hits:u64,rebind_rejections:u64,
+    precomputed_areas:u64,cache_hits:u64,cold_evaluations:u64,peak_retained_bytes:usize,
+}
+impl Default for AreaTriangulationRetention {fn default()->Self {Self {epoch:None,records:Vec::new(),payload_bytes:0,retained_bytes:0,rebind_hits:0,rebind_rejections:0,precomputed_areas:0,cache_hits:0,cold_evaluations:0,peak_retained_bytes:0}}}
+impl AreaTriangulationRetention {
+    const BYTE_CAP:usize=32*1024*1024;
+    const COUNT_CAP:usize=4096;
+    fn reset(&mut self) {self.records=Vec::new();self.epoch=None;self.payload_bytes=0;self.retained_bytes=0;}
+    fn rebind(&mut self,context:&RenderContext,out:&mut HashMap<(usize,usize,ferrite_render::FlatProjection),TriangulationStorage>,rejected:&mut FxHashSet<(usize,usize,ferrite_render::FlatProjection)>) {
+        if self.epoch!=Some(context.static_area_geometry_epoch()) {return}
+        for record in &self.records {
+            if record.projection!=context.scaler.projection() {continue}
+            // Every pointer key comes from the fresh current owner, never from
+            // the retained cache's previous allocation identity.
+            let Some(ferrite_render::DrawingInstruction::Area(area))=context.raw_instructions().get(record.ordinal) else {continue};
+            let key=WgpuRenderer::area_geometry_key(area,record.projection);
+            match &record.result {
+                AreaRetainedResult::Ready(v)=>{out.insert(key,TriangulationStorage::Shared(Arc::clone(v)));self.rebind_hits=self.rebind_hits.saturating_add(1);},
+                AreaRetainedResult::Rejected=>{rejected.insert(key);self.rebind_rejections=self.rebind_rejections.saturating_add(1);}
+            }
+        }
+    }
+
+    fn admit(&mut self,record:AreaRetainedRecord,budget:usize,count:usize)->bool {
+        let payload=match &record.result {AreaRetainedResult::Rejected=>Some(0),AreaRetainedResult::Ready(v)=>
+            v.world_vertices.capacity().checked_mul(std::mem::size_of::<f64>())
+            .and_then(|n|v.indices.capacity().checked_mul(std::mem::size_of::<usize>()).and_then(|m|n.checked_add(m)))
+            .and_then(|n|n.checked_add(std::mem::size_of::<CachedTriangulation>()+2*std::mem::size_of::<usize>()))};
+        let Some(payload)=payload.and_then(|n|n.checked_add(self.payload_bytes)) else{return false};
+        if self.records.len()>=count {return false}
+        let Some(minimum)=self.records.len().checked_add(1).and_then(|n|n.checked_mul(std::mem::size_of::<AreaRetainedRecord>())).and_then(|n|n.checked_add(payload)) else{return false};
+        if minimum>budget {return false}
+        if self.records.len()==self.records.capacity() {
+            let capacity=self.records.capacity().saturating_mul(2).max(16).min(count);
+            if capacity<=self.records.len() || capacity.checked_mul(std::mem::size_of::<AreaRetainedRecord>()).and_then(|n|n.checked_add(payload)).is_none_or(|n|n>budget) {return false}
+            if self.records.try_reserve_exact(capacity-self.records.len()).is_err() {return false}
+        }
+        let Some(actual)=self.records.capacity().checked_mul(std::mem::size_of::<AreaRetainedRecord>()).and_then(|n|n.checked_add(payload)) else{return false};
+        if actual>budget {self.reset();return false}
+        self.records.push(record);self.payload_bytes=payload;self.retained_bytes=actual;self.peak_retained_bytes=self.peak_retained_bytes.max(actual);true
+    }
+}
+
+#[cfg(test)] mod area_retention_tests {
+    use super::*;
+    fn context()->RenderContext {
+        let mut c=RenderContext::new(ferrite_render::Viewport::new(800.,600.));
+        c.set_instructions_from_cache(vec![ferrite_render::DrawingInstruction::Area(ferrite_render::AreaInstruction::new(vec![WorldPoint::new(0.,0.),WorldPoint::new(1.,0.),WorldPoint::new(0.,1.)]))]);
+        c.get_sorted_instructions();c
+    }
+    fn value()->Arc<CachedTriangulation> {
+        Arc::new(CachedTriangulation {indices:vec![2,0,1],world_vertices:vec![-0.,1.,2.,3.,4.,5.],world_aabb:(-0.,1.,4.,5.)})
+    }
+    fn record(result:AreaRetainedResult)->AreaRetainedRecord {
+        AreaRetainedRecord {ordinal:0,projection:ferrite_render::FlatProjection::LocalGeographic,result}
+    }
+    #[test] fn owner_rebinding_preserves_every_numeric_bit_and_index_without_old_pointer() {
+        let old=context();let mut next=context();assert!(next.inherit_static_area_geometry_from(&old));
+        let v=value();let mut r=AreaTriangulationRetention::default();r.epoch=Some(old.static_area_geometry_epoch());
+        assert!(r.admit(record(AreaRetainedResult::Ready(Arc::clone(&v))),4096,16));
+        let mut out=HashMap::new();let mut rejected=FxHashSet::default();r.rebind(&next,&mut out,&mut rejected);
+        let ferrite_render::DrawingInstruction::Area(a)=&next.raw_instructions()[0] else {unreachable!()};
+        let ferrite_render::DrawingInstruction::Area(b)=&old.raw_instructions()[0] else {unreachable!()};
+        let key=WgpuRenderer::area_geometry_key(a,next.scaler.projection());assert_ne!(key,WgpuRenderer::area_geometry_key(b,old.scaler.projection()));
+        let actual=&out[&key];assert_eq!(actual.indices,v.indices);
+        assert_eq!(actual.world_vertices.iter().map(|x|x.to_bits()).collect::<Vec<_>>(),v.world_vertices.iter().map(|x|x.to_bits()).collect::<Vec<_>>());
+        assert_eq!(actual.world_aabb.0.to_bits(),v.world_aabb.0.to_bits());assert!(rejected.is_empty());assert_eq!(r.rebind_hits,1);
+    }
+    #[test] fn rejection_projection_and_unadmitted_source_are_not_false_cache_hits() {
+        let old=context();let mut next=context();assert!(next.inherit_static_area_geometry_from(&old));
+        let mut r=AreaTriangulationRetention::default();r.epoch=Some(old.static_area_geometry_epoch());assert!(r.admit(record(AreaRetainedResult::Rejected),4096,16));
+        let mut out=HashMap::new();let mut rejected=FxHashSet::default();r.rebind(&next,&mut out,&mut rejected);assert_eq!(rejected.len(),1);assert!(out.is_empty());
+        rejected.clear();next.scaler.set_projection(ferrite_render::FlatProjection::EllipsoidalMercator);r.rebind(&next,&mut out,&mut rejected);assert!(rejected.is_empty());
+        let fresh=context();r.rebind(&fresh,&mut out,&mut rejected);assert!(out.is_empty());assert!(rejected.is_empty());
+    }
+    #[test] fn payload_capacity_count_caps_and_decline_do_not_remove_original_results() {
+        let mut r=AreaTriangulationRetention::default();let v=value();
+        assert!(!r.admit(record(AreaRetainedResult::Ready(Arc::clone(&v))),1,16));assert!(r.records.is_empty());
+        assert!(r.admit(record(AreaRetainedResult::Ready(Arc::clone(&v))),4096,1));assert!(r.retained_bytes<=4096);
+        assert!(!r.admit(record(AreaRetainedResult::Rejected),4096,1));assert_eq!(r.records.len(),1);assert_eq!(v.indices,[2,0,1]);
+        r.reset();assert_eq!(r.retained_bytes,0);assert!(r.records.is_empty());assert!(r.epoch.is_none());
+    }
+}
+
 /// Batched symbols grouped by texture for efficient rendering
 #[allow(dead_code)]
 struct SymbolBatch {
@@ -527,8 +618,10 @@ pub struct WgpuRenderer {
     // === OPTIMIZATION FIELDS ===
     /// Geometry allocations are unique only within an unchanged instruction lifetime.
     triangulation_cache:
-        HashMap<(usize, usize, ferrite_render::FlatProjection), CachedTriangulation>,
+        HashMap<(usize, usize, ferrite_render::FlatProjection), TriangulationStorage>,
     triangulation_revision: Option<u64>,
+    area_triangulation_reuse_enabled:bool,
+    retained_area_triangulations:AreaTriangulationRetention,
     triangulation_failures: FxHashSet<(usize, usize, ferrite_render::FlatProjection)>,
     /// Batched symbols by texture (optimization, keyed by interned SymbolId)
     /// Packed symbol vertices for single-buffer rendering
@@ -757,6 +850,8 @@ impl WgpuRenderer {
             triangulation_cache: HashMap::with_capacity(500),
             triangulation_failures: FxHashSet::default(),
             triangulation_revision: None,
+            area_triangulation_reuse_enabled:ferrite_render::area_triangulation_reuse_enabled(),
+            retained_area_triangulations:AreaTriangulationRetention::default(),
             packed_symbol_vertices: Vec::with_capacity(4000),
             packed_symbol_indices: Vec::with_capacity(6000),
             packed_symbol_ranges: Vec::with_capacity(50),
@@ -919,6 +1014,7 @@ impl WgpuRenderer {
         self.triangulation_cache.clear();
         self.triangulation_failures.clear();
         self.triangulation_revision = None;
+        self.retained_area_triangulations.reset();
         self.line_suppression.clear();
     }
 
@@ -928,6 +1024,12 @@ impl WgpuRenderer {
             self.triangulation_cache.clear();
             self.triangulation_failures.clear();
             self.triangulation_revision = Some(revision);
+            if self.area_triangulation_reuse_enabled {
+                if self.retained_area_triangulations.epoch==Some(context.static_area_geometry_epoch()) {
+                    self.retained_area_triangulations.rebind(context,&mut self.triangulation_cache,&mut self.triangulation_failures);
+                } else {self.retained_area_triangulations.reset();}
+            }
+
         }
     }
 
@@ -938,6 +1040,7 @@ impl WgpuRenderer {
         let mut count = 0;
         for instr in context.raw_instructions() {
             if let ferrite_render::DrawingInstruction::Area(area) = instr {
+                if self.area_triangulation_reuse_enabled {self.retained_area_triangulations.precomputed_areas=self.retained_area_triangulations.precomputed_areas.saturating_add(1);}
                 if self
                     .ensure_triangulated(area, context.scaler.projection())
                     .is_some()
@@ -946,7 +1049,26 @@ impl WgpuRenderer {
                 }
             }
         }
+        if self.area_triangulation_reuse_enabled {
+            // Drop old retention before recapture; no two retained generations.
+            self.retained_area_triangulations.reset();
+            let projection=context.scaler.projection();
+            for (ordinal,instruction) in context.raw_instructions().iter().enumerate() {
+                let ferrite_render::DrawingInstruction::Area(area)=instruction else {continue};
+                let key=Self::area_geometry_key(area,projection);
+                let result=if let Some(TriangulationStorage::Shared(v))=self.triangulation_cache.get(&key) {Some(AreaRetainedResult::Ready(Arc::clone(v)))}
+                    else if self.triangulation_failures.contains(&key) {Some(AreaRetainedResult::Rejected)} else {None};
+                if let Some(result)=result {self.retained_area_triangulations.admit(AreaRetainedRecord {ordinal,projection,result},AreaTriangulationRetention::BYTE_CAP,AreaTriangulationRetention::COUNT_CAP);}
+            }
+            self.retained_area_triangulations.epoch=Some(context.static_area_geometry_epoch());
+        }
         tracing::info!("Pre-computed {} area triangulations", count);
+    }
+
+    /// Logical retained capacities, not total renderer RSS or original cache size.
+    pub fn area_triangulation_reuse_statistics(&self)->(bool,usize,usize,u64,u64,u64,u64,u64,usize) {
+        let r=&self.retained_area_triangulations;
+        (self.area_triangulation_reuse_enabled,r.records.len(),r.retained_bytes,r.rebind_hits,r.rebind_rejections,r.precomputed_areas,r.cache_hits,r.cold_evaluations,r.peak_retained_bytes)
     }
 
     pub fn longitude_wrapping_enabled(&self) -> bool {
@@ -3384,6 +3506,7 @@ impl WgpuRenderer {
 
         // Check cache first
         if self.triangulation_cache.contains_key(&cache_key) {
+            if self.area_triangulation_reuse_enabled {self.retained_area_triangulations.cache_hits=self.retained_area_triangulations.cache_hits.saturating_add(1);}
             if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.triangulation_hits=row.work.triangulation_hits.saturating_add(1);}
             return Some(cache_key);
         }
@@ -3392,6 +3515,7 @@ impl WgpuRenderer {
             return None;
         }
         if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.triangulation_cold=row.work.triangulation_cold.saturating_add(1);}
+        if self.area_triangulation_reuse_enabled {self.retained_area_triangulations.cold_evaluations=self.retained_area_triangulations.cold_evaluations.saturating_add(1);}
         let triangulated = (|| -> std::result::Result<(Vec<f64>, Vec<usize>), String> {
             let project_ring = |ring: &[WorldPoint]| {
                 let points: Vec<_> = ring
@@ -3453,7 +3577,7 @@ impl WgpuRenderer {
             ),
         };
 
-        self.triangulation_cache.insert(cache_key, cached);
+        self.triangulation_cache.insert(cache_key, if self.area_triangulation_reuse_enabled {TriangulationStorage::Shared(Arc::new(cached))}else{TriangulationStorage::Owned(cached)});
         Some(cache_key)
     }
 

@@ -30,6 +30,8 @@ pub use selection::{
     WrappedGeometryHit,
 };
 
+mod area_relation_identity;
+pub use area_relation_identity::{area_triangulation_reuse_enabled, StaticAreaGeometryEpoch};
 mod line_relation_identity;
 pub use line_relation_identity::StaticLineRelationEpoch;
 mod suppression;

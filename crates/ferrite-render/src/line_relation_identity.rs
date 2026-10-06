@@ -9,7 +9,7 @@ const MAX_POINTS:usize=16_777_216;
 const MAX_PATH_NODES:usize=4096;
 fn xy(a:(f64,f64),b:(f64,f64))->bool{a.0.to_bits()==b.0.to_bits()&&a.1.to_bits()==b.1.to_bits()}
 fn world(a:WorldPoint,b:WorldPoint)->bool{xy((a.x,a.y),(b.x,b.y))}
-fn origin(a:&PortrayalOrigin,b:&PortrayalOrigin)->bool{
+pub(crate) fn origin(a:&PortrayalOrigin,b:&PortrayalOrigin)->bool{
  match(a,b){
   (PortrayalOrigin::Unspecified,PortrayalOrigin::Unspecified)|(PortrayalOrigin::NonPoint,PortrayalOrigin::NonPoint)|(PortrayalOrigin::CoverageExempt,PortrayalOrigin::CoverageExempt)=>true,
   (PortrayalOrigin::Point(a),PortrayalOrigin::Point(b))=>match(&**a,&**b){
