@@ -53,3 +53,6 @@ pub use ferrite_lua_runtime::{selected_version as lua_runtime_version, RuntimeVe
 
 // Exact linked interpreter release plus conservative build-input fingerprint.
 pub use ferrite_lua_runtime::{runtime_identity, RuntimeIdentity};
+
+// Compiler retention policy can be injected without changing bound PC inputs.
+pub use ferrite_lua_runtime::ChunkCache;

@@ -43,7 +43,7 @@ impl PreparedCoveragePass {
                         PortrayalOrigin::Point(point) => match project(instruction, point)? {
                             Some(p) => InstructionOrigin::Point(p),
                             None => {
-                                // Validate identity even for an origin behind the globe.
+                                // Validate identity before applying the source projection.
                                 frame
                                     .decision(CoverageSource::Dataset {
                                         dataset_id,
@@ -63,6 +63,22 @@ impl PreparedCoveragePass {
             decisions.push(decision);
         }
         Ok(Self { frame, decisions })
+    }
+    /// Resolve each immutable source once in this actual frame, then expand in
+    /// original instruction order. An absent projected copy still validates
+    /// its dataset; no hidden source can bypass the namespace check.
+    pub fn prepare_source_slots(
+        frame:Arc<CoverageFrame>,sources:&[(CoverageSource,bool)],slots:&[usize],
+    )->Result<Self> {
+        if sources.len()>slots.len() || slots.iter().any(|i|*i>=sources.len()) {
+            return Err(RenderError::Render("Coverage source slot outside binding".into()));
+        }
+        let resolved=sources.iter().map(|(source,absent)| {
+            let decision=frame.decision(*source).map_err(|e|RenderError::Render(e.to_string()))?;
+            Ok(if *absent {FrameCoverageDecision::Hidden} else {decision})
+        }).collect::<Result<Vec<_>>>()?;
+        let decisions=slots.iter().map(|i|resolved[*i]).collect();
+        Ok(Self {frame,decisions})
     }
     pub fn decision(&self, index: usize) -> Result<FrameCoverageDecision> {
         self.decisions
@@ -124,6 +140,16 @@ impl PreparedCoverage {
                     .any(|p| p.decisions[i] != FrameCoverageDecision::Hidden)
             })
             .collect())
+    }
+    /// Fuse the immutable coverage union into the caller's calendar mask.
+    /// Validate all binding dimensions before touching the destination, matching
+    /// `visibility` followed by the caller's elementwise AND without its Vec.
+    pub fn intersect_visibility(&self, revision: u64, view_revision: u64, visible: &mut [bool]) -> Result<()> {
+        self.validate(revision, view_revision, visible.len())?;
+        for (i, value) in visible.iter_mut().enumerate() {
+            *value &= self.passes.iter().any(|p| p.decisions[i] != FrameCoverageDecision::Hidden);
+        }
+        Ok(())
     }
     pub fn pass_count(&self) -> usize {
         self.passes.len()
@@ -195,6 +221,20 @@ mod tests {
         ));
         b.set_portrayal_origin(PortrayalOrigin::NonPoint);
         vec![a, b]
+    }
+    #[test]
+    fn source_slots_validate_absent_identity_and_preserve_order() {
+        let invalid=CoverageSource::Dataset {dataset_id:99,origin:InstructionOrigin::NonPoint};
+        assert!(PreparedCoveragePass::prepare_source_slots(frame(),&[(invalid,true)],&[0]).is_err());
+        assert!(PreparedCoveragePass::prepare_source_slots(frame(),&[(CoverageSource::Exempt,false)],&[1]).is_err());
+        let nonpoint=CoverageSource::Dataset {dataset_id:0,origin:InstructionOrigin::NonPoint};
+        let pass=PreparedCoveragePass::prepare_source_slots(frame(),&[(nonpoint,false),(CoverageSource::Exempt,false)],&[1,0,1]).unwrap();
+        assert_eq!(pass.decision(0).unwrap(),FrameCoverageDecision::Unclipped);
+        assert_eq!(pass.decision(1).unwrap(),FrameCoverageDecision::ClipDataset(0));
+        assert_eq!(pass.decision(2).unwrap(),FrameCoverageDecision::Unclipped);
+        let absent=PreparedCoveragePass::prepare_source_slots(frame(),&[(nonpoint,true)],&[0,0]).unwrap();
+        assert_eq!(absent.decision(0).unwrap(),FrameCoverageDecision::Hidden);
+        assert_eq!(absent.decision(1).unwrap(),FrameCoverageDecision::Hidden);
     }
     #[test]
     fn projected_copies_use_source_geometry_and_share_fragment_decisions() {
@@ -278,4 +318,41 @@ mod tests {
         assert!(PreparedCoverage::new(7, 8, 1, vec![pass]).is_err());
         assert!(PreparedCoverage::new(7, 8, 2, vec![]).is_err());
     }
+    #[test]
+    fn fused_visibility_matches_independent_union_and_calendar_truth_table() {
+        use FrameCoverageDecision::{Hidden, Unclipped, ClipDataset};
+        for bits in 0u32..8 {
+            let coverage=PreparedCoverage::new(7,8,3,vec![
+                PreparedCoveragePass {frame:frame(),decisions:vec![Hidden,Unclipped,Hidden]},
+                PreparedCoveragePass {frame:frame(),decisions:vec![Hidden,Hidden,ClipDataset(0)]},
+                PreparedCoveragePass {frame:frame(),decisions:vec![Hidden,Hidden,Hidden]},
+            ]).unwrap();
+            let original=(0..3).map(|i| bits & (1<<i) !=0).collect::<Vec<_>>();
+            let mut fused=original.clone();coverage.intersect_visibility(7,8,&mut fused).unwrap();
+            assert_eq!(fused,vec![false,original[1],original[2]]);
+            let mut reference=original;let union=coverage.visibility(7,8,3).unwrap();
+            for (v,c) in reference.iter_mut().zip(union) {*v &=c;}
+            assert_eq!(fused,reference);
+        }
+    }
+    #[test]
+    fn fused_stale_bindings_reject_before_any_destination_write() {
+        let p=PreparedCoverage::new(7,8,3,vec![PreparedCoveragePass{frame:frame(),decisions:vec![FrameCoverageDecision::Hidden;3]}]).unwrap();
+        for (rev,view,len) in [(9,8,3),(7,9,3),(7,8,2),(7,8,4)] {
+            let mut mask=vec![true;len];let before=mask.clone();
+            let original=p.visibility(rev,view,len).unwrap_err().to_string();
+            assert_eq!(p.intersect_visibility(rev,view,&mut mask).unwrap_err().to_string(),original);
+            assert_eq!(mask,before);
+        }
+    }
+    #[test]
+    fn fused_empty_binding_and_replaced_decisions_have_no_cached_stale_union() {
+        let empty=PreparedCoverage::new(1,2,0,vec![PreparedCoveragePass{frame:frame(),decisions:vec![]}]).unwrap();
+        empty.intersect_visibility(1,2,&mut []).unwrap();
+        for hidden in [false,true,false] {
+            let c=PreparedCoverage::new(7,8,1,vec![PreparedCoveragePass{frame:frame(),decisions:vec![if hidden {FrameCoverageDecision::Hidden}else{FrameCoverageDecision::Unclipped}]}]).unwrap();
+            let mut mask=[true];c.intersect_visibility(7,8,&mut mask).unwrap();assert_eq!(mask,[!hidden]);
+        }
+    }
+
 }

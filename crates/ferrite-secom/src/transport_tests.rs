@@ -185,10 +185,21 @@ fn actual_mtls_get_returns_only_authenticated_payload_and_encoded_uuid_query() {
     let body=serde_json::json!({"dataResponseObject":[message],"pagination":{"totalItems":1,"maxItemsPerPage":1}}).to_string();
     let (client, server) = fixture_server("200 OK", body, trust, 65536);
     let id = uuid::Uuid::parse_str("3a1f4800-3333-4444-8888-000000000001").unwrap();
-    let result = client.get(id, 1, 1);
+    let result = client.get_received(id, 1, 1);
     let request = server.join().unwrap();
     let page = result.unwrap();
     assert_eq!(page.payloads[0].bytes(), b"signed chart bytes\x00\xff");
+    let received = &page.payloads[0];
+    assert_eq!(received.routing().requested_reference(), id);
+    assert_eq!(received.routing().page(), 1);
+    assert_eq!(received.routing().page_size(), 1);
+    assert_eq!(received.routing().response_index(), 0);
+    assert!(received
+        .routing()
+        .provider()
+        .starts_with("https://127.0.0.1:"));
+    assert_eq!(*received.sha256(), openssl::sha::sha256(received.bytes()));
+    assert!(received.acknowledgement_transaction().is_none());
     assert!(request.starts_with("GET /v1/object?dataReference=3a1f4800-3333-4444-8888-000000000001&page=1&pageSize=1 HTTP/1.1"));
 }
 #[test]
@@ -211,7 +222,7 @@ fn actual_mtls_rejects_redirect_oversized_response_and_tampered_payload() {
             trust,
             if mode == 1 { 16 } else { 65536 },
         );
-        assert!(client.get(uuid::Uuid::nil(), 1, 1).is_err());
+        assert!(client.get_received(uuid::Uuid::nil(), 1, 1).is_err());
         assert!(server.join().unwrap().starts_with("GET /v1/object?"));
     }
 }
@@ -230,4 +241,24 @@ fn actual_tls_rejects_untrusted_server_and_wrong_hostname_before_http() {
         assert!(client.ping().is_err());
         assert_eq!(server.join().unwrap(), "TLS_REJECTED");
     }
+}
+
+#[test]
+fn received_page_with_late_tampering_never_releases_a_valid_prefix() {
+    let (trust, message) = fixture(
+        Nid::SECP384R1,
+        "ecdsa-384-sha2",
+        MessageDigest::sha384(),
+        false,
+        true,
+    );
+    let mut tampered = message.clone();
+    tampered["data"] = STANDARD.encode(b"tampered second object").into();
+    let body =
+        serde_json::json!({"dataResponseObject":[message,tampered],"pagination":{}}).to_string();
+    let (client, server) = fixture_server("200 OK", body, trust, 65536);
+    let result = client.get_received(uuid::Uuid::nil(), 1, 2);
+    let request = server.join().unwrap();
+    assert!(result.is_err());
+    assert!(request.contains("pageSize=2"));
 }

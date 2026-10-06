@@ -12,6 +12,8 @@ pub struct SecomClient {
     base: Url,
     trust: PayloadTrust,
     max_response: usize,
+    server_ca_sha256: [u8; 32],
+    client_certificate_sha256: [u8; 32],
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +66,7 @@ impl SecomClient {
             cert.public_key()?.public_eq(&key),
             "Client identity key mismatch"
         );
+        let client_certificate_sha256 = openssl::sha::sha256(&cert.to_der()?);
         let mut pem = cert.to_pem()?;
         if let Some(chain) = identity.ca {
             for certificate in chain {
@@ -88,6 +91,8 @@ impl SecomClient {
             base,
             trust,
             max_response,
+            server_ca_sha256: openssl::sha::sha256(server_ca_pem),
+            client_certificate_sha256,
         })
     }
     fn request<T: serde::de::DeserializeOwned>(
@@ -154,6 +159,41 @@ impl SecomClient {
                 ("pageSize", page_size.to_string()),
             ],
         )
+    }
+    /// Receive a fully verified GET page with separate local routing receipts.
+    /// Requested references and pagination are not signed chart identities.
+    pub fn get_received(
+        &self,
+        reference: uuid::Uuid,
+        page: u32,
+        page_size: u32,
+    ) -> Result<ReceivedPage> {
+        let verified = self.get(reference, page, page_size)?;
+        let received_at = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+        let payloads = verified
+            .payloads
+            .into_iter()
+            .enumerate()
+            .map(|(response_index, payload)| {
+                ReceivedPayload::from_get(
+                    payload,
+                    GetRoutingReceipt {
+                        provider: self.base.to_string(),
+                        requested_reference: reference,
+                        page,
+                        page_size,
+                        response_index,
+                        received_at,
+                        server_ca_sha256: self.server_ca_sha256,
+                        client_certificate_sha256: self.client_certificate_sha256,
+                    },
+                )
+            })
+            .collect();
+        Ok(ReceivedPage {
+            payloads,
+            pagination: verified.pagination,
+        })
     }
     /// A whole response page is authenticated before any payload becomes available.
     /// Pagination is returned to the caller; no implicit unbounded download loop.

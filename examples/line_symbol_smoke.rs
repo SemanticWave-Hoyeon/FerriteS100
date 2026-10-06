@@ -1,5 +1,4 @@
 //! Native S-101/Lua -> physical line placement -> SVG/GPU evidence.
-use ferrite_kernel::{geodesy::GeographicPosition, globe_navigation::GlobePose};
 use ferrite_render::*;
 use ferrite_s100_core::*;
 use ferrite_wgpu::{SymbolCache, WgpuRenderer};
@@ -115,7 +114,6 @@ impl ApplicationHandler for App {
                 70. + 0.02 / zoom,
             ));
             convert(&cell, &pc, &mut ctx, "Absolute", 10., false);
-            r.ui_state.globe_preview = false;
             r.begin_frame();
             r.add_instructions_with_symbols(&mut ctx, Some(&mut cache), Some(profile), None);
             assert!(
@@ -211,48 +209,7 @@ impl ApplicationHandler for App {
         let points = resolve_flat_line_symbol(p, &ctx.scaler).unwrap();
         assert_eq!(points[0].curve_tangent_bearing, Some(270.));
         rows.push(serde_json::json!({"family":"source_reversal","bearing_deg":270.,"actual_adapter_source_tangent":true}));
-        for tilt in [0., 45., 70.] {
-            for range in [30000., 3000., 150.] {
-                source(
-                    &mut cell,
-                    vec![vec![
-                        WorldPoint::new(179.9, 70.),
-                        WorldPoint::new(-179.9, 70.),
-                    ]],
-                    false,
-                );
-                convert(&cell, &pc, &mut ctx, "Absolute", 10., false);
-                let pose = GlobePose {
-                    focus: GeographicPosition::new(70., 179.9).unwrap(),
-                    range_m: range,
-                    heading_deg: 0.,
-                    tilt_deg: tilt,
-                };
-                r.ui_state.globe_preview = true;
-                r.ui_state.globe_pose = Some(pose);
-                r.ui_state.globe_tilt_deg = tilt;
-                r.begin_frame();
-                r.prepare_globe_with_symbols(&mut ctx, None, &mut cache, Some(profile))
-                    .unwrap();
-                let d = r.globe_preview_diagnostics().unwrap();
-                assert_eq!(d.rejected_geometries, 0, "{:?}", d.reasons);
-                assert_eq!(d.symbols, 1);
-                let path = self.out.join(format!("globe-{tilt}-{range}.png"));
-                r.save_screenshot(&path).unwrap();
-                sample(&path, [490. + 10. * mm, 350.]);
-                let first = image::open(&path).unwrap().to_rgba8();
-                cache.clear();
-                r.clear_symbol_textures();
-                r.begin_frame();
-                r.prepare_globe_with_symbols(&mut ctx, None, &mut cache, Some(profile))
-                    .unwrap();
-                r.save_screenshot(&path).unwrap();
-                assert_eq!(first, image::open(&path).unwrap().to_rgba8());
-                rows.push(serde_json::json!({"family":"globe_absolute","tilt":tilt,"range_m":range,"actual_adapter_and_svg":true,"fixed_mm_pixel_probe":true,"rebuild_pixels":0}));
-            }
-        }
         // Too-short curve must not clamp the symbol to its endpoint.
-        r.ui_state.globe_preview = false;
         source(
             &mut cell,
             vec![vec![WorldPoint::new(0., 0.), WorldPoint::new(0.001, 0.)]],

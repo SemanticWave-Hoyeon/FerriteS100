@@ -1,8 +1,6 @@
 //! Product-neutral chart kernel. Product encodings and application UI stay outside.
 pub mod geocentric;
 pub mod geodesy;
-pub mod globe_camera;
-pub mod globe_coverage_projection;
 pub mod map_camera;
 pub mod rhumb;
 pub mod scale_policy;
@@ -522,7 +520,6 @@ impl CompositionPlane {
 mod version;
 pub use version::SpecificationVersion;
 
-pub mod globe_navigation;
 
 pub mod surface_bounds;
 
@@ -540,7 +537,6 @@ pub mod portrayal_position;
 
 pub mod line_offset;
 
-pub mod globe_visibility;
 
 pub mod longitude_extent;
 

@@ -1,4 +1,4 @@
-//! Bounded screen-space stroke geometry shared by map and globe projections.
+//! Bounded screen-space stroke geometry for map projections.
 use ferrite_render::{CapStyle, JoinStyle};
 use lyon_tessellation::{
     geometry_builder::{GeometryBuilder, GeometryBuilderError, StrokeGeometryBuilder},

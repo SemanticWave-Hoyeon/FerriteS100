@@ -303,64 +303,6 @@ impl Mercator {
     }
 }
 
-/// Nearest forward hit of a ray with the zero-height WGS84 ellipsoid.
-/// ECEF origin is metres; direction need not be normalized. The returned ray
-/// distance is metres, not the arbitrary input direction parameter. Used by
-/// globe picking/occlusion without coupling the kernel to a graphics backend.
-#[derive(Debug, Clone, Copy)]
-pub struct EllipsoidRayHit {
-    pub ecef_m: [f64; 3],
-    pub distance_m: f64,
-}
-pub fn intersect_wgs84_ray(
-    origin_m: [f64; 3],
-    direction: [f64; 3],
-) -> Result<Option<EllipsoidRayHit>> {
-    ensure!(
-        origin_m
-            .iter()
-            .chain(direction.iter())
-            .all(|x| x.is_finite()),
-        "Invalid ECEF ray"
-    );
-    let norm = direction[0].hypot(direction[1]).hypot(direction[2]);
-    ensure!(norm.is_finite() && norm > 0., "Invalid ECEF ray direction");
-    let axes = [WGS84_A, WGS84_A, WGS84_B];
-    let mut a = 0.;
-    let mut b = 0.;
-    let mut c = -1.;
-    for i in 0..3 {
-        let o = origin_m[i] / axes[i];
-        let d = (direction[i] / norm) / axes[i];
-        a += d * d;
-        b += 2. * o * d;
-        c += o * o;
-    }
-    let discriminant = b * b - 4. * a * c;
-    ensure!(
-        [a, b, c, discriminant].iter().all(|v| v.is_finite()),
-        "ECEF ray overflow"
-    );
-    if discriminant < 0. {
-        return Ok(None);
-    }
-    // Stable quadratic formula, avoids cancellation for near-surface hits.
-    let q = -0.5 * (b + discriminant.sqrt().copysign(b));
-    let (t0, t1) = if q == 0. {
-        (-b / (2. * a), -b / (2. * a))
-    } else {
-        (q / a, c / q)
-    };
-    let distance_m = [t0, t1]
-        .into_iter()
-        .filter(|t| t.is_finite() && *t >= 0.)
-        .min_by(f64::total_cmp);
-    Ok(distance_m.map(|distance_m| EllipsoidRayHit {
-        ecef_m: std::array::from_fn(|i| origin_m[i] + (direction[i] / norm) * distance_m),
-        distance_m,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,36 +396,7 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn globe_ray_picking_hits_near_side_and_rejects_misses() {
-        let hit = intersect_wgs84_ray([WGS84_A + 1000., 0., 0.], [-7., 0., 0.])
-            .unwrap()
-            .unwrap();
-        near(hit.distance_m, 1000., 1e-6);
-        near(hit.ecef_m[0], WGS84_A, 1e-6);
-        let hit = intersect_wgs84_ray([0., 0., WGS84_B + 1000.], [0., 0., -1.])
-            .unwrap()
-            .unwrap();
-        near(hit.distance_m, 1000., 1e-6);
-        near(hit.ecef_m[2], WGS84_B, 1e-6);
-        assert!(intersect_wgs84_ray([WGS84_A + 1000., 0., 0.], [1., 0., 0.])
-            .unwrap()
-            .is_none());
-        assert!(intersect_wgs84_ray([WGS84_A + 1000., 0., 0.], [0., 1., 0.])
-            .unwrap()
-            .is_none());
-        assert!(intersect_wgs84_ray([0., 0., 0.], [0., 0., 0.]).is_err());
-        assert!(intersect_wgs84_ray([f64::NAN, 0., 0.], [1., 0., 0.]).is_err());
-        // Interior rays choose the forward exit, never the negative root.
-        near(
-            intersect_wgs84_ray([0., 0., 0.], [1., 0., 0.])
-                .unwrap()
-                .unwrap()
-                .distance_m,
-            WGS84_A,
-            1e-6,
-        );
-    }
+
 }
 
 #[cfg(test)]

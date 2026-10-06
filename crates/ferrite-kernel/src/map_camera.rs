@@ -2,7 +2,6 @@
 //! ownership, portrayal and application menus stay outside this module.
 use crate::{
     geodesy::{GeographicPosition, Mercator, WGS84_A},
-    globe_camera::GlobeCamera,
 };
 use anyhow::{ensure, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,58 +101,17 @@ impl FlatMapCamera {
 #[derive(Debug, Clone)]
 pub enum MapCamera {
     Flat(FlatMapCamera),
-    Globe {
-        camera: GlobeCamera,
-        viewport_origin: [f64; 2],
-    },
+
 }
 impl MapCamera {
-    /// Returns None for points hidden by the ellipsoid or outside its depth range.
-    /// Flat longitude copies are preserved; globe inputs use canonical WGS84.
+    /// Preserve longitude copies using the selected 2D projection.
     pub fn project(&self, point: [f64; 2]) -> Result<Option<[f64; 2]>> {
-        match self {
-            Self::Flat(c) => Ok(Some(c.project(point)?)),
-            Self::Globe {
-                camera,
-                viewport_origin,
-            } => {
-                ensure!(
-                    viewport_origin.iter().all(|v| v.is_finite()),
-                    "Invalid viewport origin"
-                );
-                let geo = GeographicPosition::new(point[1], point[0])?;
-                Ok(camera.project_visible(geo.to_ecef(0.)?)?.map(|p| {
-                    [
-                        p.screen_px[0] + viewport_origin[0],
-                        p.screen_px[1] + viewport_origin[1],
-                    ]
-                }))
-            }
-        }
+        let Self::Flat(camera) = self;
+        Ok(Some(camera.project(point)?))
     }
-    /// Returns None for a screen ray which misses the WGS84 ellipsoid. A miss is
-    /// not converted into a latitude, a previous selection, or a flat coordinate.
     pub fn unproject(&self, point: [f64; 2]) -> Result<Option<[f64; 2]>> {
-        match self {
-            Self::Flat(c) => Ok(Some(c.unproject(point)?)),
-            Self::Globe {
-                camera,
-                viewport_origin,
-            } => {
-                ensure!(
-                    viewport_origin.iter().all(|v| v.is_finite()),
-                    "Invalid viewport origin"
-                );
-                Ok(camera
-                    .pick([point[0] - viewport_origin[0], point[1] - viewport_origin[1]])?
-                    .map(|p| {
-                        [
-                            p.geodetic.surface.longitude(),
-                            p.geodetic.surface.latitude(),
-                        ]
-                    }))
-            }
-        }
+        let Self::Flat(camera) = self;
+        Ok(Some(camera.unproject(point)?))
     }
 }
 #[cfg(test)]
@@ -183,29 +141,5 @@ mod tests {
             [0., 0.]
         )
         .is_err());
-    }
-    #[test]
-    fn globe_adapter_uses_viewport_origin_horizon_and_ray_misses() {
-        let c = GlobeCamera::orbit(
-            GeographicPosition::new(48.65, -2.05).unwrap(),
-            20_000_000.,
-            0.,
-            0.,
-            [1000., 800.],
-            45.,
-            1.,
-            100_000_000.,
-        )
-        .unwrap();
-        let view = MapCamera::Globe {
-            camera: c,
-            viewport_origin: [30., 80.],
-        };
-        let p = view.project([-2.05, 48.65]).unwrap().unwrap();
-        assert!((p[0] - 530.).abs() < 1e-8 && (p[1] - 480.).abs() < 1e-8);
-        let geo = view.unproject(p).unwrap().unwrap();
-        assert!((geo[0] + 2.05).abs() < 1e-8 && (geo[1] - 48.65).abs() < 1e-8);
-        assert!(view.project([177.95, -48.65]).unwrap().is_none());
-        assert!(view.unproject([30., 80.]).unwrap().is_none());
     }
 }

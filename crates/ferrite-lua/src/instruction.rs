@@ -1528,11 +1528,55 @@ fn parse_command(
 // PortrayalResult
 // ──────────────────────────────────────────────────────
 
+/// One observed dependency. Encoded values are retained exactly, including DEF
+/// escape spelling; absence of a value denotes legacy name-only output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedContextParameter<'a> {
+    pub name: &'a str,
+    pub encoded_value: Option<&'a str>,
+}
+
+fn parse_observed_parameters(encoded: &str) -> Result<Vec<String>> {
+    if encoded.trim().is_empty() { return Ok(Vec::new()); }
+    let malformed = || crate::LuaError::InvalidInstruction("Invalid observed context parameters".into());
+    let mut records = std::collections::BTreeMap::new();
+    // Published Part 9a-14.2.1 specifies DEF. Official S-101 emits a
+    // semicolon-separated name:value set via pairs(), whose order is undefined.
+    // Commas within the encoded value are data; split only at the first colon.
+    if encoded.contains(':') || encoded.contains(';') {
+        let mut fields = encoded.split(';').peekable();
+        while let Some(record) = fields.next() {
+            if record.is_empty() && fields.peek().is_none() { continue; } // DEF terminator
+            let (name, value) = record.split_once(':').ok_or_else(malformed)?;
+            if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == ',') {
+                return Err(malformed());
+            }
+            if records.insert(name.to_owned(), Some(value.to_owned())).is_some() {
+                return Err(crate::LuaError::InvalidInstruction(format!("Duplicate observed context parameter {name}")));
+            }
+        }
+    } else {
+        // Compatibility with older host callers that emitted names only.
+        for name in encoded.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if name.chars().any(|c| c.is_whitespace() || c.is_control()) { return Err(malformed()); }
+            if records.insert(name.to_owned(), None).is_some() {
+                return Err(crate::LuaError::InvalidInstruction(format!("Duplicate observed context parameter {name}")));
+            }
+        }
+    }
+    Ok(records.into_iter().map(|(name, value)| match value {
+        Some(value) => format!("{name}:{value}"), None => name,
+    }).collect())
+}
+
 /// Result from Lua portrayal emission
 #[derive(Debug, Clone)]
 pub struct PortrayalResult {
     pub feature_id: String,
     pub instructions: Vec<ParsedInstruction>,
+    /// Canonical dependency records sorted by case-sensitive name. Official DEF
+    /// records preserve name:value; legacy records contain a name only. Use
+    /// observed_parameter_names() for invalidation membership, not this vector.
     pub observed_parameters: Vec<String>,
 }
 
@@ -1543,6 +1587,20 @@ impl PortrayalResult {
             instructions: Vec::new(),
             observed_parameters: Vec::new(),
         }
+    }
+
+    /// Structured borrowed view; values are exact encoded strings, not normalized
+    /// numbers/booleans or decoded text. Produced results have unique names.
+    pub fn observed_context_parameters(&self) -> impl Iterator<Item=ObservedContextParameter<'_>> {
+        self.observed_parameters.iter().map(|record| match record.split_once(':') {
+            Some((name,value)) => ObservedContextParameter {name,encoded_value:Some(value)},
+            None => ObservedContextParameter {name:record.as_str(),encoded_value:None},
+        })
+    }
+
+    /// Names actually read by portrayal; values remain available independently.
+    pub fn observed_parameter_names(&self) -> impl Iterator<Item=&str> {
+        self.observed_context_parameters().map(|parameter|parameter.name)
     }
 
     /// Parse from Lua output (featureID, drawingInstructions, observedParams)
@@ -1556,12 +1614,7 @@ impl PortrayalResult {
         let instruction = parse_instruction_string(feature_id, drawing_instructions)?;
         result.instructions.push(instruction);
 
-        for param in observed_params.split(',') {
-            let param = param.trim();
-            if !param.is_empty() {
-                result.observed_parameters.push(param.to_string());
-            }
-        }
+        result.observed_parameters = parse_observed_parameters(observed_params)?;
 
         Ok(result)
     }
@@ -2413,5 +2466,45 @@ mod geometry_validation_tests {
         assert!(matches!(&lines[0].0[3],PathSegment::Annulus{inner_radius,start_angle,angular_distance,..} if *inner_radius==0. && *start_angle==10. && *angular_distance== -30.));
         assert_eq!(lines[0].1.as_ref().unwrap().crs_angle,"GeographicCRS");
         assert!(lines[1].0.is_empty() && lines[1].1.is_none() && lines[1].2.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod observed_def_tests {
+    use super::*;
+    fn result(observed:&str)->PortrayalResult {
+        PortrayalResult::parse("1","PointInstruction:WRECKS01",observed).unwrap()
+    }
+    #[test]
+    fn official_def_dependencies_are_typed_order_independent_and_value_exact() {
+        let a=result("SafetyDepth:30;SafetyContour:30;IgnoreScaleMinimum:false;RadarOverlay:false");
+        let b=result("RadarOverlay:false;IgnoreScaleMinimum:false;SafetyContour:30;SafetyDepth:30");
+        assert_eq!(format!("{a:?}"),format!("{b:?}"));
+        assert_eq!(a.observed_parameter_names().collect::<Vec<_>>(),["IgnoreScaleMinimum","RadarOverlay","SafetyContour","SafetyDepth"]);
+        assert_eq!(a.observed_context_parameters().find(|v|v.name=="SafetyDepth").unwrap().encoded_value,Some("30"));
+        let exact=result("PreferredLanguage:eng,fra;Text:a&sb&cc&m:d;Number:30.00;Empty:;Spaced: text ");
+        let values=exact.observed_context_parameters().collect::<Vec<_>>();
+        assert!(values.contains(&ObservedContextParameter{name:"PreferredLanguage",encoded_value:Some("eng,fra")}));
+        assert!(values.contains(&ObservedContextParameter{name:"Text",encoded_value:Some("a&sb&cc&m:d")}));
+        assert!(values.contains(&ObservedContextParameter{name:"Number",encoded_value:Some("30.00")}));
+        assert!(values.contains(&ObservedContextParameter{name:"Empty",encoded_value:Some("")}));
+        assert!(values.contains(&ObservedContextParameter{name:"Spaced",encoded_value:Some(" text ")}));
+        assert_ne!(result("SafetyDepth:30").observed_parameters,result("SafetyDepth:30.0").observed_parameters);
+    }
+    #[test]
+    fn legacy_name_only_output_remains_supported_without_inventing_values() {
+        assert_eq!(result("SafetyDepth").observed_parameters,["SafetyDepth"]);
+        let legacy=result(" RadarOverlay, SafetyDepth, ");
+        assert_eq!(legacy.observed_parameter_names().collect::<Vec<_>>(),["RadarOverlay","SafetyDepth"]);
+        assert!(legacy.observed_context_parameters().all(|v|v.encoded_value.is_none()));
+        assert!(result("").observed_parameters.is_empty());
+        assert_eq!(result("A:1;").observed_parameters,["A:1"]);
+    }
+    #[test]
+    fn duplicate_conflicting_and_mixed_grammars_fail_instead_of_dropping_dependencies() {
+        for invalid in ["A:1;A:1","A:1;A:2","A,A","A:1;B","A;B",":1","A:1;;B:2","A,B:1"," A:1"] {
+            assert!(PortrayalResult::parse("1","PointInstruction:WRECKS01",invalid).is_err(),"{invalid}");
+        }
+        assert_eq!(result("a:1;A:2").observed_parameters,["A:2","a:1"]);
     }
 }

@@ -109,7 +109,7 @@ impl ApplicationHandler for App {
                 checks.push(serde_json::json!({"kind":"mixed_symbol_ranges","different_pixels":different,"geographic_wrap_copies":3,"device_copies":1}));
             } else {reference=Some(actual);}
         }
-        std::fs::write(self.out.join("result.json"),serde_json::to_string_pretty(&serde_json::json!({"checks":checks,"density":density,"extent":[size.width,size.height],"scene":"synthetic device commands with official S-101 ACHBRT07 and text","shifted_viewport":true,"real_product_native_verified":false,"globe_verified":false})).unwrap()).unwrap();
+        std::fs::write(self.out.join("result.json"),serde_json::to_string_pretty(&serde_json::json!({"checks":checks,"density":density,"extent":[size.width,size.height],"scene":"synthetic device commands with official S-101 ACHBRT07 and text","shifted_viewport":true,"real_product_native_verified":false})).unwrap()).unwrap();
         el.exit();
     }
     fn window_event(&mut self,_:&ActiveEventLoop,_:WindowId,_:WindowEvent) {}

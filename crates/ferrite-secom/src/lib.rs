@@ -140,3 +140,6 @@ pub use client::{SecomClient, VerifiedPage};
 
 #[cfg(test)]
 mod transport_tests;
+
+mod received;
+pub use received::{GetRoutingReceipt, ReceivedPage, ReceivedPayload};

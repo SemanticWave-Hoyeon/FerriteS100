@@ -71,91 +71,13 @@ impl CoverageLifecycleResize {
     }
 }
 
-/// Fresh provider-local policy. A zero opt-out selects the original cold path.
-/// No process-global state is mutated; tests exercise this parser directly.
-fn coverage_cache_policy(geometry: Option<&str>, midpoint: Option<&str>) -> (bool, bool) {
-    let enabled = geometry != Some("0");
-    (enabled, enabled && midpoint != Some("0"))
-}
-fn new_coverage_geometry_cache() -> Arc<std::sync::Mutex<ferrite_wgpu::globe_coverage_projection::CoverageGeometryCache>> {
-    let geometry = std::env::var("FERRITE_GLOBE_COVERAGE_GEOMETRY_CACHE").ok();
-    let midpoint = std::env::var("FERRITE_GLOBE_COVERAGE_MIDPOINT_REUSE").ok();
-    let (enabled, reuse) = coverage_cache_policy(geometry.as_deref(), midpoint.as_deref());
-    coverage_geometry_cache_with_policy(enabled, reuse)
-}
-fn coverage_geometry_cache_with_policy(enabled: bool, reuse: bool) -> Arc<std::sync::Mutex<ferrite_wgpu::globe_coverage_projection::CoverageGeometryCache>> {
-    let mut cache = ferrite_wgpu::globe_coverage_projection::CoverageGeometryCache::default();
-    cache.set_enabled(enabled);
-    cache.set_midpoint_reuse(reuse);
-    Arc::new(std::sync::Mutex::new(cache))
-}
 
-/// Application wiring: S-101 selects coverage; the renderer supplies its camera.
-struct S101GlobeCoverageProvider {
-    geometry_cache:
-        Arc<std::sync::Mutex<ferrite_wgpu::globe_coverage_projection::CoverageGeometryCache>>,
-    inventory: Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>,
-}
-impl ferrite_render::GlobeCoverageProvider for S101GlobeCoverageProvider {
-    fn prepare(
-        &self,
-        context: &RenderContext,
-        view: ferrite_render::GlobeCoverageView<'_>,
-    ) -> ferrite_render::Result<Option<ferrite_render::PreparedCoverage>> {
-        let prepare = || -> Result<_> {
-            use ferrite_kernel::coverage_selection::Region;
-            let [w, h] = view.extent;
-            let viewport = Region::from_rings(
-                &[
-                    [0., 0.],
-                    [w as f64, 0.],
-                    [w as f64, h as f64],
-                    [0., h as f64],
-                    [0., 0.],
-                ],
-                &[],
-            )?;
-            let exemptions = context
-                .raw_instructions()
-                .iter()
-                .enumerate()
-                .filter_map(|(i, command)| {
-                    matches!(
-                        command.portrayal_origin(),
-                        ferrite_render::PortrayalOrigin::CoverageExempt
-                    )
-                    .then_some(i)
-                })
-                .collect();
-            self.inventory.prepare_projected(context, &exemptions,
-                ferrite_s101::coverage_projection::ProjectedCoverageView {
-                    viewport: &viewport, extent: view.extent,
-                    display_scale: view.display_scale, pixel_budget: 128 * 1024 * 1024,
-                },
-                |dataset, coverage_id, surfaces| {
-                    let mut regions = Vec::with_capacity(surfaces.len());
-                    for (surface_index,surface) in surfaces.iter().enumerate() {
-                        let mut cache=match self.geometry_cache.lock(){Ok(cache)=>cache,Err(poison)=>{let mut cache=poison.into_inner();cache.set_enabled(false);cache}};
-                        let region=cache.project_rings((dataset,coverage_id,surface_index),&surface.exterior,&surface.holes,
-                            view.camera,ferrite_wgpu::globe_portrayal::DrapingLimits::default(),
-                            ferrite_kernel::globe_coverage_projection::CoverageProjectionLimits::default()).map_err(anyhow::Error::msg)?;
-                        regions.push(region);
-                    }
-                    Region::union_projected(&regions, 1048576)
-                },
-                |_, origin| Ok(ferrite_render::PortrayalOrigin::project_globe_source(origin, view.camera, view.pixels_per_mm)?),
-            )
-        };
-        prepare().map_err(|e| {
-            ferrite_render::RenderError::Render(format!("S-101 globe coverage: {e:#}"))
-        })
-    }
-}
 
 mod cell_source_identity;
 mod chart_publication;
 mod dataset_discovery;
 mod dataset_signature_policy;
+mod s102_input_capture;
 mod interoperability;
 mod navigation;
 mod plugins;
@@ -163,6 +85,9 @@ mod process_stats;
 mod s101_lifecycle_metadata;
 mod s101_update_plan;
 mod s102_depth_policy;
+
+mod flat_service_trajectory;
+mod flat_eventloop_diagnostics;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -448,7 +373,7 @@ struct AppConfig {
     /// Select the same catalogue display preset exposed by the settings UI.
     initial_display_mode: Option<String>,
     initial_viewing_layers: Vec<String>,
-    initial_globe_samples: Option<String>,
+
     /// Auto-save screenshot after loading (then exit)
     auto_screenshot: Option<PathBuf>,
     selection_audit: Option<PathBuf>,
@@ -606,10 +531,7 @@ impl AppConfig {
                 .filter(|(_, a)| a.as_str() == "--viewing-layer")
                 .map(|(i, _)| args.get(i + 1).cloned().unwrap_or_default())
                 .collect(),
-            initial_globe_samples: args
-                .iter()
-                .position(|a| a == "--globe-samples")
-                .map(|i| args.get(i + 1).cloned().unwrap_or_default()),
+
             auto_screenshot,
             viewing_date: args
                 .windows(2)
@@ -690,9 +612,41 @@ struct PreparedPortrayal {
     context: RenderContext,
     coverage: Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>,
     ic_changed: usize,
-    geometry_cache:
-        Arc<std::sync::Mutex<ferrite_wgpu::globe_coverage_projection::CoverageGeometryCache>>,
-    globe: Option<ferrite_wgpu::PreparedGlobePublication>,
+
+    raster_scene: Option<ferrite_wgpu::PreparedRasterScenePublication>,
+}
+
+/// Source-only additive candidate. UI routing is deliberately not wired yet.
+#[derive(Clone)]
+struct PortrayalChangeRequest {
+    profile: String,
+    settings: SettingsState,
+}
+fn coalesce_portrayal_request(pending:Option<PortrayalChangeRequest>, profile:&str, settings:&SettingsState,
+    next_profile:Option<String>, next_settings:Option<SettingsState>) -> PortrayalChangeRequest {
+    let previous=pending.unwrap_or(PortrayalChangeRequest{profile:profile.into(),settings:settings.clone()});
+    PortrayalChangeRequest {profile:next_profile.unwrap_or(previous.profile),settings:next_settings.unwrap_or(previous.settings)}
+}
+fn portrayal_navigation_pending(loading:bool,dragging:bool,touch:bool,zoom:bool,pan_phase:u8,zoom_phase:u8,velocity:(f64,f64))->bool {
+    loading || dragging || touch || zoom || pan_phase!=0 || zoom_phase!=0
+        || velocity.0.abs()>0.00001 || velocity.1.abs()>0.00001
+}
+struct PreparedPortrayalChange {
+    base_instruction_count: usize,
+    portrayal: PreparedPortrayal,
+    symbols: SymbolCache,
+    request: PortrayalChangeRequest,
+    background: ferrite_render::Color,
+}
+
+struct PreparedBathymetryInput {
+    capture: s102_input_capture::CapturedInput,
+    path: PathBuf,
+    coverages: Vec<BathymetryCoverage>,
+    policy: DepthPolicy,
+    snapshot: Option<Arc<AuthenticatedSnapshot>>,
+    unsigned_input: Option<Arc<UnauthenticatedSnapshot>>,
+    bounds: Option<GeoBounds>,
 }
 
 /// State belonging to the displayed datasets before an attempted load.
@@ -760,6 +714,7 @@ struct ChartApp {
     /// Symbol cache for SVG symbol rendering
     symbol_cache: SymbolCache,
     /// Current color profile name (Day, Dusk, Night)
+    pending_portrayal_change: Option<PortrayalChangeRequest>,
     current_profile_name: String,
     /// Current mouse position
     mouse_pos: (f64, f64),
@@ -804,9 +759,7 @@ struct ChartApp {
     >,
     cancellation_history_path: PathBuf,
     coverage_inventory: Option<Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>>,
-    coverage_geometry_cache: Option<
-        Arc<std::sync::Mutex<ferrite_wgpu::globe_coverage_projection::CoverageGeometryCache>>,
-    >,
+
     ic: Option<Arc<ferrite_interoperability::AuthenticatedCatalogue>>,
     ic_assigned_vectors: usize,
     initial_interoperability_enabled: bool,
@@ -839,7 +792,7 @@ struct ChartApp {
     /// Base instruction count (chart instructions only, before plugin instructions)
     base_instruction_count: usize,
     applied_settings: SettingsState,
-    initial_globe_samples: u32,
+
     /// Debug mode enabled
     debug_mode: bool,
     /// Charts to auto-load on startup
@@ -858,6 +811,8 @@ struct ChartApp {
     /// Frame count since load completed (for auto-screenshot timing)
     frames_since_loaded: Option<u32>,
     coverage_lifecycle_resize: Option<CoverageLifecycleResize>,
+    flat_eventloop_audit: Option<Box<flat_eventloop_diagnostics::Audit>>,
+    flat_eventloop_audit_started: bool,
     /// Frame times for FPS calculation
     frame_times: std::collections::VecDeque<std::time::Instant>,
     process_stats: process_stats::ProcessStats,
@@ -909,6 +864,7 @@ impl ChartApp {
             renderer: None,
             render_context: {
                 let mut context = RenderContext::new(Viewport::new(1920.0, 1080.0));
+                context.set_coverage_visibility_fusion_enabled(std::env::var("FERRITE_COVERAGE_VISIBILITY_FUSION").ok().as_deref()==Some("1"));
                 context
                     .scaler
                     .set_projection(ferrite_render::FlatProjection::EllipsoidalMercator);
@@ -916,6 +872,7 @@ impl ChartApp {
             },
             bounds: GeoBounds::new(-180.0, -90.0, 180.0, 90.0),
             symbol_cache,
+            pending_portrayal_change: None,
             current_profile_name: initial_profile,
             mouse_pos: (0.0, 0.0),
             rendered_symbols: Vec::new(),
@@ -942,7 +899,7 @@ impl ChartApp {
             loaded_discovery: Default::default(),
             cancellation_history_path: chart_publication::default_history_path(),
             coverage_inventory: None,
-            coverage_geometry_cache: None,
+
             ic: None,
             ic_assigned_vectors: 0,
             initial_interoperability_enabled: true,
@@ -1046,7 +1003,7 @@ impl ChartApp {
             },
             base_instruction_count: 0,
             applied_settings: SettingsState::default(),
-            initial_globe_samples: 4,
+
             debug_mode,
             pending_auto_chart,
             auto_screenshot,
@@ -1058,6 +1015,8 @@ impl ChartApp {
             auto_center,
             frames_since_loaded: None,
             coverage_lifecycle_resize: None,
+            flat_eventloop_audit: None,
+            flat_eventloop_audit_started: false,
             frame_times: std::collections::VecDeque::with_capacity(60),
             process_stats: process_stats::ProcessStats::default(),
             debug_stats_audit: ferrite_wgpu::background_test::enabled()
@@ -1088,63 +1047,21 @@ impl ChartApp {
 
     /// Switch to a different color profile (Day, Dusk, Night)
     /// Clears symbol cache to force re-rendering with new colors
-    fn set_color_profile(&mut self, profile_name: &str) {
-        if self.pc.color_profiles.profiles.contains_key(profile_name) {
-            if self.current_profile_name != profile_name {
-                self.current_profile_name = profile_name.to_string();
-                // Clear symbol cache to force re-rendering with new colors
-                self.symbol_cache.clear();
-                // Clear GPU-cached symbol textures in renderer
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.clear_symbol_textures();
-                    renderer.background_color = lookup_pc_color(&self.pc, "DEPDW", profile_name);
-                }
-                tracing::info!("Switched to color profile: {}", profile_name);
-
-                // Fast path: remap color tokens to new RGB values without re-running Lua
-                if self.chart_loaded {
-                    let pc = &self.pc;
-                    let pname = self.current_profile_name.clone();
-                    self.render_context
-                        .remap_colors(&|token: &str| lookup_pc_color(pc, token, &pname));
-                }
-            }
-        } else {
-            tracing::warn!("Color profile '{}' not found", profile_name);
-        }
+    fn set_color_profile(&mut self, profile_name: &str) -> Result<()> {
+        if profile_name == self.current_profile_name {return Ok(());}
+        let request=PortrayalChangeRequest {profile:profile_name.into(),settings:self.applied_settings.clone()};
+        let prepared=self.prepare_portrayal_change(request)?;
+        self.commit_portrayal_change(prepared)
     }
 
-    /// Validate and stage both products before replacing any active portrayal or settings.
     fn apply_portrayal_settings(&mut self) -> Result<()> {
-        let candidate = self.renderer.as_ref().map(|r| r.settings().clone());
-        validated_lua_context(&self.pc, candidate.as_ref())?;
-        let mut next = self.render_context.empty_for_rebuild();
-        if !self.cells.is_empty() {
-            try_lua_portrayal(
-                &self.cells,
-                &self.fc,
-                &self.pc,
-                &mut next,
-                &self.current_profile_name,
-                candidate.as_ref(),
-            )?;
-        }
-        let ic_changed = if let Some(ic) = self.active_ic() {
-            interoperability::compose_vectors(&ic, &self.cells, &self.fc, &mut next)?
-        } else {
-            0
-        };
-        // raster_batch commits only when every candidate tile has been prepared.
-        // The following vector swap is infallible, so a failing product changes neither display.
-        self.recolor_bathymetry()?;
-        self.render_context = next;
-        self.ic_assigned_vectors = ic_changed;
-        self.base_instruction_count = self.render_context.instruction_count();
-        if let Some(candidate) = candidate {
-            self.applied_settings = candidate;
-        }
-        self.update_interoperability_status();
-        Ok(())
+        let candidate=self.renderer.as_ref().context("Renderer not initialized")?.settings().clone();
+        // Egui edits controls before Apply. Restore live applied state before any
+        // preparation; candidate values are passed explicitly, never read back.
+        self.renderer.as_mut().unwrap().set_settings(self.applied_settings.clone());
+        let request=PortrayalChangeRequest {profile:self.current_profile_name.clone(),settings:candidate};
+        let prepared=self.prepare_portrayal_change(request)?;
+        self.commit_portrayal_change(prepared)
     }
 
     fn active_ic(&self) -> Option<Arc<ferrite_interoperability::AuthenticatedCatalogue>> {
@@ -1193,7 +1110,6 @@ impl ChartApp {
                 .as_mut()
                 .unwrap()
                 .precompute_triangulations(&self.render_context);
-            self.update_view();
             self.audit_interoperability(&out.join(format!("{name}.json")))?;
             self.renderer
                 .as_mut()
@@ -1330,53 +1246,35 @@ impl ChartApp {
         )
     }
 
-    fn load_bathymetry(&mut self, paths: &[PathBuf]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
+    fn load_bathymetry(&mut self,paths:&[PathBuf])->Result<()> {
+        let checkpoint=self.load_checkpoint();
+        match self.load_bathymetry_transaction(paths) {
+            Ok(())=>Ok(()),
+            Err(error)=>{self.restore_load_checkpoint(checkpoint);Err(error)}
         }
-        anyhow::ensure!(
-            self.loading_state.is_none(),
-            "Finish or clear the current S-101 load before adding bathymetry"
-        );
-        let paths: Vec<_> = paths
-            .iter()
-            .filter(|p| {
-                let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-                !self
-                    .bathymetry
-                    .iter()
-                    .any(|(loaded, _, _)| *loaded == canonical)
-            })
-            .cloned()
-            .collect();
-        if paths.is_empty() {
-            return Ok(());
+    }
+    fn load_bathymetry_transaction(&mut self,paths:&[PathBuf])->Result<()> {
+        if paths.is_empty() {return Ok(());}
+        anyhow::ensure!(self.loading_state.is_none(),"Finish or clear the current S-101 load before adding bathymetry");
+        let mut unique=std::collections::HashSet::new();let mut paths_to_load=Vec::new();
+        for path in paths {
+            let path=path.canonicalize().with_context(||format!("Cannot open {}",path.display()))?;
+            if !self.bathymetry.iter().any(|(loaded,_,_)|loaded==&path) && unique.insert(path.clone()) {paths_to_load.push(path);}
         }
-        let require_signature = self.signature_verification_enabled();
-        let authorization = self.authenticate_paths(&paths)?;
-        let portrayal = self.bathymetry_portrayal()?;
-        for path in &paths {
-            let path = path
-                .canonicalize()
-                .with_context(|| format!("Cannot open {}", path.display()))?;
-            if self.bathymetry.iter().any(|(p, _, _)| p == &path) {
-                continue;
-            }
-            let snapshot = dataset_signature_policy::dataset_snapshot(
-                &authorization,
-                &path,
-                require_signature,
-            )?;
-            let unsigned_input = if snapshot.is_none() && self.s102_adjustments_path.is_some() {
-                Some(Arc::new(UnauthenticatedSnapshot::copy(&path)?))
-            } else {
-                None
-            };
-            let data_path = snapshot
-                .as_ref()
-                .map(|s| s.path())
-                .or_else(|| unsigned_input.as_ref().map(|s| s.path()))
-                .unwrap_or(&path);
+        if paths_to_load.is_empty() {return Ok(());}
+        anyhow::ensure!(paths_to_load.len()<=512,"S102 publication exceeds 512-file work budget");
+        let require_signature=self.signature_verification_enabled();
+        let authorization=self.authenticate_paths(&paths_to_load)?;
+        let portrayal=self.bathymetry_portrayal()?;let edge=self.bathymetry_tile_edge()?;
+        let active_ic=self.active_ic();let mut pending=Vec::new();let mut instance_count=0usize;
+        // Receiver snapshot admission policy, not a product-specification limit.
+        let mut snapshot_budget = 512u64 * 1024 * 1024;
+        for path in paths_to_load {
+            let capture = s102_input_capture::CapturedInput::capture(
+                &authorization, &path, require_signature, &mut snapshot_budget)?;
+            let snapshot = capture.authenticated.clone();
+            let unsigned_input = capture.unchecked.clone();
+            let data_path = capture.path();
             let coverages = BathymetryCoverage::open(data_path)?;
             let policy = DepthPolicy::load(
                 self.s102_adjustments_path.as_deref(),
@@ -1386,6 +1284,15 @@ impl ChartApp {
                     .map(|c| c.vertical_datum)
                     .collect::<Vec<_>>(),
             )?;
+
+            instance_count=instance_count.checked_add(coverages.len()).context("S102 instance count overflow")?;
+            anyhow::ensure!(instance_count<=4096,"S102 publication exceeds 4096-instance work budget");
+            pending.push(PreparedBathymetryInput{path,coverages,policy,snapshot,unsigned_input,capture,bounds:None});
+        }
+        let mut batch=self.renderer.as_mut().context("Renderer not initialized")?
+            .stage_raster_material_batch(&self.render_context.scaler,|upload| {
+                for input in &mut pending {
+                    let coverages=&input.coverages;
             let mosaic = ConservativeCoverage::new(
                 coverages
                     .iter()
@@ -1394,10 +1301,10 @@ impl ChartApp {
                         reference: DepthReference(c.vertical_datum as u64),
                     })
                     .collect(),
-                DepthReference(policy.target as u64),
-                &policy,
+                DepthReference(input.policy.target as u64),
+                &input.policy,
             )?;
-            let raw = coverages.len() == 1 && policy.identity(coverages[0].vertical_datum);
+            let raw = coverages.len() == 1 && input.policy.identity(coverages[0].vertical_datum);
             let numeric: &dyn NumericCoverageSource = if raw { &coverages[0] } else { &mosaic };
             if !raw {
                 anyhow::ensure!(
@@ -1409,25 +1316,19 @@ impl ChartApp {
                     "Composed depth output exceeds 64M-cell application work budget"
                 );
             }
-            let assignment = self
-                .active_ic()
+            let assignment = active_ic
+                .as_ref()
                 .map(|ic| coverages[0].interoperability_assignment(&ic.catalogue))
                 .transpose()?
                 .flatten();
-            if let Some(ic) = self.active_ic() {
-                for c in &coverages {
+            if let Some(ic) = active_ic.as_ref() {
+                for c in coverages {
                     anyhow::ensure!(
                         c.interoperability_assignment(&ic.catalogue)? == assignment,
                         "Cannot compose S102 instances with different interoperability assignments"
                     );
                 }
             }
-            let edge = self.bathymetry_tile_edge()?;
-            let mut tile_bounds: Option<GeoBounds> = None;
-            self.renderer
-                .as_mut()
-                .context("Renderer not initialized")?
-                .raster_batch(&self.render_context.scaler, false, |upload| {
                     for window in numeric.numeric_geometry().windows(edge, edge)? {
                         let layer = interoperability::compose_raster(
                             portrayal.raster_window(
@@ -1435,7 +1336,7 @@ impl ChartApp {
                                 window,
                                 format!(
                                     "{}:composed:{}:{}",
-                                    path.display(),
+                                    input.path.display(),
                                     window.column,
                                     window.row
                                 ),
@@ -1443,83 +1344,102 @@ impl ChartApp {
                             assignment.as_ref(),
                         )?;
                         let b = layer.bounds;
-                        if let Some(bounds) = &mut tile_bounds {
+                        if let Some(bounds) = &mut input.bounds {
                             bounds.min_x = bounds.min_x.min(b.min_x);
                             bounds.min_y = bounds.min_y.min(b.min_y);
                             bounds.max_x = bounds.max_x.max(b.max_x);
                             bounds.max_y = bounds.max_y.max(b.max_y);
                         } else {
-                            tile_bounds = Some(b);
+                            input.bounds = Some(b);
                         }
-                        upload(layer)?;
+                        upload(ferrite_render::RasterMaterialLayer::Regular(layer))?;
                     }
-                    Ok::<_, anyhow::Error>(())
-                })?;
-            let bounds = tile_bounds.context("No coverage tiles")?;
-            self.bathymetry_bounds.insert(path.clone(), bounds);
-            if !self.chart_loaded && self.bathymetry.is_empty() {
-                self.bounds = bounds;
-            } else {
-                self.bounds.min_x = self.bounds.min_x.min(bounds.min_x);
-                self.bounds.min_y = self.bounds.min_y.min(bounds.min_y);
-                self.bounds.max_x = self.bounds.max_x.max(bounds.max_x);
-                self.bounds.max_y = self.bounds.max_y.max(bounds.max_y);
+
+                }
+                Ok::<_,anyhow::Error>(())
+            })?;
+        // Derive the mixed-product camera from raw data extents, never from
+        // an already padded camera. This gives the same framing when S101 or
+        // S102 arrives first, and prevents margins accumulating on append.
+        let mut incoming_bounds = Vec::with_capacity(pending.len());
+        for input in &pending {
+            incoming_bounds.push(input.bounds.context("No coverage tiles")?);
+        }
+        let mut next_bounds = chart_data_bounds(
+            &self.cells,
+            self.bathymetry_bounds.values().copied().chain(incoming_bounds),
+        );
+        next_bounds.expand_by_percent(0.1);
+        let previous_bounds=self.bounds;self.bounds=next_bounds;
+        let prepared=self.prepare_instructions_internal(true);
+        self.bounds=previous_bounds;
+        let mut prepared=prepared?;
+        let mut next_pan=self.pan_offset;let mut next_zoom=self.zoom_level;
+        if self.auto_screenshot.is_some() {
+            if let Some((lat,lon))=self.auto_center {
+                if let Some(pan)=prepared.context.scaler.projection().pan_to(next_bounds,WorldPoint::new(lon,lat)) {next_pan=(pan[0],pan[1]);}
             }
-            drop(mosaic);
-            for c in &coverages {
+            if let Some(zoom)=self.auto_zoom {next_zoom=zoom;}
+        }
+        let wrapped=next_pan.0-(next_pan.0/360.).round()*360.;
+        let view=prepared.context.scaler.projection().view_bounds(next_bounds,next_zoom,[wrapped,next_pan.1])
+            .context("Invalid proposed bathymetry camera")?;
+        let renderer=self.renderer.as_ref().context("Renderer not initialized")?;
+        let (x,y,w,h)=renderer.chart_viewport_pixels();
+        anyhow::ensure!(w>0.&&h>0.,"Invalid proposed chart viewport");
+        prepared.context.set_viewport_rect(x,y,w,h);
+        prepared.context.zoom_to_fit(view);
+        prepare_flat_coverage(Some(prepared.coverage.as_ref()),&mut prepared.context,renderer.window().inner_size(),renderer.window().scale_factor())?;
+        renderer.reproject_raster_material_batch(&mut batch,&prepared.context.scaler)?;
+        let mut raster=renderer.prepare_raster_material_publication(batch,false,None)?;
+        renderer.reproject_raster_publication(&mut raster,&prepared.context.scaler)?;
+
+        let visible_vgs=self.get_visible_viewing_groups();
+        let profile=self.pc.color_profiles.profiles.get(&self.current_profile_name);
+        let scene=renderer.prepare_raster_scene_publication(raster)?;
+        renderer.validate_raster_scene_publication(&scene)?;
+        anyhow::ensure!(!self.publication_test_fail_before_commit,"Injected bathymetry publication failure before commit");
+        if std::env::var("FERRITE_ROOT_S102_FAIL_SCENE").as_deref()==Ok("1") {
+            anyhow::ensure!(ferrite_wgpu::background_test::enabled(),"Scene failure injection requires hidden background test");
+            anyhow::bail!("Injected bathymetry failure after complete material staging");
+        }
+        for input in &pending {input.capture.verify()?;}
+        prepared.raster_scene=Some(scene);
+        // All recoverable loading, numeric, material and Flat material work is
+        // complete. Publish the entire file set and its rendering state together.
+        for input in pending {
+            for c in &input.coverages {
                 if c.observed_range_violations().iter().any(|v| *v) {
-                    warn!("S-102 {} {}: decoded values outside declared extrema; original samples retained",path.display(),c.instance_name);
+                    warn!("S-102 {} {}: decoded values outside declared extrema; original samples retained",input.path.display(),c.instance_name);
                 }
                 if !c.root_enclosure.encoding_compatible() {
                     warn!(
                         "S-102 {} {}: root geographic enclosure {:?}; raw values retained",
-                        path.display(),
+                        input.path.display(),
                         c.instance_name,
                         c.root_enclosure
                     );
                 }
                 if c.observed_depth_centroids_outside_domain() {
-                    warn!("S-102 {} {}: populated original depth sample positions outside instance validity; raw samples retained",path.display(),c.instance_name);
+                    warn!("S-102 {} {}: populated original depth sample positions outside instance validity; raw samples retained",input.path.display(),c.instance_name);
                 }
             }
-            if let Some(input) = unsigned_input {
-                self.depth_inputs.insert(path.clone(), input);
-            }
-            self.depth_policies.insert(path.clone(), policy);
-            self.bathymetry.extend(
-                coverages
-                    .into_iter()
-                    .map(|c| (path.clone(), c, snapshot.clone())),
-            );
-            self.chart_loaded = true;
+
+            let path=input.path;self.bathymetry_bounds.insert(path.clone(),input.bounds.expect("validated bounds"));
+            if let Some(unsigned)=input.unsigned_input {self.depth_inputs.insert(path.clone(),unsigned);}
+            self.depth_policies.insert(path.clone(),input.policy);
+            self.bathymetry.extend(input.coverages.into_iter().map(|c|(path.clone(),c,input.snapshot.clone())));
         }
-        if let Some(r) = &mut self.renderer {
-            r.ui_state.bathymetry_count = self.bathymetry.len();
-            r.ui_state.chart_count = self.cells.len() + self.bathymetry.len();
+        self.bounds=next_bounds;self.pan_offset=next_pan;self.zoom_level=next_zoom;self.zoom_target=next_zoom;
+        self.chart_loaded=true;
+        self.publish_instructions(prepared);
+        if let Some(renderer)=&mut self.renderer {
+            renderer.ui_state.bathymetry_count=self.bathymetry.len();renderer.ui_state.chart_count=self.cells.len()+self.bathymetry.len();
+            renderer.update_selection(&self.render_context.scaler);
         }
-        if self.auto_screenshot.is_some() && self.loading_state.is_none() {
-            if let Some((lat, lon)) = self.auto_center {
-                if let Some(pan) = self
-                    .render_context
-                    .scaler
-                    .projection()
-                    .pan_to(self.bounds, WorldPoint::new(lon, lat))
-                {
-                    self.pan_offset = (pan[0], pan[1]);
-                }
-            }
-            if let Some(zoom) = self.auto_zoom {
-                self.zoom_level = zoom;
-                self.zoom_target = zoom;
-            }
-            self.frames_since_loaded = Some(0);
-        }
-        self.update_view();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        info!("S-102 loaded: {} coverages", self.bathymetry.len());
-        Ok(())
+        if self.auto_screenshot.is_some() {self.frames_since_loaded=Some(0);}
+        if let Some(window)=&self.window {window.request_redraw();}
+        info!("S-102 loaded: {} coverages",self.bathymetry.len());Ok(())
     }
 
     fn bathymetry_tile_edge(&self) -> Result<usize> {
@@ -1539,71 +1459,229 @@ impl ChartApp {
         Ok(requested.min(limit))
     }
 
-    fn recolor_bathymetry(&mut self) -> Result<()> {
-        if self.bathymetry.is_empty() {
-            return Ok(());
+    /// Prepare all vector/raster resources without changing active colours,
+    /// settings, CPU symbol cache, texture inventory or previous target.
+    /// Active affine navigation finishes before deferred UI requests are staged;
+    /// existing navigation is reconciled before, never after, publication.
+    fn queue_portrayal_change(&mut self, request:PortrayalChangeRequest) {
+        self.pending_portrayal_change=Some(request);
+        if let Some(renderer)=&mut self.renderer {
+            renderer.set_settings(self.applied_settings.clone());
+            renderer.set_color_profile(&self.current_profile_name);
         }
-        let portrayal = self.bathymetry_portrayal()?;
+        if let Some(window)=&self.window {window.request_redraw();}
+    }
+    fn process_pending_portrayal_change(&mut self) {
+        if self.pending_portrayal_change.is_none() || portrayal_navigation_pending(
+            self.loading_state.is_some(),self.is_dragging,self.touch_navigation.active(),self.zoom_animating,
+            self.pan_rebuild_phase,self.zoom_rebuild_phase,self.pan_velocity) {return;}
+        let fast=self.renderer.as_ref().is_some_and(|r| {
+            let (pan,zoom,_)=r.fast_view_transform();
+            pan!=(0.,0.) || zoom!=1. || r.fast_view_scales().1!=1.
+        });
+        if fast {
+            // Reconcile existing navigation BEFORE preparing a new candidate.
+            // No postcommit rebuild is used to repair a failed publication.
+            self.update_view();
+        }
+        let request=self.pending_portrayal_change.take().expect("Pending request checked");
+        let result=self.prepare_portrayal_change(request).and_then(|p|self.commit_portrayal_change(p));
+        if let Err(error)=result {
+            if let Some(renderer)=&mut self.renderer {
+                renderer.set_settings(self.applied_settings.clone());
+                renderer.set_color_profile(&self.current_profile_name);
+                renderer.ui_state.notice=Some(format!("Portrayal change rejected; previous display retained: {error:#}"));
+            }
+        }
+    }
+
+    fn prepare_portrayal_change(&mut self, request: PortrayalChangeRequest) -> Result<PreparedPortrayalChange> {
+        let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
+        anyhow::ensure!(request.settings.show_shallow_pattern || self.symbol_cache.shallow_pattern_contract().is_some(),
+            "Current PC has no supported independent shallow-pattern selector; previous portrayal retained");
+        let (pan, zoom, _) = renderer.fast_view_transform();
+        anyhow::ensure!(pan == (0., 0.) && zoom == 1. && renderer.fast_view_scales().1 == 1.,
+            "Finish current affine navigation before changing portrayal");
+        let profile = self.pc.color_profiles.profiles.get(&request.profile)
+            .context("Requested colour profile not found")?;
+        validated_lua_context(&self.pc, Some(&request.settings))?;
+        ferrite_s101::validate_catalogue_pair(&self.fc, &self.pc)?;
+        let mut next = self.render_context.empty_for_rebuild();
+        if !self.cells.is_empty() {
+            try_lua_portrayal(&self.cells, &self.fc, &self.pc, &mut next,
+                &request.profile, Some(&request.settings))?;
+        }
+        let active_ic = if request.settings.interoperability_enabled {self.ic.clone()} else {None};
+        let ic_changed = if let Some(ic) = active_ic.as_ref() {
+            interoperability::compose_vectors(ic, &self.cells, &self.fc, &mut next)?
+        } else {0};
+        let base_instruction_count = next.instruction_count();
+        for mut instruction in self.plugin_system.get_render_instructions() {
+            instruction.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
+            next.add_instruction(instruction);
+        }
+        next.scaler = self.render_context.scaler.clone();
+        let coverage = Arc::new(ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(&self.cells)?);
+        prepare_flat_coverage(Some(coverage.as_ref()), &mut next,
+            renderer.window().inner_size(), renderer.window().scale_factor())?;
+        // An ordinary S101-only installation must not depend on an S102 PC.
+        let portrayal = if self.bathymetry.is_empty() {None} else {
+            let pc = PortrayalCatalogue::load(&self.s102_pc_path)?;
+            Some(BathymetryPortrayal::from_catalogue(&pc, &request.profile, DepthSettings {
+                safety_contour: request.settings.safety_contour,
+                shallow_contour: request.settings.shallow_contour,
+                deep_contour: request.settings.deep_contour,
+                four_shades: !request.settings.two_shades,
+            })?)
+        };
         let edge = self.bathymetry_tile_edge()?;
-        let active_ic = self.active_ic();
-        if let Some(r) = &mut self.renderer {
-            r.raster_batch(&self.render_context.scaler, true, |upload| {
-                for group in self.bathymetry.chunk_by(|a, b| a.0 == b.0) {
-                    let (p, c, _) = &group[0];
-                    let policy = self
-                        .depth_policies
-                        .get(p)
-                        .context("Missing loaded depth policy")?;
-                    let mosaic = ConservativeCoverage::new(
-                        group
-                            .iter()
-                            .map(|(_, c, _)| DatumCoverage {
-                                coverage: c,
-                                reference: DepthReference(c.vertical_datum as u64),
-                            })
-                            .collect(),
-                        DepthReference(policy.target as u64),
-                        policy,
-                    )?;
-                    let numeric: &dyn NumericCoverageSource =
-                        if group.len() == 1 && policy.identity(c.vertical_datum) {
-                            c
-                        } else {
-                            &mosaic
-                        };
-                    let assignment = active_ic
-                        .as_ref()
-                        .map(|ic| c.interoperability_assignment(&ic.catalogue))
-                        .transpose()?
-                        .flatten();
-                    if let Some(ic) = active_ic.as_ref() {
-                        for (_, c, _) in group {
-                            anyhow::ensure!(
-                                c.interoperability_assignment(&ic.catalogue)? == assignment,
-                                "Cannot compose differing interoperability assignments"
-                            );
-                        }
-                    }
-                    for window in numeric.numeric_geometry().windows(edge, edge)? {
-                        upload(interoperability::compose_raster(
-                            portrayal.raster_window(
-                                numeric,
-                                window,
-                                format!(
-                                    "{}:composed:{}:{}",
-                                    p.display(),
-                                    window.column,
-                                    window.row
-                                ),
-                            )?,
-                            assignment.as_ref(),
-                        )?)?;
+        let mut batch = self.renderer.as_mut().context("Renderer not initialized")?
+            .stage_raster_material_batch(&next.scaler, |upload| {
+                for group in self.bathymetry.chunk_by(|a,b| a.0 == b.0) {
+                    let (path, first, _) = &group[0];
+                    let policy = self.depth_policies.get(path).context("Missing loaded depth policy")?;
+                    let mosaic = ConservativeCoverage::new(group.iter().map(|(_,c,_)| DatumCoverage {
+                        coverage:c, reference:DepthReference(c.vertical_datum as u64),
+                    }).collect(), DepthReference(policy.target as u64), policy)?;
+                    let numeric: &dyn NumericCoverageSource = if group.len()==1 && policy.identity(first.vertical_datum) {first} else {&mosaic};
+                    let assignment = active_ic.as_ref().map(|ic| first.interoperability_assignment(&ic.catalogue)).transpose()?.flatten();
+                    if let Some(ic) = active_ic.as_ref() {for (_,c,_) in group {
+                        anyhow::ensure!(c.interoperability_assignment(&ic.catalogue)? == assignment,
+                            "Cannot compose differing interoperability assignments");
+                    }}
+                    for window in numeric.numeric_geometry().windows(edge,edge)? {
+                        let layer = interoperability::compose_raster(portrayal.as_ref().context("Missing staged S102 portrayal")?.raster_window(numeric,window,
+                            format!("{}:composed:{}:{}",path.display(),window.column,window.row))?, assignment.as_ref())?;
+                        upload(ferrite_render::RasterMaterialLayer::Regular(layer))?;
                     }
                 }
-                Ok::<_, anyhow::Error>(())
+                Ok::<_,anyhow::Error>(())
             })?;
+        let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
+        renderer.reproject_raster_material_batch(&mut batch,&next.scaler)?;
+        let raster = renderer.prepare_raster_material_publication(batch,true,None)?;
+
+
+        let preset = match request.settings.display_mode {
+            DisplayMode::Base=>ferrite_s101::DisplayPreset::Base,
+            DisplayMode::Standard=>ferrite_s101::DisplayPreset::Standard,
+            DisplayMode::All=>ferrite_s101::DisplayPreset::Other,
+        };
+        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.pc,preset)?;
+        groups.extend(ferrite_s101::viewing_groups_for_layers(&self.pc,
+            request.settings.viewing_layers.iter().map(String::as_str))?);
+        groups.insert(21010);
+        let mut symbols = self.symbol_cache.fork_empty();
+        // Fresh private cache and actual candidate profile, never clear live GPU caches.
+        let scene = renderer.prepare_raster_scene_publication(raster)?;
+        renderer.validate_raster_scene_publication(&scene)?;
+        anyhow::ensure!(!self.publication_test_fail_before_commit,
+            "Injected portrayal change failure after complete scene staging");
+        let background = lookup_pc_color(&self.pc,"DEPDW",&request.profile);
+        Ok(PreparedPortrayalChange {base_instruction_count,portrayal:PreparedPortrayal {
+            context:next,coverage,ic_changed,raster_scene:Some(scene),
+        }, symbols,request,background})
+    }
+    /// All Result-returning work finishes before installation. UI controls are
+    /// restored while requests wait; target controls change only here. No repair
+    /// update_view follows this successful commit.
+    fn commit_portrayal_change(&mut self, prepared:PreparedPortrayalChange) -> Result<()> {
+        self.renderer.as_ref().context("Renderer not initialized")?
+            .validate_raster_scene_publication(prepared.portrayal.raster_scene.as_ref().context("Missing prepared scene")?)?;
+        let PreparedPortrayalChange {base_instruction_count,portrayal,symbols,request,background}=prepared;
+        self.current_profile_name=request.profile;
+        self.applied_settings=request.settings.clone();
+        self.symbol_cache=symbols;
+        let renderer=self.renderer.as_mut().expect("Validated renderer");
+        // Invalidate old palette resources only inside the infallible commit.
+        // The staged scene owns independent new resources. This helper changes
+        // neither raster epoch nor view binding, so the following capsule remains valid.
+        renderer.clear_symbol_textures();
+        renderer.set_settings(request.settings);
+        renderer.set_color_profile(&self.current_profile_name);
+        renderer.background_color=background;
+        self.publish_instructions(portrayal);
+        self.base_instruction_count=base_instruction_count;
+        if let Some(renderer)=&mut self.renderer {
+            renderer.update_selection(&self.render_context.scaler);
+            renderer.precompute_triangulations(&self.render_context);
         }
+        self.update_interoperability_status();
+        if let Some(window)=&self.window {window.request_redraw();}
         Ok(())
+    }
+
+    /// Opt-in hidden diagnostic at the settled screenshot gate; first failure
+    /// preserves prior frame, then retries the same request.
+    fn audit_portrayal_change_recovery(&mut self, output:&Path, profile:&str) -> Result<()> {
+        anyhow::ensure!(ferrite_wgpu::background_test::enabled(), "Hidden audit required");
+        let window=self.window.as_ref().context("Window required")?;
+        anyhow::ensure!(window.is_visible()==Some(false) && !window.has_focus(), "Visible/focused audit forbidden");
+        anyhow::ensure!(!output.exists(), "Audit destination must be new");
+        fs::create_dir_all(output)?;
+        let model=self.publication_model()?;
+        let old_profile=self.current_profile_name.clone();
+        let old_background=self.renderer.as_ref().unwrap().background_color;
+        let old_revision=self.symbol_cache.resource_revision();
+        let settings=self.applied_settings.clone();
+        let mut target_settings=settings.clone();
+        if let Ok(value)=std::env::var("FERRITE_ROOT_PORTRAYAL_CHANGE_SAFETY") {
+            target_settings.safety_contour=value.parse().context("Invalid target safety contour")?;
+        }
+        if let Ok(value)=std::env::var("FERRITE_ROOT_PORTRAYAL_CHANGE_PATTERN") {
+            anyhow::ensure!(value=="0" || value=="1", "Pattern audit flag must be0or1");
+            target_settings.show_shallow_pattern=value=="1";
+        }
+        let old_scaler=format!("{:?}",self.render_context.scaler);
+        let old_selection=format!("{:?}",self.renderer.as_ref().unwrap().ui_state.selected_feature);
+        self.audit_portrayal(&output.join("before"))?;
+        anyhow::ensure!(profile != old_profile, "Recovery audit requires a different candidate profile");
+        self.renderer.as_mut().unwrap().render()?;
+        self.renderer.as_mut().unwrap().save_screenshot(&output.join("before.png"))?;
+        let previous_fault=self.publication_test_fail_before_commit;
+        self.publication_test_fail_before_commit=true;
+        let attempt=self.prepare_portrayal_change(PortrayalChangeRequest{profile:profile.into(),settings:target_settings.clone()});
+        self.publication_test_fail_before_commit=previous_fault;
+        match attempt {
+            Ok(_) => anyhow::bail!("Injected scene failure was accepted"),
+            Err(error) => anyhow::ensure!(format!("{error:#}").contains("Injected portrayal change failure after complete scene staging"),
+                "Candidate failed before the intended late stage: {error:#}"),
+        }
+        anyhow::ensure!(self.publication_model()?==model && self.current_profile_name==old_profile
+            && self.symbol_cache.resource_revision()==old_revision
+            && self.renderer.as_ref().unwrap().background_color==old_background,
+            "Rejected candidate mutated retained portrayal");
+        self.renderer.as_mut().unwrap().render()?;
+        self.renderer.as_mut().unwrap().save_screenshot(&output.join("rejected.png"))?;
+        self.audit_portrayal(&output.join("rejected"))?;
+        anyhow::ensure!(fs::read(output.join("before.png"))?==fs::read(output.join("rejected.png"))?,
+            "Rejected candidate changed direct rendered chart pixels");
+        let retry=self.prepare_portrayal_change(PortrayalChangeRequest{profile:profile.into(),settings:target_settings.clone()})?;
+        self.commit_portrayal_change(retry)?;
+        self.renderer.as_mut().unwrap().render()?;
+        self.renderer.as_mut().unwrap().save_screenshot(&output.join("retry.png"))?;
+        self.audit_portrayal(&output.join("retry"))?;
+        anyhow::ensure!(self.current_profile_name==profile && self.applied_settings==target_settings
+            && format!("{:?}",self.render_context.scaler)==old_scaler
+            && format!("{:?}",self.renderer.as_ref().unwrap().ui_state.selected_feature)==old_selection,
+            "Committed target profile/settings changed camera or selection");
+        let renderer=self.renderer.as_ref().unwrap();
+
+        fs::write(output.join("recovery.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "hidden":true,"focused":false,"old_frame_preserved":true,"retry_committed":true,
+            "profile":self.current_profile_name,"settings":format!("{:?}",self.applied_settings),
+            "scaler":format!("{:?}",self.render_context.scaler),"selection":old_selection,
+            "error":"Injected portrayal change failure after complete scene staging",
+            "postcommit_update_view":false,
+            "scope":"uncompiled opt-in audit; rawbuffers are flat CPU geometry, Flat geometry only; target-palette oracle requires external control"}))?)?;
+        Ok(())
+    }
+
+    fn recolor_bathymetry(&mut self) -> Result<()> {
+        if self.bathymetry.is_empty() {return Ok(());}
+        let request=PortrayalChangeRequest {profile:self.current_profile_name.clone(),settings:self.applied_settings.clone()};
+        let prepared=self.prepare_portrayal_change(request)?;
+        self.commit_portrayal_change(prepared)
     }
 
     fn inspect_bathymetry(&self, lon: f64, lat: f64) -> Result<Option<String>> {
@@ -1806,6 +1884,7 @@ impl ChartApp {
                 "viewport": renderer.chart_viewport_pixels(),
                 "zoom": self.zoom_level,
                 "render_stats": format!("{:?}",renderer.statistics()),
+                "flat_coverage_binding_cache": self.coverage_inventory.as_ref().map(|i|i.flat_binding_cache_statistics()),
                 "source_cells": self.cells.iter().map(|c| &c.file_path).collect::<Vec<_>>(),
                 "native_physical_input_verified": false,
                 "debug_statistics": {"cpu_percent": renderer.ui_state.debug_cpu_usage,
@@ -1941,12 +2020,11 @@ impl ChartApp {
             .map(|(p, o, g, v)| (p, o, g.to_vec(), v))
             .collect::<Vec<_>>();
         self.recolor_bathymetry()?;
-        // Recolour invalidates prepared GPU panes; rebuild the same view before capture.
-        self.update_view();
+        // Combined publication already owns a current-view pane; no repair rebuild.
         if let Some(r) = &self.renderer {
             anyhow::ensure!(
-                !r.ui_state.globe_preview || r.globe_preview_diagnostics().is_some(),
-                "Recolor audit could not restore the globe view"
+                true,
+                "Recolor audit could not restore the Flat view"
             );
         }
         let after = self
@@ -2663,8 +2741,8 @@ impl ChartApp {
         // Drop the receiver so a previously started load cannot repopulate cleared charts.
         self.loading_state = None;
         if let Some(r) = &mut self.renderer {
-            r.ui_state.globe_pose = None;
-            r.ui_state.globe_range_factor = 1.;
+
+
         }
         #[cfg(debug_assertions)]
         info!("Clearing all charts");
@@ -2676,6 +2754,7 @@ impl ChartApp {
         self.loaded_chain_paths.clear();
         self.loaded_discovery.clear();
         self.bathymetry.clear();
+        self.pending_portrayal_change=None;
         self.bathymetry_bounds.clear();
         self.depth_policies.clear();
         self.depth_inputs.clear();
@@ -2693,13 +2772,14 @@ impl ChartApp {
             let display_settings = self.render_context.settings.clone();
             self.render_context =
                 RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
+            self.render_context.set_coverage_visibility_fusion_enabled(std::env::var("FERRITE_COVERAGE_VISIBILITY_FUSION").ok().as_deref()==Some("1"));
             self.render_context.settings = display_settings;
         }
         self.base_instruction_count = 0;
         self.coverage_inventory = None;
-        self.coverage_geometry_cache = None;
+
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_globe_coverage_provider(None);
+
         }
 
         // Update UI state
@@ -2816,7 +2896,7 @@ impl ChartApp {
     /// corrupted rendering data.
     const CACHE_MAGIC: &'static [u8; 4] = b"FRC\x01";
     /// Bump this version whenever DrawingInstruction fields change.
-    const CACHE_SCHEMA_VERSION: u32 = 37;
+    const CACHE_SCHEMA_VERSION: u32 = 38;
 
     /// Wrap a bincode payload with magic + schema version + SHA-256 corruption-detection hash.
     /// NOTE: This is NOT cryptographic authentication — it detects accidental corruption only.
@@ -2869,6 +2949,9 @@ impl ChartApp {
         Ok(())
     }
     fn prepare_instructions(&mut self, preserve_view: bool) -> Result<PreparedPortrayal> {
+        self.prepare_instructions_internal(preserve_view)
+    }
+    fn prepare_instructions_internal(&mut self,preserve_view:bool)->Result<PreparedPortrayal> {
         ferrite_s101::validate_catalogue_pair(&self.fc, &self.pc)?;
         let coverage_inventory =
             ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(
@@ -2987,35 +3070,6 @@ impl ChartApp {
                 renderer.window().scale_factor(),
             )?;
         }
-        let geometry_cache = new_coverage_geometry_cache();
-        let provider: Arc<dyn ferrite_render::GlobeCoverageProvider> =
-            Arc::new(S101GlobeCoverageProvider {
-                inventory: Arc::clone(&coverage_inventory),
-                geometry_cache: Arc::clone(&geometry_cache),
-            });
-        let visible_vgs = self.get_visible_viewing_groups();
-        let color_profile = self
-            .pc
-            .color_profiles
-            .profiles
-            .get(&self.current_profile_name);
-        let globe = if let Some(renderer) = &self.renderer {
-            if renderer.ui_state.globe_preview {
-                let capsule = renderer.prepare_globe_publication(
-                    &mut next,
-                    visible_vgs.as_ref(),
-                    &mut self.symbol_cache,
-                    color_profile,
-                    provider,
-                )?;
-                renderer.validate_globe_publication(&capsule)?;
-                Some(capsule)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         if self.publication_test_fail_before_commit {
             anyhow::ensure!(
                 ferrite_wgpu::background_test::enabled(),
@@ -3029,65 +3083,31 @@ impl ChartApp {
             context: next,
             coverage: coverage_inventory,
             ic_changed,
-            geometry_cache,
-            globe,
+
+
+            raster_scene:None,
         })
     }
+
     fn publish_instructions(&mut self, prepared: PreparedPortrayal) {
-        let PreparedPortrayal {
-            context: next,
-            coverage: coverage_inventory,
-            ic_changed,
-            geometry_cache,
-            globe,
-        } = prepared;
-        self.render_context = next;
-        self.coverage_geometry_cache = Some(Arc::clone(&geometry_cache));
-        if globe.is_none() {
-            if let Some(renderer) = &mut self.renderer {
-                renderer.set_globe_coverage_provider(Some(Arc::new(S101GlobeCoverageProvider {
-                    inventory: Arc::clone(&coverage_inventory),
-                    geometry_cache,
-                })));
-            }
-        }
-        self.coverage_inventory = Some(coverage_inventory);
-        self.ic_assigned_vectors = ic_changed;
-
-        // Save base instruction count (chart instructions only, before plugin instructions)
-        self.base_instruction_count = self.render_context.instruction_count();
-        if let Some(renderer) = &self.renderer {
-            self.applied_settings = renderer.settings().clone();
-        }
-
-        // Update renderer
-        // Get color profile and visible viewing groups before mutable borrows
-        let color_profile = self
-            .pc
-            .color_profiles
-            .profiles
-            .get(&self.current_profile_name);
-        let visible_vgs = self.get_visible_viewing_groups();
-
-        if let Some(renderer) = &mut self.renderer {
+        let PreparedPortrayal {context:next,coverage,ic_changed,raster_scene}=prepared;
+        self.render_context=next;
+        self.coverage_inventory=Some(coverage);
+        self.ic_assigned_vectors=ic_changed;
+        self.base_instruction_count=self.render_context.instruction_count();
+        if let Some(renderer)=&self.renderer {self.applied_settings=renderer.settings().clone();}
+        let color_profile=self.pc.color_profiles.profiles.get(&self.current_profile_name);
+        let visible_vgs=self.get_visible_viewing_groups();
+        if let Some(renderer)=&mut self.renderer {
             renderer.begin_frame();
-            if let Some(globe) = globe {
-                // The prepared pane is installed last. No provider setter or
-                // fallible globe preparation may invalidate it after history.
-                renderer.commit_globe_publication(globe);
-            } else {
-                renderer.set_lon_wrap_pixels(360.0 * self.render_context.scaler.scale_x() as f32);
-                renderer.add_world_map_lines(&self.render_context.scaler);
-                renderer.add_instructions_with_symbols(
-                    &mut self.render_context,
-                    Some(&mut self.symbol_cache),
-                    color_profile,
-                    visible_vgs.as_ref(),
-                );
-            }
+            if let Some(scene)=raster_scene {renderer.commit_raster_scene_publication(scene);}
+            renderer.set_lon_wrap_pixels(360.0*self.render_context.scaler.scale_x() as f32);
+            renderer.add_world_map_lines(&self.render_context.scaler);
+            renderer.add_instructions_with_symbols(&mut self.render_context,Some(&mut self.symbol_cache),color_profile,visible_vgs.as_ref());
             self.build_rendered_symbols();
         }
     }
+
 
     /// Build rendered symbols list for hit testing
     /// Build rendered symbols asynchronously on a background thread.
@@ -3442,7 +3462,7 @@ impl ChartApp {
             .unwrap()
             .save_screenshot(&output.join("before.png"))?;
         // Exercise the ordinary interactive branch, not the auto-screenshot
-        // branch that otherwise repairs a missing globe pane after commit.
+        // ordinary interactive publication branch.
         self.publication_test_fail_before_commit = true;
         self.load_charts(&[selected.clone()])?;
         self.wait_publication_test_load()?;
@@ -3514,23 +3534,17 @@ impl ChartApp {
                     viewport.1 + viewport.3 * y as f32 / 5.,
                 );
                 let renderer = self.renderer.as_mut().unwrap();
-                let globe = renderer.ui_state.globe_preview;
-                let candidates = if globe {
-                    // This invokes the real cropped GPU ID readback, even
-                    // though the application has chart_loaded=false.
-                    renderer
-                        .globe_feature_candidates(&self.render_context, point, 4.)?
-                        .len()
-                } else {
+
+                let candidates =
                     renderer
                         .selection_candidates_in_context(&self.render_context, point, 4.)
                         .len()
-                };
+                ;
                 anyhow::ensure!(
                     candidates == 0,
                     "Cancelled object remained in renderer picking"
                 );
-                direct_pick_probes.push(serde_json::json!({"point":[point.x,point.y],"backend":if globe {"GPU cropped feature IDs"} else {"flat selection index"},"candidates":candidates}));
+                direct_pick_probes.push(serde_json::json!({"point":[point.x,point.y],"backend":"flat selection index","candidates":candidates}));
             }
         }
         let history =
@@ -3555,6 +3569,129 @@ impl ChartApp {
         )?;
         Ok(())
     }
+
+
+    fn capture_coverage_lifecycle(&mut self, output: &Path) -> Result<()> {
+        anyhow::ensure!(ferrite_wgpu::background_test::enabled(), "Hidden lifecycle audit required");
+        fs::create_dir_all(output)?;
+        self.select_feature(None);
+        self.renderer.as_mut().context("Renderer missing")?.ui_state.selection_candidates.clear();
+        std::env::set_var("FERRITE_ROOT_KEY_PROOF_COVERAGE", output.join("coverage"));
+        self.update_view();
+        std::env::remove_var("FERRITE_ROOT_KEY_PROOF_COVERAGE");
+        anyhow::ensure!(self.startup_error.is_none(), "Lifecycle update failed {:?}", self.startup_error);
+        let r=self.renderer.as_mut().unwrap();
+        r.render()?;r.wait_hidden_key_frame()?;
+        anyhow::ensure!(r.window().is_visible()==Some(false)&&!r.window().has_focus(), "Visible/focused lifecycle forbidden");
+        let viewport=r.chart_viewport_pixels();
+        r.save_screenshot(output.join("chart.png"))?;
+        self.audit_portrayal(&output.join("audit"))?;
+        self.renderer.as_ref().unwrap().export_hidden_key_flat_coverage(&output.join("coverage"),&self.render_context)?;
+        let mut picks=Vec::new();
+        for y in 1..=2 {for x in 1..=3 {
+            let point=(viewport.0 as f64+viewport.2 as f64*x as f64/4.,viewport.1 as f64+viewport.3 as f64*y as f64/3.);
+            self.chart_click(point);
+            let selected=self.renderer.as_ref().unwrap().ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
+            picks.push(serde_json::json!({"pixel":point,"selected":selected}));
+        }}
+        self.select_feature(None);self.renderer.as_mut().unwrap().ui_state.selection_candidates.clear();
+        fs::write(output.join("semantic.json"),serde_json::to_vec_pretty(&serde_json::json!({"picks":picks,"profile":self.current_profile_name,"source_cells":self.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}))?)?;
+        fs::write(output.join("coverage-scope.json"), b"{\"mode\":\"2D\",\"scope\":\"actual Flat coverage and picking; no removed 3D geometry cache claim\"}")?;
+        Ok(())
+    }
+    fn regenerate_coverage_lifecycle(&mut self) -> Result<()> {
+        let prepared=self.prepare_instructions(true)?;
+        self.publish_instructions(prepared);
+        Ok(())
+    }
+
+    fn resume_coverage_lifecycle_resize(&mut self) -> Result<bool> {
+        let mut pending=self.coverage_lifecycle_resize.take().context("Resize state missing")?;
+        let window=self.window.as_ref().context("Window missing")?;
+        anyhow::ensure!(window.is_visible()==Some(false)&&!window.has_focus(),"Resize exposed/focused window");
+        let actual=window.inner_size();
+        let ready=pending.ready(actual);
+        if !ready {
+            anyhow::ensure!(pending.started.elapsed()<std::time::Duration::from_secs(10),"Native Resized→Redraw timeout: requested {:?}, actual {:?}, observed {:?}",pending.requested,actual,pending.observed);
+            self.coverage_lifecycle_resize=Some(pending);return Ok(false);
+        }
+        // The normal Resized handler has resized GPU/context and rebuilt coverage.
+        let i=usize::from(pending.restore);
+        self.capture_coverage_lifecycle(&pending.output.join(format!("10-viewport-{i}")))?;
+        fs::write(pending.output.join(format!("10-viewport-{i}-event.json")),serde_json::to_vec_pretty(&serde_json::json!({"requested":[pending.requested.width,pending.requested.height],"actual_window":[actual.width,actual.height],"observed_resized":[actual.width,actual.height],"after_redraw":true,"window_visible":false,"window_focus":false}))?)?;
+        if !pending.restore {
+            pending.restore=true;pending.requested=pending.original;pending.observed=None;
+            pending.started=std::time::Instant::now();pending.next_poll=pending.started;
+            let original=pending.original;self.coverage_lifecycle_resize=Some(pending);
+            let _=self.window.as_ref().unwrap().request_inner_size(original);
+            self.window.as_ref().unwrap().request_redraw();return Ok(false);
+        }
+        self.complete_coverage_cache_lifecycle(&pending.output)?;
+        Ok(true)
+    }
+    fn complete_coverage_cache_lifecycle(&mut self, output:&Path) -> Result<()> {
+        let old_danger=self.renderer.as_ref().unwrap().settings().isolated_dangers;
+        for (i,enabled) in [true,false,true].into_iter().enumerate() {
+            self.renderer.as_mut().unwrap().ui_state.settings.isolated_dangers=enabled;
+            self.regenerate_coverage_lifecycle()?;
+            self.capture_coverage_lifecycle(&output.join(format!("09-shallow-water-dangers-{i}")))?;
+        }
+        self.renderer.as_mut().unwrap().ui_state.settings.isolated_dangers=old_danger;
+        self.regenerate_coverage_lifecycle()?;
+        fs::write(output.join("scope.json"),serde_json::to_vec_pretty(&serde_json::json!({"source_reorder":true,"source_remove_restore":true,"fcpc_actual_reload":true,"profile_actual_change":true,"publication_rejection_cache_identity":true,"shallow_water_dangers_regenerated":[true,false,true],"hardware_dpi_changed":false,"viewport_actual_mutated":true,"camera_zoom_path":[1,2,20,200,20,2,1],"official_update_source_replacement":"separate Root publication audit required","window_visible":false,"window_focus":false}))?)?;
+        Ok(())
+    }
+
+    fn bathymetry_publication_model(&self)->Result<serde_json::Value> {
+        let renderer=self.renderer.as_ref().context("Renderer required")?;
+        let mut policies=self.depth_policies.iter().map(|(path,policy)|(path.clone(),policy.target)).collect::<Vec<_>>();policies.sort();
+        let mut inputs=self.depth_inputs.keys().cloned().collect::<Vec<_>>();inputs.sort();
+        let mut bounds=self.bathymetry_bounds.iter().map(|(path,b)|(path.clone(),[b.min_x.to_bits(),b.min_y.to_bits(),b.max_x.to_bits(),b.max_y.to_bits()])).collect::<Vec<_>>();bounds.sort();
+        let sources=self.bathymetry.iter().map(|(path,c,snapshot)|serde_json::json!({"path":path,"instance":c.instance_name,"geometry":format!("{:?}",c.numeric_geometry()),"datum":c.vertical_datum,"snapshot":snapshot.as_ref().map(|s|s.path())})).collect::<Vec<_>>();
+        Ok(serde_json::json!({"vectors":self.publication_model()?,"sources":sources,"policies":policies,"private_inputs":inputs,"bounds":bounds,"pan_bits":[self.pan_offset.0.to_bits(),self.pan_offset.1.to_bits()],"zoom_bits":self.zoom_level.to_bits(),"zoom_target_bits":self.zoom_target.to_bits(),"raster_composition":renderer.raster_composition_metadata().map(|(p,o,g,v)|(format!("{p:?}"),o,g.to_vec(),v)).collect::<Vec<_>>(),"ui_bathymetry_count":renderer.ui_state.bathymetry_count,"ui_chart_count":renderer.ui_state.chart_count}))
+    }
+    /// A genuine application transaction regression using private immutable
+    /// copies of public HDF5 files, never source dataset modifications.
+    fn audit_root_bathymetry_publication(&mut self,output:&Path)->Result<()> {
+        anyhow::ensure!(ferrite_wgpu::background_test::enabled(),"Hidden background test required");
+        let window=self.window.as_ref().context("Window required")?;
+        anyhow::ensure!(window.is_visible()==Some(false)&&!window.has_focus(),"Visible/focused audit forbidden");
+        anyhow::ensure!(self.loading_state.is_none()&&self.bathymetry.is_empty(),"Audit requires completed original vector load and no existing bathymetry");
+        let paths:Vec<PathBuf>=serde_json::from_str(&std::env::var("FERRITE_ROOT_S102_PUBLICATION_INPUTS")?)?;
+        anyhow::ensure!(paths.len()>=2,"Audit needs at least two public HDF5 copies");
+        let private=output.parent().context("Output parent")?.join("input").canonicalize()?;
+        for p in &paths {anyhow::ensure!(p.canonicalize()?.parent()==Some(private.as_path()),"Audit requires private input copies");}
+        fs::create_dir_all(output)?;
+        let original=self.bathymetry_publication_model()?;
+        let original_inventory=self.coverage_inventory.clone();
+        self.audit_portrayal(&output.join("before"))?;
+        self.renderer.as_mut().unwrap().save_screenshot(&output.join("before.png"))?;
+        let bad=private.join("invalid-last.H5");anyhow::ensure!(!bad.exists(),"New invalid fixture required");fs::write(&bad,b"explicitly invalid HDF5 transaction fixture")?;
+        let partial_error=self.load_bathymetry(&[paths[0].clone(),bad]).unwrap_err();
+        anyhow::ensure!(self.bathymetry_publication_model()?==original,"Partial file set altered model");
+        self.renderer.as_mut().unwrap().render()?;
+        self.audit_portrayal(&output.join("after-partial"))?;
+        self.renderer.as_mut().unwrap().save_screenshot(&output.join("after-partial.png"))?;
+
+        std::env::set_var("FERRITE_ROOT_S102_FAIL_SCENE","1");let failed=self.load_bathymetry(&paths);std::env::remove_var("FERRITE_ROOT_S102_FAIL_SCENE");
+        let late_error=failed.unwrap_err();
+        {anyhow::ensure!(late_error.to_string().contains("after complete material staging"),"Wrong late-stage diagnostic: {late_error:#}");}
+        anyhow::ensure!(self.bathymetry_publication_model()?==original,"Late staging failure altered model");
+        anyhow::ensure!(match (&original_inventory,&self.coverage_inventory) {(Some(a),Some(b))=>Arc::ptr_eq(a,b),(None,None)=>true,_=>false},"Failure replaced coverage inventory");
+        self.renderer.as_mut().unwrap().render()?;
+        self.audit_portrayal(&output.join("after-late"))?;
+        self.renderer.as_mut().unwrap().save_screenshot(&output.join("after-late.png"))?;
+        self.load_bathymetry(&paths)?;
+            anyhow::ensure!(self.bathymetry_bounds.len()==paths.len()&&self.depth_policies.len()==paths.len(),"Successful publication did not publish all file metadata");
+            anyhow::ensure!(self.renderer.as_ref().unwrap().ui_state.bathymetry_count==self.bathymetry.len(),"UI count out of sync");
+
+            // Immediate direct frame, never update_view repair after commit.
+            self.renderer.as_mut().unwrap().render()?;self.audit_portrayal(&output.join("after-success"))?;
+            self.renderer.as_mut().unwrap().save_screenshot(&output.join("after-success.png"))?;
+        let successful=true;
+        fs::write(output.join("publication.json"),serde_json::to_vec_pretty(&serde_json::json!({"original":original,"after":self.bathymetry_publication_model()?,"partial_error":format!("{partial_error:#}"),"late_error":format!("{late_error:#}"),"successful_retry":successful,"all_files":paths.len(),"hidden":true,"focused":false,"no_update_view_repair":true,"signature_policy":"default OFF; no signed producer-cancellation or general continuous mapping claim"}))?)?;Ok(())
+    }
+
 
     /// Exercise absence-only notices through the real worker and persisted
     /// history, with an unrelated loaded scene retained across first/replay.
@@ -3602,10 +3739,7 @@ impl ChartApp {
         }
         self.renderer.as_mut().unwrap().render()?;
         let original = self.publication_model()?;
-        let cache = self
-            .coverage_geometry_cache
-            .clone()
-            .context("Coverage cache")?;
+
         self.audit_portrayal(&output.join("before"))?;
         self.renderer
             .as_mut()
@@ -3639,15 +3773,7 @@ impl ChartApp {
                 self.publication_model()? == original,
                 "Announcement changed retained model/selection/scaler/security"
             );
-            anyhow::ensure!(
-                Arc::ptr_eq(
-                    &cache,
-                    self.coverage_geometry_cache
-                        .as_ref()
-                        .context("Retained cache")?
-                ),
-                "Announcement replaced the retained geometry cache"
-            );
+
             anyhow::ensure!(
                 self.renderer
                     .as_ref()
@@ -3690,146 +3816,6 @@ impl ChartApp {
         )?;
         Ok(())
     }
-
-    /// Real load_charts -> worker -> poll_loading -> Lua/IC/coverage -> commit path.
-    /// Runs only in hidden test mode, using copied official fixture bytes.
-    /// Diagnostic-only lifecycle gate; commands/materials are never filtered.
-    fn capture_coverage_lifecycle(&mut self, output: &Path) -> Result<()> {
-        anyhow::ensure!(ferrite_wgpu::background_test::enabled(), "Hidden lifecycle audit required");
-        fs::create_dir_all(output)?;
-        self.select_feature(None);
-        self.renderer.as_mut().context("Renderer missing")?.ui_state.selection_candidates.clear();
-        std::env::set_var("FERRITE_ROOT_KEY_PROOF_COVERAGE", output.join("coverage"));
-        self.update_view();
-        std::env::remove_var("FERRITE_ROOT_KEY_PROOF_COVERAGE");
-        anyhow::ensure!(self.startup_error.is_none(), "Lifecycle update failed {:?}", self.startup_error);
-        let r=self.renderer.as_mut().unwrap();
-        r.render()?;r.wait_hidden_key_frame()?;
-        anyhow::ensure!(r.window().is_visible()==Some(false)&&!r.window().has_focus(), "Visible/focused lifecycle forbidden");
-        let viewport=r.chart_viewport_pixels();
-        r.save_screenshot(output.join("chart.png"))?;
-        self.audit_portrayal(&output.join("audit"))?;
-        if !self.renderer.as_ref().unwrap().ui_state.globe_preview {
-            self.renderer.as_ref().unwrap().export_hidden_key_flat_coverage(&output.join("coverage"),&self.render_context)?;
-        }
-        let mut picks=Vec::new();
-        for y in 1..=2 {for x in 1..=3 {
-            let point=(viewport.0 as f64+viewport.2 as f64*x as f64/4.,viewport.1 as f64+viewport.3 as f64*y as f64/3.);
-            self.chart_click(point);
-            let selected=self.renderer.as_ref().unwrap().ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
-            picks.push(serde_json::json!({"pixel":point,"selected":selected}));
-        }}
-        self.select_feature(None);self.renderer.as_mut().unwrap().ui_state.selection_candidates.clear();
-        fs::write(output.join("semantic.json"),serde_json::to_vec_pretty(&serde_json::json!({"picks":picks,"profile":self.current_profile_name,"source_cells":self.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}))?)?;
-        fs::write(output.join("cache.json"),serde_json::to_vec_pretty(&self.coverage_geometry_cache.as_ref().context("Cache missing")?.lock().map_err(|_|anyhow::anyhow!("Cache poisoned"))?.diagnostics())?)?;
-        Ok(())
-    }
-    fn regenerate_coverage_lifecycle(&mut self) -> Result<()> {
-        let old=Arc::clone(self.coverage_geometry_cache.as_ref().context("Cache missing")?);
-        let prepared=self.prepare_instructions(true)?;
-        anyhow::ensure!(!Arc::ptr_eq(&old,&prepared.geometry_cache),"New source preparation reused old provider cache");
-        self.publish_instructions(prepared);
-        Ok(())
-    }
-    fn audit_coverage_cache_lifecycle(&mut self, output: &Path) -> Result<()> {
-        anyhow::ensure!(ferrite_wgpu::background_test::enabled(),"Hidden lifecycle required");
-        anyhow::ensure!(self.cells.len()==4,"Lifecycle expects original four SHOM cells");
-        self.capture_coverage_lifecycle(&output.join("00-initial-cold"))?;
-        self.capture_coverage_lifecycle(&output.join("01-initial-warm"))?;
-        self.cells.reverse();
-        let reordered=self.regenerate_coverage_lifecycle().and_then(|_|self.capture_coverage_lifecycle(&output.join("02-source-reordered")));
-        self.cells.reverse();self.regenerate_coverage_lifecycle()?;reordered?;
-        let removed=self.cells.pop().unwrap();
-        let removal=self.regenerate_coverage_lifecycle().and_then(|_|self.capture_coverage_lifecycle(&output.join("03-source-removed")));
-        self.cells.push(removed);self.regenerate_coverage_lifecycle()?;removal?;
-        self.capture_coverage_lifecycle(&output.join("04-source-restored"))?;
-        let oldcache=Arc::clone(self.coverage_geometry_cache.as_ref().unwrap());
-        let original=self.publication_model()?;
-        self.publication_test_fail_before_commit=true;
-        let rejected=self.prepare_instructions(true);
-        self.publication_test_fail_before_commit=false;
-        anyhow::ensure!(rejected.is_err(),"Injected publication unexpectedly accepted");
-        anyhow::ensure!(Arc::ptr_eq(&oldcache,self.coverage_geometry_cache.as_ref().unwrap()),"Rejected publication replaced cache");
-        anyhow::ensure!(self.publication_model()?==original,"Rejected publication changed original state");
-        // Render the retained publication directly; no update_view repair.
-        self.renderer.as_mut().unwrap().render()?;
-        self.renderer.as_mut().unwrap().wait_hidden_key_frame()?;
-        self.renderer.as_mut().unwrap().save_screenshot(output.join("05-rejected-publication-direct.png"))?;
-        self.capture_coverage_lifecycle(&output.join("06-rejected-publication"))?;
-        let initial=self.current_profile_name.clone();
-        let mut profiles:Vec<String>=self.pc.color_profiles.profiles.keys().cloned().collect();profiles.sort();
-        for (i,profile) in profiles.iter().enumerate() {
-            self.set_color_profile(profile);self.regenerate_coverage_lifecycle()?;
-            self.capture_coverage_lifecycle(&output.join(format!("07-profile-{i}")))?;
-        }
-        self.set_color_profile(&initial);self.regenerate_coverage_lifecycle()?;
-        // Reload the actual bound FC/PC inputs rather than changing a name key.
-        let fc=load_feature_catalogue(Path::new(&std::env::var("FERRITE_COVERAGE_LIFECYCLE_FC")?))?;
-        let pc=load_portrayal_catalogue(Path::new(&std::env::var("FERRITE_COVERAGE_LIFECYCLE_PC")?))?;
-        ferrite_s101::validate_catalogue_pair(&fc,&pc)?;
-        self.fc=Arc::new(fc);self.pc=Arc::new(pc);self.symbol_cache.clear();
-        self.renderer.as_mut().unwrap().clear_symbol_textures();
-        self.regenerate_coverage_lifecycle()?;
-        self.capture_coverage_lifecycle(&output.join("08-bound-fcpc-reloaded"))?;
-        let base_pose=self.renderer.as_ref().unwrap().globe_pose();
-        let old_zoom=self.zoom_level;let old_pan=self.pan_offset;
-        for (i,zoom) in [1.,2.,20.,200.,20.,2.,1.].into_iter().enumerate() {
-            if let Some(base)=base_pose {
-                let mut pose=base;pose.range_m=base.range_m/zoom;
-                pose.focus=ferrite_kernel::geodesy::GeographicPosition::new(base.focus.latitude()+0.2*(i as f64).sin(),base.focus.longitude()+0.5*(i as f64).sin())?;
-                pose.heading_deg=base.heading_deg+15.*(i as f64).sin();
-                self.renderer.as_mut().unwrap().ui_state.globe_pose=Some(pose);
-            } else {self.zoom_level=old_zoom*zoom;self.pan_offset=(old_pan.0+1000.*(i as f64).sin(),old_pan.1);}
-            self.capture_coverage_lifecycle(&output.join(format!("09-camera-zoom-{i}")))?;
-        }
-        self.renderer.as_mut().unwrap().ui_state.globe_pose=base_pose;
-        self.zoom_level=old_zoom;self.pan_offset=old_pan;
-        let original_size=self.window.as_ref().unwrap().inner_size();
-        let smaller=winit::dpi::PhysicalSize::new((original_size.width*3/4).max(640),(original_size.height*3/4).max(480));
-        anyhow::ensure!(smaller!=original_size,"Resize must alter native extent");
-        let now=std::time::Instant::now();
-        self.coverage_lifecycle_resize=Some(CoverageLifecycleResize {output:output.to_path_buf(),original:original_size,requested:smaller,restore:false,observed:None,started:now,next_poll:now});
-        let _=self.window.as_ref().unwrap().request_inner_size(smaller);
-        self.window.as_ref().unwrap().request_redraw();
-        Ok(())
-    }
-    fn resume_coverage_lifecycle_resize(&mut self) -> Result<bool> {
-        let mut pending=self.coverage_lifecycle_resize.take().context("Resize state missing")?;
-        let window=self.window.as_ref().context("Window missing")?;
-        anyhow::ensure!(window.is_visible()==Some(false)&&!window.has_focus(),"Resize exposed/focused window");
-        let actual=window.inner_size();
-        let ready=pending.ready(actual);
-        if !ready {
-            anyhow::ensure!(pending.started.elapsed()<std::time::Duration::from_secs(10),"Native Resized→Redraw timeout: requested {:?}, actual {:?}, observed {:?}",pending.requested,actual,pending.observed);
-            self.coverage_lifecycle_resize=Some(pending);return Ok(false);
-        }
-        // The normal Resized handler has resized GPU/context and rebuilt coverage.
-        let i=usize::from(pending.restore);
-        self.capture_coverage_lifecycle(&pending.output.join(format!("10-viewport-{i}")))?;
-        fs::write(pending.output.join(format!("10-viewport-{i}-event.json")),serde_json::to_vec_pretty(&serde_json::json!({"requested":[pending.requested.width,pending.requested.height],"actual_window":[actual.width,actual.height],"observed_resized":[actual.width,actual.height],"after_redraw":true,"window_visible":false,"window_focus":false}))?)?;
-        if !pending.restore {
-            pending.restore=true;pending.requested=pending.original;pending.observed=None;
-            pending.started=std::time::Instant::now();pending.next_poll=pending.started;
-            let original=pending.original;self.coverage_lifecycle_resize=Some(pending);
-            let _=self.window.as_ref().unwrap().request_inner_size(original);
-            self.window.as_ref().unwrap().request_redraw();return Ok(false);
-        }
-        self.complete_coverage_cache_lifecycle(&pending.output)?;
-        Ok(true)
-    }
-    fn complete_coverage_cache_lifecycle(&mut self, output:&Path) -> Result<()> {
-        let old_danger=self.renderer.as_ref().unwrap().settings().isolated_dangers;
-        for (i,enabled) in [true,false,true].into_iter().enumerate() {
-            self.renderer.as_mut().unwrap().ui_state.settings.isolated_dangers=enabled;
-            self.regenerate_coverage_lifecycle()?;
-            self.capture_coverage_lifecycle(&output.join(format!("09-shallow-water-dangers-{i}")))?;
-        }
-        self.renderer.as_mut().unwrap().ui_state.settings.isolated_dangers=old_danger;
-        self.regenerate_coverage_lifecycle()?;
-        fs::write(output.join("scope.json"),serde_json::to_vec_pretty(&serde_json::json!({"source_reorder":true,"source_remove_restore":true,"fcpc_actual_reload":true,"profile_actual_change":true,"publication_rejection_cache_identity":true,"shallow_water_dangers_regenerated":[true,false,true],"hardware_dpi_changed":false,"viewport_actual_mutated":true,"camera_zoom_path":[1,2,20,200,20,2,1],"official_update_source_replacement":"separate Root publication audit required","window_visible":false,"window_focus":false}))?)?;
-        Ok(())
-    }
-
     fn audit_root_publication(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
             ferrite_wgpu::background_test::enabled(),
@@ -4077,741 +4063,6 @@ impl ChartApp {
         Ok(())
     }
 
-    fn audit_root_source_topology(&mut self, output: &Path) -> Result<()> {
-        anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
-            "Background test required"
-        );
-        let r = self.renderer.as_ref().context("Renderer missing")?;
-        anyhow::ensure!(
-            !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-            "Visible/focused test forbidden"
-        );
-        let globe = r.ui_state.globe_preview;
-        let base_pose = r.globe_pose();
-        let old_zoom = self.zoom_level;
-        let old_pan = self.pan_offset;
-        let old_pose = r.ui_state.globe_pose;
-        let epoch = self.render_context.geometry_revision();
-        let viewport = r.chart_viewport_pixels();
-        let profile = self.current_profile_name.clone();
-        self.renderer.as_mut().unwrap().set_profiling_enabled(true);
-        let mut rows = Vec::new();
-        std::fs::create_dir_all(output)?;
-        anyhow::ensure!(
-            std::env::var_os("FERRITE_ROOT_KEY_PROOF_COVERAGE").is_none(),
-            "Proof coverage env must be unset before harness"
-        );
-        for (mode, source_mode) in [0u8, 1, 2, 2, 1, 0].into_iter().enumerate() {
-            let enabled = false;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_source_cache_diagnostic(source_mode)?;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_pattern_key_diagnostic(true)?;
-            // Original boundary behavior unchanged; no negative allocation candidate applied.
-            for cycle in 0..4 {
-                for frame in 0..25usize {
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    self.renderer.as_mut().unwrap().set_globe_selection_click(
-                        [0., 0.],
-                        false,
-                        &self.render_context.scaler,
-                    );
-                    let phase = frame as f64 / 24.;
-                    let zoom = 200f64.powf(1. - (2. * phase - 1.).abs());
-                    if globe {
-                        let base = base_pose.context("Globe pose missing")?;
-                        let mut pose = base;
-                        pose.range_m = base.range_m / zoom;
-                        pose.focus = ferrite_kernel::geodesy::GeographicPosition::new(
-                            base.focus.latitude() + 0.35 * (phase * std::f64::consts::TAU).sin(),
-                            base.focus.longitude() + 0.7 * (phase * std::f64::consts::TAU).sin(),
-                        )?;
-                        pose.heading_deg =
-                            base.heading_deg + 30. * (phase * std::f64::consts::TAU).sin();
-                        self.renderer.as_mut().unwrap().ui_state.globe_pose = Some(pose);
-                    } else {
-                        self.zoom_level = old_zoom * zoom;
-                        self.pan_offset = old_pan;
-                    }
-                    let proof = output.join(format!("mode{mode}/cycle{cycle}-frame{frame:02}"));
-                    if cycle == 3 {
-                        std::fs::create_dir_all(&proof)?;
-                        std::env::set_var(
-                            "FERRITE_ROOT_KEY_PROOF_COVERAGE",
-                            proof.join("coverage"),
-                        );
-                    }
-                    let start = std::time::Instant::now();
-                    self.update_view();
-                    std::env::remove_var("FERRITE_ROOT_KEY_PROOF_COVERAGE");
-                    anyhow::ensure!(
-                        self.startup_error.is_none(),
-                        "Prepare failed {:?}",
-                        self.startup_error
-                    );
-                    let prepare_ms = start.elapsed().as_secs_f64() * 1000.;
-                    let r = self.renderer.as_mut().unwrap();
-                    r.render()?;
-                    let wait = std::time::Instant::now();
-                    r.wait_hidden_key_frame()?;
-                    let wait_ms = wait.elapsed().as_secs_f64() * 1000.;
-                    let service_ms = start.elapsed().as_secs_f64() * 1000.;
-                    anyhow::ensure!(
-                        !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-                        "Visible/focused frame"
-                    );
-                    anyhow::ensure!(
-                        r.chart_viewport_pixels() == viewport
-                            && self.current_profile_name == profile,
-                        "Viewport/palette changed"
-                    );
-                    anyhow::ensure!(
-                        self.render_context.geometry_revision() == epoch,
-                        "Source epoch changed"
-                    );
-                    let preparation = r.globe_preview_diagnostics().map(|d| d.preparation.clone());
-                    rows.push(serde_json::json!({"mode":mode,"source_cache_mode":source_mode,"boundary_storage":enabled,"request_keys":true,"cycle":cycle,"frame":frame,"zoom":zoom,"warmup":cycle==0,"correctness_replay":cycle==3,"geometry_revision":epoch,"globe":globe,"viewport":[viewport.0,viewport.1,viewport.2,viewport.3],"prepare_cpu_wall_ms":prepare_ms,"serialized_frame_service_wall_ms":service_ms,"residual_completion_wait_wall_ms":wait_ms,"preparation_diagnostics":preparation,"window_visible":false,"window_focus":false}));
-                    if cycle != 3 {
-                        continue;
-                    }
-                    // Proof only: source/instructions/current GPU CPU payloads plus actual image/ID clicks.
-                    self.audit_portrayal(&proof.join("audit"))?;
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .save_screenshot(proof.join("chart.png"))?;
-                    if !globe {
-                        self.renderer
-                            .as_ref()
-                            .unwrap()
-                            .export_hidden_key_flat_coverage(
-                                &proof.join("coverage"),
-                                &self.render_context,
-                            )?;
-                    }
-                    let mut picks = Vec::new();
-                    for y in 1..=2 {
-                        for x in 1..=3 {
-                            let point = (
-                                viewport.0 as f64 + viewport.2 as f64 * x as f64 / 4.,
-                                viewport.1 as f64 + viewport.3 as f64 * y as f64 / 3.,
-                            );
-                            self.chart_click(point);
-                            let selected=self.renderer.as_ref().unwrap().ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
-                            picks.push(serde_json::json!({"pixel":point,"selected":selected}));
-                        }
-                    }
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    std::fs::write(
-                        proof.join("semantic.json"),
-                        serde_json::to_vec_pretty(
-                            &serde_json::json!({"globe":globe,"frame":frame,"zoom":zoom,"picks":picks,"profile":profile,"geometry_revision":epoch,"source_cells":self.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}),
-                        )?,
-                    )?;
-                }
-            }
-        }
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_source_cache_diagnostic(0)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_pattern_key_diagnostic(false)?;
-        self.zoom_level = old_zoom;
-        self.pan_offset = old_pan;
-        self.renderer.as_mut().unwrap().ui_state.globe_pose = old_pose;
-        self.select_feature(None);
-        self.update_view();
-        std::fs::write(
-            output.join("frames.json"),
-            serde_json::to_vec_pretty(&rows)?,
-        )?;
-        Ok(())
-    }
-
-    fn audit_root_retained_passing(&mut self, output: &Path) -> Result<()> {
-        anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
-            "Background test required"
-        );
-        let r = self.renderer.as_ref().context("Renderer missing")?;
-        anyhow::ensure!(
-            !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-            "Visible/focused test forbidden"
-        );
-        let globe = r.ui_state.globe_preview;
-        let base_pose = r.globe_pose();
-        let old_zoom = self.zoom_level;
-        let old_pan = self.pan_offset;
-        let old_pose = r.ui_state.globe_pose;
-        let epoch = self.render_context.geometry_revision();
-        let viewport = r.chart_viewport_pixels();
-        let profile = self.current_profile_name.clone();
-        self.renderer.as_mut().unwrap().set_profiling_enabled(true);
-        let mut rows = Vec::new();
-        std::fs::create_dir_all(output)?;
-        anyhow::ensure!(
-            std::env::var_os("FERRITE_ROOT_KEY_PROOF_COVERAGE").is_none(),
-            "Proof coverage env must be unset before harness"
-        );
-        for (mode, retained_passing) in [false, true, true, false].into_iter().enumerate() {
-            let source_mode = 1u8;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_retained_passing_diagnostic(retained_passing)?;
-            let enabled = false;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_source_cache_diagnostic(source_mode)?;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_pattern_key_diagnostic(true)?;
-            // Original boundary behavior unchanged; no negative allocation candidate applied.
-            for cycle in 0..4 {
-                for frame in 0..25usize {
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    self.renderer.as_mut().unwrap().set_globe_selection_click(
-                        [0., 0.],
-                        false,
-                        &self.render_context.scaler,
-                    );
-                    let phase = frame as f64 / 24.;
-                    let zoom = 200f64.powf(1. - (2. * phase - 1.).abs());
-                    if globe {
-                        let base = base_pose.context("Globe pose missing")?;
-                        let mut pose = base;
-                        pose.range_m = base.range_m / zoom;
-                        pose.focus = ferrite_kernel::geodesy::GeographicPosition::new(
-                            base.focus.latitude() + 0.35 * (phase * std::f64::consts::TAU).sin(),
-                            base.focus.longitude() + 0.7 * (phase * std::f64::consts::TAU).sin(),
-                        )?;
-                        pose.heading_deg =
-                            base.heading_deg + 30. * (phase * std::f64::consts::TAU).sin();
-                        self.renderer.as_mut().unwrap().ui_state.globe_pose = Some(pose);
-                    } else {
-                        self.zoom_level = old_zoom * zoom;
-                        self.pan_offset = old_pan;
-                    }
-                    let proof = output.join(format!("mode{mode}/cycle{cycle}-frame{frame:02}"));
-                    if cycle == 3 {
-                        std::fs::create_dir_all(&proof)?;
-                        std::env::set_var(
-                            "FERRITE_ROOT_KEY_PROOF_COVERAGE",
-                            proof.join("coverage"),
-                        );
-                    }
-                    let start = std::time::Instant::now();
-                    self.update_view();
-                    std::env::remove_var("FERRITE_ROOT_KEY_PROOF_COVERAGE");
-                    anyhow::ensure!(
-                        self.startup_error.is_none(),
-                        "Prepare failed {:?}",
-                        self.startup_error
-                    );
-                    let prepare_ms = start.elapsed().as_secs_f64() * 1000.;
-                    let r = self.renderer.as_mut().unwrap();
-                    r.render()?;
-                    let wait = std::time::Instant::now();
-                    r.wait_hidden_key_frame()?;
-                    let wait_ms = wait.elapsed().as_secs_f64() * 1000.;
-                    let service_ms = start.elapsed().as_secs_f64() * 1000.;
-                    anyhow::ensure!(
-                        !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-                        "Visible/focused frame"
-                    );
-                    anyhow::ensure!(
-                        r.chart_viewport_pixels() == viewport
-                            && self.current_profile_name == profile,
-                        "Viewport/palette changed"
-                    );
-                    anyhow::ensure!(
-                        self.render_context.geometry_revision() == epoch,
-                        "Source epoch changed"
-                    );
-                    let preparation = r.globe_preview_diagnostics().map(|d| d.preparation.clone());
-                    rows.push(serde_json::json!({"mode":mode,"retained_passing":retained_passing,"source_cache_mode":source_mode,"boundary_storage":enabled,"request_keys":true,"cycle":cycle,"frame":frame,"zoom":zoom,"warmup":cycle==0,"correctness_replay":cycle==3,"geometry_revision":epoch,"globe":globe,"viewport":[viewport.0,viewport.1,viewport.2,viewport.3],"prepare_cpu_wall_ms":prepare_ms,"serialized_frame_service_wall_ms":service_ms,"residual_completion_wait_wall_ms":wait_ms,"preparation_diagnostics":preparation,"window_visible":false,"window_focus":false}));
-                    if cycle != 3 {
-                        continue;
-                    }
-                    // Proof only: source/instructions/current GPU CPU payloads plus actual image/ID clicks.
-                    self.audit_portrayal(&proof.join("audit"))?;
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .save_screenshot(proof.join("chart.png"))?;
-                    if !globe {
-                        self.renderer
-                            .as_ref()
-                            .unwrap()
-                            .export_hidden_key_flat_coverage(
-                                &proof.join("coverage"),
-                                &self.render_context,
-                            )?;
-                    }
-                    let mut picks = Vec::new();
-                    for y in 1..=2 {
-                        for x in 1..=3 {
-                            let point = (
-                                viewport.0 as f64 + viewport.2 as f64 * x as f64 / 4.,
-                                viewport.1 as f64 + viewport.3 as f64 * y as f64 / 3.,
-                            );
-                            self.chart_click(point);
-                            let selected=self.renderer.as_ref().unwrap().ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
-                            picks.push(serde_json::json!({"pixel":point,"selected":selected}));
-                        }
-                    }
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    std::fs::write(
-                        proof.join("semantic.json"),
-                        serde_json::to_vec_pretty(
-                            &serde_json::json!({"globe":globe,"frame":frame,"zoom":zoom,"picks":picks,"profile":profile,"geometry_revision":epoch,"source_cells":self.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}),
-                        )?,
-                    )?;
-                }
-            }
-        }
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_retained_passing_diagnostic(false)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_source_cache_diagnostic(0)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_pattern_key_diagnostic(false)?;
-        self.zoom_level = old_zoom;
-        self.pan_offset = old_pan;
-        self.renderer.as_mut().unwrap().ui_state.globe_pose = old_pose;
-        self.select_feature(None);
-        self.update_view();
-        std::fs::write(
-            output.join("frames.json"),
-            serde_json::to_vec_pretty(&rows)?,
-        )?;
-        Ok(())
-    }
-
-    fn audit_root_resource_epoch(&mut self, output: &Path) -> Result<()> {
-        anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
-            "Background test required"
-        );
-        let r = self.renderer.as_ref().context("Renderer missing")?;
-        anyhow::ensure!(
-            !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-            "Visible/focused test forbidden"
-        );
-        let globe = r.ui_state.globe_preview;
-        let base_pose = r.globe_pose();
-        let old_zoom = self.zoom_level;
-        let old_pan = self.pan_offset;
-        let old_pose = r.ui_state.globe_pose;
-        let epoch = self.render_context.geometry_revision();
-        let viewport = r.chart_viewport_pixels();
-        let profile = self.current_profile_name.clone();
-        self.renderer.as_mut().unwrap().set_profiling_enabled(true);
-        let mut rows = Vec::new();
-        std::fs::create_dir_all(output)?;
-        anyhow::ensure!(
-            std::env::var_os("FERRITE_ROOT_KEY_PROOF_COVERAGE").is_none(),
-            "Proof coverage env must be unset before harness"
-        );
-        for (mode, resource_reuse) in [false, true, true, false].into_iter().enumerate() {
-            let retained_passing = true;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_prepared_symbol_resources(resource_reuse)?;
-            let source_mode = 1u8;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_retained_passing_diagnostic(retained_passing)?;
-            let enabled = false;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_source_cache_diagnostic(source_mode)?;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_pattern_key_diagnostic(true)?;
-            // Original boundary behavior unchanged; no negative allocation candidate applied.
-            for cycle in 0..4 {
-                for frame in 0..25usize {
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    self.renderer.as_mut().unwrap().set_globe_selection_click(
-                        [0., 0.],
-                        false,
-                        &self.render_context.scaler,
-                    );
-                    let phase = frame as f64 / 24.;
-                    let zoom = 200f64.powf(1. - (2. * phase - 1.).abs());
-                    if globe {
-                        let base = base_pose.context("Globe pose missing")?;
-                        let mut pose = base;
-                        pose.range_m = base.range_m / zoom;
-                        pose.focus = ferrite_kernel::geodesy::GeographicPosition::new(
-                            base.focus.latitude() + 0.35 * (phase * std::f64::consts::TAU).sin(),
-                            base.focus.longitude() + 0.7 * (phase * std::f64::consts::TAU).sin(),
-                        )?;
-                        pose.heading_deg =
-                            base.heading_deg + 30. * (phase * std::f64::consts::TAU).sin();
-                        self.renderer.as_mut().unwrap().ui_state.globe_pose = Some(pose);
-                    } else {
-                        self.zoom_level = old_zoom * zoom;
-                        self.pan_offset = old_pan;
-                    }
-                    let proof = output.join(format!("mode{mode}/cycle{cycle}-frame{frame:02}"));
-                    if cycle == 3 {
-                        std::fs::create_dir_all(&proof)?;
-                        std::env::set_var(
-                            "FERRITE_ROOT_KEY_PROOF_COVERAGE",
-                            proof.join("coverage"),
-                        );
-                    }
-                    let start = std::time::Instant::now();
-                    self.update_view();
-                    std::env::remove_var("FERRITE_ROOT_KEY_PROOF_COVERAGE");
-                    anyhow::ensure!(
-                        self.startup_error.is_none(),
-                        "Prepare failed {:?}",
-                        self.startup_error
-                    );
-                    let prepare_ms = start.elapsed().as_secs_f64() * 1000.;
-                    let r = self.renderer.as_mut().unwrap();
-                    r.render()?;
-                    let wait = std::time::Instant::now();
-                    r.wait_hidden_key_frame()?;
-                    let wait_ms = wait.elapsed().as_secs_f64() * 1000.;
-                    let service_ms = start.elapsed().as_secs_f64() * 1000.;
-                    anyhow::ensure!(
-                        !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-                        "Visible/focused frame"
-                    );
-                    anyhow::ensure!(
-                        r.chart_viewport_pixels() == viewport
-                            && self.current_profile_name == profile,
-                        "Viewport/palette changed"
-                    );
-                    anyhow::ensure!(
-                        self.render_context.geometry_revision() == epoch,
-                        "Source epoch changed"
-                    );
-                    let preparation = r.globe_preview_diagnostics().map(|d| d.preparation.clone());
-                    rows.push(serde_json::json!({"mode":mode,"retained_passing":retained_passing,"resource_reuse":resource_reuse,"source_cache_mode":source_mode,"boundary_storage":enabled,"request_keys":true,"cycle":cycle,"frame":frame,"zoom":zoom,"warmup":cycle==0,"correctness_replay":cycle==3,"geometry_revision":epoch,"globe":globe,"viewport":[viewport.0,viewport.1,viewport.2,viewport.3],"prepare_cpu_wall_ms":prepare_ms,"serialized_frame_service_wall_ms":service_ms,"residual_completion_wait_wall_ms":wait_ms,"preparation_diagnostics":preparation,"window_visible":false,"window_focus":false}));
-                    if cycle != 3 {
-                        continue;
-                    }
-                    // Proof only: source/instructions/current GPU CPU payloads plus actual image/ID clicks.
-                    self.audit_portrayal(&proof.join("audit"))?;
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .save_screenshot(proof.join("chart.png"))?;
-                    if !globe {
-                        self.renderer
-                            .as_ref()
-                            .unwrap()
-                            .export_hidden_key_flat_coverage(
-                                &proof.join("coverage"),
-                                &self.render_context,
-                            )?;
-                    }
-                    let mut picks = Vec::new();
-                    for y in 1..=2 {
-                        for x in 1..=3 {
-                            let point = (
-                                viewport.0 as f64 + viewport.2 as f64 * x as f64 / 4.,
-                                viewport.1 as f64 + viewport.3 as f64 * y as f64 / 3.,
-                            );
-                            self.chart_click(point);
-                            let selected=self.renderer.as_ref().unwrap().ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
-                            picks.push(serde_json::json!({"pixel":point,"selected":selected}));
-                        }
-                    }
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    std::fs::write(
-                        proof.join("semantic.json"),
-                        serde_json::to_vec_pretty(
-                            &serde_json::json!({"globe":globe,"frame":frame,"zoom":zoom,"picks":picks,"profile":profile,"geometry_revision":epoch,"source_cells":self.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}),
-                        )?,
-                    )?;
-                }
-            }
-        }
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_prepared_symbol_resources(false)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_retained_passing_diagnostic(false)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_source_cache_diagnostic(0)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_pattern_key_diagnostic(false)?;
-        self.zoom_level = old_zoom;
-        self.pan_offset = old_pan;
-        self.renderer.as_mut().unwrap().ui_state.globe_pose = old_pose;
-        self.select_feature(None);
-        self.update_view();
-        std::fs::write(
-            output.join("frames.json"),
-            serde_json::to_vec_pretty(&rows)?,
-        )?;
-        Ok(())
-    }
-
-    fn audit_root_coverage_geometry_epoch(&mut self, output: &Path) -> Result<()> {
-        anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
-            "Background test required"
-        );
-        let r = self.renderer.as_ref().context("Renderer missing")?;
-        anyhow::ensure!(
-            !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-            "Visible/focused test forbidden"
-        );
-        let globe = r.ui_state.globe_preview;
-        let base_pose = r.globe_pose();
-        let old_zoom = self.zoom_level;
-        let old_pan = self.pan_offset;
-        let old_pose = r.ui_state.globe_pose;
-        let epoch = self.render_context.geometry_revision();
-        let viewport = r.chart_viewport_pixels();
-        let profile = self.current_profile_name.clone();
-        self.renderer.as_mut().unwrap().set_profiling_enabled(true);
-        let mut rows = Vec::new();
-        std::fs::create_dir_all(output)?;
-        anyhow::ensure!(
-            std::env::var_os("FERRITE_ROOT_KEY_PROOF_COVERAGE").is_none(),
-            "Proof coverage env must be unset before harness"
-        );
-        for (mode, coverage_geometry_reuse) in [false, true, true, false].into_iter().enumerate() {
-            let resource_reuse = true;
-            self.coverage_geometry_cache
-                .as_ref()
-                .context("Coverage cache missing")?
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Coverage geometry cache poisoned"))?
-                .set_enabled(coverage_geometry_reuse);
-            let retained_passing = true;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_prepared_symbol_resources(resource_reuse)?;
-            let source_mode = 1u8;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_retained_passing_diagnostic(retained_passing)?;
-            let enabled = false;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_source_cache_diagnostic(source_mode)?;
-            self.renderer
-                .as_mut()
-                .unwrap()
-                .configure_hidden_pattern_key_diagnostic(true)?;
-            // Original boundary behavior unchanged; no negative allocation candidate applied.
-            for cycle in 0..4 {
-                for frame in 0..25usize {
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    self.renderer.as_mut().unwrap().set_globe_selection_click(
-                        [0., 0.],
-                        false,
-                        &self.render_context.scaler,
-                    );
-                    let phase = frame as f64 / 24.;
-                    let zoom = 200f64.powf(1. - (2. * phase - 1.).abs());
-                    if globe {
-                        let base = base_pose.context("Globe pose missing")?;
-                        let mut pose = base;
-                        pose.range_m = base.range_m / zoom;
-                        pose.focus = ferrite_kernel::geodesy::GeographicPosition::new(
-                            base.focus.latitude() + 0.35 * (phase * std::f64::consts::TAU).sin(),
-                            base.focus.longitude() + 0.7 * (phase * std::f64::consts::TAU).sin(),
-                        )?;
-                        pose.heading_deg =
-                            base.heading_deg + 30. * (phase * std::f64::consts::TAU).sin();
-                        self.renderer.as_mut().unwrap().ui_state.globe_pose = Some(pose);
-                    } else {
-                        self.zoom_level = old_zoom * zoom;
-                        self.pan_offset = old_pan;
-                    }
-                    let proof = output.join(format!("mode{mode}/cycle{cycle}-frame{frame:02}"));
-                    if cycle == 3 {
-                        std::fs::create_dir_all(&proof)?;
-                        std::env::set_var(
-                            "FERRITE_ROOT_KEY_PROOF_COVERAGE",
-                            proof.join("coverage"),
-                        );
-                    }
-                    let start = std::time::Instant::now();
-                    self.update_view();
-                    std::env::remove_var("FERRITE_ROOT_KEY_PROOF_COVERAGE");
-                    anyhow::ensure!(
-                        self.startup_error.is_none(),
-                        "Prepare failed {:?}",
-                        self.startup_error
-                    );
-                    let prepare_ms = start.elapsed().as_secs_f64() * 1000.;
-                    let r = self.renderer.as_mut().unwrap();
-                    r.render()?;
-                    let wait = std::time::Instant::now();
-                    r.wait_hidden_key_frame()?;
-                    let wait_ms = wait.elapsed().as_secs_f64() * 1000.;
-                    let service_ms = start.elapsed().as_secs_f64() * 1000.;
-                    anyhow::ensure!(
-                        !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
-                        "Visible/focused frame"
-                    );
-                    anyhow::ensure!(
-                        r.chart_viewport_pixels() == viewport
-                            && self.current_profile_name == profile,
-                        "Viewport/palette changed"
-                    );
-                    anyhow::ensure!(
-                        self.render_context.geometry_revision() == epoch,
-                        "Source epoch changed"
-                    );
-                    let preparation = r.globe_preview_diagnostics().map(|d| d.preparation.clone());
-                    rows.push(serde_json::json!({"mode":mode,"coverage_geometry_reuse":coverage_geometry_reuse,"coverage_geometry_cache":self.coverage_geometry_cache.as_ref().unwrap().lock().unwrap().diagnostics(),"retained_passing":retained_passing,"resource_reuse":resource_reuse,"source_cache_mode":source_mode,"boundary_storage":enabled,"request_keys":true,"cycle":cycle,"frame":frame,"zoom":zoom,"warmup":cycle==0,"correctness_replay":cycle==3,"geometry_revision":epoch,"globe":globe,"viewport":[viewport.0,viewport.1,viewport.2,viewport.3],"prepare_cpu_wall_ms":prepare_ms,"serialized_frame_service_wall_ms":service_ms,"residual_completion_wait_wall_ms":wait_ms,"preparation_diagnostics":preparation,"window_visible":false,"window_focus":false}));
-                    if cycle != 3 {
-                        continue;
-                    }
-                    // Proof only: source/instructions/current GPU CPU payloads plus actual image/ID clicks.
-                    self.audit_portrayal(&proof.join("audit"))?;
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .save_screenshot(proof.join("chart.png"))?;
-                    if !globe {
-                        self.renderer
-                            .as_ref()
-                            .unwrap()
-                            .export_hidden_key_flat_coverage(
-                                &proof.join("coverage"),
-                                &self.render_context,
-                            )?;
-                    }
-                    let mut picks = Vec::new();
-                    for y in 1..=2 {
-                        for x in 1..=3 {
-                            let point = (
-                                viewport.0 as f64 + viewport.2 as f64 * x as f64 / 4.,
-                                viewport.1 as f64 + viewport.3 as f64 * y as f64 / 3.,
-                            );
-                            self.chart_click(point);
-                            let selected=self.renderer.as_ref().unwrap().ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
-                            picks.push(serde_json::json!({"pixel":point,"selected":selected}));
-                        }
-                    }
-                    self.select_feature(None);
-                    self.renderer
-                        .as_mut()
-                        .unwrap()
-                        .ui_state
-                        .selection_candidates
-                        .clear();
-                    std::fs::write(
-                        proof.join("semantic.json"),
-                        serde_json::to_vec_pretty(
-                            &serde_json::json!({"globe":globe,"frame":frame,"zoom":zoom,"picks":picks,"profile":profile,"geometry_revision":epoch,"source_cells":self.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}),
-                        )?,
-                    )?;
-                }
-            }
-        }
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_prepared_symbol_resources(false)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_retained_passing_diagnostic(false)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_source_cache_diagnostic(0)?;
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .configure_hidden_pattern_key_diagnostic(false)?;
-        self.zoom_level = old_zoom;
-        self.pan_offset = old_pan;
-        self.renderer.as_mut().unwrap().ui_state.globe_pose = old_pose;
-        self.select_feature(None);
-        self.update_view();
-        std::fs::write(
-            output.join("frames.json"),
-            serde_json::to_vec_pretty(&rows)?,
-        )?;
-        Ok(())
-    }
 
     fn audit_animation(&mut self, output: &Path) -> Result<()> {
         let mut rows = Vec::new();
@@ -4844,85 +4095,9 @@ impl ChartApp {
         Ok(())
     }
 
-    /// Opt-in runtime audit against the same displayed geometry and pick path as mouse input.
-    fn audit_globe_selection(&mut self, output: &Path) -> Result<()> {
-        let diagnostics = self
-            .renderer
-            .as_ref()
-            .and_then(|r| r.globe_preview_diagnostics())
-            .context("Globe selection audit has no actual frame")?;
-        let v = diagnostics.viewport;
-        let mut probes: Vec<[f64; 2]> = diagnostics
-            .symbol_footprints_px
-            .iter()
-            .take(12)
-            .map(|b| {
-                [
-                    (b[0] as f64 + b[2] as f64) / 2.,
-                    (b[1] as f64 + b[3] as f64) / 2.,
-                ]
-            })
-            .collect();
-        for y in 1..=3 {
-            for x in 1..=4 {
-                probes.push([v[0] + v[2] * x as f64 / 5., v[1] + v[3] * y as f64 / 4.]);
-            }
-        }
-        let mut rows = Vec::new();
-        let mut selected_count = 0;
-        let mut last_selected = None;
-        for p in probes {
-            if !self.chart_contains((p[0], p[1])) {
-                continue;
-            }
-            self.globe_chart_click((p[0], p[1]));
-            let renderer = self.renderer.as_ref().unwrap();
-            if let Some(feature) = &renderer.ui_state.selected_feature {
-                let cell = feature
-                    .cell_index
-                    .and_then(|i| self.cells.get(i as usize))
-                    .context("Globe pick has no product cell")?;
-                anyhow::ensure!(
-                    cell.features.contains_key(&feature.feature_id),
-                    "Globe pick fabricated feature identity"
-                );
-                anyhow::ensure!(
-                    feature.source.as_deref() == Some(cell.file_path.to_string_lossy().as_ref()),
-                    "Globe pick mixed source cells"
-                );
-                selected_count += 1;
-                last_selected = Some(feature.clone());
-                rows.push(serde_json::json!({"pixel":p,"feature_id":feature.feature_id,"cell_index":feature.cell_index,"feature_type":feature.feature_type,"attributes":feature.attributes.len(),"source":feature.source,"candidates":renderer.ui_state.selection_candidates.len(),"world_position":feature.world_pos}));
-            } else {
-                rows.push(serde_json::json!({"pixel":p,"selected":false}));
-            }
-        }
-        anyhow::ensure!(selected_count > 0, "No actual globe objects selected");
-        if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        self.select_feature(last_selected);
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .save_screenshot_with_ui(output.with_file_name("selection-ui.png"))?;
-        std::fs::write(
-            output,
-            serde_json::to_vec_pretty(
-                &serde_json::json!({"same_click_handler_as_pointer":true,"selected_probes":selected_count,"probes":rows,"viewport":v,"physical_pixel_radius_maximum":64,"single_sample_picking":true,"coverage_3d_verified":false}),
-            )?,
-        )?;
-        Ok(())
-    }
 
     fn audit_selection(&mut self, output: &Path) -> Result<()> {
-        if self
-            .renderer
-            .as_ref()
-            .is_some_and(|r| r.ui_state.globe_preview)
-        {
-            return self.audit_globe_selection(output);
-        }
+
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -5223,20 +4398,7 @@ impl ChartApp {
                 }
             }
         }
-        if self
-            .renderer
-            .as_ref()
-            .is_some_and(|r| r.ui_state.globe_preview)
-        {
-            visible.clear();
-            for &source in self.renderer.as_ref().unwrap().globe_displayed_sources() {
-                if let Some(instruction) = self.render_context.raw_instructions().get(source) {
-                    if let Some(id) = instruction.feature_id() {
-                        visible.insert((instruction.cell_index(), id));
-                    }
-                }
-            }
-        }
+
         let selected = self
             .renderer
             .as_ref()
@@ -5313,14 +4475,7 @@ impl ChartApp {
     }
 
     fn chart_click(&mut self, position: (f64, f64)) {
-        if self
-            .renderer
-            .as_ref()
-            .is_some_and(|r| r.ui_state.globe_preview)
-        {
-            self.globe_chart_click(position);
-            return;
-        }
+
         if !self.chart_loaded {
             return;
         }
@@ -5387,212 +4542,8 @@ impl ChartApp {
         }
     }
 
-    fn globe_chart_click(&mut self, position: (f64, f64)) {
-        if !self.chart_loaded || !self.chart_contains(position) {
-            return;
-        }
-        if self.zoom_animating || self.zoom_rebuild_phase != 0 || self.pan_rebuild_phase != 0 {
-            self.zoom_animating = false;
-            self.zoom_target = self.zoom_level;
-            self.zoom_rebuild_phase = 0;
-            self.pan_rebuild_phase = 0;
-            self.update_view();
-        }
-        let screen = ferrite_render::ScreenPoint::new(position.0 as f32, position.1 as f32);
-        let world = self
-            .renderer
-            .as_ref()
-            .and_then(|r| r.globe_world_at(screen));
-        if let Some(world) = world {
-            if self.plugin_system.handle_click(
-                world.x,
-                world.y,
-                ferrite_plugin_api::MouseButton::Left,
-                false,
-            ) {
-                self.update_view();
-                return;
-            }
-        }
-        let radius = (20. * self.window.as_ref().map_or(1., |w| w.scale_factor())).min(64.);
-        let hits = match self.renderer.as_mut().unwrap().globe_feature_candidates(
-            &self.render_context,
-            screen,
-            radius,
-        ) {
-            Ok(hits) => hits,
-            Err(e) => {
-                self.renderer.as_mut().unwrap().ui_state.notice =
-                    Some(format!("Globe selection failed: {e}"));
-                return;
-            }
-        };
-        let mut nearby = Vec::new();
-        for (source, hit) in hits {
-            let Some(instruction) = self.render_context.raw_instructions().get(source) else {
-                continue;
-            };
-            let Some(feature_id) = instruction.feature_id() else {
-                continue;
-            };
-            let cell_index = instruction.cell_index();
-            let at = self.renderer.as_ref().and_then(|r| {
-                r.globe_world_at(ferrite_render::ScreenPoint::new(
-                    hit.pixel[0] as f32,
-                    hit.pixel[1] as f32,
-                ))
-            });
-            let reference = cell_index
-                .and_then(|c| self.cells.get(c as usize))
-                .and_then(|c| {
-                    c.features.get(&feature_id).and_then(|f| {
-                        f.spatial_associations
-                            .iter()
-                            .find_map(|a| c.points.get(&a.spatial_id.key()))
-                    })
-                })
-                .map(|p| WorldPoint::new(p.position.x, p.position.y));
-            let device = instruction.portrayal_origin().is_device_fixed();
-            let authored_reference = match instruction.portrayal_origin() {
-                ferrite_render::PortrayalOrigin::Point(source) => match source.as_ref() {
-                    ferrite_render::PointOriginGeometry::FeaturePoint(p) => Some(*p),
-                    ferrite_render::PointOriginGeometry::AugmentedLocalPoint {
-                        reference_point,
-                        ..
-                    } => Some(*reference_point),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let coordinate = if matches!(
-                instruction,
-                DrawingInstruction::Point(_) | DrawingInstruction::Text(_)
-            ) {
-                authored_reference
-                    .or(reference)
-                    .or(if device { None } else { at })
-            } else {
-                at.or(reference)
-            };
-            let Some(coordinate) = coordinate else {
-                continue;
-            };
-            nearby.push((
-                RenderedSymbol {
-                    source: Some(source),
-                    plane: instruction
-                        .display_plane()
-                        .composition_plane(ferrite_kernel::CompositionStage::Chart),
-                    kind: match instruction {
-                        DrawingInstruction::Line(_) => 1,
-                        DrawingInstruction::Area(_) => 2,
-                        _ => 0,
-                    },
-                    world_x: coordinate.x,
-                    world_y: coordinate.y,
-                    longitude_shift: 0.,
-                    feature_id,
-                    screen_x: hit.pixel[0] as f32,
-                    screen_y: hit.pixel[1] as f32,
-                    priority: instruction.priority().0,
-                    symbol_ref: if let DrawingInstruction::Point(p) = instruction {
-                        p.symbol_ref.clone()
-                    } else {
-                        String::new()
-                    },
-                    cell_index,
-                },
-                hit.distance_px,
-            ));
-        }
-        nearby.sort_by(RenderedSymbol::compare_hits);
-        let mut seen = std::collections::HashSet::new();
-        nearby.retain(|(h, _)| seen.insert((h.cell_index, h.feature_id)));
-        let candidates: Vec<_> = nearby.iter().map(|(h, _)| self.describe_hit(h)).collect();
-        let first = nearby
-            .first()
-            .map(|(h, _)| (h.source.unwrap(), [h.screen_x as f64, h.screen_y as f64]));
-        let selected = candidates.first().cloned();
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .ui_state
-            .selection_candidates = candidates;
-        self.renderer.as_mut().unwrap().ui_state.selection_requested = None;
-        self.renderer.as_mut().unwrap().ui_state.coverage_info =
-            world.and_then(|w| self.inspect_bathymetry(w.x, w.y).ok().flatten());
-        self.select_feature(selected);
-        if let Some((source, pixel)) = first {
-            let device = self.render_context.raw_instructions()[source]
-                .portrayal_origin()
-                .is_device_fixed();
-            self.renderer.as_mut().unwrap().set_globe_selection_click(
-                pixel,
-                device,
-                &self.render_context.scaler,
-            );
-        }
-    }
-
-    fn sync_globe_controller(&mut self) {
-        let Some(pose) = self.renderer.as_ref().and_then(|r| r.ui_state.globe_pose) else {
-            return;
-        };
-        let viewport = self.render_context.scaler.viewport;
-        if let Some(bounds) = ferrite_render::anchored_zoom_bounds_projected(
-            self.render_context.scaler.projection(),
-            self.bounds,
-            viewport,
-            self.zoom_level,
-            WorldPoint::new(pose.focus.longitude(), pose.focus.latitude()),
-            viewport.center(),
-            pose.focus.latitude(),
-        ) {
-            if let Some(pan) = self
-                .render_context
-                .scaler
-                .projection()
-                .pan_between(self.bounds, bounds)
-            {
-                self.pan_offset = (pan[0], pan[1]);
-            }
-            self.render_context.zoom_to_fit(bounds);
-        }
-    }
-    fn globe_gesture(&mut self, motion: navigation::GestureMotion) -> bool {
-        if !self
-            .renderer
-            .as_ref()
-            .is_some_and(|r| r.ui_state.globe_preview)
-        {
-            return false;
-        }
-        let Some(zoom) = navigation::bounded_zoom(self.zoom_level * motion.ratio) else {
-            return true;
-        };
-        let ratio = zoom / self.zoom_level;
-        let from = ferrite_render::ScreenPoint::new(motion.from.0 as f32, motion.from.1 as f32);
-        let to = ferrite_render::ScreenPoint::new(motion.to.0 as f32, motion.to.1 as f32);
-        let r = self.renderer.as_mut().unwrap();
-        if let Some(anchor) = r.globe_world_at(from) {
-            if r.move_globe_anchor(anchor, to, ratio) {
-                self.zoom_level = zoom;
-                self.zoom_target = zoom;
-                self.zoom_animating = false;
-                self.pan_velocity = (0., 0.);
-                self.sync_globe_controller();
-                self.update_view();
-            }
-        }
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        true
-    }
     fn apply_gesture_motion(&mut self, motion: navigation::GestureMotion) {
-        if self.globe_gesture(motion) {
-            return;
-        }
+
         // Settle only legacy mouse pan: its CPU scaler lags the GPU transform.
         // Continuous gestures keep the current CPU and GPU cameras synchronized.
         if self.pan_rebuild_phase != 0 || self.is_dragging || self.pan_velocity != (0., 0.) {
@@ -5660,7 +4611,103 @@ impl ChartApp {
     /// Update the view based on current zoom and pan
     /// - `rebuild_hit_test`: if false, skip rebuilding the hit-test symbol list
     /// - `preserve_declutter`: if true, preserve symbol declutter grids to avoid flickering
+    fn start_flat_eventloop_diagnostics(&mut self,path:PathBuf)->anyhow::Result<()> {
+        anyhow::ensure!(ferrite_wgpu::background_test::enabled(),"Eventloop diagnostic requires BG=1");
+        anyhow::ensure!(std::env::var_os("FERRITE_FLAT_SERVICE_AUDIT").is_none(),"Do not combine synchronous and eventloop diagnostics");
+        anyhow::ensure!(!path.join("flat-eventloop.json").exists(),"Refuse to overwrite existing eventloop proof");
+        let r=self.renderer.as_ref().ok_or_else(||anyhow::anyhow!("No renderer"))?;
+        anyhow::ensure!(!r.window().is_visible().unwrap_or(true)&&!r.window().has_focus(),"Eventloop diagnostic cannot activate a window");
+        let bounds=[self.bounds.min_x,self.bounds.min_y,self.bounds.max_x,self.bounds.max_y];
+        anyhow::ensure!(flat_service_trajectory::valid_bounds(bounds),"Invalid diagnostic bounds");
+        self.select_feature(None);self.pan_velocity=(0.,0.);self.is_dragging=false;
+        self.flat_eventloop_audit=Some(Box::new(flat_eventloop_diagnostics::Audit::new(path,bounds,self.zoom_level,self.pan_offset)));
+        self.flat_eventloop_audit_started=true;Ok(())
+    }
+    fn begin_flat_eventloop_diagnostic_frame(&mut self, callback_entry:Option<std::time::Instant>)->anyhow::Result<()> {
+        let Some(a)=self.flat_eventloop_audit.as_ref() else{return Ok(());};
+        let index=a.next;let (target_zoom,target_pan)=a.pose();
+        let source=self.render_context.geometry_revision();
+        self.renderer.as_mut().ok_or_else(||anyhow::anyhow!("No renderer"))?.begin_flat_diagnostics(index as u64,source,index as u64)?;
+        self.flat_eventloop_audit.as_mut().unwrap().begin(callback_entry.ok_or_else(||anyhow::anyhow!("Missing callback entry clock"))?);
+        let camera=std::time::Instant::now();
+        let viewport=self.render_context.scaler.viewport;
+        let center=(viewport.width as f64*0.5+viewport.x as f64,viewport.height as f64*0.5+viewport.y as f64);
+        // Use the actual touch/pinch camera route, not direct geometry mutation.
+        let wrapped=target_pan.0-(target_pan.0/360.0).round()*360.0;
+        let target_bounds=self.render_context.scaler.projection().view_bounds(self.bounds,target_zoom,[wrapped,target_pan.1]).ok_or_else(||anyhow::anyhow!("Invalid gesture target bounds"))?;
+        let anchor=self.render_context.scaler.screen_to_world(ferrite_render::ScreenPoint::new(center.0 as f32,center.1 as f32));
+        let mut desired=self.render_context.scaler.clone();desired.zoom_to_fit(target_bounds);
+        let to=desired.world_to_screen(anchor);
+        self.apply_gesture_motion(navigation::GestureMotion{from:center,to:(to.x as f64,to.y as f64),ratio:target_zoom/self.zoom_level});
+        self.renderer.as_ref().unwrap().record_flat_stage(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Camera,camera.elapsed());
+        let view=self.render_context.scaler.geo_bounds;
+        let overlap=flat_service_trajectory::overlap_fraction(self.flat_eventloop_audit.as_ref().unwrap().bounds,[view.min_x,view.min_y,view.max_x,view.max_y]);
+        anyhow::ensure!(index>=400||overlap>0.,"Primary diagnostic pose outside loaded AABB");
+        self.flat_eventloop_audit.as_mut().unwrap().overlap[index]=overlap;Ok(())
+    }
+    fn end_flat_eventloop_diagnostic_frame(&mut self)->anyhow::Result<()> {
+        let Some(a)=self.flat_eventloop_audit.as_mut() else{return Ok(());};
+        let service=a.start.ok_or_else(||anyhow::anyhow!("Missing eventloop frame start"))?.elapsed();
+        a.gpu_coverage_host[a.next]=self.renderer.as_ref().unwrap().flat_gpu_coverage_host_ns();
+        let row=self.renderer.as_mut().unwrap().finish_flat_diagnostics(service.as_nanos().min(u64::MAX as u128) as u64)?;
+        a.complete(row)?;
+        if a.next==flat_eventloop_diagnostics::FRAME_COUNT {
+            a.export()?;
+            let a=self.flat_eventloop_audit.take().unwrap();
+            self.zoom_level=a.saved_zoom;self.zoom_target=a.saved_zoom;self.pan_offset=a.saved_pan;self.zoom_animating=false;self.pan_velocity=(0.,0.);self.pan_rebuild_phase=0;self.zoom_rebuild_phase=0;
+            self.update_view();if let Some(w)=&self.window{w.request_redraw();}
+        }Ok(())
+    }
+
+    fn audit_flat_service(&mut self,path:&std::path::Path)->anyhow::Result<()> {
+        anyhow::ensure!(ferrite_wgpu::background_test::enabled(),"Flat service requires background mode");
+        let mut ledger=ferrite_render::flat_reuse_diagnostics::FlatFrameLedger::<512>::default();
+        anyhow::ensure!(ferrite_render::flat_reuse_diagnostics::FlatFrameLedger::<512>::capacity_bytes().unwrap_or(usize::MAX) <= 1024*1024,"Diagnostic budget");
+        let mut prepare_wall=[0u64;500]; let mut render_wall=[0u64;500];
+        let mut bounds_overlap=[0.0f64;500];
+        let mut gpu_coverage_host_wall=[0u64;500];
+        let loaded=[self.bounds.min_x,self.bounds.min_y,self.bounds.max_x,self.bounds.max_y];
+        anyhow::ensure!(flat_service_trajectory::valid_bounds(loaded),"Invalid loaded chart bounds");
+        let saved_zoom=self.zoom_level; let saved_pan=self.pan_offset;
+        self.select_feature(None);
+        for cycle in 0..5u64 {for pose in 0..100u64 {
+            let r=self.renderer.as_mut().ok_or_else(||anyhow::anyhow!("No renderer"))?;
+            r.begin_flat_diagnostics(cycle*100+pose,self.render_context.geometry_revision(),cycle*100+pose)?;
+            let service=std::time::Instant::now();
+            let camera=std::time::Instant::now();
+            let t=pose as f64/99.0; self.zoom_level=200.0f64.powf(if cycle%2==0{t}else{1.0-t});
+            // Primary: chart-relative +/-20% extent, outside sweep separate.
+            self.pan_offset=flat_service_trajectory::pan(loaded,t,cycle==4);
+            self.render_context.scaler.projection().view_bounds(self.bounds,self.zoom_level,[self.pan_offset.0-(self.pan_offset.0/360.0).round()*360.0,self.pan_offset.1]).map(|b|self.render_context.zoom_to_fit(b)).ok_or_else(||anyhow::anyhow!("Invalid diagnostic camera"))?;
+            let view=self.render_context.scaler.geo_bounds;
+            let overlap=flat_service_trajectory::overlap_fraction(loaded,[view.min_x,view.min_y,view.max_x,view.max_y]);
+            bounds_overlap[(cycle*100+pose) as usize]=overlap;
+            anyhow::ensure!(cycle==4 || overlap>0.0,"Primary pose does not intersect loaded chart AABB");
+            let r=self.renderer.as_mut().unwrap();r.record_flat_stage(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Camera,camera.elapsed());
+            if !r.set_gpu_view_scaler(&self.render_context.scaler){self.update_view_ex(false,true);}
+            prepare_wall[(cycle*100+pose) as usize]=service.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let render_start=std::time::Instant::now();
+            let r=self.renderer.as_mut().unwrap();r.render()?;
+            render_wall[(cycle*100+pose) as usize]=render_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            r.wait_hidden_key_frame()?;
+            gpu_coverage_host_wall[(cycle*100+pose) as usize]=r.flat_gpu_coverage_host_ns();
+            ledger.record(r.finish_flat_diagnostics(service.elapsed().as_nanos().min(u64::MAX as u128) as u64)?);
+        }}
+        self.zoom_level=saved_zoom;self.pan_offset=saved_pan;self.update_view();
+        let rows:Vec<_>=ledger.rows().map(|r|serde_json::json!({"frame":r.frame,"trajectory":if r.frame<400{"chart_relative"}else{"outside_wide"},"phase":if r.frame<100 || r.frame>=400{"first_traversal"}else{"warm_revisit"},"chart_aabb_overlap_fraction":bounds_overlap[r.frame as usize],"chart_aabb_intersects":bounds_overlap[r.frame as usize]>0.0,"source_epoch":r.source_epoch,"view_epoch":r.view_epoch,"service_ns":r.service_ns,"prepare_wall_ns":prepare_wall[r.frame as usize],"render_through_present_wall_ns":render_wall[r.frame as usize],"hidden":r.hidden,"focused":r.focused,"spans_ns":r.spans_ns,"coverage_gpu_binding_plan_upload_host_wall_ns":gpu_coverage_host_wall[r.frame as usize],"reuse_attempts":r.reuse_attempts,"reuse_accepted":r.reuse_accepted,"rejected_by_bit":r.rejected_by_bit,"source_iterations":r.work.source_commands,"executed_commands":r.work.executed_commands,"dependency_iterations":r.work.dependency_iterations,"buffer_upload_calls":r.work.buffer_upload_calls,"buffer_upload_bytes":r.work.buffer_upload_bytes,"triangulation_hits":r.work.triangulation_hits,"triangulation_cold":r.work.triangulation_cold,"area_pattern_projected_vertices":r.work.projected_vertices,"area_pattern_input_triangles":r.work.triangles})).collect();
+        let mut service:Vec<_>=ledger.rows().filter(|r|r.frame>=100 && r.frame<400).map(|r|r.service_ns).collect();service.sort_unstable();
+        let quantile=|q:f64|service[((service.len() as f64*q).ceil() as usize).saturating_sub(1)];
+        let summarize=|primary:bool,inside:bool,warm:bool| {
+            let mut ns:Vec<_>=ledger.rows().filter(|r|(r.frame<400)==primary && (bounds_overlap[r.frame as usize]>0.0)==inside && (r.frame>=100 && r.frame<400)==warm).map(|r|r.service_ns).collect();ns.sort_unstable();
+            let q=|f:f64|if ns.is_empty(){None}else{Some(ns[((ns.len() as f64*f).ceil() as usize).saturating_sub(1)])};
+            serde_json::json!({"trajectory":if primary{"chart_relative"}else{"outside_wide"},"chart_aabb_intersects":inside,"warm_revisit":warm,"samples":ns.len(),"p95_ns":q(0.95),"p99_ns":q(0.99),"over_16_7_ms":ns.iter().filter(|&&n|n>16_700_000).count()})
+        };
+        let categories:Vec<_>=[true,false].into_iter().flat_map(|primary|[true,false].into_iter().flat_map(move |inside|[true,false].into_iter().map(move |warm|(primary,inside,warm)))).map(|(p,i,w)|summarize(p,i,w)).collect();
+        std::fs::create_dir_all(path)?;std::fs::write(path.join("flat-service.json"),serde_json::to_vec_pretty(&serde_json::json!({"loaded_chart_aabb":loaded,"categories":categories,"aabb_scope":"geographic loaded bounding rectangle only, not exact DataCoverage polygon/visibility/pixel area","rows":rows,"dropped":ledger.dropped(),"warm_nearest_rank_p95_ns":quantile(0.95),"warm_nearest_rank_p99_ns":quantile(0.99),"warm_over_16_7_ms":service.iter().filter(|&&n|n>16_700_000).count(),"scope":"serialized service includes prepare+async submit+present+residual completion; NOT GPU duration or foreground FPS; readback excluded; overlapping stage walls nonadditive","source_iteration_scope":"per emission including dependency retry","upload_scope":"only instrumented create_vertex/index_buffer payloads; excludes symbol mapped buffers/text/texture/uniform uploads"}))?)?; Ok(())
+    }
+
     fn update_view_ex(&mut self, rebuild_hit_test: bool, preserve_declutter: bool) {
+        let flat_camera_timer=self.renderer.as_ref().filter(|r|r.flat_diagnostics_active()).map(|_|std::time::Instant::now());
         self.next_temporal_wake = None;
         // A rebuild already includes the current world pan/zoom in its scaler.
         // Discard the previous fast transform so it is never applied twice.
@@ -5698,6 +4745,7 @@ impl ChartApp {
 
         self.render_context.zoom_to_fit(new_bounds);
 
+        if let (Some(t),Some(r))=(flat_camera_timer,self.renderer.as_ref()){r.record_flat_stage(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Camera,t.elapsed());}
         // Pre-compute color profile and viewing groups before mutable borrow of renderer
         let color_profile = self
             .pc
@@ -5708,15 +4756,16 @@ impl ChartApp {
 
         // Prepare plugin instructions before renderer borrow
         // Always add plugin instructions (route overlays should render even without charts)
+        let flat_overlay_timer=self.renderer.as_ref().filter(|r|r.flat_diagnostics_active()).map(|_|std::time::Instant::now());
         self.render_context.remove_coverage_exempt_instructions();
         for mut instr in self.plugin_system.get_render_instructions() {
             instr.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
             self.render_context.add_instruction(instr);
         }
+        if let (Some(t),Some(r))=(flat_overlay_timer,self.renderer.as_ref()){r.record_flat_stage(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Overlay,t.elapsed());}
+        let flat_coverage_timer=self.renderer.as_ref().filter(|r|r.flat_diagnostics_active()).map(|_|std::time::Instant::now());
         if let Some(renderer) = &self.renderer {
-            if renderer.ui_state.globe_preview {
-                self.render_context.clear_prepared_coverage();
-            } else if let Err(error) = prepare_flat_coverage(
+            if let Err(error) = prepare_flat_coverage(
                 self.coverage_inventory.as_deref(),
                 &mut self.render_context,
                 renderer.window().inner_size(),
@@ -5735,28 +4784,15 @@ impl ChartApp {
             }
         }
 
+        if let (Some(t),Some(r))=(flat_coverage_timer,self.renderer.as_ref()){r.record_flat_stage(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Coverage,t.elapsed());}
         if let Some(renderer) = &mut self.renderer {
             // Update zoom level for symbol decluttering and UI
             renderer.set_zoom_level(self.zoom_level);
             renderer.ui_state.zoom_level = self.zoom_level;
             // During animation, preserve declutter state to avoid flickering
             renderer.begin_frame_ex(preserve_declutter);
-            if renderer.ui_state.globe_preview {
-                if let Err(error) = renderer.prepare_globe_with_symbols(
-                    &mut self.render_context,
-                    visible_vgs.as_ref(),
-                    &mut self.symbol_cache,
-                    color_profile,
-                ) {
-                    renderer.ui_state.globe_summary = format!("Globe preparation failed: {error}");
-                    tracing::error!("Globe preparation failed: {error}");
-                    if self.auto_screenshot.is_some() {
-                        self.startup_error = Some(format!("Globe preparation failed: {error}"));
-                    }
-                }
-                return;
-            }
-            renderer.clear_globe_preview();
+
+            ();
             renderer.update_raster_view(&self.render_context.scaler);
             renderer.update_selection(&self.render_context.scaler);
 
@@ -5780,7 +4816,9 @@ impl ChartApp {
             } else {
                 None
             };
+            let flat_pick_timer=self.renderer.as_ref().filter(|r|r.flat_diagnostics_active()).map(|_|std::time::Instant::now());
             self.build_rendered_symbols();
+            if let (Some(t),Some(r))=(flat_pick_timer,self.renderer.as_ref()){r.record_flat_stage(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::PickIndex,t.elapsed());}
             if let Some(s) = hit_test_start {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.cpu_profiler.record("build_hit_test", s.elapsed());
@@ -5868,9 +4906,7 @@ impl ApplicationHandler for ChartApp {
                     // Create renderer asynchronously
                     match pollster::block_on(WgpuRenderer::new(window.clone())) {
                         Ok(mut renderer) => {
-                            renderer
-                                .set_globe_sample_count(self.initial_globe_samples)
-                                .expect("Startup globe sampling was prevalidated");
+
                             // Update render context viewport
                             let size = window.inner_size();
                             self.render_context
@@ -5975,21 +5011,9 @@ impl ApplicationHandler for ChartApp {
                                 self.symbol_cache.len()
                             );
 
-                            renderer.ui_state.globe_preview =
-                                std::env::args().any(|a| a == "--globe");
                             let args: Vec<_> = std::env::args().collect();
-                            renderer.ui_state.globe_range_factor = args
-                                .windows(2)
-                                .find(|a| a[0] == "--globe-range-factor")
-                                .and_then(|a| a[1].parse::<f64>().ok())
-                                .filter(|v| v.is_finite() && *v > 0. && *v <= 10000.)
-                                .unwrap_or(1.);
-                            renderer.ui_state.globe_tilt_deg = args
-                                .windows(2)
-                                .find(|a| a[0] == "--globe-tilt")
-                                .and_then(|a| a[1].parse::<f64>().ok())
-                                .filter(|v| v.is_finite() && (0. ..=70.).contains(v))
-                                .unwrap_or(0.);
+
+
                             self.renderer = Some(renderer);
 
                             if !self.pending_auto_s102.is_empty() {
@@ -6223,6 +5247,7 @@ impl ApplicationHandler for ChartApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let diagnostic_callback_entry=self.flat_eventloop_audit.as_ref().map(|_|std::time::Instant::now());
                 if self.coverage_lifecycle_resize.is_some() {
                     match self.resume_coverage_lifecycle_resize() {
                         Ok(true)=>{if let Some(w)=&self.window {w.request_redraw();}},
@@ -6231,6 +5256,7 @@ impl ApplicationHandler for ChartApp {
                     }
                     return;
                 }
+                if let Err(e)=self.begin_flat_eventloop_diagnostic_frame(diagnostic_callback_entry){self.startup_error=Some(format!("Eventloop diagnostic start failed: {e:#}"));event_loop.exit();return;}
                 // Poll for completed async hit-test build
                 self.poll_hit_test();
 
@@ -6302,25 +5328,7 @@ impl ApplicationHandler for ChartApp {
                     // scale; zeroing pan and solving once caused the old end jump.
                     let (cursor_sx, cursor_sy) = self.zoom_cursor_screen;
                     let viewport = self.render_context.scaler.viewport;
-                    if self
-                        .renderer
-                        .as_ref()
-                        .is_some_and(|r| r.ui_state.globe_preview)
-                    {
-                        let moved = self.renderer.as_mut().unwrap().move_globe_anchor(
-                            WorldPoint::new(self.zoom_anchor_world.0, self.zoom_anchor_world.1),
-                            ferrite_render::ScreenPoint::new(cursor_sx, cursor_sy),
-                            self.zoom_level / previous_zoom,
-                        );
-                        if moved {
-                            self.sync_globe_controller();
-                            self.update_view();
-                        } else {
-                            self.zoom_level = previous_zoom;
-                            self.zoom_target = previous_zoom;
-                            self.zoom_animating = false;
-                        }
-                    } else if let Some(bounds) = ferrite_render::anchored_zoom_bounds_projected(
+                    if let Some(bounds) = ferrite_render::anchored_zoom_bounds_projected(
                         self.render_context.scaler.projection(),
                         self.bounds,
                         viewport,
@@ -6410,6 +5418,8 @@ impl ApplicationHandler for ChartApp {
                     }
                 }
 
+                self.process_pending_portrayal_change();
+
                 let candidate = self.renderer.as_mut().and_then(|renderer| {
                     renderer
                         .ui_state
@@ -6423,28 +5433,9 @@ impl ApplicationHandler for ChartApp {
                     self.select_feature(Some(candidate));
                 }
                 if let Some(r) = &mut self.renderer {
-                    if std::mem::take(&mut r.ui_state.fit_globe_requested) {
-                        if let Some(d) = r.globe_preview_diagnostics() {
-                            let factor = if r.ui_state.globe_range_factor > 0. {
-                                r.ui_state.globe_range_factor
-                            } else {
-                                1.
-                            };
-                            r.ui_state.globe_range_factor = 20_000_000. / (d.range_m / factor);
-                            if let Some(mut pose) = r.globe_pose() {
-                                pose.range_m = 20_000_000.;
-                                pose.tilt_deg = 0.;
-                                r.ui_state.globe_pose = Some(pose);
-                            }
-                            r.ui_state.globe_tilt_deg = 0.;
-                            r.ui_state.view_mode_changed = true;
-                        }
-                    }
+
                 }
-                let view_changed = self
-                    .renderer
-                    .as_mut()
-                    .is_some_and(|r| std::mem::take(&mut r.ui_state.view_mode_changed));
+                let view_changed = false;
                 if view_changed {
                     self.recent_positions.clear();
                     self.zoom_animating = false;
@@ -6579,9 +5570,9 @@ impl ApplicationHandler for ChartApp {
                             Ok((fc, pc)) => {
                                 self.fc_status = validate_fc(&fc, &fc.source_path);
                                 self.pc_status = validate_pc(&pc, &pc.root_path);
-                                self.symbol_cache = SymbolCache::new_with_sources(
+                                self.symbol_cache = SymbolCache::new_with_pattern_contract(
                                     pc.root_path.join("Symbols"),
-                                    pc.sources(),
+                                    pc.sources(), ferrite_s101::shallow_pattern_contract(&pc),
                                 );
                                 self.fc = Arc::new(fc);
                                 self.pc = Arc::new(pc);
@@ -6807,7 +5798,7 @@ impl ApplicationHandler for ChartApp {
                                 // Reload symbol cache with new PC
                                 let symbols_path = path.join("Symbols");
                                 self.symbol_cache =
-                                    SymbolCache::new_with_sources(&symbols_path, new_pc.sources());
+                                    SymbolCache::new_with_pattern_contract(&symbols_path, new_pc.sources(), ferrite_s101::shallow_pattern_contract(&new_pc));
                                 self.pc = Arc::new(new_pc);
 
                                 if let Some(renderer) = &mut self.renderer {
@@ -6861,11 +5852,7 @@ impl ApplicationHandler for ChartApp {
                     let target = navigation::zoom_by_steps(self.zoom_level, steps, 1.5)
                         .unwrap_or(self.zoom_level);
                     let centre = self.render_context.scaler.viewport.center();
-                    if !self.globe_gesture(navigation::GestureMotion {
-                        from: (centre.x as f64, centre.y as f64),
-                        to: (centre.x as f64, centre.y as f64),
-                        ratio: target / self.zoom_level,
-                    }) {
+
                         if let Some(renderer) = &mut self.renderer {
                             renderer.reset_pan_offset();
                         }
@@ -6873,13 +5860,13 @@ impl ApplicationHandler for ChartApp {
                         self.zoom_target = target;
                         self.zoom_animating = false;
                         self.update_view();
-                    }
+
                 }
 
                 if reset_view {
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.ui_state.globe_pose = None;
-                        renderer.ui_state.globe_range_factor = 1.;
+
+
                         renderer.reset_pan_offset();
                     }
                     self.zoom_level = 1.0;
@@ -6897,37 +5884,12 @@ impl ApplicationHandler for ChartApp {
                     self.plugin_system.clear_all_data();
                 }
 
-                // Handle color profile change
-                if let Some(new_profile) = color_change {
-                    self.set_color_profile(&new_profile);
-                    if let Err(e) = self.recolor_bathymetry() {
-                        error!("S-102 portrayal failed: {e:#}");
-                    }
-                    // Force re-render with new colors
-                    if self.chart_loaded {
-                        self.update_view();
-                    }
-                }
-
-                // Validate the complete candidate context before Lua, bathymetry, or GPU changes.
-                if settings_change.is_some() {
-                    let result = self.apply_portrayal_settings();
-                    match result {
-                        Ok(()) => {
-                            if let Some(renderer) = &mut self.renderer {
-                                self.applied_settings = renderer.settings().clone();
-                                renderer.precompute_triangulations(&self.render_context);
-                            }
-                        }
-                        Err(error) => {
-                            let message = format!("Settings were not applied: {error:#}. Previous portrayal retained.");
-                            error!("{message}");
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.ui_state.settings = self.applied_settings.clone();
-                                renderer.ui_state.notice = Some(message);
-                            }
-                        }
-                    }
+                // Egui candidate controls are not live portrayal. Coalesce the
+                // latest settings/profile request and restore applied controls now.
+                if color_change.is_some() || settings_change.is_some() {
+                    let request=coalesce_portrayal_request(self.pending_portrayal_change.take(),
+                        &self.current_profile_name,&self.applied_settings,color_change,settings_change);
+                    self.queue_portrayal_change(request);
                 }
 
                 // Handle plugin toggle request (only when chart is loaded)
@@ -7050,22 +6012,17 @@ impl ApplicationHandler for ChartApp {
                             self.mouse_pos.1 as f32,
                         ),
                     );
-                    let p = if renderer.ui_state.globe_preview {
-                        renderer
-                            .globe_world_at(ferrite_render::ScreenPoint::new(
-                                self.mouse_pos.0 as f32,
-                                self.mouse_pos.1 as f32,
-                            ))
-                            .unwrap_or(ferrite_render::WorldPoint::new(f64::NAN, f64::NAN))
-                    } else {
+                    let p =
                         p
-                    };
+                    ;
                     renderer.set_cursor_world(p.x, p.y);
                 }
+                if let Some(a)=self.flat_eventloop_audit.as_mut(){a.before_render();}
                 // Render
                 if let Some(renderer) = &mut self.renderer {
                     if let Err(e) = renderer.render() {
                         error!("Render error: {}", e);
+                        if self.flat_eventloop_audit.is_some(){self.startup_error=Some(format!("Eventloop diagnostic render failed: {e}"));event_loop.exit();return;}
                     }
 
                     // Frame profiling: end frame (logs periodic report)
@@ -7074,11 +6031,13 @@ impl ApplicationHandler for ChartApp {
                     }
                 }
 
+                if let Some(a)=self.flat_eventloop_audit.as_mut(){a.after_render();}
                 if self.startup_error.is_some() {
                     event_loop.exit();
                     return;
                 }
                 if self.sync_chart_layout() {
+                    if self.flat_eventloop_audit.is_some(){self.startup_error=Some("Diagnostic layout changed during measured frame".into());event_loop.exit();return;}
                     if self.frames_since_loaded.is_some() {
                         self.frames_since_loaded = Some(0);
                     }
@@ -7099,7 +6058,7 @@ impl ApplicationHandler for ChartApp {
                             && zoom == 1.
                             && r.geometry_matches_view(&self.render_context.scaler)
                     });
-                if self.frames_since_loaded.is_some() && !view_settled {
+                if self.flat_eventloop_audit.is_none() && self.frames_since_loaded.is_some() && !view_settled {
                     self.frames_since_loaded = Some(0);
                     if let Some(w) = &self.window {
                         w.request_redraw();
@@ -7107,9 +6066,19 @@ impl ApplicationHandler for ChartApp {
                     return;
                 }
                 // Auto-screenshot: wait a few frames after load for rendering to stabilize
-                if let Some(count) = &mut self.frames_since_loaded {
+                let flat_audit_active=self.flat_eventloop_audit.is_some();
+                if let Some(count) = self.frames_since_loaded.as_mut().filter(|_|!flat_audit_active) {
                     *count += 1;
                     if *count >= 5 {
+                        if !self.flat_eventloop_audit_started {
+                            if let Some(path)=std::env::var_os("FERRITE_FLAT_EVENTLOOP_AUDIT") {
+                                if let Err(e)=self.start_flat_eventloop_diagnostics(PathBuf::from(path)){self.startup_error=Some(format!("Eventloop diagnostic activation failed: {e:#}"));event_loop.exit();return;}
+                                if let Some(w)=&self.window{w.request_redraw();}return;
+                            }
+                        }
+                        if let Some(path)=std::env::var_os("FERRITE_FLAT_SERVICE_AUDIT") {
+                            if let Err(e)=self.audit_flat_service(&PathBuf::from(path)){self.startup_error=Some(format!("Flat service diagnostic failed: {e:#}"));event_loop.exit();return;}
+                        }
                         if let Some(path) = std::env::var_os("FERRITE_ROOT_CANCELLATION_AUDIT") {
                             if let Err(error) = self.audit_root_cancellation(&PathBuf::from(path)) {
                                 self.startup_error =
@@ -7118,13 +6087,20 @@ impl ApplicationHandler for ChartApp {
                                 return;
                             }
                         }
-                        if let Some(path) = std::env::var_os("FERRITE_COVERAGE_CACHE_LIFECYCLE_AUDIT") {
-                            std::env::remove_var("FERRITE_COVERAGE_CACHE_LIFECYCLE_AUDIT");
-                            if let Err(error) = self.audit_coverage_cache_lifecycle(&PathBuf::from(path)) {
-                                self.startup_error = Some(format!("Coverage lifecycle audit failed: {error:#}"));
-                                event_loop.exit(); return;
+
+                        if let Some(path)=std::env::var_os("FERRITE_ROOT_PORTRAYAL_CHANGE_AUDIT") {
+                            std::env::remove_var("FERRITE_ROOT_PORTRAYAL_CHANGE_AUDIT");
+                            let target=std::env::var("FERRITE_ROOT_PORTRAYAL_CHANGE_PROFILE").unwrap_or_else(|_|"Night".into());
+                            if let Err(error)=self.audit_portrayal_change_recovery(&PathBuf::from(path),&target) {
+                                self.startup_error=Some(format!("Atomic portrayal change audit failed: {error:#}"));
+                                event_loop.exit();return;
                             }
-                            if self.coverage_lifecycle_resize.is_some() {return;}
+                        }
+                        if let Some(path)=std::env::var_os("FERRITE_ROOT_S102_PUBLICATION_AUDIT") {
+                            std::env::remove_var("FERRITE_ROOT_S102_PUBLICATION_AUDIT");
+                            if let Err(error)=self.audit_root_bathymetry_publication(&PathBuf::from(path)) {
+                                self.startup_error=Some(format!("Bathymetry publication audit failed: {error:#}"));event_loop.exit();return;
+                            }
                         }
                         if let Some(path) = std::env::var_os("FERRITE_ROOT_PUBLICATION_AUDIT") {
                             if let Err(error) = self.audit_root_publication(&PathBuf::from(path)) {
@@ -7134,51 +6110,10 @@ impl ApplicationHandler for ChartApp {
                                 return;
                             }
                         }
-                        if let Some(path) =
-                            std::env::var_os("FERRITE_ROOT_COVERAGE_GEOMETRY_EPOCH_AUDIT")
-                        {
-                            if let Err(error) =
-                                self.audit_root_coverage_geometry_epoch(&PathBuf::from(path))
-                            {
-                                self.startup_error = Some(format!(
-                                    "Coverage geometry epoch audit failed: {error:#}"
-                                ));
-                                event_loop.exit();
-                                return;
-                            }
-                            event_loop.exit();
-                            return;
-                        }
-                        if let Some(path) = std::env::var_os("FERRITE_ROOT_RESOURCE_EPOCH_AUDIT") {
-                            if let Err(error) = self.audit_root_resource_epoch(&PathBuf::from(path))
-                            {
-                                self.startup_error =
-                                    Some(format!("Resource epoch audit failed: {error:#}"));
-                                event_loop.exit();
-                                return;
-                            }
-                        }
-                        if let Some(path) = std::env::var_os("FERRITE_ROOT_RETAINED_PASSING_AUDIT")
-                        {
-                            if let Err(error) =
-                                self.audit_root_retained_passing(&PathBuf::from(path))
-                            {
-                                self.startup_error =
-                                    Some(format!("Retained passing audit failed: {error:#}"));
-                                event_loop.exit();
-                                return;
-                            }
-                        }
-                        if let Some(path) = std::env::var_os("FERRITE_ROOT_SOURCE_TOPOLOGY_AUDIT") {
-                            if let Err(error) =
-                                self.audit_root_source_topology(&PathBuf::from(path))
-                            {
-                                self.startup_error =
-                                    Some(format!("Source topology audit failed: {error:#}"));
-                                event_loop.exit();
-                                return;
-                            }
-                        }
+
+
+
+
                         if let Some(path) = self.animation_audit.take() {
                             if let Err(error) = self.audit_animation(&path) {
                                 self.startup_error =
@@ -7221,26 +6156,7 @@ impl ApplicationHandler for ChartApp {
                         if let Some(path) = self.auto_screenshot.take() {
                             info!("Auto-screenshot: saving to {}", path.display());
                             if let Some(renderer) = &mut self.renderer {
-                                if renderer.ui_state.globe_preview {
-                                    let Some(diagnostics) = renderer.globe_preview_diagnostics()
-                                    else {
-                                        self.startup_error = Some(
-                                            "Globe camera did not prepare successfully".into(),
-                                        );
-                                        event_loop.exit();
-                                        return;
-                                    };
-                                    let audit_path = path.with_extension("globe.json");
-                                    if let Err(error) = std::fs::write(
-                                        &audit_path,
-                                        serde_json::to_vec_pretty(&diagnostics.as_json()).unwrap(),
-                                    ) {
-                                        self.startup_error =
-                                            Some(format!("Globe audit export failed: {error}"));
-                                        event_loop.exit();
-                                        return;
-                                    }
-                                }
+
                                 match renderer.save_screenshot(&path) {
                                     Ok(_) => info!("Screenshot saved successfully"),
                                     Err(e) => {
@@ -7268,6 +6184,7 @@ impl ApplicationHandler for ChartApp {
 
                 // Request next frame only when needed (on-demand rendering)
                 // During drag/inertia: keep requesting frames at VSync rate for smooth motion
+                if let Err(e)=self.end_flat_eventloop_diagnostic_frame(){self.startup_error=Some(format!("Eventloop diagnostic completion failed: {e:#}"));event_loop.exit();return;}
                 let needs_redraw = {
                     let has_inertia =
                         self.pan_velocity.0.abs() > 0.00001 || self.pan_velocity.1.abs() > 0.00001;
@@ -7279,13 +6196,15 @@ impl ApplicationHandler for ChartApp {
                         .as_ref()
                         .is_some_and(|r| r.egui_needs_repaint());
                     let has_pan_rebuild = self.pan_rebuild_phase > 0;
-                    self.is_dragging
+                    self.flat_eventloop_audit.is_some()
+                        || self.is_dragging
                         || self.zoom_animating
                         || has_inertia
                         || has_loading
                         || has_screenshot_pending
                         || has_zoom_pending
                         || has_pan_rebuild
+                        || self.pending_portrayal_change.is_some()
                         || egui_needs
                 };
                 if needs_redraw {
@@ -7306,19 +6225,15 @@ impl ApplicationHandler for ChartApp {
                     // Track world-space pan offset for final calculation
                     let world_dx = -dx / self.render_context.scaler.scale_x();
                     let world_dy = dy / self.render_context.scaler.scale_y();
-                    let globe = self.globe_gesture(navigation::GestureMotion {
-                        from: self.mouse_pos,
-                        to: new_pos,
-                        ratio: 1.,
-                    });
-                    if !globe {
+
+
                         self.pan_camera_by([world_dx, world_dy]);
-                    }
+
 
                     // Track recent positions for velocity calculation (keep last 100ms worth)
-                    if !globe {
+
                         self.recent_positions.push((new_pos, now));
-                    }
+
                     self.recent_positions
                         .retain(|(_, t)| now.duration_since(*t).as_millis() < 100);
 
@@ -7334,13 +6249,9 @@ impl ApplicationHandler for ChartApp {
                     let screen_pt =
                         ferrite_render::ScreenPoint::new(new_pos.0 as f32, new_pos.1 as f32);
                     let world = self.render_context.scaler.screen_to_world(screen_pt);
-                    let world = if renderer.ui_state.globe_preview {
-                        renderer
-                            .globe_world_at(screen_pt)
-                            .unwrap_or(ferrite_render::WorldPoint::new(f64::NAN, f64::NAN))
-                    } else {
+                    let world =
                         world
-                    };
+                    ;
                     renderer.set_cursor_world(world.x, world.y);
                     renderer.set_cursor_screen(new_pos.0 as f32, new_pos.1 as f32);
                 }
@@ -7405,25 +6316,9 @@ impl ApplicationHandler for ChartApp {
                     .render_context
                     .scaler
                     .screen_to_world(ferrite_render::ScreenPoint::new(cursor_sx, cursor_sy));
-                let anchor = if self
-                    .renderer
-                    .as_ref()
-                    .is_some_and(|r| r.ui_state.globe_preview)
-                {
-                    let Some(a) = self
-                        .renderer
-                        .as_ref()
-                        .unwrap()
-                        .globe_world_at(ferrite_render::ScreenPoint::new(cursor_sx, cursor_sy))
-                    else {
-                        self.zoom_animating = false;
-                        self.zoom_target = self.zoom_level;
-                        return;
-                    };
-                    a
-                } else {
+                let anchor =
                     anchor
-                };
+                ;
                 self.zoom_anchor_world = (anchor.x, anchor.y);
 
                 // Mark rebuild pending — will execute when animation stops
@@ -7582,8 +6477,8 @@ impl ApplicationHandler for ChartApp {
                     if !plugin_consumed {
                         // Plugin didn't consume, do default behavior (reset view)
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.ui_state.globe_pose = None;
-                            renderer.ui_state.globe_range_factor = 1.;
+
+
                             renderer.reset_pan_offset();
                         }
                         self.zoom_level = 1.0;
@@ -7769,11 +6664,7 @@ fn run_app() -> Result<()> {
             anyhow::bail!("--display-mode requires base, standard or all; got {value:?}")
         }
     };
-    let initial_globe_samples = match config.initial_globe_samples.as_deref() {
-        None | Some("4") => 4,
-        Some("1") => 1,
-        Some(value) => anyhow::bail!("--globe-samples requires 1 or 4; got {value:?}"),
-    };
+
     let authenticated_ic = if let Some(path) = &config.ic_path {
         let mut anchors = TrustAnchors::default();
         let root = config
@@ -7840,7 +6731,7 @@ fn run_app() -> Result<()> {
 
     // Create symbol cache for SVG rendering (S-101 only)
     let symbols_path = config.pc_path.join("Symbols");
-    let symbol_cache = SymbolCache::new_with_sources(&symbols_path, pc.sources());
+    let symbol_cache = SymbolCache::new_with_pattern_contract(&symbols_path, pc.sources(), ferrite_s101::shallow_pattern_contract(&pc));
     #[cfg(debug_assertions)]
     info!("Symbol cache initialized: {}", symbols_path.display());
 
@@ -7893,7 +6784,6 @@ fn run_app() -> Result<()> {
         config.auto_center,
     );
 
-    app.initial_globe_samples = initial_globe_samples;
     app.applied_settings.display_mode = initial_display_mode;
     app.applied_settings.viewing_layers = config.initial_viewing_layers.into_iter().collect();
     app.ic = authenticated_ic;
@@ -8629,7 +7519,20 @@ mod instruction_cache_schema_tests {
     use ferrite_render::{AreaInstruction, DrawingInstruction, PatternCrs, WorldPoint};
 
     #[test]
-    fn schema37_round_trip_preserves_both_clip_modes_and_source() {
+    fn schema38_retains_authored_fill_reference_and_rejects_37() {
+        let mut area=AreaInstruction::new(vec![WorldPoint::new(0.,0.),WorldPoint::new(1.,0.),WorldPoint::new(0.,1.)])
+            .with_pattern_fill("DIAMOND1P".into(),(22.5,0.),(0.,43.13));
+        area.fill_ref=Some("DIAMOND1".into());
+        let mut wrapped=ChartApp::wrap_cache(&bincode::serialize(&vec![DrawingInstruction::Area(area)]).unwrap());
+        let decoded=ChartApp::verify_and_deserialize_cache(&wrapped).unwrap();
+        let DrawingInstruction::Area(area)=&decoded[0] else{panic!("not area")};
+        assert_eq!(area.fill_ref.as_deref(),Some("DIAMOND1"));
+        wrapped[4..8].copy_from_slice(&37u32.to_le_bytes());
+        assert!(ChartApp::verify_and_deserialize_cache(&wrapped).unwrap_err().contains("file=37, expected=38"));
+    }
+
+    #[test]
+    fn schema38_round_trip_preserves_both_clip_modes_and_source() {
         let instructions: Vec<_> = [true, false]
             .into_iter()
             .map(|clip| {
@@ -8650,7 +7553,7 @@ mod instruction_cache_schema_tests {
             .collect();
         let payload = bincode::serialize(&instructions).unwrap();
         let file = ChartApp::wrap_cache(&payload);
-        assert_eq!(&file[4..8], &37u32.to_le_bytes());
+        assert_eq!(&file[4..8], &38u32.to_le_bytes());
         let decoded = ChartApp::verify_and_deserialize_cache(&file).unwrap();
         assert_eq!(bincode::serialize(&decoded).unwrap(), payload);
         for (instruction, clip) in decoded.iter().zip([true, false]) {
@@ -8671,7 +7574,7 @@ mod instruction_cache_schema_tests {
         file[8] ^= 1; // Invalid hash must not bypass the schema gate.
         assert_eq!(
             ChartApp::verify_and_deserialize_cache(&file).unwrap_err(),
-            "schema version mismatch: file=36, expected=37"
+            "schema version mismatch: file=36, expected=38"
         );
         assert_eq!(
             ChartApp::verify_and_deserialize_cache(&file[..39]).unwrap_err(),
@@ -8707,7 +7610,7 @@ mod instruction_cache_schema_tests {
         old_file[4..8].copy_from_slice(&36u32.to_le_bytes());
         assert_eq!(
             ChartApp::verify_and_deserialize_cache(&old_file).unwrap_err(),
-            "schema version mismatch: file=36, expected=37"
+            "schema version mismatch: file=36, expected=38"
         );
         let current = std::fs::read(std::env::var("FERRITE_CACHE37_PAYLOAD").unwrap()).unwrap();
         let decoded =
@@ -8770,41 +7673,7 @@ mod updated_chart_bounds_tests {
     }
 }
 
-#[cfg(test)]
-mod coverage_production_policy_tests {
-    use super::coverage_cache_policy;
-    #[test]
-    fn defaults_on_and_independent_original_path_opt_out() {
-        assert_eq!(coverage_cache_policy(None,None),(true,true));
-        assert_eq!(coverage_cache_policy(Some("0"),None),(false,false));
-        assert_eq!(coverage_cache_policy(None,Some("0")),(true,false));
-        assert_eq!(coverage_cache_policy(Some("1"),Some("1")),(true,true));
-    }
-    #[test]
-    fn each_precommit_provider_owns_fresh_cache_not_a_shared_epoch() {
-        let a=super::coverage_geometry_cache_with_policy(true,true);
-        let b=super::coverage_geometry_cache_with_policy(true,true);
-        assert!(!std::sync::Arc::ptr_eq(&a,&b));
-        a.lock().unwrap().set_enabled(false);
-        let d=b.lock().unwrap().diagnostics();
-        assert_eq!(d["enabled"],true);assert_eq!(d["midpoint_reuse"],true);
-        assert_eq!(d["entries"],0);assert_eq!(d["retained_bytes"],0);
-        assert_eq!(d["budget_bytes"],16*1024*1024);
-    }
-    #[test]
-    fn explicit_cold_optout_has_no_optional_record_or_reuse() {
-        let a=super::coverage_geometry_cache_with_policy(false,false);
-        let d=a.lock().unwrap().diagnostics();
-        assert_eq!(d["enabled"],false);assert_eq!(d["midpoint_reuse"],false);
-        assert_eq!(d["entries"],0);assert_eq!(d["retained_bytes"],0);
-    }
-    #[test]
-    fn no_eager_validation_or_global_env_mutation() {
-        for value in ["", "false", "unknown"] {
-            assert_eq!(coverage_cache_policy(Some(value),Some(value)),(true,true));
-        }
-    }
-}
+
 
 #[cfg(test)]
 mod coverage_resize_event_tests {
@@ -8828,5 +7697,30 @@ mod coverage_resize_event_tests {
     fn restoration_requires_its_own_native_event_and_original_extent() {
         let mut s=state();s.restore=true;s.observed=Some(s.requested);assert!(!s.ready(s.requested));
         s.observed=Some(s.original);assert!(s.ready(s.original));
+    }
+}
+
+#[cfg(test)]
+mod portrayal_request_tests {
+    use super::*;
+    #[test]
+    fn deferred_requests_keep_latest_colour_and_latest_settings_together() {
+        let applied=SettingsState::default();
+        let first=coalesce_portrayal_request(None,"Day",&applied,Some("Dusk".into()),None);
+        let mut changed=applied.clone();changed.safety_contour=23.;
+        let second=coalesce_portrayal_request(Some(first),"Day",&applied,None,Some(changed.clone()));
+        let third=coalesce_portrayal_request(Some(second),"Day",&applied,Some("Night".into()),None);
+        assert_eq!(third.profile,"Night");assert_eq!(third.settings,changed);
+        assert_eq!(applied,SettingsState::default());
+    }
+    #[test]
+    fn requests_wait_until_all_navigation_and_loading_phases_finish() {
+        assert!(!portrayal_navigation_pending(false,false,false,false,0,0,(0.,0.)));
+        for flags in [(true,false,false,false),(false,true,false,false),(false,false,true,false),(false,false,false,true)] {
+            assert!(portrayal_navigation_pending(flags.0,flags.1,flags.2,flags.3,0,0,(0.,0.)));
+        }
+        assert!(portrayal_navigation_pending(false,false,false,false,1,0,(0.,0.)));
+        assert!(portrayal_navigation_pending(false,false,false,false,0,1,(0.,0.)));
+        assert!(portrayal_navigation_pending(false,false,false,false,0,0,(0.001,0.)));
     }
 }

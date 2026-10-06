@@ -61,7 +61,7 @@ impl PortrayalDevice {
             origin[1] - mm[1] * self.pixels_per_mm[1],
         ])
     }
-    /// None means an invisible source point, e.g. behind the globe horizon.
+    /// None means a source point outside the active projection domain.
     /// Glyph LocalOffset is separate and must not alter this coverage origin.
     pub fn resolve(
         &self,

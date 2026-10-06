@@ -312,7 +312,7 @@ impl Scaler {
     }
     /// Snapshot of the actual camera plus physical viewport/DPI. No qualification.
     pub fn flat_encoded_identity(&self) -> Option<[u64; 16]> {
-        let ferrite_kernel::map_camera::MapCamera::Flat(camera) = &self.camera else { return None; };
+        let ferrite_kernel::map_camera::MapCamera::Flat(camera) = &self.camera;
         let c = camera.encoded_identity();
         Some([c[0],c[1],c[2],c[3],c[4],c[5],c[6],
             self.geo_bounds.min_x.to_bits(),self.geo_bounds.min_y.to_bits(),self.geo_bounds.max_x.to_bits(),self.geo_bounds.max_y.to_bits(),

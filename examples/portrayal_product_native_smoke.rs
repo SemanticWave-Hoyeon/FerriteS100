@@ -1,6 +1,5 @@
 //! Real SHOM feature and catalogue; synthetic portrayal output through the
-//! actual parser, S-101 adapter, cache, flat renderer, and globe renderer.
-use ferrite_kernel::{geodesy::GeographicPosition,globe_navigation::GlobePose};
+//! actual parser, S-101 adapter, cache, flat renderer.
 use ferrite_render::*;
 use ferrite_s100_core::{S101Cell,SpatialPrimitiveType};
 use ferrite_wgpu::{SymbolCache,WgpuRenderer};
@@ -48,7 +47,6 @@ impl ApplicationHandler for App{
             }
             let mut reference=None;
             for fixed in [false,true]{
-                renderer.ui_state.globe_preview=false;
                 renderer.begin_frame();renderer.reset_pan_offset();renderer.set_lon_wrap_pixels(if fixed{80.}else{0.});
                 let c=if fixed{&mut context}else{&mut reference_context};
                 renderer.add_instructions_with_symbols(c,Some(&mut cache),Some(profile),None);
@@ -57,21 +55,9 @@ impl ApplicationHandler for App{
                 let image=image::open(path).unwrap().to_rgba8();
                 if fixed{let before:&image::RgbaImage=reference.as_ref().unwrap();let different=image.pixels().zip(before.pixels()).filter(|(a,b)|a.0!=b.0).count();assert_eq!(different,0,"Product adapter changed device placement");checks.push(serde_json::json!({"kind":"flat","zoom":zoom,"different_pixels":different,"cache_roundtrip":true}));}else{reference=Some(image);}
             }
-            renderer.ui_state.globe_preview=true;
-            renderer.ui_state.globe_pose=Some(GlobePose{focus:GeographicPosition::new(anchor.y,anchor.x).unwrap(),range_m:30000./zoom,heading_deg:90.,tilt_deg:70.});
-            renderer.ui_state.globe_tilt_deg=70.;
-            renderer.begin_frame();
-            renderer.prepare_globe_with_symbols(&mut context,None,&mut cache,Some(profile)).unwrap();
-            let d=renderer.globe_preview_diagnostics().unwrap();
-            assert_eq!((d.symbols,d.texts,d.rejected_geometries),(1,1,0));
-            let footprints=serde_json::json!({"symbol":d.symbol_footprints_px,"text":d.text_footprints_px});
-            let path=self.out.join(format!("globe-{zoom}-adapter.png"));renderer.save_screenshot(&path).unwrap();
-            let image=image::open(path).unwrap().to_rgb8();
-            let colored=image.pixels().filter(|p|p[0] as i16-p[1] as i16>60 && p[2] as i16-p[1] as i16>60).count();
-            assert!(colored>16,"Product adapter native image empty");
-            checks.push(serde_json::json!({"kind":"globe","zoom":zoom,"symbols":1,"texts":1,"colored_pixels":colored,"footprints":footprints}));
+
         }
-        std::fs::write(self.out.join("result.json"),serde_json::to_string_pretty(&serde_json::json!({"checks":checks,"feature_id":id,"actual_cell":self.cell,"pc":self.pc,"actual_reference":[anchor.x,anchor.y],"density":density,"synthetic_lua_command":true,"official_pc_emits_device_commands_claimed":false,"raw_dataset_modified":false,"signature_verification_in_this_fixture":false,"coverage_3d_verified":false})).unwrap()).unwrap();e.exit();
+        std::fs::write(self.out.join("result.json"),serde_json::to_string_pretty(&serde_json::json!({"checks":checks,"feature_id":id,"actual_cell":self.cell,"pc":self.pc,"actual_reference":[anchor.x,anchor.y],"density":density,"synthetic_lua_command":true,"official_pc_emits_device_commands_claimed":false,"raw_dataset_modified":false,"signature_verification_in_this_fixture":false})).unwrap()).unwrap();e.exit();
     }
     fn window_event(&mut self,_:&ActiveEventLoop,_:WindowId,_:WindowEvent){}
 }

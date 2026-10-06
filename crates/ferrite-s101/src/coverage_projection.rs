@@ -3,16 +3,61 @@
 use anyhow::{ensure, Context, Result};
 use ferrite_kernel::coverage_frame::CoverageFrame;
 use ferrite_kernel::coverage_selection::{CoverageFootprint, Region};
+use ferrite_kernel::{coverage_frame::CoverageSource, coverage_rendering::InstructionOrigin};
 use ferrite_render::{
     InstructionCoverageClass, PreparedCoverage, PreparedCoveragePass, RenderContext, RenderError,
     Scaler, WorldPoint,
 };
+use ferrite_render::{PointOriginGeometry, PortrayalOrigin};
 use ferrite_s100_core::S101Cell;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug)]
 pub struct GeographicCoverageInventory {
     datasets: Vec<Option<Vec<crate::coverage_geometry::DataCoverage>>>,
+    binding_cache: Mutex<Option<Arc<FlatSourceBinding>>>,
+    binding_cache_enabled: bool,
+    binding_requests: AtomicU64,
+    binding_hits: AtomicU64,
+}
+#[derive(Debug, Clone)]
+enum FlatBoundSource {
+    Exempt,
+    NonPoint(usize),
+    Point(usize, Arc<PointOriginGeometry>),
+}
+#[derive(Debug)]
+struct FlatSourceBinding {
+    revision: u64,
+    count: usize,
+    exemptions: BTreeSet<usize>,
+    slots: Vec<usize>,
+    sources: Vec<FlatBoundSource>,
+}
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum FlatSourceKey {
+    Exempt,
+    NonPoint(usize),
+    Point(usize, usize),
+}
+impl FlatSourceBinding {
+    const MAX_LOGICAL_BYTES: usize = 32 * 1024 * 1024;
+    fn admitted(count: usize, exemptions: usize) -> bool {
+        count
+            .checked_mul(128)
+            .and_then(|n| exemptions.checked_mul(32).and_then(|e| n.checked_add(e)))
+            .is_some_and(|n| n <= Self::MAX_LOGICAL_BYTES)
+    }
+    fn matches(&self, context: &RenderContext, exempt: &BTreeSet<usize>) -> bool {
+        context.instructions_are_sorted()
+            && self.revision == context.geometry_revision()
+            && self.count == context.instruction_count()
+            && self.exemptions == *exempt
+    }
 }
 
 #[cfg(test)]
@@ -21,6 +66,10 @@ mod tests {
     use ferrite_render::{GeoBounds, PointInstruction, PointOriginCrs, PortrayalOrigin, Viewport};
     fn inventory() -> GeographicCoverageInventory {
         GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
             datasets: vec![Some(vec![crate::coverage_geometry::DataCoverage {
                 feature_key: 1,
                 drawing_index: None,
@@ -48,6 +97,116 @@ mod tests {
         context.add_instruction(point);
         context.get_sorted_instructions();
         context
+    }
+    #[test]
+    fn cached_slots_preserve_current_view_decisions_and_fragment_rights() {
+        let cold = inventory();
+        let mut cached = inventory();
+        cached.binding_cache_enabled = true;
+        let origin = PortrayalOrigin::augmented_point(PointOriginCrs::Portrayal, [5., 5.]).unwrap();
+        let mut context = context(Some(0), origin);
+        let duplicate = context.raw_instructions()[0].clone();
+        context.add_instruction(duplicate);
+        let nonpoint =
+            PointInstruction::new("ACHBRT07".into(), WorldPoint::new(0.5, 0.5)).with_cell_index(0);
+        // A separate primitive with a nonpoint source is kept in its original slot.
+        let mut command = ferrite_render::DrawingInstruction::Point(nonpoint);
+        command.set_portrayal_origin(PortrayalOrigin::NonPoint);
+        context.add_instruction(command);
+        context.get_sorted_instructions();
+        for dx in [0., 7., -12.] {
+            context.scaler.pan(dx, 3.);
+            let a = cold
+                .prepare_flat(&context, &BTreeSet::new(), [64, 40], true, 10000)
+                .unwrap()
+                .unwrap();
+            let b = cached
+                .prepare_flat(&context, &BTreeSet::new(), [64, 40], true, 10000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.pass_count(), b.pass_count());
+            for pass in 0..a.pass_count() {
+                for ordinal in 0..context.instruction_count() {
+                    let a = a.pass(pass).unwrap();
+                    let b = b.pass(pass).unwrap();
+                    assert_eq!(a.decision(ordinal).unwrap(), b.decision(ordinal).unwrap());
+                    for pixel in [[0., 0.], [5., 5.], [32., 20.], [63., 39.]] {
+                        assert_eq!(
+                            a.accepts_fragment(ordinal, pixel).unwrap(),
+                            b.accepts_fragment(ordinal, pixel).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+        let (_, requests, hits, slots, sources) = cached.flat_binding_cache_statistics();
+        assert_eq!((requests, hits, slots, sources), (3, 2, 3, 2));
+    }
+    #[test]
+    fn exact_owner_exemptions_and_source_mutation_invalidate_binding() {
+        let mut inventory = inventory();
+        inventory.binding_cache_enabled = true;
+        let mut context = context(Some(0), PortrayalOrigin::NonPoint);
+        let first = inventory
+            .flat_binding(&context, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &inventory
+                .flat_binding(&context, &BTreeSet::new())
+                .unwrap()
+                .unwrap()
+        ));
+        let overlay = inventory
+            .flat_binding(&context, &BTreeSet::from([0]))
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &overlay));
+        assert!(matches!(overlay.sources[0], FlatBoundSource::Exempt));
+        context.set_portrayal_origin_from(
+            0,
+            PortrayalOrigin::augmented_point(PointOriginCrs::Portrayal, [7., 9.]).unwrap(),
+        );
+        let changed = inventory
+            .flat_binding(&context, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(matches!(changed.sources[0], FlatBoundSource::Point(0, _)));
+        let separate = self::context(Some(0), PortrayalOrigin::NonPoint);
+        assert!(!first.matches(&separate, &BTreeSet::new()));
+        context.add_instruction(context.raw_instructions()[0].clone());
+        assert!(inventory
+            .flat_binding(&context, &BTreeSet::new())
+            .unwrap()
+            .is_none());
+        context.get_sorted_instructions();
+        assert_eq!(
+            inventory
+                .flat_binding(&context, &BTreeSet::new())
+                .unwrap()
+                .unwrap()
+                .slots
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn cache_never_retains_errors_or_unbounded_bindings() {
+        let mut cached = inventory();
+        cached.binding_cache_enabled = true;
+        for cell in [None, Some(99)] {
+            let context = context(cell, PortrayalOrigin::NonPoint);
+            assert!(cached.flat_binding(&context, &BTreeSet::new()).is_err());
+            assert!(cached.binding_cache.lock().unwrap().is_none());
+        }
+        assert!(!FlatSourceBinding::admitted(usize::MAX, 0));
+        assert!(!FlatSourceBinding::admitted(0, usize::MAX));
+        assert!(!FlatSourceBinding::admitted(
+            FlatSourceBinding::MAX_LOGICAL_BYTES / 128 + 1,
+            0
+        ));
     }
     #[test]
     fn missing_or_unknown_dataset_cannot_bypass_coverage() {
@@ -123,13 +282,124 @@ impl GeographicCoverageInventory {
                 _ => anyhow::bail!("Unsupported S-101 coverage edition {}", version.edition),
             });
         }
-        Ok(Self { datasets })
+        Ok(Self {
+            datasets,
+            binding_cache: Mutex::new(None),
+            // Exact immutable source binding is reused; screen decisions remain fresh.
+            // Explicit 0 retains the uncached diagnostic/control route.
+            binding_cache_enabled: std::env::var("FERRITE_FLAT_COVERAGE_BINDING_CACHE").as_deref()
+                != Ok("0"),
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
+        })
     }
 
     pub fn current_dataset_count(&self) -> usize {
         self.datasets.iter().filter(|d| d.is_some()).count()
     }
 
+    /// Diagnostic counters only; never a visibility or authorization token.
+    pub fn flat_binding_cache_statistics(&self) -> (bool, u64, u64, usize, usize) {
+        let (slots, sources) = self
+            .binding_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|b| (b.slots.len(), b.sources.len())))
+            .unwrap_or_default();
+        (
+            self.binding_cache_enabled,
+            self.binding_requests.load(Ordering::Relaxed),
+            self.binding_hits.load(Ordering::Relaxed),
+            slots,
+            sources,
+        )
+    }
+    fn build_flat_binding(
+        &self,
+        context: &RenderContext,
+        exempt: &BTreeSet<usize>,
+    ) -> Result<FlatSourceBinding> {
+        let mut sources = Vec::new();
+        let mut slots = Vec::with_capacity(context.instruction_count());
+        let mut lookup = HashMap::new();
+        for (ordinal, command) in context.raw_instructions().iter().enumerate() {
+            let (key, source) = if exempt.contains(&ordinal) {
+                (FlatSourceKey::Exempt, FlatBoundSource::Exempt)
+            } else {
+                let cell = command.cell_index().ok_or_else(|| {
+                    RenderError::Render("Chart command missing dataset identity".into())
+                })? as usize;
+                let dataset = self.datasets.get(cell).ok_or_else(|| {
+                    RenderError::Render("Chart command refers to unknown dataset".into())
+                })?;
+                if dataset.is_none() {
+                    (FlatSourceKey::Exempt, FlatBoundSource::Exempt)
+                } else {
+                    match command.portrayal_origin() {
+                        PortrayalOrigin::CoverageExempt => {
+                            return Err(RenderError::Render(
+                                "Host overlay cannot be assigned a product dataset".into(),
+                            )
+                            .into())
+                        }
+                        PortrayalOrigin::Unspecified => {
+                            return Err(RenderError::Render(
+                                "Missing portrayal origin for coverage binding".into(),
+                            )
+                            .into())
+                        }
+                        PortrayalOrigin::NonPoint => (
+                            FlatSourceKey::NonPoint(cell),
+                            FlatBoundSource::NonPoint(cell),
+                        ),
+                        PortrayalOrigin::Point(p) => (
+                            FlatSourceKey::Point(cell, Arc::as_ptr(p) as usize),
+                            FlatBoundSource::Point(cell, p.clone()),
+                        ),
+                    }
+                }
+            };
+            let slot = *lookup.entry(key).or_insert_with(|| {
+                let i = sources.len();
+                sources.push(source);
+                i
+            });
+            slots.push(slot);
+        }
+        Ok(FlatSourceBinding {
+            revision: context.geometry_revision(),
+            count: context.instruction_count(),
+            exemptions: exempt.clone(),
+            slots,
+            sources,
+        })
+    }
+    fn flat_binding(
+        &self,
+        context: &RenderContext,
+        exempt: &BTreeSet<usize>,
+    ) -> Result<Option<Arc<FlatSourceBinding>>> {
+        if !self.binding_cache_enabled
+            || !context.instructions_are_sorted()
+            || !FlatSourceBinding::admitted(context.instruction_count(), exempt.len())
+        {
+            return Ok(None);
+        }
+        self.binding_requests.fetch_add(1, Ordering::Relaxed);
+        let Ok(mut cache) = self.binding_cache.lock() else {
+            return Ok(None);
+        };
+        if cache.as_ref().is_some_and(|b| b.matches(context, exempt)) {
+            self.binding_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(cache.as_ref().cloned());
+        }
+        let binding = self.build_flat_binding(context, exempt)?;
+        // Store an Arc once, not a clone of every source/slot on each camera.
+        let shared = Arc::new(binding);
+        *cache = Some(shared.clone());
+        drop(cache);
+        Ok(Some(shared))
+    }
     /// All longitude copies participate in one selection in device coordinates.
     /// A dataset retains one identity even when its footprint crosses the seam.
     pub fn project(&self, scaler: &Scaler, wrapping: bool) -> Result<Vec<CoverageFootprint>> {
@@ -197,6 +467,7 @@ impl GeographicCoverageInventory {
         if self.current_dataset_count() == 0 {
             return Ok(None);
         }
+        let binding = self.flat_binding(context, exempt_ordinals)?;
         let scaler = &context.scaler;
         let inventory = self.project(scaler, wrapping)?;
         let v = scaler.viewport;
@@ -222,6 +493,51 @@ impl GeographicCoverageInventory {
         // PreparedCoverage and its caller share the already-sorted raw order.
         let mut passes = Vec::new();
         for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
+            if let Some(binding) = binding.as_ref() {
+                // Project unique immutable source metadata in THIS actual view.
+                let sources = binding
+                    .sources
+                    .iter()
+                    .map(|source| -> ferrite_render::Result<(CoverageSource, bool)> {
+                        Ok(match source {
+                            FlatBoundSource::Exempt => (CoverageSource::Exempt, false),
+                            FlatBoundSource::NonPoint(dataset_id) => (
+                                CoverageSource::Dataset {
+                                    dataset_id: *dataset_id,
+                                    origin: InstructionOrigin::NonPoint,
+                                },
+                                false,
+                            ),
+                            FlatBoundSource::Point(dataset_id, origin) => {
+                                match PortrayalOrigin::project_flat_source(origin, scaler, shift)? {
+                                    Some(p) => (
+                                        CoverageSource::Dataset {
+                                            dataset_id: *dataset_id,
+                                            origin: InstructionOrigin::Point([
+                                                p.x as f64, p.y as f64,
+                                            ]),
+                                        },
+                                        false,
+                                    ),
+                                    None => (
+                                        CoverageSource::Dataset {
+                                            dataset_id: *dataset_id,
+                                            origin: InstructionOrigin::NonPoint,
+                                        },
+                                        true,
+                                    ),
+                                }
+                            }
+                        })
+                    })
+                    .collect::<ferrite_render::Result<Vec<_>>>()?;
+                passes.push(PreparedCoveragePass::prepare_source_slots(
+                    frame.clone(),
+                    &sources,
+                    &binding.slots,
+                )?);
+                continue;
+            }
             let mut ordinal = 0;
             let pass = PreparedCoveragePass::prepare(
                 context.raw_instructions(),
@@ -270,6 +586,10 @@ mod anchored_local_coverage_tests {
         // feature lies in its interior, but the augmented point is displaced
         // physically into uncovered water on the right. Hide the former only.
         let source = GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
             datasets: vec![
                 Some(vec![crate::coverage_geometry::DataCoverage {
                     feature_key: 1,
@@ -351,7 +671,7 @@ mod anchored_local_coverage_tests {
 
 /// An actual device projection supplied by the view backend. The same physical
 /// pixel coordinates must be used for coverage surfaces, point origins and the
-/// drawing/picking passes. A globe caller invalidates the context coverage view
+/// drawing/picking passes. A projection caller invalidates the context coverage view
 /// on every camera change before constructing this immutable binding.
 pub struct ProjectedCoverageView<'a> {
     pub viewport: &'a Region,
@@ -525,6 +845,10 @@ mod projected_view_tests {
     #[test]
     fn alternate_projection_preserves_component_holes_scales_and_dataset_identity() {
         let inventory = GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
             datasets: vec![Some(vec![coverage(7)]), None, Some(vec![coverage(9)])],
         };
         let result = inventory.project_with(projected).unwrap();
@@ -548,6 +872,10 @@ mod projected_view_tests {
     #[test]
     fn invisible_origin_is_hidden_and_camera_revision_rejects_old_binding() {
         let source = GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
             datasets: vec![Some(vec![coverage(7)])],
         };
         let mut c = context(0);
@@ -580,6 +908,10 @@ mod projected_view_tests {
     #[test]
     fn projected_view_retains_identity_and_memory_fail_closed_contracts() {
         let source = GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
             datasets: vec![Some(vec![coverage(7)])],
         };
         let v = viewport();

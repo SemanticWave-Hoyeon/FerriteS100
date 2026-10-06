@@ -3,6 +3,12 @@
 //! Orchestrates rendering of drawing instructions to the screen.
 //! Uses resvg for SVG symbol rendering via textures.
 
+// Opt-in runtime diagnostics. A frame owns one collector; no diagnostic clocks or
+// instruction guard allocations are created when the collector is absent.
+type FlatDiagnosticCell = std::rc::Rc<std::cell::RefCell<ferrite_render::flat_reuse_diagnostics::FlatFrameSample>>;
+struct FlatDiagnosticSpan { cell: FlatDiagnosticCell, stage: ferrite_render::flat_reuse_diagnostics::FlatFrameStage, start: std::time::Instant }
+impl Drop for FlatDiagnosticSpan { fn drop(&mut self) {self.cell.borrow_mut().record_span(self.stage,self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64);} }
+
 // =============================================================================
 // S-100/S-101 Symbol Scaling Constants
 // =============================================================================
@@ -339,6 +345,7 @@ impl ChartTextBufferPool {
         pair
     }
 }
+#[derive(Clone)]
 struct GpuRasterLayer {
     continuous_identity: Option<crate::continuous_frame_binding::PreparedContinuousIdentity>,
     index_count: u32,
@@ -361,6 +368,23 @@ pub struct PreparedRasterMaterialBatch {
     owner: std::sync::Arc<()>,
 }
 
+/// Complete unpublished raster inventory. Continuous proof headers are written
+/// only into owned textures; retained live textures are never modified by staging.
+pub struct PreparedRasterPublication {
+    layers: Vec<GpuRasterLayer>,
+    proof: Option<crate::ValidatedContinuousFrame>,
+    owner: Arc<()>,
+    previous_epoch: Arc<()>,
+    frame: crate::continuous_frame_binding::ContinuousFrameBinding,
+    transform: [u32;9],
+}
+
+/// Raster materials form one visible atomic commit.
+pub struct PreparedRasterScenePublication {
+    raster: PreparedRasterPublication,
+
+}
+
 /// Backend execution evidence for S-100 Parent dependencies.
 #[derive(Debug, Clone, Default)]
 pub struct DependencyRenderStatus {
@@ -380,154 +404,47 @@ impl DependencyRenderStatus {
     }
 }
 
-#[derive(Default)]
-struct GlobeSymbolPreparation {
-    symbol_textures: HashMap<SymbolId, SymbolTexture>,
-    globe_pattern_resources: crate::globe_pattern::PatternResources,
-    globe_pattern_epoch: Option<(u64,u64)>,
-    globe_prepared_symbol_epoch: Option<crate::prepared_symbol_epoch::PreparedSymbolEpoch>,
-    globe_pattern_textures: HashMap<String, Arc<crate::globe_pattern::PatternTexture>>,
-    globe_whole_motif_textures: HashMap<String, Arc<crate::whole_motif_gpu::NaturalMotifTexture>>,
-}
-impl GlobeSymbolPreparation {
-    fn ensure_symbol_texture(&mut self,gpu:&GpuState,pipelines:&RenderPipelines,id:SymbolId,name:&str,geom:&crate::SymbolGeometry) {
-        if !self.symbol_textures.contains_key(&id) {self.symbol_textures.insert(id,create_symbol_texture(gpu,pipelines,name,geom));}
-    }
-    fn prepare(&mut self,gpu:&GpuState,pipelines:&RenderPipelines,context:&mut RenderContext,cache:&mut SymbolCache,profile:Option<&ColorProfile>,request_keys_enabled:bool,resource_reuse_enabled:bool)->Result<serde_json::Value> {
-        let symbol_start=std::time::Instant::now();
-        let pattern_count=context.raw_instructions().iter().filter(|i|matches!(i,DrawingInstruction::Area(a) if matches!(a.fill,ferrite_render::AreaFillType::Pattern {..}))).count();
-        // Bound map metadata by bytes, rather than rejecting ordinary multi-cell
-        // charts at an arbitrary small command count. Include a conservative
-        // hash-table bucket/capacity factor and track diagnostic payload separately.
-        let entry_bytes=2*std::mem::size_of::<(usize,std::result::Result<crate::globe_pattern::PreparedPatternResource,String>)>();
-        if pattern_count.checked_mul(entry_bytes).is_none_or(|n|n>32*1024*1024) {
-            return Err(WgpuError::Render("Globe pattern instruction metadata budget exceeded".into()));
-        }
-        let mut diagnostic_bytes=0usize;
-        // Resource ordinals must use the same sorted stream as the scene and ID pass.
-        context.get_sorted_instructions();
-        context.scaler.set_pixel_ratio(gpu.window.scale_factor());
-        let epoch_inputs=crate::prepared_symbol_epoch::Inputs{source_epoch:context.geometry_revision(),instruction_count:context.instruction_count(),resource_revision:cache.resource_revision(),ppm_bits:context.scaler.pixels_per_mm().to_bits(),whole_motifs:std::env::var("FERRITE_EXPERIMENTAL_WHOLE_MOTIFS").as_deref()==Ok("1"),request_keys:request_keys_enabled};
-        if resource_reuse_enabled && self.globe_pattern_epoch==Some((epoch_inputs.source_epoch,epoch_inputs.ppm_bits)) && self.globe_prepared_symbol_epoch.as_ref().is_some_and(|e|e.matches(epoch_inputs,profile)) {
-            let e=self.globe_prepared_symbol_epoch.as_ref().unwrap();
-            return Ok(serde_json::json!({"symbol_resources_ms":symbol_start.elapsed().as_secs_f64()*1000.,"prepared_request_keys_enabled":request_keys_enabled,
-                "prepared_request_keys":if request_keys_enabled {serde_json::json!({"hits":0,"misses":0,"refusals":0,"entries":0,"accounted_bytes":0,"budget_bytes":1048576,"entry_limit":256})}else{serde_json::Value::Null},
-                "prepared_symbol_resources":{"enabled":true,"hit":true,"identity_bytes":e.bytes(),"identity_budget_bytes":1048576,"resource_preparation_calls":0},
-                "pattern_resource_count":self.globe_pattern_resources.len(),"pattern_texture_count":self.globe_pattern_textures.len()+self.globe_whole_motif_textures.len(),"pattern_retained_resource_bytes":e.pattern_payload_bytes}));
-        }
-        self.globe_prepared_symbol_epoch=None;
-        let mut symbol_preparation_complete=true;
-        self.globe_pattern_resources.clear();
-        let mut current_textures = HashMap::new();
-        let mut current_whole_textures = HashMap::new();
-        let mut pattern_bytes = 0usize;
-        let mut request_keys_diagnostics=serde_json::Value::Null;
-        if let Some(profile) = profile {
-            let mut request_keys=request_keys_enabled.then(||crate::symbol_cache::PreparedLatticeKeys::new(profile));
-            for (ordinal, instruction) in context.raw_instructions().iter().enumerate() {
-                if let DrawingInstruction::Area(area) = instruction {
-                    if let ferrite_render::AreaFillType::Pattern {symbol_ref,v1,v2} = &area.fill {
-                        let resource = (|| -> std::result::Result<crate::globe_pattern::PreparedPatternResource,String> {
-                            let lattice = ferrite_render::PatternLattice::from_mm(*v1,*v2,context.scaler.pixels_per_mm())?;
-                            if !area.pattern_clip_symbols {
-                                if std::env::var("FERRITE_EXPERIMENTAL_WHOLE_MOTIFS").as_deref()!=Ok("1") {return Err("Pattern clipSymbols=false requires whole-motif containment conformance gate".into());}
-                                let motif=cache.get_whole_motif(symbol_ref,profile,context.scaler.pixels_per_mm(),Default::default(),Default::default())?.ok_or("Whole motif has no painted support")?;
-                                if !current_whole_textures.contains_key(&motif.resource_key) {
-                                    if current_textures.len()+current_whole_textures.len()>=256 {return Err("Globe pattern resource entry budget exceeded".into());}
-                                    let bytes=motif.retained_payload_bytes.checked_add(motif.resource_key.len()*2).ok_or("Whole motif resource byte overflow")?;
-                                    let total=pattern_bytes.checked_add(bytes).filter(|n|*n<=64*1024*1024).ok_or("Globe pattern aggregate resource budget exceeded")?;
-                                    let texture=if let Some(existing)=self.globe_whole_motif_textures.get(&motif.resource_key) {existing.clone()} else {Arc::new(crate::whole_motif_gpu::NaturalMotifTexture::upload(&gpu.device,&gpu.queue,&motif)?)};
-                                    current_whole_textures.insert(motif.resource_key.clone(),texture);pattern_bytes=total;
-                                }
-                                return Ok(crate::globe_pattern::PreparedPatternResource{texture:None,whole:Some(crate::globe_pattern::PreparedWholeResource{texture:current_whole_textures[&motif.resource_key].clone(),resource:motif}),lattice});
-                            }
-                            let cell = if let Some(keys)=request_keys.as_mut() {cache.get_symbol_for_lattice_request_keys(symbol_ref,keys,lattice,context.scaler.pixels_per_mm())?} else {cache.get_symbol_for_lattice(symbol_ref,profile,lattice,context.scaler.pixels_per_mm())?};
-                            if !current_textures.contains_key(&cell.name) {
-                                // Bound aggregate retained textures and their exact resource keys.
-                                if current_textures.len()+current_whole_textures.len() >= 256 {return Err("Globe pattern resource entry budget exceeded".into());}
-                                let bytes = cell.pixels.len().checked_add(cell.name.len()*2).ok_or("Globe pattern resource byte overflow")?;
-                                let total = pattern_bytes.checked_add(bytes).filter(|n|*n<=64*1024*1024).ok_or("Globe pattern aggregate resource budget exceeded")?;
-                                let texture = if let Some(existing) = self.globe_pattern_textures.get(&cell.name) {existing.clone()} else {Arc::new(crate::globe_pattern::PatternTexture::upload(&gpu.device,&gpu.queue,cell)?)};
-                                current_textures.insert(cell.name.clone(),texture);
-                                pattern_bytes=total;
-                            }
-                            Ok(crate::globe_pattern::PreparedPatternResource {texture:Some(current_textures[&cell.name].clone()),whole:None,lattice})
-                        })();
-                        if let Some(error)=resource.as_ref().err() {
-                            symbol_preparation_complete=false;
-                            diagnostic_bytes=diagnostic_bytes.checked_add(error.len()).filter(|n|*n<=16*1024*1024).ok_or_else(||WgpuError::Render("Globe pattern aggregate diagnostic budget exceeded".into()))?;
-                            if error.len()>4096 {return Err(WgpuError::Render("Globe pattern diagnostic budget exceeded".into()));}
-                        }
-                        self.globe_pattern_resources.insert(ordinal,resource);
-                    }
-                }
-                if let DrawingInstruction::Point(p) = instruction {
-                    let id = intern_symbol(&p.symbol_ref);
-                    if let Some(geom) = cache.get_symbol(&p.symbol_ref, profile) {
-                        self.ensure_symbol_texture(gpu, pipelines, id, &p.symbol_ref, geom);
-                    } else {symbol_preparation_complete=false;}
-                }
-            }
-            if let Some(keys)=request_keys {request_keys_diagnostics=keys.diagnostics();}
-        }
-        self.globe_pattern_textures = current_textures;
-        self.globe_whole_motif_textures = current_whole_textures;
-        self.globe_pattern_epoch = Some((context.geometry_revision(),context.scaler.pixels_per_mm().to_bits()));
-        if resource_reuse_enabled && symbol_preparation_complete {self.globe_prepared_symbol_epoch=crate::prepared_symbol_epoch::PreparedSymbolEpoch::capture(epoch_inputs,profile,pattern_bytes);}
-        Ok(serde_json::json!({"symbol_resources_ms":symbol_start.elapsed().as_secs_f64()*1000.,"prepared_symbol_resources":{"enabled":resource_reuse_enabled,"hit":false,"identity_bytes":self.globe_prepared_symbol_epoch.as_ref().map_or(0,|e|e.bytes()),"identity_budget_bytes":1048576,"resource_preparation_calls":context.instruction_count()},
-            "prepared_request_keys_enabled":request_keys_enabled,"prepared_request_keys":request_keys_diagnostics,
-            "pattern_resource_count":self.globe_pattern_resources.len(),"pattern_texture_count":self.globe_pattern_textures.len()+self.globe_whole_motif_textures.len(),"pattern_retained_resource_bytes":pattern_bytes}))
-    }
-}
 fn create_symbol_texture(gpu:&GpuState,pipelines:&RenderPipelines,name:&str,geom:&crate::SymbolGeometry)->SymbolTexture {
     let (texture,view)=gpu.create_texture_from_rgba(&geom.pixels,geom.width,geom.height,&format!("symbol_{name}"));
     SymbolTexture {texture,bind_group:pipelines.create_texture_bind_group(&gpu.device,&view),width:geom.width,height:geom.height,pivot_in_texture:geom.pivot_in_texture(),render_scale:geom.render_scale,has_coverage:geom.pixels.chunks_exact(4).any(|p|p[3]!=0)}
 }
-/// Unpublished scene using independent targets and chart font atlas.
-/// Preparation may warm the supplied CPU cache, but does not mutate renderer.
-pub struct PreparedGlobePublication {
-    owner: Arc<()>, binding:GlobePublicationBinding,
-    pane:crate::globe_view::GlobePane,resources:Option<crate::globe_view::GlobeResources>,fonts:EguiIntegration,
-    symbols:GlobeSymbolPreparation,resource_revision:u64,
-    provider:Arc<dyn ferrite_render::GlobeCoverageProvider>,viewport:ferrite_render::Viewport,display_scale:u32,summary:String,
+
+fn raster_publication_identity_matches(owner:&Arc<()>,expected_owner:&Arc<()>,epoch:&Arc<()>,expected_epoch:&Arc<()>)->bool {
+    Arc::ptr_eq(owner,expected_owner)&&Arc::ptr_eq(epoch,expected_epoch)
 }
-#[derive(Clone,PartialEq,Eq,Debug)]
-struct GlobePublicationBinding {
-    extent:[u32;2],format:wgpu::TextureFormat,density:u64,samples:u32,symbol_scale:u32,
-    tilt:u64,range_factor:u64,pose:Option<[u64;5]>,flags:[bool;9],
+
+
+/// Optional hidden-test ownership evidence; independent of index min/max.
+#[derive(Clone, Debug)]
+struct PatternEmissionAudit {
+    source_ordinal: usize,
+    vertex_start: usize,
+    vertex_end: usize,
+    index_start: usize,
+    index_end: usize,
+    wrap_mode: u8,
+    /// Actual CPU clipping translation in physical screen pixels, exact binary64.
+    wrap_dx_screen_bits: u64,
 }
-fn globe_publication_binding_matches(owner:&Arc<()>,expected_owner:&Arc<()>,binding:&GlobePublicationBinding,expected:&GlobePublicationBinding)->bool {
-    Arc::ptr_eq(owner,expected_owner)&&binding==expected
-}
-fn merge_symbol_diagnostics(target:&mut serde_json::Value,diagnostics:serde_json::Value) {
-    if let (Some(target),Some(source))=(target.as_object_mut(),diagnostics.as_object()) {target.extend(source.iter().map(|(k,v)|(k.clone(),v.clone())));}
+const MAX_PATTERN_AUDIT_EMISSIONS: usize = 65536;
+fn record_pattern_emission(records: &mut Vec<PatternEmissionAudit>, dropped: &mut usize, record: PatternEmissionAudit) {
+    if records.len() < MAX_PATTERN_AUDIT_EMISSIONS { records.push(record); }
+    else { *dropped = dropped.saturating_add(1); }
 }
 
 pub struct WgpuRenderer {
+
     draw_range_index_enabled: bool,
-    globe_sample_count: u32,
-    globe_area_cache_enabled: bool,
-    globe_curve_cache_enabled: bool,
-    globe_curve_bounds_cache_enabled: bool,
-    globe_dyadic_sample_cache_enabled: bool,
-    globe_curve_scratch_reuse_enabled: bool,
-    globe_gpu_projection_enabled: bool,
+
     spatial_hierarchy_enabled: bool,
-    globe_pane: Option<crate::globe_view::GlobePane>,
-    globe_coverage_provider: Option<Arc<dyn ferrite_render::GlobeCoverageProvider>>,
-    globe_resources: Option<crate::globe_view::GlobeResources>,
-    globe_publication_fonts: Option<EguiIntegration>,
-    globe_pattern_resources: crate::globe_pattern::PatternResources,
-    globe_pattern_epoch: Option<(u64,u64)>,
-    globe_prepared_symbol_epoch: Option<crate::prepared_symbol_epoch::PreparedSymbolEpoch>,
-    diagnostic_prepared_symbol_reuse: Option<bool>,
-    diagnostic_pattern_request_keys: Option<bool>,
-    globe_symbol_resource_revision: Option<u64>,
-    globe_pattern_textures: HashMap<String, Arc<crate::globe_pattern::PatternTexture>>,
-    globe_whole_motif_textures: HashMap<String, Arc<crate::whole_motif_gpu::NaturalMotifTexture>>,
+
+
+
+
     geometry_transform: Option<ferrite_render::FlatTransform>,
     raster_layers: Vec<GpuRasterLayer>,
     continuous_owner: std::sync::Arc<()>,
+    raster_epoch: Arc<()>,
     continuous_uniforms: [Option<ViewUniforms>;3],
     continuous_frame: Option<crate::ValidatedContinuousFrame>,
     // Updated only on scene commit: regular frames avoid scanning raster materials.
@@ -624,6 +541,8 @@ pub struct WgpuRenderer {
     pub animation_mode: bool,
     view_dependent_symbols: bool,
     view_clipped_patterns: bool,
+    flat_diagnostic: Option<FlatDiagnosticCell>,
+    flat_gpu_coverage_host_ns: u64,
     /// LOD level (0=full detail, 1=medium, 2=low)
     /// Viewport bounds in world coordinates for culling
     viewport_world_bounds: Option<(f64, f64, f64, f64)>,
@@ -643,6 +562,8 @@ pub struct WgpuRenderer {
     // === PATTERN FILL (S-100 GPU texture-repeat tiling) ===
     /// Pattern fill vertices (TextureVertex: position + inv_tile_size)
     pattern_vertices: Vec<PatternVertex>,
+    pattern_emission_audit: Option<Vec<PatternEmissionAudit>>,
+    pattern_emission_audit_dropped: usize,
     /// Pattern fill indices
     pattern_indices: Vec<u32>,
     /// Pattern fill ranges: (display_plane, priority, index_start, index_end, pattern_texture_key)
@@ -684,6 +605,10 @@ pub struct WgpuRenderer {
     cached_pattern_index_count: u32,
     /// Whether cached GPU buffers are stale and need rebuild
     gpu_buffers_dirty: bool,
+    /// Immutable INDEX-only quad topology, shared by all instanced symbol batches.
+    /// Never rewritten, including during candidate publication.
+    shared_symbol_quad_index_buffer: Option<wgpu::Buffer>,
+    immutable_instance_cache: Option<crate::immutable_payload_cache::ImmutablePayloadCache<wgpu::Buffer>>,
     /// Cached symbol GPU buffers per priority range (avoid recreating every frame)
     #[allow(clippy::type_complexity)]
     cached_symbol_buffers: Vec<(
@@ -737,6 +662,15 @@ pub struct WgpuRenderer {
     view_bind_group_right: wgpu::BindGroup,
 }
 
+impl GpuRasterLayer {
+    fn admit(&self,budget:&mut crate::raster_publication_budget::RasterPublicationBudget)->Result<()> {
+        let texture=u64::from(self._texture.width())*u64::from(self._texture.height())*4;
+        let geometry=self.vertices.size().checked_add(self.indices.size()).ok_or_else(||WgpuError::Render("Raster geometry size overflow".into()))?;
+        let identity=self.continuous_identity.as_ref().map_or(0,|i|(i.vertex_bytes.len()+i.index_bytes.len()) as u64);
+        budget.admit(texture,geometry,identity)
+    }
+}
+
 impl WgpuRenderer {
     /// Create new renderer for window
     pub async fn new(window: Arc<Window>) -> Result<Self> {
@@ -780,10 +714,12 @@ impl WgpuRenderer {
             line_indices: Vec::with_capacity(15000),
             raster_layers: Vec::new(),
             continuous_owner: std::sync::Arc::new(()),
+            raster_epoch: Arc::new(()),
             continuous_uniforms: [Some(uniforms),None,None],
             continuous_frame: None,
             continuous_layer_count: 0,
             raster_enabled_groups: None,
+
             symbol_textures: HashMap::with_capacity(100),
             symbol_instances: Vec::with_capacity(2000),
             background_color: Color::from_u8(201, 237, 255, 255), // DEPDW (deep water) — matches S-101 default
@@ -827,6 +763,8 @@ impl WgpuRenderer {
             animation_mode: false,
             view_dependent_symbols: false,
             view_clipped_patterns: false,
+            flat_diagnostic: None,
+            flat_gpu_coverage_host_ns: 0,
             viewport_world_bounds: None,
             prepared_coverage: None,
             coverage_frame: None,
@@ -840,6 +778,8 @@ impl WgpuRenderer {
             symbol_priority_ranges: Vec::with_capacity(10),
             // Pattern fill
             pattern_vertices: Vec::with_capacity(5000),
+            pattern_emission_audit: (crate::background_test::enabled() && std::env::var("FERRITE_PATTERN_EMISSION_AUDIT").as_deref() == Ok("1")).then(Vec::new),
+            pattern_emission_audit_dropped: 0,
             pattern_indices: Vec::with_capacity(15000),
             pattern_ranges: Vec::with_capacity(10),
             pattern_textures: HashMap::new(),
@@ -860,6 +800,8 @@ impl WgpuRenderer {
             gpu_buffers_dirty: true,
             geometry_transform: None,
             cached_symbol_buffers: Vec::new(),
+            shared_symbol_quad_index_buffer: None,
+            immutable_instance_cache: (std::env::var("FERRITE_IMMUTABLE_INSTANCE_CACHE").as_deref()==Ok("1")).then(crate::immutable_payload_cache::ImmutablePayloadCache::new),
             line_suppression: ferrite_render::LineSuppressionCache::default(),
             // Profiling
             cpu_profiler: CpuProfiler::new(),
@@ -868,27 +810,15 @@ impl WgpuRenderer {
             world_map_coastlines: Default::default(),
             world_map_detailed: Default::default(),
             chart_geometry_viewport: None,
-            globe_sample_count: crate::state::MSAA_SAMPLE_COUNT,
-            globe_area_cache_enabled: true,
-            globe_curve_cache_enabled: true,
-            globe_curve_bounds_cache_enabled: true,
-            globe_dyadic_sample_cache_enabled: false,
-            globe_curve_scratch_reuse_enabled: false,
+
+
             // Keep opt-in until representative frame-time gates pass.
             spatial_hierarchy_enabled: false,
-            globe_gpu_projection_enabled: false,
-            globe_pane: None,
-            globe_coverage_provider: None,
-            globe_resources: None,
-            globe_publication_fonts: None,
-            globe_pattern_resources: Default::default(),
-            globe_pattern_epoch: None,
-            globe_prepared_symbol_epoch: None,
-            diagnostic_prepared_symbol_reuse: None,
-            diagnostic_pattern_request_keys: None,
-            globe_symbol_resource_revision: None,
-            globe_pattern_textures: Default::default(),
-            globe_whole_motif_textures: Default::default(),
+
+
+
+
+
             world_map_chart_boxes: Vec::new(),
             world_map_line_vertices: Vec::with_capacity(2000),
             world_map_line_indices: Vec::with_capacity(6000),
@@ -926,20 +856,7 @@ impl WgpuRenderer {
 
     /// CPU chart geometry must have been built with the currently requested view.
     pub fn geometry_matches_view(&self, scaler: &ferrite_render::Scaler) -> bool {
-        if self.ui_state.globe_preview {
-            return self.globe_pane.as_ref().is_some_and(|p| {
-                p.matches(
-                    scaler,
-                    self.ui_state.globe_tilt_deg,
-                    self.ui_state.globe_pose,
-                    if self.ui_state.globe_range_factor > 0. {
-                        self.ui_state.globe_range_factor
-                    } else {
-                        1.
-                    },
-                )
-            });
-        }
+
         self.geometry_transform == Some(Self::scaler_transform(scaler))
     }
 
@@ -1102,28 +1019,7 @@ impl WgpuRenderer {
         if self.ui_state.selected_feature.is_none() {
             self.selection_world_geometry.clear();
         }
-        if self.ui_state.globe_preview {
-            self.selection_screen_geometry.clear();
-            self.selection_anchor = self.ui_state.selected_feature.as_ref().and_then(|f| {
-                let pane = self.globe_pane.as_ref()?;
-                if let Some((cell, id, mm)) = self
-                    .selection_device_anchor
-                    .filter(|(cell, id, _)| *cell == f.cell_index && *id == f.feature_id)
-                {
-                    let _ = (cell, id);
-                    let v = pane.diagnostics.viewport;
-                    let ppm = pane.pixels_per_mm();
-                    Some([
-                        (v[0] + mm[0] * ppm) as f32,
-                        (v[1] + v[3] - mm[1] * ppm) as f32,
-                    ])
-                } else {
-                    pane.project_world([f.world_pos.0, f.world_pos.1])
-                        .map(|p| p.map(|x| x as f32))
-                }
-            });
-            return;
-        }
+
         let shift = self
             .ui_state
             .selected_feature
@@ -1157,8 +1053,11 @@ impl WgpuRenderer {
         scaler: &ferrite_render::Scaler,
     ) -> crate::Result<()> {
         let uploaded = self.prepare_raster_layer(layer, scaler)?;
+        let mut budget=crate::raster_publication_budget::RasterPublicationBudget::default();
+        for layer in &self.raster_layers {layer.admit(&mut budget)?;}uploaded.admit(&mut budget)?;
         self.raster_layers.push(uploaded);
-        self.globe_pane=None;
+        self.raster_epoch=Arc::new(());
+
         Ok(())
     }
     pub fn raster_texture_limit(&self) -> u32 {
@@ -1173,21 +1072,13 @@ impl WgpuRenderer {
             &mut dyn FnMut(ferrite_render::RasterLayer) -> std::result::Result<(), E>,
         ) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        let mut staged = Vec::new();
-        producer(&mut |layer| {
-            staged.push(self.prepare_raster_layer(layer, scaler)?);
-            Ok(())
+        let batch=self.stage_raster_material_batch(scaler,|upload| {
+            producer(&mut |layer| upload(ferrite_render::RasterMaterialLayer::Regular(layer)))
         })?;
-        self.globe_pane=None;
-        if replace {
-            self.raster_layers = staged;
-            self.continuous_layer_count = 0;
-            self.continuous_frame = None;
-        } else {
-            self.raster_layers.extend(staged);
-        }
+        self.commit_raster_material_batch(batch,replace,None)?;
         Ok(())
     }
+
     /// Bounded transactional staging; the regular raster_batch API is preserved.
     /// Continuous bytes are copied to an unorm texture without premultiplication.
     pub fn stage_raster_material_batch<E:From<crate::WgpuError>>(
@@ -1195,6 +1086,7 @@ impl WgpuRenderer {
         producer:impl FnOnce(&mut dyn FnMut(ferrite_render::RasterMaterialLayer)->std::result::Result<(),E>)->std::result::Result<(),E>,
     )->std::result::Result<PreparedRasterMaterialBatch,E> {
         let mut layers=Vec::new();let mut bytes=0usize;
+        let mut budget=crate::raster_publication_budget::RasterPublicationBudget::default();
         producer(&mut |input| {
             let (layer,continuous)=match input {
                 ferrite_render::RasterMaterialLayer::Regular(layer)=>(layer,None),
@@ -1208,9 +1100,26 @@ impl WgpuRenderer {
                 }
                 self.pipelines.ensure_continuous_raster_pipeline(&self.state);
             }
-            layers.push(self.prepare_raster_material(layer,scaler,continuous)?);Ok(())
+            let prepared=self.prepare_raster_material(layer,scaler,continuous)?;
+            prepared.admit(&mut budget)?;layers.push(prepared);Ok(())
         })?;
         Ok(PreparedRasterMaterialBatch{layers,owner:std::sync::Arc::clone(&self.continuous_owner)})
+    }
+    /// Rebuild only unpublished buffers for the proposed camera. Numerical
+    /// continuous qualification still has to bind these actual new bytes.
+    pub fn reproject_raster_material_batch(&self,batch:&mut PreparedRasterMaterialBatch,scaler:&ferrite_render::Scaler)->Result<()> {
+        if !Arc::ptr_eq(&batch.owner,&self.continuous_owner) {return Err(WgpuError::Render("Raster batch belongs to another renderer".into()));}
+        for layer in &mut batch.layers {
+            let vertices=self.raster_vertices(layer.bounds,layer.grid,layer.tile_size,scaler);
+            let indices=Self::raster_indices(vertices.len());
+            if let Some(identity)=layer.continuous_identity.as_mut() {
+                identity.camera=scaler.flat_encoded_identity().ok_or_else(||WgpuError::Render("Continuous identity requires an actual flat camera".into()))?;
+                identity.vertex_bytes=bytemuck::cast_slice(&vertices).to_vec();identity.index_bytes=bytemuck::cast_slice(&indices).to_vec();
+            }
+            layer.vertices=self.state.create_vertex_buffer(&vertices,"unpublished-raster-vertices");
+            layer.indices=self.state.create_index_buffer(&indices,"unpublished-raster-indices");layer.index_count=indices.len() as u32;
+        }
+        Ok(())
     }
     fn continuous_binding_matches<'a>(&self,binding:&crate::continuous_frame_binding::ContinuousFrameBinding,
         layers:impl Iterator<Item=&'a GpuRasterLayer>)->bool {
@@ -1224,10 +1133,18 @@ impl WgpuRenderer {
         [width.to_bits(),height.to_bits(),self.screen_pan_offset.0.to_bits(),self.screen_pan_offset.1.to_bits(),self.screen_zoom_scale.to_bits(),
             self.screen_zoom_scale_y.to_bits(),self.screen_zoom_pivot.0.to_bits(),self.screen_zoom_pivot.1.to_bits(),self.lon_wrap_screen_px.to_bits()]
     }
-    pub fn commit_raster_material_batch(&mut self,batch:PreparedRasterMaterialBatch,replace:bool,
-        proof:Option<crate::ValidatedContinuousFrame>)->crate::Result<()> {
-        if !std::sync::Arc::ptr_eq(&batch.owner,&self.continuous_owner) {return Err(crate::WgpuError::Render("Raster material batch belongs to another renderer".into()));}
-        let has_continuous=batch.layers.iter().any(|l|l.continuous.is_some());
+    fn raster_publication_frame(&self)->crate::continuous_frame_binding::ContinuousFrameBinding {
+        crate::continuous_frame_binding::ContinuousFrameBinding::capture(&self.continuous_owner,
+            &self.continuous_uniforms.iter().flatten().map(|v|bytemuck::bytes_of(v).to_vec()).collect::<Vec<_>>(),
+            [self.state.size.width,self.state.size.height],crate::state::MSAA_SAMPLE_COUNT,
+            self.state.config.format,self.raster_layers.iter().filter_map(|l|l.continuous_identity.clone()).collect())
+    }
+    /// All recoverable checks and GPU work precede visible scene installation.
+    pub fn prepare_raster_material_publication(&self,batch:PreparedRasterMaterialBatch,replace:bool,
+        proof:Option<crate::ValidatedContinuousFrame>)->crate::Result<PreparedRasterPublication> {
+        if !Arc::ptr_eq(&batch.owner,&self.continuous_owner) {return Err(crate::WgpuError::Render("Raster material batch belongs to another renderer".into()));}
+        let has_continuous=self.raster_layers.iter().filter(|_|!replace).chain(batch.layers.iter()).any(|l|l.continuous.is_some());
+        let proof=if has_continuous {proof.or_else(||if !replace {self.continuous_frame.clone()}else{None})} else {None};
         if has_continuous {
             let certificate=proof.as_ref().ok_or_else(||crate::WgpuError::Render("Continuous selector is staged: validated projection/interpolant/hardware bound required".into()))?;
             if !self.continuous_binding_matches(&certificate.binding,self.raster_layers.iter().filter(|_|!replace).chain(batch.layers.iter())) || certificate.transform_key!=self.continuous_transform_key() || !certificate.error().is_finite() || certificate.error()<0. {
@@ -1237,17 +1154,72 @@ impl WgpuRenderer {
                 .any(|material| !certificate.material_keys.contains(&material.content_digest)) {
                 return Err(crate::WgpuError::Render("Continuous frame proof does not cover these source/material bytes".into()));
             }
-            // Append can requalify existing layers; apply the same bound to all covered atlases.
-            for layer in batch.layers.iter().chain(self.raster_layers.iter().filter(|_|!replace)) {if layer.continuous.is_some() {
+        }
+        let mut budget=crate::raster_publication_budget::RasterPublicationBudget::default();let mut count=0usize;
+        for layer in self.raster_layers.iter().filter(|_|!replace).chain(batch.layers.iter()) {layer.admit(&mut budget)?;count+=1;}
+        // Sharing unchanged regular textures is safe. A retained continuous atlas
+        // must be detached before any proof-header write, including requalification.
+        let mut layers=Vec::with_capacity(count);
+        for live in self.raster_layers.iter().filter(|_|!replace) {
+            let mut next=live.clone();
+            if live.continuous.is_some() {
+                let texture=self.state.device.create_texture(&wgpu::TextureDescriptor {
+                    label:Some("unpublished-continuous-atlas"),size:live._texture.size(),mip_level_count:1,sample_count:1,
+                    dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,
+                    usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::COPY_SRC|wgpu::TextureUsages::COPY_DST,view_formats:&[],
+                });
+                let mut encoder=self.state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {label:Some("detach-continuous-atlas")});
+                encoder.copy_texture_to_texture(live._texture.as_image_copy(),texture.as_image_copy(),live._texture.size());
+                self.state.queue.submit(Some(encoder.finish()));
+                let view=texture.create_view(&wgpu::TextureViewDescriptor::default());
+                next.bind_group=self.pipelines.create_raster_bind_group(&self.state.device,&view);next._texture=texture;
+            }
+            layers.push(next);
+        }
+        layers.extend(batch.layers);
+        if let Some(certificate)=proof.as_ref() {
+            for layer in layers.iter().filter(|l|l.continuous.is_some()) {
                 let mut bytes=Vec::with_capacity(8);bytes.extend(certificate.error().to_bits().to_le_bytes());bytes.extend(1u32.to_le_bytes());
                 self.state.queue.write_texture(wgpu::TexelCopyTextureInfo{texture:&layer._texture,mip_level:0,origin:wgpu::Origin3d{x:13,y:0,z:0},aspect:wgpu::TextureAspect::All},
                     &bytes,wgpu::TexelCopyBufferLayout{offset:0,bytes_per_row:Some(8),rows_per_image:Some(1)},wgpu::Extent3d{width:2,height:1,depth_or_array_layers:1});
-            }}
+            }
         }
-        if has_continuous {self.continuous_frame=proof;}else if replace {self.continuous_frame=None;}
-        if replace {self.raster_layers=batch.layers;}else {self.raster_layers.extend(batch.layers);}
-        self.continuous_layer_count=self.raster_layers.iter().filter(|layer|layer.continuous.is_some()).count();
-        self.globe_pane=None;Ok(())
+        Ok(PreparedRasterPublication{layers,proof,owner:Arc::clone(&self.continuous_owner),previous_epoch:Arc::clone(&self.raster_epoch),frame:self.raster_publication_frame(),transform:self.continuous_transform_key()})
+    }
+    /// Reproject the entire unpublished regular inventory, including retained
+    /// tiles. Continuous sources need a new numerical qualification after this
+    /// operation; the current unsupported route cannot reuse its old token.
+    pub fn reproject_raster_publication(&self,prepared:&mut PreparedRasterPublication,scaler:&ferrite_render::Scaler)->Result<()> {
+        self.validate_raster_publication(prepared)?;
+        if prepared.layers.iter().any(|l|l.continuous.is_some()) {return Err(WgpuError::Render("Continuous camera replacement requires new numerical qualification".into()));}
+        for layer in &mut prepared.layers {
+            let vertices=self.raster_vertices(layer.bounds,layer.grid,layer.tile_size,scaler);
+            let indices=Self::raster_indices(vertices.len());
+            layer.vertices=self.state.create_vertex_buffer(&vertices,"unpublished-raster-scene-vertices");
+            layer.indices=self.state.create_index_buffer(&indices,"unpublished-raster-scene-indices");layer.index_count=indices.len() as u32;
+        }
+        let mut budget=crate::raster_publication_budget::RasterPublicationBudget::default();
+        for layer in &prepared.layers {layer.admit(&mut budget)?;}Ok(())
+    }
+    pub fn validate_raster_publication(&self,prepared:&PreparedRasterPublication)->crate::Result<()> {
+        if !raster_publication_identity_matches(&self.continuous_owner,&prepared.owner,&self.raster_epoch,&prepared.previous_epoch)
+            || prepared.transform!=self.continuous_transform_key() || !self.continuous_binding_matches(&prepared.frame,self.raster_layers.iter()) {
+            return Err(crate::WgpuError::Render("Raster publication renderer, source inventory or view changed".into()));
+        }
+        Ok(())
+    }
+    /// Validate immediately before this infallible installation on the UI thread.
+    pub fn commit_raster_publication(&mut self,prepared:PreparedRasterPublication) {
+        assert!(self.validate_raster_publication(&prepared).is_ok(),"Stale raster publication");
+        self.raster_layers=prepared.layers;self.continuous_frame=prepared.proof;
+        self.continuous_layer_count=self.raster_layers.iter().filter(|l|l.continuous.is_some()).count();
+        self.raster_epoch=Arc::new(());
+    }
+    /// Compatibility entry point; no old texture is changed on preparation failure.
+    pub fn commit_raster_material_batch(&mut self,batch:PreparedRasterMaterialBatch,replace:bool,
+        proof:Option<crate::ValidatedContinuousFrame>)->crate::Result<()> {
+        let prepared=self.prepare_raster_material_publication(batch,replace,proof)?;
+        self.validate_raster_publication(&prepared)?;self.commit_raster_publication(prepared);Ok(())
     }
     fn validate_continuous_frame(&self)->crate::Result<()> {
         if self.continuous_layer_count == 0 { return Ok(()); }
@@ -1454,6 +1426,7 @@ impl WgpuRenderer {
             .collect()
     }
     pub fn update_raster_view(&mut self, scaler: &ferrite_render::Scaler) {
+        self.raster_epoch=Arc::new(());
         self.continuous_frame=None;
         for i in 0..self.raster_layers.len() {
             let vertices = self.raster_vertices(
@@ -1478,6 +1451,7 @@ impl WgpuRenderer {
     /// Update visibility without re-uploading coverage pixels or geometry.
     pub fn set_raster_enabled_groups(&mut self, groups: Option<&std::collections::HashSet<u32>>) {
         self.raster_enabled_groups = groups.cloned();
+        self.raster_epoch=Arc::new(());
     }
     /// Inspect retained GPU layer composition without copying textures or pixel buffers.
     pub fn raster_composition_metadata(
@@ -1497,10 +1471,11 @@ impl WgpuRenderer {
         })
     }
     pub fn clear_raster_layers(&mut self) {
+        self.raster_epoch=Arc::new(());
         self.continuous_frame=None;
         self.continuous_layer_count=0;
         self.raster_layers.clear();
-        self.globe_pane=None;
+
     }
     fn draw_rasters<'a>(
         &'a self,
@@ -1537,13 +1512,13 @@ impl WgpuRenderer {
         self.symbol_textures.clear();
         // Patterns are rasterized with the same PC colour profile as symbols.
         self.pattern_textures.clear();
-        self.globe_pattern_textures.clear();
-        self.globe_whole_motif_textures.clear();
-        self.globe_pattern_resources.clear();
-        self.globe_pattern_epoch=None;
-        self.globe_prepared_symbol_epoch=None;
-        self.globe_symbol_resource_revision=None;
-        self.globe_pane=None;
+
+
+
+
+
+
+
     }
 
     /// Exactly the quad/culling decision used by both packing and Parent
@@ -1672,6 +1647,13 @@ impl WgpuRenderer {
             "fast_view_scales": self.fast_view_scales(),
             "area_ranges": self.area_priority_ranges.iter().map(|&(p,q,a,b,_)| (p,q,a,b)).collect::<Vec<_>>(),
             "line_ranges": self.line_priority_ranges.iter().map(|&(p,q,a,b,_)| (p,q,a,b)).collect::<Vec<_>>(),
+            "pattern_emissions": self.pattern_emission_audit.as_ref().map(|records| records.iter().map(|r| serde_json::json!({
+                "source_ordinal":r.source_ordinal,"vertex_start":r.vertex_start,"vertex_end":r.vertex_end,
+                "index_start":r.index_start,"index_end":r.index_end,"wrap_mode":r.wrap_mode,
+                "wrap_dx_screen_bits":r.wrap_dx_screen_bits,
+            })).collect::<Vec<_>>()),
+            "pattern_emission_dropped": self.pattern_emission_audit_dropped,
+            "pattern_emission_scope": "full appended CPU vertex ownership including unused earcut vertices; wrap255 mesh is subsequently reused by draw-time wrap uniforms",
             "pattern_ranges": self.pattern_ranges.iter().map(|(p,q,a,b,k,w,_)| (p,q,a,b,k,w)).collect::<Vec<_>>(),
             "packed_symbol_ranges": self.packed_symbol_ranges.iter().map(|&(id,start,count)| (ferrite_render::resolve_symbol(id),start,count)).collect::<Vec<_>>(),
             "symbol_gpu_buffers": self.symbol_gpu_buffer_statistics(),
@@ -1690,11 +1672,18 @@ impl WgpuRenderer {
         serde_json::json!({
             "instancing_enabled": self.pipelines.symbol_instance_pipeline.is_some(),
             "vertex_bytes": self.cached_symbol_buffers.iter().map(|b| b.4.size()).sum::<u64>(),
-            "index_bytes": self.cached_symbol_buffers.iter().map(|b| b.5.size()).sum::<u64>(),
+            "index_bytes": if self.pipelines.symbol_instance_pipeline.is_some() { self.shared_symbol_quad_index_buffer.as_ref().map_or(0,wgpu::Buffer::size) } else { self.cached_symbol_buffers.iter().map(|b| b.5.size()).sum::<u64>() },
+            "shared_quad_index_buffers": usize::from(self.shared_symbol_quad_index_buffer.is_some()),
             "buffer_pairs": self.cached_symbol_buffers.len(),
             "instance_payload_bytes": 40,
             "original_payload_per_symbol_bytes": 120,
-            "scope": "2D packed symbols only; globe scene unchanged",
+            "immutable_instance_cache": self.immutable_instance_cache.as_ref().map(|cache|serde_json::json!({
+                "requests":cache.requests,"hits":cache.hits,"creations":cache.creations,"rejected":cache.rejected,"resets":cache.resets,
+                "entries":cache.entries(),"retained_logical_bytes":cache.retained_bytes(),
+                "budget_bytes":crate::immutable_payload_cache::ImmutablePayloadCache::<wgpu::Buffer>::BUDGET,
+                "no_live_buffer_writes":true,"scope":"cache-owned immutable CPU/GPU payload budget; live cloned handles and total GPU/RSS excluded",
+            })),
+            "scope": "2D packed symbols",
         })
     }
 
@@ -2076,7 +2065,7 @@ impl WgpuRenderer {
     /// Apply an affine only when all retained geometry supports navigation.
     /// Validate both directions before changing uniforms or coverage state.
     fn accepts_gpu_navigation(&self, scale: [f32; 2], pan: [f32; 2], pivot: [f32; 2]) -> bool {
-        if self.ui_state.globe_preview || self.requires_visibility_rebuild_for_navigation() {
+        if false || self.requires_visibility_rebuild_for_navigation() {
             return false;
         }
         (0..2).all(|axis| {
@@ -2160,20 +2149,47 @@ impl WgpuRenderer {
             || self.view_clipped_patterns
     }
 
+    pub fn begin_flat_diagnostics(&mut self, frame:u64, source_epoch:u64, view_epoch:u64) -> Result<()> {
+        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Flat diagnostics require hidden unfocused background mode".into()));}
+        self.flat_gpu_coverage_host_ns=0;
+        self.flat_diagnostic=Some(std::rc::Rc::new(std::cell::RefCell::new(ferrite_render::flat_reuse_diagnostics::FlatFrameSample::new(frame,source_epoch,view_epoch,true,false)))); Ok(())
+    }
+    pub fn finish_flat_diagnostics(&mut self, service_ns:u64) -> Result<ferrite_render::flat_reuse_diagnostics::FlatFrameSample> {
+        if self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Flat diagnostic window visibility changed".into()));}
+        let cell=self.flat_diagnostic.take().ok_or_else(||WgpuError::Render("No diagnostic frame".into()))?;
+        let mut row=*cell.borrow(); row.service_ns=service_ns; row.work.dependency_iterations=self.dependency_status.iterations as u64; Ok(row)
+    }
+    fn flat_span(&self,stage:ferrite_render::flat_reuse_diagnostics::FlatFrameStage)->Option<FlatDiagnosticSpan> {
+        self.flat_diagnostic.as_ref().map(|cell|FlatDiagnosticSpan{cell:cell.clone(),stage,start:std::time::Instant::now()})
+    }
+    pub fn flat_gpu_coverage_host_ns(&self)->u64 {self.flat_gpu_coverage_host_ns}
+    pub fn flat_diagnostics_active(&self)->bool {self.flat_diagnostic.is_some()}
+    pub fn record_flat_stage(&self,stage:ferrite_render::flat_reuse_diagnostics::FlatFrameStage, elapsed:std::time::Duration) {if let Some(cell)=&self.flat_diagnostic {cell.borrow_mut().record_span(stage,elapsed.as_nanos().min(u64::MAX as u128) as u64);}}
+    fn record_flat_reuse(&self,affine:Option<ferrite_render::flat_reuse_diagnostics::NavigationAffine>) {
+        if let Some(cell)=&self.flat_diagnostic {
+            use ferrite_render::flat_reuse_diagnostics::*;
+            let reason=classify_flat_reuse(FlatNavigationInputs{mode_supported:true,dependency_iterations:self.dependency_status.iterations,view_dependent_symbols:self.view_dependent_symbols,view_clipped_patterns:self.view_clipped_patterns,source_transform_present:self.geometry_transform.is_some(),affine});
+            cell.borrow_mut().record_reuse(reason);
+        }
+    }
     pub fn set_gpu_view_scaler(&mut self, target: &ferrite_render::Scaler) -> bool {
-        if self.ui_state.globe_preview || self.requires_visibility_rebuild_for_navigation() {
+        if false || self.requires_visibility_rebuild_for_navigation() {
+            self.record_flat_reuse(None);
             return false;
         }
         let Some(source) = self.geometry_transform else {
+            self.record_flat_reuse(None);
             return false;
         };
         let Some(view) = ferrite_render::ScreenAffine::between_transform(source, target) else {
+            self.record_flat_reuse(None);
             return false;
         };
         let pan = [
             view.translation[0] / view.scale[0],
             view.translation[1] / view.scale[1],
         ];
+        self.record_flat_reuse(Some(ferrite_render::flat_reuse_diagnostics::NavigationAffine{scale:view.scale,pan,pivot:[0.,0.]}));
         if !self.accepts_gpu_navigation(view.scale, pan, [0., 0.]) {
             return false;
         }
@@ -2252,6 +2268,8 @@ impl WgpuRenderer {
         self.pattern_vertices.clear();
         self.pattern_indices.clear();
         self.pattern_ranges.clear();
+        if let Some(records)=self.pattern_emission_audit.as_mut() { records.clear(); }
+        self.pattern_emission_audit_dropped=0;
         self.view_clipped_patterns = false;
         self.text_labels.clear();
         // World map separate buffers
@@ -2516,8 +2534,10 @@ impl WgpuRenderer {
         visible_viewing_groups: Option<&std::collections::HashSet<u32>>,
     ) {
         context.get_sorted_instructions();
+        let flat_dependency_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::DependencyResolution);
         let graph = context.dependency_graph();
         if !graph.has_parents() {
+            drop(flat_dependency_span);
             self.dependency_status = DependencyRenderStatus {
                 converged: true,
                 ..Default::default()
@@ -2550,6 +2570,7 @@ impl WgpuRenderer {
             self.pattern_ranges.len(),
             self.displayed_geometry.len(),
         );
+        let audit_prefix=(self.pattern_emission_audit.as_ref().map_or(0,Vec::len),self.pattern_emission_audit_dropped);
         let grids = (
             self.symbol_grid.clone(),
             self.sounding_screen_grid.clone(),
@@ -2581,6 +2602,8 @@ impl WgpuRenderer {
             self.line_priority_ranges.truncate(lengths.9);
             self.symbol_priority_ranges.truncate(lengths.10);
             self.pattern_ranges.truncate(lengths.11);
+            if let Some(records)=self.pattern_emission_audit.as_mut() { records.truncate(audit_prefix.0); }
+            self.pattern_emission_audit_dropped=audit_prefix.1;
             self.displayed_geometry.truncate(lengths.12);
             self.symbol_grid.clone_from(&grids.0);
             self.sounding_screen_grid.clone_from(&grids.1);
@@ -2655,6 +2678,7 @@ impl WgpuRenderer {
         self.geometry_transform = Some(Self::scaler_transform(&scaler));
         self.display_scale = scaler.display_scale.round().clamp(1.0, u32::MAX as f64) as u32;
         context.get_sorted_instructions();
+        let flat_visibility_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Visibility);
         let (temporal_visible, hidden, diagnostics) = match context.portrayal_visibility() {
             Ok(visibility) => visibility,
             Err(error) => {
@@ -2663,6 +2687,8 @@ impl WgpuRenderer {
                 return;
             }
         };
+        drop(flat_visibility_span);
+        if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.source_commands=row.work.source_commands.saturating_add(context.raw_instructions().len() as u64);}
         if diagnostics > 0 && self.temporal_visibility_counts.1 != diagnostics {
             tracing::warn!("Temporal selector: {diagnostics} primitives preserved due to unsupported or invalid time conditions");
         }
@@ -2673,6 +2699,7 @@ impl WgpuRenderer {
             .enumerate()
             .filter_map(|(i, command)| command.portrayal_origin().is_device_fixed().then_some(i))
             .collect();
+        let flat_gpu_coverage_start=self.flat_diagnostic.as_ref().map(|_|std::time::Instant::now());
         self.prepared_coverage = match context.prepared_coverage_binding() {
             Ok(binding) => binding,
             Err(error) => {
@@ -2731,6 +2758,11 @@ impl WgpuRenderer {
             }
         }
         self.update_coverage_transform();
+        if let Some(start)=flat_gpu_coverage_start {
+            let elapsed=start.elapsed();
+            self.flat_gpu_coverage_host_ns=self.flat_gpu_coverage_host_ns.saturating_add(elapsed.as_nanos().min(u64::MAX as u128) as u64);
+            self.record_flat_stage(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Coverage,elapsed);
+        }
         let instructions = context.raw_instructions();
         let visibility = dependency_permission.map(|permission| {
             temporal_visible
@@ -2904,6 +2936,7 @@ impl WgpuRenderer {
         }
 
         for (inst_idx, instruction) in instructions.iter().enumerate() {
+            let _flat_instruction_span=if self.flat_diagnostic.is_some() {self.flat_span(match instruction {DrawingInstruction::Area(_)=>ferrite_render::flat_reuse_diagnostics::FlatFrameStage::AreaAndPattern,DrawingInstruction::Line(_)=>ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Lines,DrawingInstruction::Point(_)=>ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Points,DrawingInstruction::Text(_)=>ferrite_render::flat_reuse_diagnostics::FlatFrameStage::TextAndDeclutter})}else{None};
             if !area_candidates[inst_idx] || !execution_visibility[inst_idx] {
                 continue;
             }
@@ -2916,6 +2949,7 @@ impl WgpuRenderer {
                 continue;
             }
 
+            if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.executed_commands=row.work.executed_commands.saturating_add(1);}
             let inst_priority = instruction.priority().0;
             let inst_plane = instruction
                 .display_plane()
@@ -3012,8 +3046,9 @@ impl WgpuRenderer {
                         v2,
                     } = area.fill
                     {
-                        // Render pattern overlay only when enabled
-                        if self.ui_state.settings.show_shallow_pattern {
+                        // Only the validated independent shallow selector may hide this pattern.
+                        if ferrite_render::pattern_display_allows(instruction,self.ui_state.settings.show_shallow_pattern,
+                            symbol_cache.as_ref().and_then(|cache|cache.shallow_pattern_contract())) {
                             if let (Some(cache), Some(profile)) =
                                 (symbol_cache.as_mut(), color_profile)
                             {
@@ -3026,6 +3061,7 @@ impl WgpuRenderer {
                                     cache,
                                     profile,
                                     inst_priority,
+                                    inst_idx,
                                 );
                             }
                         }
@@ -3350,12 +3386,14 @@ impl WgpuRenderer {
 
         // Check cache first
         if self.triangulation_cache.contains_key(&cache_key) {
+            if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.triangulation_hits=row.work.triangulation_hits.saturating_add(1);}
             return Some(cache_key);
         }
 
         if self.triangulation_failures.contains(&cache_key) {
             return None;
         }
+        if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.triangulation_cold=row.work.triangulation_cold.saturating_add(1);}
         let triangulated = (|| -> std::result::Result<(Vec<f64>, Vec<usize>), String> {
             let project_ring = |ring: &[WorldPoint]| {
                 let points: Vec<_> = ring
@@ -3464,6 +3502,7 @@ impl WgpuRenderer {
             }
 
             let total_vertex_count = cached.world_vertices.len() / 2;
+            if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.triangulation_hits=row.work.triangulation_hits.saturating_add(1);row.work.projected_vertices=row.work.projected_vertices.saturating_add(total_vertex_count as u64);row.work.triangles=row.work.triangles.saturating_add((cached.indices.len()/3) as u64);}
             let wv_ptr = cached.world_vertices.as_ptr();
             let wv_len = cached.world_vertices.len();
             let idx_ptr = cached.indices.as_ptr();
@@ -3532,6 +3571,7 @@ impl WgpuRenderer {
         symbol_cache: &mut SymbolCache,
         color_profile: &ColorProfile,
         priority: i32,
+        source_ordinal: usize,
     ) {
         // Frustum culling: quick AABB check on exterior ring
         if !Self::is_ring_visible_static(
@@ -3614,12 +3654,13 @@ impl WgpuRenderer {
         let [ox, oy] = transform.offset;
         let [min_x, max_lat] = transform.geographic_origin;
         let max_y = transform.projection.project_y(max_lat);
+        if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.projected_vertices=row.work.projected_vertices.saturating_add((cached.world_vertices.len()/2) as u64);row.work.triangles=row.work.triangles.saturating_add((cached.indices.len()/3) as u64); }
         let coords: Vec<f64> = cached
             .world_vertices
             .chunks_exact(2)
             .flat_map(|p| [(p[0] - min_x) * sx + ox, (max_y - p[1]) * sy + oy])
             .collect();
-        let indices = cached.indices.clone();
+        let indices = &cached.indices;
 
         // S-100: parallelogram shear ratio (dimensionless).
         // shear = v2.x / v2.y: for each pixel of Y movement, X shifts by shear pixels.
@@ -3630,6 +3671,7 @@ impl WgpuRenderer {
         // triangles are intersected in f64, never rejected by vertex distance.
         let clipped = coords.iter().any(|v| v.abs() > 16000.);
         let idx_start = self.pattern_indices.len();
+        let vertex_start = self.pattern_vertices.len();
         let plane = area
             .display_plane
             .composition_plane(CompositionStage::Chart);
@@ -3649,6 +3691,7 @@ impl WgpuRenderer {
             };
             for (wrap_mode, dx) in wraps.into_iter().enumerate() {
                 let start = self.pattern_indices.len();
+                let clipped_vertex_start = self.pattern_vertices.len();
                 for tri in indices.chunks_exact(3) {
                     let points =
                         std::array::from_fn(|i| [coords[2 * tri[i]] + dx, coords[2 * tri[i] + 1]]);
@@ -3672,6 +3715,12 @@ impl WgpuRenderer {
                     }
                 }
                 let end = self.pattern_indices.len();
+                if let Some(records)=self.pattern_emission_audit.as_mut() {
+                    record_pattern_emission(records,&mut self.pattern_emission_audit_dropped,PatternEmissionAudit {
+                        source_ordinal,vertex_start:clipped_vertex_start,vertex_end:self.pattern_vertices.len(),
+                        index_start:start,index_end:end,wrap_mode:wrap_mode as u8,wrap_dx_screen_bits:dx.to_bits(),
+                    });
+                }
                 self.pattern_ranges.push((
                     plane,
                     priority,
@@ -3696,6 +3745,12 @@ impl WgpuRenderer {
             .display_plane
             .composition_plane(CompositionStage::Chart);
         if !clipped {
+            if let Some(records)=self.pattern_emission_audit.as_mut() {
+                record_pattern_emission(records,&mut self.pattern_emission_audit_dropped,PatternEmissionAudit {
+                    source_ordinal,vertex_start,vertex_end:self.pattern_vertices.len(),
+                    index_start:idx_start,index_end:idx_end,wrap_mode:255,wrap_dx_screen_bits:0_f64.to_bits(),
+                });
+            }
             self.pattern_ranges.push((
                 plane,
                 priority,
@@ -4240,76 +4295,21 @@ impl WgpuRenderer {
     fn ensure_symbol_texture(&mut self,symbol_id:SymbolId,symbol_str:&str,geom:&crate::SymbolGeometry) {
         if !self.symbol_textures.contains_key(&symbol_id) {self.symbol_textures.insert(symbol_id,create_symbol_texture(&self.state,&self.pipelines,symbol_str,geom));}
     }
-    pub fn prepare_globe_with_symbols(&mut self,context:&mut RenderContext,groups:Option<&std::collections::HashSet<u32>>,cache:&mut SymbolCache,profile:Option<&ColorProfile>)->Result<()> {
-        self.globe_pane=None;
-        if self.globe_symbol_resource_revision!=Some(cache.resource_revision()) {
-            self.clear_symbol_textures();self.globe_symbol_resource_revision=Some(cache.resource_revision());
-        }
-        let mut symbols=self.take_globe_symbol_preparation();
-        let result=symbols.prepare(&self.state,&self.pipelines,context,cache,profile,
-            self.diagnostic_pattern_request_keys.unwrap_or_else(||std::env::var("FERRITE_PATTERN_PREPARED_REQUEST_KEYS").as_deref()==Ok("1")),
-            self.diagnostic_prepared_symbol_reuse.unwrap_or_else(||std::env::var("FERRITE_GLOBE_PREPARED_SYMBOL_RESOURCES").as_deref()==Ok("1")));
-        self.install_globe_symbol_preparation(symbols);
-        let diagnostics=result?;
-        self.prepare_globe_preview(context,groups)?;
-        if let Some(pane)=self.globe_pane.as_mut() {merge_symbol_diagnostics(&mut pane.diagnostics.preparation,diagnostics);}
-        Ok(())
+
+    pub fn prepare_raster_scene_publication(&self,raster:PreparedRasterPublication)->Result<PreparedRasterScenePublication> {
+        self.validate_raster_publication(&raster)?;
+        Ok(PreparedRasterScenePublication{raster})
     }
-    fn take_globe_symbol_preparation(&mut self)->GlobeSymbolPreparation {
-        GlobeSymbolPreparation {symbol_textures:std::mem::take(&mut self.symbol_textures),globe_pattern_resources:std::mem::take(&mut self.globe_pattern_resources),globe_pattern_epoch:self.globe_pattern_epoch.take(),globe_prepared_symbol_epoch:self.globe_prepared_symbol_epoch.take(),globe_pattern_textures:std::mem::take(&mut self.globe_pattern_textures),globe_whole_motif_textures:std::mem::take(&mut self.globe_whole_motif_textures)}
+
+    pub fn validate_raster_scene_publication(&self,prepared:&PreparedRasterScenePublication)->Result<()> {self.validate_raster_publication(&prepared.raster)}
+
+    pub fn commit_raster_scene_publication(&mut self,prepared:PreparedRasterScenePublication) {
+        assert!(self.validate_raster_scene_publication(&prepared).is_ok(),"Stale raster scene publication");
+        self.commit_raster_publication(prepared.raster);
+        if self.continuous_layer_count==0 {self.reset_pan_offset();}
     }
-    fn install_globe_symbol_preparation(&mut self,s:GlobeSymbolPreparation) {
-        self.symbol_textures=s.symbol_textures;self.globe_pattern_resources=s.globe_pattern_resources;self.globe_pattern_epoch=s.globe_pattern_epoch;self.globe_prepared_symbol_epoch=s.globe_prepared_symbol_epoch;self.globe_pattern_textures=s.globe_pattern_textures;self.globe_whole_motif_textures=s.globe_whole_motif_textures;
-    }
-    fn globe_publication_binding(&self)->GlobePublicationBinding {
-        GlobePublicationBinding{extent:[self.state.size.width,self.state.size.height],format:self.state.format(),density:self.state.window.scale_factor().to_bits(),samples:self.globe_sample_count,symbol_scale:self.symbol_scale.to_bits(),tilt:self.ui_state.globe_tilt_deg.to_bits(),range_factor:self.ui_state.globe_range_factor.to_bits(),pose:self.ui_state.globe_pose.map(|p|[p.focus.latitude().to_bits(),p.focus.longitude().to_bits(),p.range_m.to_bits(),p.heading_deg.to_bits(),p.tilt_deg.to_bits()]),flags:[self.ui_state.globe_preview,self.globe_area_cache_enabled,self.globe_curve_cache_enabled,self.globe_curve_bounds_cache_enabled,self.globe_dyadic_sample_cache_enabled,self.globe_curve_scratch_reuse_enabled,self.globe_gpu_projection_enabled,self.spatial_hierarchy_enabled,self.continuous_layer_count!=0]}
-    }
-    /// Prepare only against next context and a fresh provider/cache. Does not
-    /// mutate live renderer fields, uniforms, old target, atlas or selected picks.
-    pub fn prepare_globe_publication(&self,context:&mut RenderContext,groups:Option<&std::collections::HashSet<u32>>,cache:&mut SymbolCache,profile:Option<&ColorProfile>,provider:Arc<dyn ferrite_render::GlobeCoverageProvider>)->Result<PreparedGlobePublication> {
-        if self.globe_coverage_provider.as_ref().is_some_and(|live|Arc::ptr_eq(live,&provider)) {return Err(WgpuError::Render("Publication requires a fresh coverage provider and source epoch cache".into()));}
-        if self.continuous_layer_count!=0 {return Err(WgpuError::Render("Continuous globe domain material is not qualified".into()));}
-        context.scaler.set_pixel_ratio(self.state.window.scale_factor());
-        let mut symbols=GlobeSymbolPreparation::default();
-        let diagnostics=symbols.prepare(&self.state,&self.pipelines,context,cache,profile,
-            self.diagnostic_pattern_request_keys.unwrap_or_else(||std::env::var("FERRITE_PATTERN_PREPARED_REQUEST_KEYS").as_deref()==Ok("1")),
-            self.diagnostic_prepared_symbol_reuse.unwrap_or_else(||std::env::var("FERRITE_GLOBE_PREPARED_SYMBOL_RESOURCES").as_deref()==Ok("1")))?;
-        // Separate Egui Context, renderer and atlas: Context::clone is shared.
-        let mut fonts=EguiIntegration::new(&self.state.device,self.state.format(),1,Arc::clone(&self.state.window));
-        let mut resources=None;
-        let rasters:Vec<_>=if std::env::var("FERRITE_EXPERIMENTAL_GLOBE_RASTERS").as_deref()==Ok("1") {
-            self.raster_layers.iter().map(|l|crate::globe_raster::GlobeRasterLayer{bounds:l.bounds,grid:l.grid,tile_size:l.tile_size,continuous:l.continuous.is_some(),draw_order:l.draw_order,viewing_groups:&l.viewing_groups,bind_group:&l.bind_group}).collect()
-        }else{Vec::new()};
-        let mut pane=crate::globe_view::GlobePane::prepare(&self.state,&mut resources,&self.pipelines,context,groups,self.ui_state.globe_tilt_deg,
-            if self.ui_state.globe_range_factor>0. {self.ui_state.globe_range_factor}else{1.},self.ui_state.globe_pose,
-            &symbols.symbol_textures,&symbols.globe_pattern_resources,&rasters,self.symbol_scale,&mut fonts,self.globe_sample_count,
-            self.globe_area_cache_enabled,self.globe_curve_cache_enabled,self.globe_curve_bounds_cache_enabled,self.globe_dyadic_sample_cache_enabled,
-            self.globe_curve_scratch_reuse_enabled,self.globe_gpu_projection_enabled,self.spatial_hierarchy_enabled,Some(provider.as_ref())).map_err(WgpuError::Render)?;
-        merge_symbol_diagnostics(&mut pane.diagnostics.preparation,diagnostics);
-        let display_scale=pane.diagnostics.scale_denominator.round().clamp(1.,u32::MAX as f64) as u32;
-        let summary=format!("Globe preview: {} areas, {} lines, {} labels; {} unsupported commands, {} rejected geometries",pane.diagnostics.areas,pane.diagnostics.lines,pane.diagnostics.texts,pane.diagnostics.unsupported_commands,pane.diagnostics.rejected_geometries);
-        Ok(PreparedGlobePublication{owner:Arc::clone(&self.continuous_owner),binding:self.globe_publication_binding(),pane,resources,fonts,symbols,resource_revision:cache.resource_revision(),provider,viewport:context.scaler.viewport,display_scale,summary})
-    }
-    /// Validate immediately before durable history commit; no external events
-    /// may mutate this renderer between validation and infallible installation.
-    pub fn validate_globe_publication(&self,prepared:&PreparedGlobePublication)->Result<()> {
-        if !globe_publication_binding_matches(&self.continuous_owner,&prepared.owner,&self.globe_publication_binding(),&prepared.binding) {
-            return Err(WgpuError::Render("Globe publication renderer/extent/sample state changed".into()));
-        }
-        Ok(())
-    }
-    /// No recoverable fallible preparation follows this capsule installation.
-    /// Must have been validated on this renderer immediately before history commit.
-    pub fn commit_globe_publication(&mut self,prepared:PreparedGlobePublication) {
-        assert!(Arc::ptr_eq(&self.continuous_owner,&prepared.owner),"Globe publication belongs to another renderer");
-        if self.globe_symbol_resource_revision!=Some(prepared.resource_revision) {self.pattern_textures.clear();}
-        self.install_globe_symbol_preparation(prepared.symbols);
-        self.globe_symbol_resource_revision=Some(prepared.resource_revision);
-        self.globe_resources=prepared.resources;self.globe_publication_fonts=Some(prepared.fonts);
-        self.globe_coverage_provider=Some(prepared.provider);self.globe_pane=Some(prepared.pane);
-        self.chart_geometry_viewport=Some(prepared.viewport);self.display_scale=prepared.display_scale;self.ui_state.globe_summary=prepared.summary;
-        self.reset_pan_offset();
-    }
+
+
     fn try_add_symbol(
         &mut self,
         point: &ferrite_render::PointInstruction,
@@ -4534,6 +4534,7 @@ impl WgpuRenderer {
         )>,
         Vec<bool>,
     ) {
+        let _flat_text_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::TextAndDeclutter);
         shapes.clear();
         let mut accepted = if capture_shapes {
             Vec::new()
@@ -4800,22 +4801,46 @@ impl WgpuRenderer {
         self.egui.end_frame(&self.state.window)
     }
 
+    /// Reuse exact immutable40B payloads only. Changed content always allocates;
+    /// neither live batches nor future private publications are queue-written.
+    fn prepare_symbol_instance_vertex_buffer(&mut self)->wgpu::Buffer {
+        let count=self.packed_symbol_vertices.len()/4;
+        let byte_count=(count as u64)*40;
+        if let Some(cache)=self.immutable_instance_cache.as_mut().filter(|_|byte_count<=crate::immutable_payload_cache::ImmutablePayloadCache::<wgpu::Buffer>::MAX_PAYLOAD as u64) {
+            let mut bytes=Vec::with_capacity(byte_count as usize);
+            for quad in self.packed_symbol_vertices.chunks_exact(4) {
+                bytes.extend_from_slice(bytemuck::bytes_of(&crate::symbol_instance::SymbolQuadInstance::from_quad(quad)));
+            }
+            let state=&self.state;
+            return cache.reuse_or_create(&bytes,||state.create_vertex_buffer(&bytes,"immutable_symbol_instance_vb"));
+        }
+        if let Some(cache)=self.immutable_instance_cache.as_mut() { cache.record_uncached_creation(); }
+        // OFF/oversized fallback preserves the original direct mapped upload.
+        let buffer=self.state.device.create_buffer(&wgpu::BufferDescriptor {
+            label:Some("symbol_instance_vb"),size:byte_count,usage:wgpu::BufferUsages::VERTEX,mapped_at_creation:true,
+        });
+        {
+            let mut mapped=buffer.slice(..).get_mapped_range_mut();
+            for (output,quad) in mapped.chunks_exact_mut(40).zip(self.packed_symbol_vertices.chunks_exact(4)) {
+                output.copy_from_slice(bytemuck::bytes_of(&crate::symbol_instance::SymbolQuadInstance::from_quad(quad)));
+            }
+        }
+        buffer.unmap();buffer
+    }
+
     /// Upload changed geometry once, shared by screen and image targets.
     fn prepare_geometry_buffers(&mut self) {
+        let _flat_upload_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::BufferUpload);
         if self.gpu_buffers_dirty {
             self.cached_area_vb = if !self.area_vertices.is_empty() {
-                Some(
-                    self.state
-                        .create_vertex_buffer(&self.area_vertices, "area_vertices"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.area_vertices).len() as u64);} self.state.create_vertex_buffer(&self.area_vertices, "area_vertices") },
                 )
             } else {
                 None
             };
             self.cached_area_ib = if !self.area_indices.is_empty() {
                 self.cached_area_index_count = self.area_indices.len() as u32;
-                Some(
-                    self.state
-                        .create_index_buffer(&self.area_indices, "area_indices"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.area_indices).len() as u64);} self.state.create_index_buffer(&self.area_indices, "area_indices") },
                 )
             } else {
                 self.cached_area_index_count = 0;
@@ -4823,18 +4848,14 @@ impl WgpuRenderer {
             };
 
             self.cached_line_vb = if !self.line_vertices.is_empty() {
-                Some(
-                    self.state
-                        .create_vertex_buffer(&self.line_vertices, "line_vertices"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.line_vertices).len() as u64);} self.state.create_vertex_buffer(&self.line_vertices, "line_vertices") },
                 )
             } else {
                 None
             };
             self.cached_line_ib = if !self.line_indices.is_empty() {
                 self.cached_line_index_count = self.line_indices.len() as u32;
-                Some(
-                    self.state
-                        .create_index_buffer(&self.line_indices, "line_indices"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.line_indices).len() as u64);} self.state.create_index_buffer(&self.line_indices, "line_indices") },
                 )
             } else {
                 self.cached_line_index_count = 0;
@@ -4842,18 +4863,14 @@ impl WgpuRenderer {
             };
 
             self.cached_pattern_vb = if !self.pattern_vertices.is_empty() {
-                Some(
-                    self.state
-                        .create_vertex_buffer(&self.pattern_vertices, "pattern_vertices"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.pattern_vertices).len() as u64);} self.state.create_vertex_buffer(&self.pattern_vertices, "pattern_vertices") },
                 )
             } else {
                 None
             };
             self.cached_pattern_ib = if !self.pattern_indices.is_empty() {
                 self.cached_pattern_index_count = self.pattern_indices.len() as u32;
-                Some(
-                    self.state
-                        .create_index_buffer(&self.pattern_indices, "pattern_indices"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.pattern_indices).len() as u64);} self.state.create_index_buffer(&self.pattern_indices, "pattern_indices") },
                 )
             } else {
                 self.cached_pattern_index_count = 0;
@@ -4862,33 +4879,25 @@ impl WgpuRenderer {
 
             // World map separate GPU buffers
             self.cached_wm_line_vb = if !self.world_map_line_vertices.is_empty() {
-                Some(
-                    self.state
-                        .create_vertex_buffer(&self.world_map_line_vertices, "wm_line_vb"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.world_map_line_vertices).len() as u64);} self.state.create_vertex_buffer(&self.world_map_line_vertices, "wm_line_vb") },
                 )
             } else {
                 None
             };
             self.cached_wm_line_ib = if !self.world_map_line_indices.is_empty() {
-                Some(
-                    self.state
-                        .create_index_buffer(&self.world_map_line_indices, "wm_line_ib"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.world_map_line_indices).len() as u64);} self.state.create_index_buffer(&self.world_map_line_indices, "wm_line_ib") },
                 )
             } else {
                 None
             };
             self.cached_wm_mask_vb = if !self.world_map_mask_vertices.is_empty() {
-                Some(
-                    self.state
-                        .create_vertex_buffer(&self.world_map_mask_vertices, "wm_mask_vb"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.world_map_mask_vertices).len() as u64);} self.state.create_vertex_buffer(&self.world_map_mask_vertices, "wm_mask_vb") },
                 )
             } else {
                 None
             };
             self.cached_wm_mask_ib = if !self.world_map_mask_indices.is_empty() {
-                Some(
-                    self.state
-                        .create_index_buffer(&self.world_map_mask_indices, "wm_mask_ib"),
+                Some({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.world_map_mask_indices).len() as u64);} self.state.create_index_buffer(&self.world_map_mask_indices, "wm_mask_ib") },
                 )
             } else {
                 None
@@ -4900,14 +4909,17 @@ impl WgpuRenderer {
         // This avoids mutable self borrows inside the render pass where view bind groups
         // are held as immutable references (for longitude wrapping multi-pass rendering).
         {
-            let sym_ranges = self.symbol_priority_ranges.to_vec();
+            // Copy one tuple before mutable packing. Packing changes only the
+            // packed output arrays; it never changes symbol_priority_ranges.
+            let range_count = self.symbol_priority_ranges.len();
             // Bound the transient lookup; oversized charts use the original scan.
-            let mut symbol_keys = (self.draw_range_index_enabled && !self.ui_state.globe_preview
+            let mut symbol_keys = (self.draw_range_index_enabled && !false
                 && self.cached_symbol_buffers.len() <= 32_768
-                && sym_ranges.len() <= 32_768)
+                && range_count <= 32_768)
                 .then(|| self.cached_symbol_buffers.iter()
                     .map(|(p,q,a,b,_,_,_)| (*p,*q,*a,*b)).collect::<FxHashSet<_>>());
-            for &(pl, pri, start, end, _) in &sym_ranges {
+            for range_index in 0..range_count {
+                let (pl, pri, start, end, _) = self.symbol_priority_ranges[range_index];
                 if end <= start {
                     continue;
                 }
@@ -4924,27 +4936,16 @@ impl WgpuRenderer {
                     continue;
                 }
                 let (sym_vb, sym_ib) = if self.pipelines.symbol_instance_pipeline.is_some() {
-                    // Populate the mapped GPU buffer directly; retain no extra CPU instance vector.
-                    let count = self.packed_symbol_vertices.len() / 4;
-                    let buffer = self.state.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("symbol_instance_vb"),
-                        size: (count as u64) * 40,
-                        usage: wgpu::BufferUsages::VERTEX,
-                        mapped_at_creation: true,
-                    });
-                    {
-                        let mut mapped = buffer.slice(..).get_mapped_range_mut();
-                        for (output, quad) in mapped.chunks_exact_mut(40)
-                            .zip(self.packed_symbol_vertices.chunks_exact(4)) {
-                            output.copy_from_slice(bytemuck::bytes_of(
-                                &crate::symbol_instance::SymbolQuadInstance::from_quad(quad)));
-                        }
+                    let buffer=self.prepare_symbol_instance_vertex_buffer();
+                    // Buffer::clone retains the same immutable GPU handle; INDEX-only
+                    // usage deliberately omits COPY_DST, preventing pool-style writes.
+                    if self.shared_symbol_quad_index_buffer.is_none() {
+                        self.shared_symbol_quad_index_buffer=Some(self.state.create_index_buffer(
+                            &crate::symbol_instance::QUAD_INDICES,"shared_symbol_instance_ib"));
                     }
-                    buffer.unmap();
-                    (buffer, self.state.create_index_buffer(&crate::symbol_instance::QUAD_INDICES, "symbol_instance_ib"))
+                    (buffer,self.shared_symbol_quad_index_buffer.as_ref().expect("quad initialized").clone())
                 } else {
-                    (self.state.create_vertex_buffer(&self.packed_symbol_vertices, "symbol_packed_vb"),
-                     self.state.create_index_buffer(&self.packed_symbol_indices, "symbol_packed_ib"))
+                    ({ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.packed_symbol_vertices).len() as u64);} self.state.create_vertex_buffer(&self.packed_symbol_vertices, "symbol_packed_vb") },{ if let Some(cell)=&self.flat_diagnostic {let mut row=cell.borrow_mut();row.work.buffer_upload_calls=row.work.buffer_upload_calls.saturating_add(1);row.work.buffer_upload_bytes=row.work.buffer_upload_bytes.saturating_add(bytemuck::cast_slice::<_,u8>(&self.packed_symbol_indices).len() as u64);} self.state.create_index_buffer(&self.packed_symbol_indices, "symbol_packed_ib") })
                 };
                 let ranges: Vec<_> = self.packed_symbol_ranges.clone();
                 self.cached_symbol_buffers
@@ -5030,7 +5031,6 @@ impl WgpuRenderer {
         serde_json::json!({"allocations":self.chart_text_buffers.allocations,"writes":self.chart_text_buffers.writes,"retained_bytes":self.chart_text_buffers.retained_bytes,"budget_bytes":ChartTextBufferPool::BUDGET,"slots":self.chart_text_buffers.slots.len()})
     }
 
-    /// Select supported globe sampling without changing the camera pose.
     /// Default 4x matches chart antialiasing; 1x permits controlled sampling audits.
     /// Disable retained area meshes for constrained hosts or differential audits.
     /// The next preparation releases cached areas and executes identical cold draping.
@@ -5039,238 +5039,7 @@ impl WgpuRenderer {
     pub fn set_spatial_hierarchy_enabled(&mut self, enabled: bool) {
         self.spatial_hierarchy_enabled = enabled;
     }
-    pub fn set_globe_gpu_projection_enabled(&mut self, enabled: bool) {
-        self.globe_gpu_projection_enabled = enabled;
-    }
-    /// Reuse bounded subdivision work buffers within each curve call.
-    /// Off until controlled geometry, memory, and performance audits pass.
-    pub fn set_globe_curve_scratch_reuse_enabled(&mut self, enabled: bool) {
-        self.globe_curve_scratch_reuse_enabled = enabled;
-    }
-    /// Optional bounded source-coordinate samples; off until performance gates pass.
-    pub fn set_globe_dyadic_sample_cache_enabled(&mut self, enabled: bool) {
-        self.globe_dyadic_sample_cache_enabled = enabled;
-    }
-    /// Differential audit control for source bounds only; route preparation remains cached.
-    pub fn set_globe_curve_bounds_cache_enabled(&mut self, enabled: bool) {
-        self.globe_curve_bounds_cache_enabled = enabled;
-    }
-    pub fn set_globe_curve_cache_enabled(&mut self, enabled: bool) {
-        self.globe_curve_cache_enabled = enabled;
-    }
-    pub fn set_globe_area_cache_enabled(&mut self, enabled: bool) {
-        self.globe_area_cache_enabled = enabled;
-    }
-    pub fn set_globe_sample_count(&mut self, count: u32) -> Result<()> {
-        if !matches!(count, 1 | 4) {
-            return Err(WgpuError::Render("Globe sampling must be 1 or 4".into()));
-        }
-        if self.globe_sample_count != count {
-            self.globe_sample_count = count;
-            self.globe_pane = None;
-            self.globe_resources = None;
-        }
-        Ok(())
-    }
-    /// Prepare a real perspective chart target. Flat caches remain separate.
-    pub fn prepare_globe_preview(
-        &mut self,
-        context: &mut RenderContext,
-        groups: Option<&std::collections::HashSet<u32>>,
-    ) -> Result<()> {
-        self.reset_pan_offset();
-        context
-            .scaler
-            .set_pixel_ratio(self.state.window.scale_factor());
-        if self.globe_pattern_epoch != Some((context.geometry_revision(),context.scaler.pixels_per_mm().to_bits())) {
-            self.globe_pattern_resources.clear();
-            self.globe_pattern_epoch=None;
-        self.globe_prepared_symbol_epoch=None;
-        }
-        self.chart_geometry_viewport = Some(context.scaler.viewport);
-        self.display_scale = context
-            .scaler
-            .display_scale
-            .round()
-            .clamp(1., u32::MAX as f64) as u32;
-        // Invalidate before preparing: an error must not leave an old camera's image/pick.
-        self.globe_pane = None;
-        if self.continuous_layer_count != 0 {
-            return Err(crate::WgpuError::Render("Continuous globe domain material is staged: whole-triangle ray/native interpolation and hardware bounds not qualified".into()));
-        }
-        // Experimental until nearest-node geographic interpolation and tile
-        // seams are independently verified. Flat texture pixels are shared.
-        let globe_rasters:Vec<_>=if std::env::var("FERRITE_EXPERIMENTAL_GLOBE_RASTERS").as_deref()==Ok("1") {
-            self.raster_layers.iter().map(|l|crate::globe_raster::GlobeRasterLayer{bounds:l.bounds,grid:l.grid,tile_size:l.tile_size,continuous:l.continuous.is_some(),draw_order:l.draw_order,viewing_groups:&l.viewing_groups,bind_group:&l.bind_group}).collect()
-        } else {Vec::new()};
-        let pane = crate::globe_view::GlobePane::prepare(
-            &self.state,
-            &mut self.globe_resources,
-            &self.pipelines,
-            context,
-            groups,
-            self.ui_state.globe_tilt_deg,
-            if self.ui_state.globe_range_factor > 0. {
-                self.ui_state.globe_range_factor
-            } else {
-                1.
-            },
-            self.ui_state.globe_pose,
-            &self.symbol_textures,
-            &self.globe_pattern_resources,
-            &globe_rasters,
-            self.symbol_scale,
-            self.globe_publication_fonts.as_mut().unwrap_or(&mut self.egui),
-            self.globe_sample_count,
-            self.globe_area_cache_enabled,
-            self.globe_curve_cache_enabled,
-            self.globe_curve_bounds_cache_enabled,
-            self.globe_dyadic_sample_cache_enabled,
-            self.globe_curve_scratch_reuse_enabled,
-            self.globe_gpu_projection_enabled,
-            self.spatial_hierarchy_enabled,
-            self.globe_coverage_provider.as_deref(),
-        )
-        .map_err(WgpuError::Render)?;
-        self.display_scale = pane
-            .diagnostics
-            .scale_denominator
-            .round()
-            .clamp(1., u32::MAX as f64) as u32;
-        self.ui_state.globe_summary =
-            format!(
-            "Globe preview: {} areas, {} lines, {} labels; {} unsupported commands, {} rejected geometries",
-            pane.diagnostics.areas, pane.diagnostics.lines, pane.diagnostics.texts,
-            pane.diagnostics.unsupported_commands, pane.diagnostics.rejected_geometries,
-        );
-        self.globe_pane = Some(pane);
-        self.update_selection(&context.scaler);
-        Ok(())
-    }
-    /// Replacing product policy invalidates the displayed pane and its picks.
-    pub fn set_globe_coverage_provider(
-        &mut self,
-        provider: Option<Arc<dyn ferrite_render::GlobeCoverageProvider>>,
-    ) {
-        self.globe_pane = None;
-        self.globe_coverage_provider = provider;
-    }
-    pub fn clear_globe_preview(&mut self) {
-        self.ui_state.globe_pose = None;
-        self.globe_pane = None;
-        self.globe_resources = None;
-        self.globe_publication_fonts = None;
-    }
-    pub fn globe_pose(&self) -> Option<ferrite_kernel::globe_navigation::GlobePose> {
-        let d = self.globe_preview_diagnostics()?;
-        Some(ferrite_kernel::globe_navigation::GlobePose {
-            focus: ferrite_kernel::geodesy::GeographicPosition::new(d.focus[1], d.focus[0]).ok()?,
-            range_m: d.range_m,
-            heading_deg: d.heading_deg,
-            tilt_deg: d.tilt_deg,
-        })
-    }
-    pub fn move_globe_anchor(
-        &mut self,
-        anchor: WorldPoint,
-        screen: ScreenPoint,
-        ratio: f64,
-    ) -> bool {
-        let Some(pose) = self.globe_pose() else {
-            return false;
-        };
-        let Some(d) = self.globe_preview_diagnostics() else {
-            return false;
-        };
-        if !ratio.is_finite() || ratio <= 0. {
-            return false;
-        }
-        let v = d.viewport;
-        let Ok(anchor) = ferrite_kernel::geodesy::GeographicPosition::new(anchor.y, anchor.x)
-        else {
-            return false;
-        };
-        let Ok(next) = pose.anchored(
-            [v[2], v[3]],
-            anchor,
-            [screen.x as f64 - v[0], screen.y as f64 - v[1]],
-            (pose.range_m / ratio).clamp(10., 50_000_000.),
-        ) else {
-            return false;
-        };
-        self.ui_state.globe_pose = Some(next);
-        true
-    }
-    /// Current final execution sources, including admitted text/point commands.
-    pub fn globe_displayed_sources(&self) -> &[usize] {
-        self.globe_pane
-            .as_ref()
-            .map_or(&[], |p| p.source_ordinals.as_slice())
-    }
-    pub fn globe_feature_candidates(
-        &mut self,
-        context: &RenderContext,
-        screen: ScreenPoint,
-        radius: f64,
-    ) -> Result<Vec<(usize, crate::globe_scene::GlobeDrawHit)>> {
-        let pane = self
-            .globe_pane
-            .as_ref()
-            .ok_or_else(|| WgpuError::Render("No current globe image for selection".into()))?;
-        if pane.source_geometry_revision != context.geometry_revision()
-            || !pane.matches(
-                &context.scaler,
-                self.ui_state.globe_tilt_deg,
-                self.ui_state.globe_pose,
-                if self.ui_state.globe_range_factor > 0. {
-                    self.ui_state.globe_range_factor
-                } else {
-                    1.
-                },
-            )
-        {
-            return Err(WgpuError::Render(
-                "Globe selection camera or source is stale".into(),
-            ));
-        }
-        let resources = self
-            .globe_resources
-            .as_mut()
-            .ok_or_else(|| WgpuError::Render("Globe selection resources absent".into()))?;
-        pane.pick_sources(
-            resources,
-            &self.state,
-            [screen.x as f64, screen.y as f64],
-            radius,
-        )
-        .map_err(WgpuError::Render)
-    }
-    pub fn set_globe_selection_click(
-        &mut self,
-        screen: [f64; 2],
-        device_fixed: bool,
-        scaler: &ferrite_render::Scaler,
-    ) {
-        self.selection_device_anchor = None;
-        if device_fixed {
-            if let (Some(p), Some(f)) = (&self.globe_pane, &self.ui_state.selected_feature) {
-                let v = p.diagnostics.viewport;
-                let ppm = p.pixels_per_mm();
-                self.selection_device_anchor = Some((
-                    f.cell_index,
-                    f.feature_id,
-                    [(screen[0] - v[0]) / ppm, (v[1] + v[3] - screen[1]) / ppm],
-                ));
-            }
-        }
-        self.update_selection(scaler);
-    }
-    pub fn globe_world_at(&self, screen: ScreenPoint) -> Option<WorldPoint> {
-        self.globe_pane.as_ref()?.world_at(screen)
-    }
-    pub fn globe_preview_diagnostics(&self) -> Option<&crate::GlobePreviewDiagnostics> {
-        self.globe_pane.as_ref().map(|p| &p.diagnostics)
-    }
+
 
     /// Encode the same ordered geometry pass for every render target.
     fn bind_coverage_pipeline<'a>(
@@ -5343,7 +5112,7 @@ impl WgpuRenderer {
         resolve_target: Option<&wgpu::TextureView>,
         gpu_query: Option<&wgpu_profiler::GpuProfilerQuery>,
     ) {
-        let draw_index = if self.draw_range_index_enabled && !self.ui_state.globe_preview {
+        let draw_index = if self.draw_range_index_enabled && !false {
             let total = self.area_priority_ranges.len()
                 .checked_add(self.pattern_ranges.len())
                 .and_then(|n| n.checked_add(self.line_priority_ranges.len()))
@@ -5406,17 +5175,7 @@ impl WgpuRenderer {
                 chart_scissor[3],
             );
 
-            if self.ui_state.globe_preview {
-                if let Some(pane) = &self.globe_pane {
-                    render_pass.set_pipeline(&self.pipelines.texture_pipeline);
-                    render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                    render_pass.set_bind_group(1, &pane.bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, pane.vertices.slice(..));
-                    render_pass.set_index_buffer(pane.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..6, 0, 0..1);
-                }
-                return;
-            }
+
 
             // === LAYER 1: World map coastlines (lowest layer) ===
             if let (Some(vb), Some(ib)) = (&self.cached_wm_line_vb, &self.cached_wm_line_ib) {
@@ -5656,6 +5415,7 @@ impl WgpuRenderer {
 
     /// Render the frame
     pub fn render(&mut self) -> Result<()> {
+        let flat_acquire_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::CompletionWait);
         self.validate_continuous_frame()?;
         let profiling = crate::profiler::is_profiling_enabled();
 
@@ -5666,6 +5426,8 @@ impl WgpuRenderer {
             None
         };
         let output = self.state.get_current_texture()?;
+        drop(flat_acquire_span);
+        let flat_encode_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::EncodeAndSubmit);
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -5782,6 +5544,7 @@ impl WgpuRenderer {
             self.cpu_profiler.record("queue_submit", t.elapsed());
         }
 
+        drop(flat_encode_span);
         // GPU profiler: end frame and process results
         if self.gpu_profiler.is_enabled() {
             if let Err(error) = self.gpu_profiler.profiler.end_frame() {
@@ -5795,7 +5558,9 @@ impl WgpuRenderer {
         } else {
             None
         };
+        let flat_present_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::PresentCall);
         output.present();
+        drop(flat_present_span);
         if let Some(t) = present_timer {
             self.cpu_profiler.record("present", t.elapsed());
         }
@@ -5812,6 +5577,7 @@ impl WgpuRenderer {
     /// Private hidden test control; production defaults OFF unless explicitly enabled.
     pub fn wait_hidden_key_frame(&self)->Result<()> {
         if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Key frame wait requires hidden unfocused mode".into()));}
+        let _flat_wait_span=self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::CompletionWait);
         self.state.device.poll(wgpu::Maintain::Wait);Ok(())
     }
 
@@ -5837,29 +5603,6 @@ impl WgpuRenderer {
         std::fs::write(path.join("coverage.json"),serde_json::to_vec_pretty(&serde_json::json!({"bound":self.prepared_coverage.is_some(),"source_datasets":ids,"instruction_count":context.instruction_count(),"passes":passes})).map_err(|e|WgpuError::Render(e.to_string()))?).map_err(|e|WgpuError::Render(e.to_string()))?;Ok(())
     }
 
-    pub fn configure_hidden_prepared_symbol_resources(&mut self,enabled:bool)->Result<()> {
-        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Prepared symbol diagnostic requires hidden unfocused mode".into()));}
-        self.diagnostic_prepared_symbol_reuse=Some(enabled);self.globe_prepared_symbol_epoch=None;Ok(())
-    }
-    pub fn configure_hidden_retained_passing_diagnostic(&mut self,enabled:bool)->Result<()> {
-        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Retained passing diagnostic requires hidden unfocused mode".into()));}
-        if let Some(resources)=self.globe_resources.as_mut() {resources.configure_retained_passing(enabled);}
-        else if self.ui_state.globe_preview {return Err(WgpuError::Render("Prepared globe required".into()));}
-        Ok(())
-    }
-    pub fn configure_hidden_source_cache_diagnostic(&mut self,mode:u8)->Result<()> {
-        if mode>2 || !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Source cache diagnostic requires hidden unfocused mode and mode0..2".into()));}
-        if let Some(resources)=self.globe_resources.as_mut() {resources.configure_source_cache(mode);}
-        else if self.ui_state.globe_preview {return Err(WgpuError::Render("Prepared globe required".into()));}
-        Ok(())
-    }
-
-    pub fn configure_hidden_pattern_key_diagnostic(&mut self,enabled:bool)->Result<()> {
-        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {
-            return Err(WgpuError::Render("Pattern key diagnostic requires hidden unfocused mode".into()));
-        }
-        self.diagnostic_pattern_request_keys=Some(enabled);Ok(())
-    }
     pub fn window(&self) -> &Window {
         &self.state.window
     }
@@ -6223,21 +5966,39 @@ mod chart_pass_scissor_tests {
     }
 }
 
+
+
 #[cfg(test)]
-mod globe_publication_stage_tests {
+mod raster_publication_stage_tests {
     use super::*;
-    fn binding()->GlobePublicationBinding {GlobePublicationBinding{extent:[800,600],format:wgpu::TextureFormat::Bgra8UnormSrgb,density:2f64.to_bits(),samples:4,symbol_scale:1f32.to_bits(),tilt:0f64.to_bits(),range_factor:1f64.to_bits(),pose:Some([0,0,100f64.to_bits(),0,0]),flags:[false;9]}}
     #[test]
-    fn publication_binding_rejects_other_renderer_and_changed_frame_state() {
-        let owner=Arc::new(());let other=Arc::new(());let expected=binding();
-        assert!(globe_publication_binding_matches(&owner,&owner,&expected,&expected));
-        assert!(!globe_publication_binding_matches(&owner,&other,&expected,&expected));
-        for field in 0..9 {let mut changed=expected.clone();match field {0=>changed.extent[0]+=1,1=>changed.format=wgpu::TextureFormat::Rgba8Unorm,2=>changed.density=1f64.to_bits(),3=>changed.samples=1,4=>changed.symbol_scale=2f32.to_bits(),5=>changed.tilt=1f64.to_bits(),6=>changed.range_factor=2f64.to_bits(),7=>changed.pose.as_mut().unwrap()[2]=101f64.to_bits(),_=>changed.flags[1]=true};assert!(!globe_publication_binding_matches(&owner,&owner,&changed,&expected),"field{field}");}
+    fn renderer_lifetime_and_source_inventory_epoch_must_both_match() {
+        let owner=Arc::new(());let epoch=Arc::new(());
+        assert!(raster_publication_identity_matches(&owner,&owner,&epoch,&epoch));
+        assert!(!raster_publication_identity_matches(&owner,&Arc::new(()),&epoch,&epoch));
+        assert!(!raster_publication_identity_matches(&owner,&owner,&epoch,&Arc::new(())));
+    }
+}
+
+
+#[cfg(test)]
+mod pattern_emission_audit_tests {
+    use super::*;
+    fn record(source:usize)->PatternEmissionAudit {
+        PatternEmissionAudit {source_ordinal:source,vertex_start:7199,vertex_end:7204,index_start:0,index_end:3,wrap_mode:255,wrap_dx_screen_bits:0_f64.to_bits()}
     }
     #[test]
-    fn fresh_publication_symbol_state_has_no_live_gpu_aliases_or_epochs() {
-        let fresh=GlobeSymbolPreparation::default();
-        assert!(fresh.symbol_textures.is_empty()&&fresh.globe_pattern_resources.is_empty()&&fresh.globe_pattern_textures.is_empty()&&fresh.globe_whole_motif_textures.is_empty());
-        assert!(fresh.globe_pattern_epoch.is_none()&&fresh.globe_prepared_symbol_epoch.is_none());
+    fn owned_vertices_include_unused_earcut_prefix_and_exact_source() {
+        let mut records=Vec::new();let mut dropped=0;
+        record_pattern_emission(&mut records,&mut dropped,record(66));
+        let r=&records[0];assert_eq!((r.source_ordinal,r.vertex_start,r.vertex_end),(66,7199,7204));
+        assert_eq!((r.index_start,r.index_end,r.wrap_mode,r.wrap_dx_screen_bits),(0,3,255,0_f64.to_bits()));
+        assert_eq!(dropped,0);
+    }
+    #[test]
+    fn bounded_audit_reports_incompleteness_instead_of_silent_subset() {
+        let mut records=vec![record(0);MAX_PATTERN_AUDIT_EMISSIONS];let mut dropped=0;
+        record_pattern_emission(&mut records,&mut dropped,record(1));
+        assert_eq!(records.len(),MAX_PATTERN_AUDIT_EMISSIONS);assert_eq!(dropped,1);
     }
 }

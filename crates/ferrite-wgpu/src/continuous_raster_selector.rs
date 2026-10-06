@@ -1,4 +1,4 @@
-//! Shared selector material prototype. Flat colour and globe colour/coverage/ID
+//! Shared selector material prototype for flat colour
 //! must call this SAME function before emitting anything. This module is staged;
 //! uploader and shared material entrypoints are wired, but frame promotion remains
 //! disabled until projection/interpolation and hardware precision are qualified.
@@ -84,6 +84,7 @@ fn continuous_grid_select(image:texture_2d<f32>,p:vec2<f32>,span:vec2<f32>,coord
 /// Opaque promotion token. There is intentionally NO constructor while whole-
 /// triangle projection/interpolation and hardware precision remain unvalidated.
 /// Staging/compiling a material must not silently turn it into a frame certificate.
+#[derive(Clone)]
 pub struct ValidatedContinuousFrame {
     pub(crate) transform_key:[u32;9],
     pub(crate) binding:crate::continuous_frame_binding::ContinuousFrameBinding,
@@ -96,7 +97,7 @@ impl ValidatedContinuousFrame {
 }
 
 /// A separate flat material leaves the existing raster shader/pipeline unchanged.
-/// The same selector function below is also composed into globe colour/coverage/ID.
+/// The selector function below is composed into flat colour.
 pub(crate) fn flat_shader()->String {
     format!("{}\n{}",SELECTOR_WGSL,r#"
 struct Input { @location(0) position:vec2<f32>, @location(1) anchor:vec2<f32>, @location(2) origin:vec2<f32>, @location(3) step:vec2<f32>, @location(4) offset:vec2<u32>, @location(5) size:vec2<u32>, @location(6) row_bounds:vec2<f32>, @location(7) row_index:u32 }

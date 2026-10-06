@@ -160,6 +160,7 @@ impl<'a> PreparedLatticeKeys<'a> {
 /// Symbol cache for efficient symbol rendering
 #[derive(Debug)]
 pub struct SymbolCache {
+    shallow_pattern_contract: Option<ferrite_render::ShallowPatternContract>,
     /// Cached symbol geometry (keyed by symbol ID)
     symbols: HashMap<String, SymbolGeometry>,
     /// Symbol IDs that failed to load (avoid re-attempting every frame)
@@ -191,6 +192,16 @@ fn next_symbol_resource_revision() -> u64 {
 
 impl SymbolCache {
     pub fn resource_revision(&self) -> u64 {self.resource_revision}
+    /// Independent unpublished caches sharing immutable PC source bytes only.
+    /// A failed candidate cannot clear live raster/support/motif resources.
+    pub fn fork_empty(&self) -> Self {
+        let mut next = Self::new(&self.symbols_path);
+        next.sources = self.sources.clone();
+        next.shallow_pattern_contract = self.shallow_pattern_contract.clone();
+        next.render_scale = self.render_scale;
+        next
+    }
+
     /// Create new symbol cache
     ///
     /// Symbols are rasterized at `BASE_PX_PER_MM × RENDER_QUALITY_MULTIPLIER` pixels per mm
@@ -198,7 +209,7 @@ impl SymbolCache {
     /// in the renderer.
     pub fn new<P: AsRef<Path>>(symbols_path: P) -> Self {
         SymbolCache {
-            symbols: HashMap::new(),
+            shallow_pattern_contract: None,            symbols: HashMap::new(),
             missing_symbols: HashSet::new(),
             lattice_patterns: HashMap::new(),
             lattice_pattern_bytes: 0,
@@ -218,6 +229,13 @@ impl SymbolCache {
         cache.sources = Some(sources);
         cache
     }
+
+    pub fn new_with_pattern_contract<P: AsRef<Path>>(symbols_path:P,sources:std::sync::Arc<ferrite_portrayal_catalog::CatalogueSources>,contract:Option<ferrite_render::ShallowPatternContract>)->Self {
+        let contract=contract.filter(|c|c.source_digest()==*sources.digest());
+        let mut cache=Self::new_with_sources(symbols_path,sources);
+        cache.shallow_pattern_contract=contract;cache
+    }
+    pub fn shallow_pattern_contract(&self)->Option<&ferrite_render::ShallowPatternContract> {self.shallow_pattern_contract.as_ref()}
 
     fn source_exists(&self, path: &Path) -> bool {
         match &self.sources { Some(s) => match s.read_path(path) {
@@ -1387,4 +1405,24 @@ fn legacy_key(revision:u64,symbol_id:&str,color_profile:&ColorProfile,lattice:fe
         assert!(keys.entries.is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod publication_fork_tests {
+    use super::*;
+    #[test]
+    fn empty_fork_preserves_source_configuration_without_invalidating_live_cache() {
+        let mut live=SymbolCache::new("unused-publication-test-path");
+        live.render_scale=7.25;
+        live.missing_symbols.insert("retained-missing-symbol".into());
+        let revision=live.resource_revision();
+        let next=live.fork_empty();
+        assert_eq!(live.resource_revision(),revision);
+        assert!(live.missing_symbols.contains("retained-missing-symbol"));
+        assert!(next.missing_symbols.is_empty());
+        assert!(next.symbols.is_empty() && next.whole_motifs.is_empty() && next.whole_supports.is_empty());
+        assert_ne!(next.resource_revision(),revision);
+        assert_eq!(next.symbols_path,live.symbols_path);
+        assert_eq!(next.render_scale.to_bits(),live.render_scale.to_bits());
+    }
 }

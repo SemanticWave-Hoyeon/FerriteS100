@@ -589,31 +589,69 @@ The viewer has palette-aware application colours, vector toolbar icons, keyboard
 
 Mac native pointer/menu/keyboard tests loaded the signed SHOM four-cell set and selected a Wreck. Final Mac/Windows workspace tests and native rendering passed, with five changed source hashes matching. These UI checks do not certify complete S-100/S-101 or S-98 interoperability. See `TestResults/UI_CHROME_REPORT.txt`.
 
-### Current integration validation (macOS)
+### Current integration validation (macOS, 2D)
 
-The current source separates the product-neutral kernel, S-101 and S-102 adapters,
-security, SECOM receive client, and build-selectable Lua runtime. Lua 5.4 is the
-validated shipping backend; selecting a different backend requires rebuilding.
-S-101 full base/update chains and loaded or absent-dataset cancellation are staged
-before publication. Failed preparation retains the previous chart and rendered
-scene. Coverage geometry and midpoint caches are enabled by default with bounded
-storage and source/view/settings validation before reuse.
+The current 318-file integration removes the globe/sphere camera, UI mode, CLI
+path and rendering modules and retains the 2D S-101/S-102 chart view. General
+WGS84 geodesy and Mercator navigation remain. Historical globe reports in
+`TestResults/` describe the older implementation.
 
-The integrated source passed 117 CPU checks and 17 build-guard regression tests.
-Debug and Release passed 16 hidden native cases across two official SHOM full
-chains in flat and globe views, covering cancellation announcement/replay and
-ordinary updates. Their captured images and drawing commands matched Release-fast
-exactly. These cases use default signature verification OFF; CPU chain checks also
-exercise ON. Synthetic cancellation fixtures do not prove authentication of an
-actual producer-signed cancellation. Tests run with hidden, unfocused windows.
+Lua 5.4 remains the shipping qualification backend; Lua 5.4/5.5 are selected at
+build time. Feature/Portrayal Catalogue versions remain independently selectable.
+The corrected shallow-pattern contract suppresses only the recognized official PC's
+optional shallow selector. Other mandatory pattern fills remain enabled. Source
+cell/feature attributes, display order, coverage masks remain part of
+the exact comparison gates; mandatory ENC objects are not clustered or omitted.
 
-Public trial datasets are kept locally under `TestData/` and excluded from Git,
-as are trust configuration, private keys, captures and compiled executables.
-Catalogue versions remain independently selectable. Build commands and source
-input tracking are documented in `BUILDING.md`.
+The V9 2D candidate passed 484 CPU tests and 14 paired checks (28 hidden native
+cases) with exact comparison of the tested geometry, pixels and semantic exports.
+Actual symbol instancing reduced one measured packed payload from 40,680 to
+13,584 bytes. The extra immutable instance cache saw 11 hits in 4,262 requests;
+these figures do not establish a frame-rate improvement. V10 subsequently passed 488 CPU tests and eight same-executable, separate-process
+OFF/ON 500-frame diagnostic runs. Their final restored-frame images and semantic
+exports matched; the additional 14-pose/28-execution hidden parity gate
+also passed. V12 passed its all-targets check, 51 S-101 tests, 73 application
+tests and native executable build. Its two 500-frame hidden eventloop controls
+completed with exact final RGBA, instructions and all exported raw geometry buffers. Debug, Release and Release-fast builds also
+passed six hidden loading cases over two complete SHOM base/update chains, with
+exact image, drawing-instruction and raw-buffer parity. All three executable
+profiles use the default coverage cache.
 
-Remaining work includes general S-102 polygon/projected/continuous portrayal and
-normal globe integration, atomic raster publication, same-delivery base/update
-plus cancellation, SECOM-to-viewer loading, current Windows validation and measured
-60 FPS during real drag/zoom. The current Windows test PC is offline. This
-integration does not establish complete S-100/S-101 conformance or certification.
+V12 enables the exact immutable coverage source-binding cache by default.
+`FERRITE_FLAT_COVERAGE_BINDING_CACHE=0` explicitly selects the uncached control
+path. The cache reuses source-to-command binding metadata, while current camera,
+scale, settings and coverage decisions are evaluated afresh. It does not cache
+permission to hide chart objects or reuse stale screen masks. The V10 controlled
+comparison reduced mean CPU coverage preparation from 4.953 to 2.960 ms (40.24%).
+This is a measured stage reduction in Release-fast, not a demonstrated 60 FPS
+improvement. Symbol instancing and the additional instance cache remain opt-in.
+
+The V9 controlled 500-pose diagnostic kept first-use traversal and wide outside
+panning separate from 300 warm chart-relative samples. Warm serialized service
+p95 was 20.168 ms and p99 21.678 ms; 62 of 300 samples exceeded 16.7 ms. The
+measured mean 4.2 ms coverage stage is CPU `prepare_flat_coverage`, not GPU
+execution. A separate timer measures host-side coverage binding, plan,
+pipeline and upload preparation. Serialized GPU completion waits and hidden
+redraw cadence do not prove foreground presentation rate or smooth 60 FPS.
+
+In the V12 cache-enabled eventloop control, the 300 warm submitted-redraw
+intervals had p95 9.267 ms and p99 9.760 ms; none exceeded 16.7 ms. The first
+399 inside-chart intervals included four above 16.7 ms, with a maximum of
+35.45 ms. These are hidden synthetic-gesture eventloop intervals, not completed
+GPU frames or foreground display FPS. Only two configurations were measured;
+this is not an ABBA statistical gain qualification.
+
+Tests use `FERRITE_BACKGROUND_TEST=1`, the macOS prohibited activation policy and
+actual hidden/unfocused-window assertions. Eventloop diagnostics issue one
+compound gesture camera change per redraw and do not wait for the GPU per frame;
+GPU completion and physical display cadence remain distinct measurements. Real
+OS gestures, hardware DPI changes and a sustained foreground 60 FPS guarantee
+are not established. The Windows test PC is offline; current Windows validation
+has not been performed.
+
+Public test datasets remain in `TestData/`; historical `TestResults/`, local
+catalogues, `Trust/`, chart paths and `Start*.command` launchers are preserved.
+Private keys, captures, datasets and compiled executables remain excluded from
+Git. Source/build provenance and backend selection are documented in
+`BUILDING.md`. Complete S-100/S-101/S-98 conformance, SECOM-to-viewer integration
+and untested input/product cases are not certified by these scoped results.

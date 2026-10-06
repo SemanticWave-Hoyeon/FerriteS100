@@ -141,6 +141,7 @@ pub struct RenderContext {
     dependency_plan_cache_enabled: bool,
     prepared_coverage: Option<std::sync::Arc<crate::PreparedCoverage>>,
     coverage_required: bool,
+    coverage_visibility_fusion_enabled: bool,
     coverage_view_revision: u64,
     coverage_scaler_signature: Option<[u64; 15]>,
     scene_spatial: std::sync::OnceLock<std::sync::Arc<crate::SceneSpatialIndex>>,
@@ -166,6 +167,7 @@ impl RenderContext {
             dependency_plan_cache_enabled: true,
             prepared_coverage: None,
             coverage_required: false,
+            coverage_visibility_fusion_enabled: false,
             coverage_view_revision: next_geometry_revision(),
             coverage_scaler_signature: None,
             scene_spatial: std::sync::OnceLock::new(),
@@ -251,6 +253,8 @@ impl RenderContext {
     /// Note: Uses stable sort to ensure consistent decluttering results across frames.
     /// par_sort_by_key is NOT stable, which caused symbols to appear/disappear inconsistently.
     /// Reuses sorted content during animation; newly changed instructions still sort.
+    /// Read-only guard for caches bound to the stable raw instruction order.
+    pub fn instructions_are_sorted(&self)->bool {self.sorted}
     pub fn get_sorted_instructions(&mut self) -> &[DrawingInstruction] {
         // Animation must retain the same portrayal order as a stationary view.
         if !self.sorted {
@@ -329,7 +333,7 @@ impl RenderContext {
         self.temporal_index_dirty = true;
     }
 
-    /// Call on every non-affine camera/projection change, including globe pose.
+    /// Call on every non-affine camera/projection change, including a projection change.
     /// Retain the old binding so stale state is rejected rather than bypassed.
     pub fn invalidate_coverage_view(&mut self) {
         self.coverage_view_revision = next_geometry_revision();
@@ -405,9 +409,15 @@ impl RenderContext {
     }
     /// Calendar diagnostics retain their meaning; coverage visibility is an
     /// independent execution pre-filter before suppression and decluttering.
+    pub fn set_coverage_visibility_fusion_enabled(&mut self, enabled: bool) {
+        self.coverage_visibility_fusion_enabled=enabled;
+    }
     pub fn portrayal_visibility(&self) -> crate::error::Result<(Vec<bool>, usize, usize)> {
         let (mut visible, hidden, diagnostics) = self.date_visibility();
         if let Some(coverage) = self.prepared_coverage()? {
+            if self.coverage_visibility_fusion_enabled {
+                coverage.intersect_visibility(self.geometry_revision,self.coverage_view_revision,&mut visible)?;
+            } else {
             let mask = coverage.visibility(
                 self.geometry_revision,
                 self.coverage_view_revision,
@@ -415,6 +425,7 @@ impl RenderContext {
             )?;
             for (v, c) in visible.iter_mut().zip(mask) {
                 *v &= c;
+            }
             }
         }
         Ok((visible, hidden, diagnostics))

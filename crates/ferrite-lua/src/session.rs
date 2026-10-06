@@ -546,7 +546,18 @@ impl PortrayalEngine {
     }
 
     pub fn new_with_sources(sources: Arc<ferrite_portrayal_catalog::CatalogueSources>) -> Result<Self> {
+        Self::new_with_sources_and_chunk_cache(sources, ferrite_lua_runtime::ChunkCache::process_shared())
+    }
+
+    /// Choose a bounded compiler cache without changing snapshot/VM semantics.
+    /// A fresh Default cache reproduces engine-local retention; a zero-budget
+    /// cache disables retention. Neither choice can reuse execution results.
+    pub fn new_with_sources_and_chunk_cache(
+        sources: Arc<ferrite_portrayal_catalog::CatalogueSources>,
+        cache: ferrite_lua_runtime::ChunkCache,
+    ) -> Result<Self> {
         let mut session = LuaSession::new()?;
+        session.chunk_cache = cache;
         session.set_rules_sources(sources)?;
         Ok(Self { session, type_catalogue: None })
     }
@@ -838,6 +849,28 @@ mod engine_catalogue_transfer_tests {
 #[cfg(test)]
 mod immutable_source_tests {
     use super::*;
+    #[test]
+    fn shared_engine_compilation_reruns_with_changed_fc_and_context() {
+        let root = std::env::temp_dir().join(format!("ferrite-lua-process-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("Rules")).unwrap();
+        std::fs::write(root.join("Rules/main.lua"), "iteration=0; function PortrayalMain() iteration=iteration+1; HostPortrayalEmit(HostGetFeatureTypeCodes()[1] .. ':' .. tostring(HostGetContextParameter('IsolatedDangers')) .. ':' .. iteration, 'PointInstruction:WRECKS01', 'IsolatedDangers'); return true end").unwrap();
+        let sources = ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
+        for (code, danger) in [("Wreck", true), ("Sounding", false)] {
+            let mut engine = PortrayalEngine::new_with_sources(Arc::clone(&sources)).unwrap();
+            engine.set_type_catalogue(TypeCatalogue { feature_codes:vec![code.into()], ..Default::default() });
+            engine.initialize().unwrap();
+            engine.session_mut().set_context(ContextParameters { isolated_dangers:danger, ..Default::default() });
+            for iteration in 1..=2 {
+                let result=engine.session_mut().execute_portrayal().unwrap();
+                assert_eq!(result.len(),1);
+                assert_eq!(result[0].feature_id,format!("{code}:{danger}:{iteration}"));
+                assert_eq!(result[0].observed_parameters,["IsolatedDangers"]);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn main_require_reset_and_vm_tables_use_retained_sources_after_original_changes() {
         let root = std::env::temp_dir().join(format!("ferrite-lua-source-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));

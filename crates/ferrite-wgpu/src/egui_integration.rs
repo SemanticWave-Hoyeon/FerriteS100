@@ -115,13 +115,9 @@ pub struct PluginButton {
 #[derive(Debug, Clone, Default)]
 pub struct AppUiState {
     pub reduced_motion: bool,
-    pub globe_preview: bool,
-    pub view_mode_changed: bool,
-    pub globe_summary: String,
-    pub globe_tilt_deg: f64,
-    pub globe_range_factor: f64,
-    pub globe_pose: Option<ferrite_kernel::globe_navigation::GlobePose>,
-    pub fit_globe_requested: bool,
+
+
+
     pub object_detail_sections: ObjectDetailSections,
     pub object_attribute_query: String,
     pub open_exchange_requested: bool,
@@ -687,37 +683,9 @@ impl EguiIntegration {
 
                     // View menu
                     ui.menu_button("View", |ui| {
-                        for (globe, label) in [(false, "2D Chart"), (true, "3D Globe")] {
-                            if ui
-                                .selectable_label(ui_state.globe_preview == globe, label)
-                                .clicked()
-                            {
-                                if ui_state.globe_preview != globe {
-                                    ui_state.globe_preview = globe;
-                                    ui_state.view_mode_changed = true;
-                                }
-                                ui.close_menu();
-                            }
-                        }
+
                         ui.separator();
-                        if ui_state.globe_preview {
-                            if ui.button("Whole Earth").clicked() {
-                                ui_state.fit_globe_requested = true;
-                                ui.close_menu();
-                            }
-                            for (tilt, label) in
-                                [(0., "Look straight down"), (45., "Tilt toward horizon")]
-                            {
-                                if ui
-                                    .selectable_label(ui_state.globe_tilt_deg == tilt, label)
-                                    .clicked()
-                                {
-                                    ui_state.globe_tilt_deg = tilt;
-                                    ui_state.view_mode_changed = true;
-                                    ui.close_menu();
-                                }
-                            }
-                        }
+
                         ui.menu_button("Color palette", |ui| {
                             for profile in ["Day", "Dusk", "Night"] {
                                 if ui
@@ -799,20 +767,7 @@ impl EguiIntegration {
 
                     // Keep the view choice visible without opening a menu.
                     ui.horizontal(|ui| {
-                        for (globe, label, help) in [
-                            (false, "2D Chart", "View the chart as a flat map"),
-                            (true, "3D Globe", "View the chart on the WGS84 globe"),
-                        ] {
-                            if ui
-                                .selectable_label(ui_state.globe_preview == globe, label)
-                                .on_hover_text(help)
-                                .clicked()
-                                && ui_state.globe_preview != globe
-                            {
-                                ui_state.globe_preview = globe;
-                                ui_state.view_mode_changed = true;
-                            }
-                        }
+
                     });
                     ui.separator();
                     // Zoom controls
@@ -964,11 +919,7 @@ impl EguiIntegration {
                 ui.separator();
 
                 egui::ScrollArea::vertical().id_salt("object_details_scroll").auto_shrink([false,false]).show(ui,|ui| {
-                if ui_state.globe_preview {
-                    ui.colored_label(theme.error, "Globe preview: patterns, bathymetry, line text placement remain unavailable.");
-                    ui.label(&ui_state.globe_summary);
-                    ui.separator();
-                }
+
                 if let Some(notice)=ui_state.notice.clone() {
                     ui.colored_label(theme.error,&notice);
                     if ui.small_button("Dismiss message").clicked(){ui_state.notice=None;}
@@ -1785,12 +1736,8 @@ impl EguiIntegration {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // Non-Lua settings (show_shallow_pattern) apply immediately for responsiveness
-                if let Some(pending) = ui_state.pending_settings.as_ref() {
-                    if pending.show_shallow_pattern != ui_state.settings.show_shallow_pattern {
-                        ui_state.settings.show_shallow_pattern = pending.show_shallow_pattern;
-                    }
-                }
+                // All controls remain candidates until App validates and commits
+                // the complete vector/raster scene. Pattern visibility is included.
 
                 // Check if pending settings differ from applied (for Apply button highlight)
                 let has_pending_changes = ui_state
