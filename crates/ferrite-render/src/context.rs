@@ -466,10 +466,7 @@ impl RenderContext {
             return (
                 vec![true; self.instructions.len()],
                 0,
-                self.instructions
-                    .iter()
-                    .filter(|i| !i.time_intervals().is_empty())
-                    .count(),
+                self.temporal_entries().count(),
             );
         };
         let selected = if let Some(value) = self.settings.current_datetime.as_deref() {
@@ -491,37 +488,30 @@ impl RenderContext {
                 return (
                     vec![true; self.instructions.len()],
                     0,
-                    self.instructions
-                        .iter()
-                        .filter(|i| !i.time_intervals().is_empty())
-                        .count(),
+                    self.temporal_entries().count(),
                 )
             }
         };
         let mut hidden = 0;
         let mut diagnostics = 0;
-        let visibility = self
-            .instructions
-            .iter()
-            .map(|i| {
-                match ferrite_kernel::temporal_intervals_visible_with_offset(
-                    i.time_intervals(),
-                    &instant,
-                    local_offset,
-                ) {
-                    Ok(v) => {
-                        if !v {
-                            hidden += 1;
-                        }
-                        v
-                    }
-                    Err(_) => {
-                        diagnostics += 1;
-                        true
-                    }
+        // Empty interval selectors always return true without diagnostics in the
+        // kernel. The existing index preserves instruction order and falls back
+        // to a source scan while dirty; no viewing instant/result is cached.
+        let mut visibility = vec![true; self.instructions.len()];
+        for (index, instruction) in self.temporal_entries() {
+            match ferrite_kernel::temporal_intervals_visible_with_offset(
+                instruction.time_intervals(), &instant, local_offset,
+            ) {
+                Ok(value) => {
+                    if !value { hidden += 1; }
+                    visibility[index] = value;
                 }
-            })
-            .collect();
+                Err(_) => {
+                    diagnostics += 1;
+                    // Keep unsupported or malformed selectors visible.
+                }
+            }
+        }
         (visibility, hidden, diagnostics)
     }
 
@@ -1610,5 +1600,159 @@ mod coverage_overlay_lifetime_tests {
         assert!(context.coverage_fragment_visible(0, 0, [1., 1.]).is_err());
         context.clear_prepared_coverage();
         assert!(context.prepared_coverage_binding().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod indexed_date_visibility_controls {
+    use super::*;
+    use crate::{LineInstruction, WorldPoint};
+    fn original_full_scan(context: &RenderContext) -> (Vec<bool>, usize, usize) {
+        if !context.settings.date_dependent {
+            return (vec![true; context.instructions.len()], 0, 0);
+        }
+        let Some(local_offset) =
+            chrono::FixedOffset::east_opt(context.settings.local_time_offset_seconds)
+        else {
+            return (
+                vec![true; context.instructions.len()],
+                0,
+                context.instructions
+                    .iter()
+                    .filter(|i| !i.time_intervals().is_empty())
+                    .count(),
+            );
+        };
+        let selected = if let Some(value) = context.settings.current_datetime.as_deref() {
+            ferrite_kernel::parse_viewing_instant(value)
+        } else if let Some(value) = context.settings.current_date.as_deref() {
+            ferrite_kernel::parse_viewing_date(value).and_then(|date| {
+                ferrite_kernel::parse_viewing_instant(&format!(
+                    "{}T00:00:00{}",
+                    date.format("%Y-%m-%d"),
+                    local_offset
+                ))
+            })
+        } else {
+            Ok(chrono::Utc::now().fixed_offset())
+        };
+        let instant = match selected {
+            Ok(value) => value,
+            Err(_) => {
+                return (
+                    vec![true; context.instructions.len()],
+                    0,
+                    context.instructions
+                        .iter()
+                        .filter(|i| !i.time_intervals().is_empty())
+                        .count(),
+                )
+            }
+        };
+        let mut hidden = 0;
+        let mut diagnostics = 0;
+        let visibility = context
+            .instructions
+            .iter()
+            .map(|i| {
+                match ferrite_kernel::temporal_intervals_visible_with_offset(
+                    i.time_intervals(),
+                    &instant,
+                    local_offset,
+                ) {
+                    Ok(v) => {
+                        if !v {
+                            hidden += 1;
+                        }
+                        v
+                    }
+                    Err(_) => {
+                        diagnostics += 1;
+                        true
+                    }
+                }
+            })
+            .collect();
+        (visibility, hidden, diagnostics)
+    }
+
+
+    fn annual() -> ferrite_kernel::TemporalInterval {
+        ferrite_kernel::TemporalInterval::new(Some(ferrite_kernel::TemporalBounds::new(
+            Some("----1101".into()),Some("----0331".into())).unwrap()),None,None,
+            ferrite_kernel::IntervalClosure::Closed).unwrap()
+    }
+    fn context() -> RenderContext {
+        let mut c=RenderContext::new(Viewport::new(960.,640.));
+        c.settings.current_date=Some("2026-07-15".into());
+        for index in 0..128 {
+            let mut i=DrawingInstruction::Line(LineInstruction::new(vec![
+                WorldPoint::new(index as f64,0.),WorldPoint::new(index as f64,1.)])
+                .with_priority(127-index));
+            if index==1 || index==91 {i.set_time_intervals(&[annual()]);}
+            if index==91 {i.set_portrayal_origin(crate::PortrayalOrigin::CoverageExempt);}
+            c.add_instruction(i);
+        }
+        c
+    }
+    fn check(c: &RenderContext) {
+        assert_eq!(c.date_visibility(),original_full_scan(c));
+    }
+    #[test]
+    fn sparse_dirty_and_sorted_entries_preserve_mask_counts_and_source_order() {
+        let mut c=context();assert!(c.temporal_index_dirty);check(&c);
+        assert_eq!(c.date_visibility().1,2);
+        c.get_sorted_instructions();assert!(!c.temporal_index_dirty);
+        assert_eq!(c.temporal_indices.len(),2);check(&c);
+        c.settings.current_date=Some("2026-01-15".into());check(&c);
+        assert_eq!(c.date_visibility().1,0);
+        c.settings.date_dependent=false;check(&c);
+        assert!(c.date_visibility().0.iter().all(|v|*v));
+    }
+    #[test]
+    fn invalid_view_offset_and_selector_diagnostics_match_original_exactly() {
+        let mut c=context();c.get_sorted_instructions();
+        for offset in [0,9*3600,-7*3600,61,86400] {
+            c.settings.local_time_offset_seconds=offset;
+            for date in ["2026-07-15","bad-date","2026-02-30"] {
+                c.settings.current_date=Some(date.into());check(&c);
+            }
+        }
+        c.settings.local_time_offset_seconds=0;c.settings.current_date=Some("2026-07-15".into());
+        c.settings.current_datetime=Some("2026-01-15T23:59:59-07:00".into());check(&c);
+        c.settings.current_datetime=Some("bad-instant".into());check(&c);
+        c.settings.current_datetime=None;
+        let invalid=ferrite_kernel::TemporalInterval::new(None,Some(ferrite_kernel::TemporalBounds::new(
+            Some("250000".into()),Some("130000".into())).unwrap()),None,
+            ferrite_kernel::IntervalClosure::Closed).unwrap();
+        c.set_time_intervals_from(127,&[invalid.clone()]);check(&c);c.get_sorted_instructions();check(&c);
+        assert_eq!(c.date_visibility().2,1);
+        let mixed=ferrite_kernel::TemporalInterval::new(annual().date,invalid.time,None,
+            ferrite_kernel::IntervalClosure::Closed).unwrap();
+        c.set_time_intervals_from(127,&[mixed]);check(&c);c.get_sorted_instructions();check(&c);
+        assert_eq!(c.date_visibility().2,1);
+    }
+    #[test]
+    fn mutations_rebuild_ordinals_without_reusing_visibility_or_errors() {
+        let mut c=context();c.get_sorted_instructions();check(&c);
+        c.remove_coverage_exempt_instructions();assert!(c.temporal_index_dirty);check(&c);
+        c.get_sorted_instructions();assert_eq!(c.temporal_indices.len(),1);check(&c);
+        c.set_time_intervals_from(126,&[annual()]);check(&c);c.get_sorted_instructions();check(&c);
+        c.truncate_instructions(16);check(&c);c.get_sorted_instructions();check(&c);
+        let mut replacement=c.raw_instructions().to_vec();replacement.reverse();
+        c.set_instructions_from_cache(replacement);check(&c);c.get_sorted_instructions();check(&c);
+        c.clear_instructions();assert!(c.temporal_indices.is_empty());assert!(!c.temporal_index_dirty);
+        assert_eq!(c.date_visibility(),(vec![],0,0));check(&c);
+    }
+    #[test]
+    fn empty_selector_index_keeps_all_visible_including_invalid_view() {
+        let mut c=RenderContext::new(Viewport::new(960.,640.));
+        c.settings.current_date=Some("bad-date".into());
+        for _ in 0..512 {c.add_instruction(DrawingInstruction::Line(LineInstruction::new(vec![
+            WorldPoint::new(0.,0.),WorldPoint::new(1.,1.)])));}
+        check(&c);c.get_sorted_instructions();assert!(c.temporal_indices.is_empty());check(&c);
+        assert_eq!(c.date_visibility(),(vec![true;512],0,0));
+        c.settings.current_date=None;c.settings.local_time_offset_seconds=61;check(&c);
+        c.settings.date_dependent=false;check(&c);
     }
 }
