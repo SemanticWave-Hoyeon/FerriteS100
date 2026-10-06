@@ -30,6 +30,8 @@ pub use selection::{
     WrappedGeometryHit,
 };
 
+mod line_relation_identity;
+pub use line_relation_identity::StaticLineRelationEpoch;
 mod suppression;
 pub use suppression::{
     instruction_visible, LineSpan, LineSuppressionCache, LineSuppressionPlan,

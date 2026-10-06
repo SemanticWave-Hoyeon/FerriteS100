@@ -2816,14 +2816,12 @@ impl WgpuRenderer {
         };
         let suppressed_lines = self
             .line_suppression
-            .plan_immutable_projected_with_visibility(
-                instructions,
-                context.geometry_revision(),
+            .plan_context_projected_with_visibility(
+                context,
                 self.viewing_scale(),
                 visible_viewing_groups,
                 self.show_soundings.then_some(33010),
                 Some(execution_visibility),
-                scaler.projection(),
             );
         if let Some(t) = suppression_timer {
             self.cpu_profiler.record("line_suppression", t.elapsed());

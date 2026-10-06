@@ -136,6 +136,7 @@ pub struct RenderContext {
     sorted: bool,
     /// Process-unique identity for the lifetime of this instruction geometry.
     geometry_revision: u64,
+    static_line_relation_epoch:crate::StaticLineRelationEpoch,
     /// Immutable command topology; camera, palette and date changes do not rebuild it.
     dependency_graph: std::sync::OnceLock<std::sync::Arc<crate::DrawingDependencyGraph>>,
     dependency_plan_cache_enabled: bool,
@@ -163,6 +164,7 @@ impl RenderContext {
             feature_ids: HashSet::new(),
             sorted: false,
             geometry_revision: next_geometry_revision(),
+            static_line_relation_epoch:crate::StaticLineRelationEpoch::fresh(),
             dependency_graph: std::sync::OnceLock::new(),
             dependency_plan_cache_enabled: true,
             prepared_coverage: None,
@@ -240,6 +242,7 @@ impl RenderContext {
 
         self.instructions.push(instruction);
         self.geometry_revision = next_geometry_revision();
+        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.temporal_index_dirty = true;
@@ -258,6 +261,7 @@ impl RenderContext {
     pub fn get_sorted_instructions(&mut self) -> &[DrawingInstruction] {
         // Animation must retain the same portrayal order as a stationary view.
         if !self.sorted {
+            self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
             // Use stable sort to ensure consistent symbol decluttering
             // Unstable sorts can reorder same-priority instructions differently each frame
             self.dependency_graph.take();
@@ -281,6 +285,7 @@ impl RenderContext {
     pub fn clear_instructions(&mut self) {
         self.instructions.clear();
         self.geometry_revision = next_geometry_revision();
+        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.temporal_indices.clear();
@@ -295,6 +300,7 @@ impl RenderContext {
             return;
         }
         self.geometry_revision = next_geometry_revision();
+        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
         for instruction in self.instructions.iter_mut().skip(start) {
             instruction.set_portrayal_origin(origin.clone());
         }
@@ -617,6 +623,7 @@ impl RenderContext {
             .retain(|i| !matches!(i.portrayal_origin(), crate::PortrayalOrigin::CoverageExempt));
         if before != self.instructions.len() {
             self.geometry_revision = next_geometry_revision();
+        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.temporal_index_dirty = true;
@@ -643,6 +650,7 @@ impl RenderContext {
         if count < self.instructions.len() {
             self.instructions.truncate(count);
             self.geometry_revision = next_geometry_revision();
+        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.temporal_index_dirty = true;
@@ -656,6 +664,15 @@ impl RenderContext {
         for inst in &mut self.instructions {
             inst.remap_colors(lookup);
         }
+    }
+
+    /// Read-only relation identity, independent from owned geometry lifetime.
+    pub fn static_line_relation_epoch(&self)->crate::StaticLineRelationEpoch{self.static_line_relation_epoch}
+    /// Once per staged publication. Never digest/pointer equality and never per-frame.
+    /// Both contexts must already have the same stable ordinal sorting applied.
+    pub fn inherit_static_line_relations_from(&mut self,previous:&Self)->bool{
+        if !self.sorted||!previous.sorted||!crate::line_relation_identity::same_static_line_relation_inputs(&self.instructions,&previous.instructions){return false}
+        self.static_line_relation_epoch=previous.static_line_relation_epoch;true
     }
 
     /// Geometry lifetime token. Viewport, colors, sorting and temporal settings
@@ -713,6 +730,7 @@ impl RenderContext {
     pub fn set_instructions_from_cache(&mut self, instructions: Vec<DrawingInstruction>) {
         self.instructions = instructions;
         self.geometry_revision = next_geometry_revision();
+        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.temporal_index_dirty = true;

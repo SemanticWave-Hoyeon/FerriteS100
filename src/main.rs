@@ -1623,6 +1623,8 @@ impl ChartApp {
         let old_profile=self.current_profile_name.clone();
         let old_background=self.renderer.as_ref().unwrap().background_color;
         let old_revision=self.symbol_cache.resource_revision();
+        let old_geometry_revision=self.render_context.geometry_revision();
+        let old_relation_epoch=self.render_context.static_line_relation_epoch();
         let settings=self.applied_settings.clone();
         let mut target_settings=settings.clone();
         if let Ok(value)=std::env::var("FERRITE_ROOT_PORTRAYAL_CHANGE_SAFETY") {
@@ -1649,6 +1651,8 @@ impl ChartApp {
         }
         anyhow::ensure!(self.publication_model()?==model && self.current_profile_name==old_profile
             && self.symbol_cache.resource_revision()==old_revision
+            && self.render_context.geometry_revision()==old_geometry_revision
+            && self.render_context.static_line_relation_epoch()==old_relation_epoch
             && self.renderer.as_ref().unwrap().background_color==old_background,
             "Rejected candidate mutated retained portrayal");
         self.renderer.as_mut().unwrap().render()?;
@@ -1669,11 +1673,14 @@ impl ChartApp {
 
         fs::write(output.join("recovery.json"),serde_json::to_vec_pretty(&serde_json::json!({
             "hidden":true,"focused":false,"old_frame_preserved":true,"retry_committed":true,
+            "old_geometry_revision":old_geometry_revision,"retry_geometry_revision":self.render_context.geometry_revision(),
+            "old_relation_epoch":format!("{:?}",old_relation_epoch),"retry_relation_epoch":format!("{:?}",self.render_context.static_line_relation_epoch()),
+            "relation_reuse_admitted":self.render_context.static_line_relation_epoch()==old_relation_epoch,
             "profile":self.current_profile_name,"settings":format!("{:?}",self.applied_settings),
             "scaler":format!("{:?}",self.render_context.scaler),"selection":old_selection,
             "error":"Injected portrayal change failure after complete scene staging",
             "postcommit_update_view":false,
-            "scope":"uncompiled opt-in audit; rawbuffers are flat CPU geometry, Flat geometry only; target-palette oracle requires external control"}))?)?;
+            "scope":"opt-in hidden audit; rawbuffers are flat CPU geometry, Flat geometry only; target-palette oracle requires external control"}))?)?;
         Ok(())
     }
 
@@ -3089,8 +3096,17 @@ impl ChartApp {
         })
     }
 
+    fn static_line_relation_reuse_enabled(value: Option<&str>) -> bool {
+        value.is_none_or(|value| value == "1")
+    }
+
     fn publish_instructions(&mut self, prepared: PreparedPortrayal) {
-        let PreparedPortrayal {context:next,coverage,ic_changed,raster_scene}=prepared;
+        let PreparedPortrayal {context:mut next,coverage,ic_changed,raster_scene}=prepared;
+        if Self::static_line_relation_reuse_enabled(std::env::var("FERRITE_STATIC_LINE_RELATION_REUSE").ok().as_deref()) {
+            // Context comparison requires existing stable sorting. Do not sort or
+            // mutate the retained context, especially during failed preparation.
+            next.inherit_static_line_relations_from(&self.render_context);
+        }
         self.render_context=next;
         self.coverage_inventory=Some(coverage);
         self.ic_assigned_vectors=ic_changed;
@@ -7721,5 +7737,17 @@ mod portrayal_request_tests {
         assert!(portrayal_navigation_pending(false,false,false,false,1,0,(0.,0.)));
         assert!(portrayal_navigation_pending(false,false,false,false,0,1,(0.,0.)));
         assert!(portrayal_navigation_pending(false,false,false,false,0,0,(0.001,0.)));
+    }
+}
+
+#[cfg(test)]
+mod static_line_relation_policy_tests {
+    #[test]
+    fn default_enables_exact_context_comparison_and_explicit_controls_override() {
+        assert!(super::ChartApp::static_line_relation_reuse_enabled(None));
+        assert!(super::ChartApp::static_line_relation_reuse_enabled(Some("1")));
+        for value in ["0", "", "true", "unknown"] {
+            assert!(!super::ChartApp::static_line_relation_reuse_enabled(Some(value)));
+        }
     }
 }

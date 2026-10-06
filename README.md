@@ -691,3 +691,29 @@ Private keys, captures, datasets and compiled executables remain excluded from
 Git. Source/build provenance and backend selection are documented in
 `BUILDING.md`. Complete S-100/S-101/S-98 conformance, SECOM-to-viewer integration
 and untested input/product cases are not certified by these scoped results.
+
+Palette/settings publication now reuses static line relations after an exact,
+bounded comparison of the two sorted instruction streams. Directed coordinate
+bits, source ordinals/provenance, priority, display plane, suppression and deferred
+geometry must match. The relation epoch is independent of the geometry ownership
+revision: borrowed triangulation pointers, coverage bindings and picking keep
+their original lifetime rules. Current colour/stroke visibility, date, scale,
+groups, dependencies and coverage eligibility are still evaluated afresh.
+`FERRITE_STATIC_LINE_RELATION_REUSE=0` disables inheritance; the default and `1`
+enable it. A declined comparison follows the existing preparation path. Existing
+64MiB transformed-input, 32MiB relation and 16MiB visibility-plan limits remain.
+The comparison keeps no source geometry copy and runs only at publication.
+
+The candidate passed 297 CPU tests and the all-targets check. Six paired hidden
+palette-change poses, including a centred official Wreck symbol at 200x, matched
+full chart pixels, ordered instructions, raw GPU buffers and symbol attributes.
+Failed staging retained the old frame; successful publication retained the relation
+epoch while issuing a fresh geometry ownership revision. Independent sixteen-run
+same-binary OFF/ON ABBA/BAAB measurements over the signed SHOM 5,059-feature chain
+reduced warm palette-change commit medians from about 323ms to 169ms (47.5–47.6%).
+Preparation stayed near 230ms; preparation plus commit medians fell by about
+27.6–27.7%. These timings exclude subsequent render/present and describe the
+retry path after rejected staging, not startup, continuous navigation or displayed
+FPS. Separate signed loading/profile checks cover Debug, Release and Release-fast.
+The transaction-local Lua stroke cache remains uninstalled because its timing
+results were mixed.

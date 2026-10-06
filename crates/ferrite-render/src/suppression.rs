@@ -218,22 +218,25 @@ impl Segment {
         (low < high && low.is_finite() && high.is_finite()).then_some((low, high))
     }
 }
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+enum SuppressionRevision {Legacy(u64),Context(crate::StaticLineRelationEpoch)}
+
 /// Content validation costs O(V) even on a hit. Results share an Arc and contain
 /// no borrowed vertices. Spatial indexes are temporary and discarded after planning.
 #[derive(Default)]
 pub struct LineSuppressionCache {
     last: Option<([u8; 32], Arc<LineSuppressionPlan>)>,
     immutable_prepared: Option<(
-        u64,
+        SuppressionRevision,
         FlatProjection,
         Vec<bool>,
         Option<PreparedLineSuppression>,
     )>,
     immutable_last: Option<(Vec<bool>, Arc<LineSuppressionPlan>)>,
     immutable_current: Option<Arc<LineSuppressionPlan>>,
-    // Opt-in only. A declined prewarm is tried once per immutable source epoch.
+    // Existing default-on bounded prewarm; decline tried once per namespaced source epoch.
     prewarm_policy: Option<bool>,
-    prewarm_attempt: Option<(u64, FlatProjection, usize)>,
+    prewarm_attempt: Option<(SuppressionRevision, FlatProjection, usize)>,
 }
 impl LineSuppressionCache {
     fn static_prewarm_policy(value: Option<&str>) -> bool {
@@ -263,6 +266,11 @@ impl LineSuppressionCache {
             .as_ref()
             .map(PreparedLineSuppression::retained_bytes)
     }
+    /// Binding-safe context entry: callers cannot supply a different source slice
+    /// with an inherited epoch. Current permissions are still evaluated every call.
+    pub fn plan_context_projected_with_visibility(&mut self,context:&crate::RenderContext,scale:u32,groups:Option<&HashSet<u32>>,override_group:Option<u32>,visibility:Option<&[bool]>)->Arc<LineSuppressionPlan>{
+        self.plan_immutable_projected_with_visibility_key(context.raw_instructions(),SuppressionRevision::Context(context.static_line_relation_epoch()),scale,groups,override_group,visibility,context.scaler.projection())
+    }
     /// Static overlap reuse for immutable RenderContext instruction geometry.
     /// The caller MUST advance revision when points, ordering, priority, planes,
     /// suppression or deferred geometry changes. Live stroke visibility, date,
@@ -278,6 +286,9 @@ impl LineSuppressionCache {
         visibility: Option<&[bool]>,
         projection: FlatProjection,
     ) -> Arc<LineSuppressionPlan> {
+        self.plan_immutable_projected_with_visibility_key(instructions,SuppressionRevision::Legacy(revision),scale,groups,override_group,visibility,projection)
+    }
+    fn plan_immutable_projected_with_visibility_key(&mut self,instructions:&[DrawingInstruction],revision:SuppressionRevision,scale:u32,groups:Option<&HashSet<u32>>,override_group:Option<u32>,visibility:Option<&[bool]>,projection:FlatProjection)->Arc<LineSuppressionPlan>{
         debug_assert!(visibility.is_none_or(|v| v.len() == instructions.len()));
         let prewarm = *self.prewarm_policy.get_or_insert_with(|| {
             Self::static_prewarm_policy(std::env::var("FERRITE_LINE_SUPPRESSION_PREWARM").ok().as_deref())
@@ -1585,7 +1596,7 @@ mod static_prewarm_contract_tests {
             let mut cache=LineSuppressionCache::default();cache.set_static_prewarm_enabled(true);
             compare(&mut cache,&items,1,FlatProjection::EllipsoidalMercator,0,None,&[true,false,true]);
             compare(&mut cache,&items,1,FlatProjection::EllipsoidalMercator,0,None,&[true,true,true]);
-            assert_eq!(cache.prewarm_attempt,Some((1,FlatProjection::EllipsoidalMercator,3)));
+            assert_eq!(cache.prewarm_attempt,Some((SuppressionRevision::Legacy(1),FlatProjection::EllipsoidalMercator,3)));
         }
     }
     #[test]
@@ -1631,5 +1642,19 @@ mod static_prewarm_numeric_tests {
   }
   let mut owner=LineSuppressionCache::default();owner.set_static_prewarm_enabled(false);
   assert_eq!(owner.prewarm_policy,Some(false));owner.clear();assert_eq!(owner.prewarm_policy,Some(false));
+ }
+}
+
+#[cfg(test)]mod context_prewarm_epoch_tests {
+ use super::*;
+ #[test]fn inherited_context_keeps_prewarm_attempt_and_cached_plan_but_legacy_does_not_alias(){
+  let items=vec![DrawingInstruction::Line(crate::LineInstruction::new(vec![WorldPoint::new(0.,0.),WorldPoint::new(10.,0.)]).with_priority(1)),DrawingInstruction::Line(crate::LineInstruction::new(vec![WorldPoint::new(2.,0.),WorldPoint::new(8.,0.)]).with_priority(9))];
+  let mut old=crate::RenderContext::new(crate::Viewport::new(800.,600.));old.set_instructions_from_cache(items.clone());old.get_sorted_instructions();
+  let mut next=old.empty_for_rebuild();next.set_instructions_from_cache(items);next.get_sorted_instructions();assert!(next.inherit_static_line_relations_from(&old));assert_ne!(old.geometry_revision(),next.geometry_revision());
+  let mut cache=LineSuppressionCache::default();cache.set_static_prewarm_enabled(true);
+  let first=cache.plan_context_projected_with_visibility(&old,0,None,None,None);let attempt=cache.prewarm_attempt;assert!(matches!(attempt,Some((SuppressionRevision::Context(_),_,2))));
+  let retry=cache.plan_context_projected_with_visibility(&next,0,None,None,None);assert_eq!(cache.prewarm_attempt,attempt);assert!(Arc::ptr_eq(&first,&retry));
+  let expected=LineSuppressionCache::default().plan_projected_with_visibility(next.raw_instructions(),0,None,None,None,next.scaler.projection());assert_eq!(*retry,*expected);
+  cache.plan_immutable_projected_with_visibility(next.raw_instructions(),1,0,None,None,None,next.scaler.projection());assert!(matches!(cache.prewarm_attempt,Some((SuppressionRevision::Legacy(1),_,2))));
  }
 }
