@@ -849,3 +849,23 @@ bytes; this is owned payload capacity, not an RSS or allocator-overhead measure.
 The inclusive conversion-plus-Lua experiment showed roughly 0.5% median change
 with a paired regression, so it does not establish a robust whole-load or FPS
 improvement. Current foreground 60 FPS and Windows validation remain unproven.
+
+
+### Frame-local coverage clip reuse (macOS, 2D)
+
+The renderer shares identical coverage masks across wrap passes within a single
+immutable frame. Reuse is enabled by default; set
+`FERRITE_FLAT_COVERAGE_CLIP_CSE=0` before launch to use the original upload path.
+The bounded identity lookup admits at most 1,024 alias rows and otherwise falls
+back to the original path. Original logical payload budgets and device-limit
+checks still apply. No mask is retained across frame lifetimes.
+
+On the two signed SHOM test chains, diagnostics measured three mask creations
+and R8 payload uploads becoming one (66.7% less cumulative work). Same-binary
+Day trials reduced HOST upload time by approximately 54% and 50%, respectively;
+these are CPU submission measurements, not GPU completion or display FPS.
+Separate Dusk/Night navigation tests compared 160 selected rendered poses,
+including whole RGBA pixels, commands, CPU mask upload inputs and uniform
+shadows, with exact results. Two slow samples above 16.7ms in an OFF control were
+retained in the report. Physical display FPS and Windows interaction remain
+unverified.

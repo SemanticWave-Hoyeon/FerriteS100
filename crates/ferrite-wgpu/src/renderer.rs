@@ -642,6 +642,7 @@ pub struct WgpuRenderer {
     prepared_coverage: Option<Arc<ferrite_render::PreparedCoverage>>,
     coverage_frame: Option<crate::coverage_gpu_frame::CoverageGpuFrame>,
     coverage_pipelines: Option<crate::coverage_pipeline::CoveragePipelines>,
+    frame_local_coverage_clip_reuse: bool,
     coverage_failed: bool,
     emitting_coverage_source: Option<usize>,
     device_fixed_sources: FxHashSet<usize>,
@@ -864,6 +865,7 @@ impl WgpuRenderer {
             prepared_coverage: None,
             coverage_frame: None,
             coverage_pipelines: None,
+            frame_local_coverage_clip_reuse: crate::coverage_gpu_frame::frame_local_clip_reuse_policy(std::env::var_os("FERRITE_FLAT_COVERAGE_CLIP_CSE").as_deref()),
             coverage_failed: false,
             emitting_coverage_source: None,
             device_fixed_sources: FxHashSet::default(),
@@ -2285,6 +2287,13 @@ impl WgpuRenderer {
         self.flat_diagnostic.as_ref().map(|cell|FlatDiagnosticSpan{cell:cell.clone(),stage,start:std::time::Instant::now()})
     }
     pub fn flat_gpu_coverage_host_ns(&self)->u64 {self.flat_gpu_coverage_host_ns}
+    /// (enabled, alias bindings, unique clips, legacy logical R8 charge, unique R8 payload).
+    /// Current frame only; no cache identity or resources survive replacement.
+    pub fn coverage_clip_cse_statistics(&self) -> (bool, usize, usize, usize, usize) {
+        self.coverage_frame.as_ref().map_or((self.frame_local_coverage_clip_reuse,0,0,0,0), |frame|
+            (self.frame_local_coverage_clip_reuse,frame.mask_count(),frame.unique_clip_count(),frame.pixel_bytes(),frame.unique_pixel_bytes()))
+    }
+
     pub fn flat_diagnostics_active(&self)->bool {self.flat_diagnostic.is_some()}
     pub fn record_flat_stage(&self,stage:ferrite_render::flat_reuse_diagnostics::FlatFrameStage, elapsed:std::time::Duration) {if let Some(cell)=&self.flat_diagnostic {cell.borrow_mut().record_span(stage,elapsed.as_nanos().min(u64::MAX as u128) as u64);}}
     fn record_flat_reuse(&self,affine:Option<ferrite_render::flat_reuse_diagnostics::NavigationAffine>) {
@@ -2835,7 +2844,7 @@ impl WgpuRenderer {
         self.coverage_failed = false;
         if let Some(prepared) = &self.prepared_coverage {
             let result = (|| -> Result<crate::coverage_gpu_frame::CoverageGpuFrame> {
-                let plan = crate::coverage_gpu_frame::CoverageGpuPlan::new(
+                let plan = crate::coverage_gpu_frame::CoverageGpuPlan::new_with_frame_local_reuse(
                     prepared,
                     context.geometry_revision(),
                     context.coverage_view_revision(),
@@ -2843,6 +2852,7 @@ impl WgpuRenderer {
                     if self.lon_wrap_screen_px > 0. { 3 } else { 1 },
                     self.state.device.limits().max_texture_dimension_2d,
                     128 * 1024 * 1024,
+                    self.frame_local_coverage_clip_reuse,
                 )?;
                 if plan.mask_count() > 0 && self.coverage_pipelines.is_none() {
                     self.coverage_pipelines =
