@@ -58,6 +58,8 @@ pub struct VerifiedResource {
     pub certificate_ids: Vec<String>,
     pub sha384: String,
     pub size: u64,
+    #[serde(skip)]
+    authentication: std::sync::Arc<ResourceAuthentication>,
 }
 /// Private immutable input copy retained while a product reader owns the resource.
 /// Copying and hashing use constant memory and authenticate the exact copied bytes.
@@ -100,6 +102,15 @@ impl AuthenticatedSnapshot {
 }
 impl VerifiedResource {
     pub fn snapshot(&self) -> Result<AuthenticatedSnapshot> {
+        ensure!(self.path == self.authentication.path && self.sha384 == self.authentication.sha384
+            && self.size == self.authentication.size
+            && self.signature_ids.iter().map(String::as_str).eq(self.authentication.signatures.iter().map(|s| s.id.as_str()))
+            && self.certificate_ids.iter().map(String::as_str).eq(self.authentication.signatures.iter().map(|s| s.certificate_id.as_str())), "Resource report differs from retained authentication");
+        self.authentication.snapshot()
+    }
+}
+impl ResourceAuthentication {
+    fn snapshot(&self) -> Result<AuthenticatedSnapshot> {
         let mut input = File::open(&self.path)?;
         let mut output = tempfile::NamedTempFile::new()?;
         let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
@@ -323,7 +334,7 @@ fn parse_signature(n: Node<'_, '_>) -> Result<Signature> {
     })
 }
 /// Resolve the S-100 exchange-relative URI and reject traversal and escaping symlinks.
-fn resource_path(root: &Path, name: &str) -> Result<PathBuf> {
+fn resource_relative_name(name: &str) -> Result<String> {
     let decoded = percent_encoding::percent_decode_str(name)
         .decode_utf8()?
         .replace('\\', "/");
@@ -348,8 +359,12 @@ fn resource_path(root: &Path, name: &str) -> Result<PathBuf> {
             && !p.contains('\0')),
         "Unsafe exchange-relative path"
     );
+    Ok(name.to_owned())
+}
+fn resource_path(root: &Path, name: &str) -> Result<PathBuf> {
+    let name = resource_relative_name(name)?;
     let path = root
-        .join(name)
+        .join(&name)
         .canonicalize()
         .with_context(|| format!("Missing exchange resource {name}"))?;
     ensure!(
@@ -401,6 +416,17 @@ fn verify_resource(
     signatures: Vec<Signature>,
     certificates: &HashMap<String, X509>,
 ) -> Result<VerifiedResource> {
+    verify_resource_with_limit(path, signatures, certificates, None)
+}
+fn verify_resource_with_limit(
+    path: PathBuf,
+    signatures: Vec<Signature>,
+    certificates: &HashMap<String, X509>,
+    max_bytes: Option<u64>,
+) -> Result<VerifiedResource> {
+    if let Some(limit) = max_bytes {
+        ensure!(std::fs::metadata(&path)?.len() <= limit, "Signed resource exceeds receiver byte budget");
+    }
     ensure!(!signatures.is_empty(), "Missing resource signature");
     let mut ids = HashMap::with_capacity(signatures.len());
     for (i, s) in signatures.iter().enumerate() {
@@ -463,6 +489,7 @@ fn verify_resource(
         size = size
             .checked_add(n as u64)
             .context("Resource size overflow")?;
+        ensure!(max_bytes.is_none_or(|limit| size <= limit), "Signed resource grew beyond receiver byte budget");
         digest.update(&buffer[..n])?;
     }
     let digest = digest.finish()?;
@@ -489,7 +516,25 @@ fn verify_resource(
         ready.extend(children[i].iter().copied());
     }
     ensure!(validated == signatures.len(), "Signature reference cycle");
+    // Shared once per distinct signer within this resource, not cloned per signature.
+    let signer_der = keys.keys().map(|id| {
+        let cert = certificates.get(id).context("Missing verified signer")?;
+        Ok((id.clone(), std::sync::Arc::<[u8]>::from(cert.to_der()?)))
+    }).collect::<Result<HashMap<_, _>>>()?;
+    let descriptors = signatures.iter().map(|s| {
+        let cert = certificates.get(&s.certificate).context("Missing verified signer")?;
+        Ok(VerifiedSignatureDescriptor {
+            id: s.id.clone(), certificate_id: s.certificate.clone(),
+            der: s.bytes.clone(), signer_certificate_sha256: hex(&cert.digest(MessageDigest::sha256())?),
+            signer_certificate_der: signer_der[&s.certificate].clone(),
+            signature_target: s.target.clone(),
+        })
+    }).collect::<Result<Vec<_>>>()?;
+    let authentication = std::sync::Arc::new(ResourceAuthentication {
+        path: path.clone(), sha384: hex(&digest), size, signatures: descriptors,
+    });
     Ok(VerifiedResource {
+        authentication,
         path,
         sha384: hex(&digest),
         size,
@@ -505,31 +550,11 @@ pub fn verify_exchange(
     time: i64,
 ) -> Result<VerificationReport> {
     let root = root.as_ref().canonicalize()?;
-    let sign_bytes = read_xml(&resource_path(&root, "CATALOG.SIGN")?)?;
-    let standalone = xml(&sign_bytes)?;
-    let node = standalone.root_element();
-    ensure!(
-        is(node, SE, "StandaloneDigitalSignature"),
-        "Unsupported standalone signature namespace/type"
-    );
-    let filename = text(unique_child(node, SE, "filename")?)?;
-    ensure!(
-        filename == "CATALOG.XML",
-        "Catalogue signature filename must be CATALOG.XML"
-    );
-    let certs = Certificates::parse(node)?.verified(anchors, time)?;
-    let signatures = node
-        .children()
-        .filter(|n| is(*n, SE, "digitalSignature"))
-        .map(parse_signature)
-        .collect::<Result<Vec<_>>>()?;
-    let catalogue = verify_resource(resource_path(&root, filename)?, signatures, &certs)?;
-    let bytes = read_xml(&catalogue.path)?;
-    // Avoid consuming metadata from a file changed between verification and read.
-    ensure!(
-        hex(&hash(MessageDigest::sha384(), &bytes)?) == catalogue.sha384,
-        "Catalogue changed during verification"
-    );
+    let authenticated = verify_exchange_catalogue(&root, anchors, time)?;
+    let catalogue = authenticated.catalogue;
+    let bytes = authenticated.bytes;
+    let trust_anchor_sha256 = authenticated.trust_anchor_sha256;
+    let legacy_namespace = authenticated.legacy_namespace;
     let document = xml(&bytes)?;
     let node = document.root_element();
     ensure!(
@@ -540,7 +565,7 @@ pub fn verify_exchange(
     let mut resources = Vec::new();
     let mut dataset_discovery = HashMap::new();
     let mut metadata_warnings = Vec::new();
-    if standalone.root_element().tag_name().namespace() != Some(SE) {
+    if legacy_namespace {
         metadata_warnings.push("Standalone signature uses legacy SE5.1 namespace; P-384 and current independently installed root remain required".into());
     }
     let mut paths = HashSet::new();
@@ -609,7 +634,8 @@ pub fn verify_exchange(
         if is(entry, XC, "S100_DatasetDiscoveryMetadata") {
             let discovery = dataset_discovery::parse(entry)?;
             dataset_discovery.insert(resource.path.clone(),
-                AuthenticatedDatasetDiscovery::bind(discovery, &resource, &catalogue));
+                AuthenticatedDatasetDiscovery::bind(discovery, &resource, &catalogue,
+                    bytes.clone(), time, trust_anchor_sha256.clone(), filename.to_owned(), entry.range()));
         }
         resources.push(resource);
     }
@@ -624,11 +650,7 @@ pub fn verify_exchange(
         verified_unix_seconds: time,
         revocation_checked: false,
         metadata_warnings,
-        trust_anchor_sha256: anchors
-            .roots
-            .iter()
-            .map(|(id, c)| Ok((id.clone(), hex(&c.digest(MessageDigest::sha256())?))))
-            .collect::<Result<_>>()?,
+        trust_anchor_sha256: (*trust_anchor_sha256).clone(),
     })
 }
 
@@ -760,5 +782,11 @@ mod unverified_input_tests {
     }
 }
 
+mod original_authentication;
+pub use original_authentication::{OriginalDatasetAuthentication, VerifiedSignatureDescriptor};
+use original_authentication::ResourceAuthentication;
 mod dataset_discovery;
 pub use dataset_discovery::{AuthenticatedDatasetDiscovery, DatasetDiscovery, DatasetDiscoveryAuthorization, DatasetIssueDate, DatasetPurpose};
+
+mod exchange_catalogue_authentication;
+pub use exchange_catalogue_authentication::{verify_exchange_catalogue, AuthenticatedExchangeCatalogue, CatalogueDiscoveryView, OriginalEntryView};

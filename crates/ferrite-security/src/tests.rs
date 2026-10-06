@@ -606,3 +606,164 @@ fn checked_discovery_rejects_rekey_missing_snapshot_and_changed_private_bytes() 
     std::fs::write(private,b"private bytes changed").unwrap();
     assert!(result.checked_dataset_discovery(&path).is_err());
 }
+
+#[test]
+fn retained_original_proof_survives_catalogue_mutation_and_records_real_signatures() {
+    let f = Fixture::new(true, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", true, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let discovery = report.dataset_discovery.values().next().unwrap();
+    let proof = discovery.original_authentication();
+    let original = std::fs::read(f.dir.path().join("CATALOG.XML")).unwrap();
+    assert_eq!(proof.catalogue_bytes(), original);
+    assert_eq!(proof.resource_uri(), "file:/DATA.H5");
+    let entry = std::str::from_utf8(proof.discovery_bytes()).unwrap();
+    assert!(entry.starts_with("<xc:S100_DatasetDiscoveryMetadata>"));
+    assert!(entry.contains("<xc:fileName>file:/DATA.H5</xc:fileName>"));
+    assert!(!format!("{report:?}").contains("catalogue_bytes"));
+    assert!(!format!("{report:?}").contains("S100_ExchangeCatalogue"));
+    assert_eq!(proof.catalogue_sha384(), hex(&hash(MessageDigest::sha384(), &original).unwrap()));
+    assert_eq!(proof.verified_unix_seconds(), NOW);
+    assert_eq!(proof.trust_anchor_sha256(), &report.trust_anchor_sha256);
+    assert_eq!(proof.signatures().len(), 2);
+    let direct = &proof.signatures()[0];
+    let chained = &proof.signatures()[1];
+    assert_eq!(direct.signature_target(), None);
+    assert_eq!(chained.signature_target(), Some(direct.id()));
+    assert_ne!(direct.der(), chained.der());
+    assert_eq!(direct.signer_certificate_sha256(), chained.signer_certificate_sha256());
+    assert_eq!(direct.signer_certificate_sha256().len(), 64);
+    let document = xml(&original).unwrap();
+    let signature = document.descendants().find(|n| is(*n, SE, "S100_SE_SignatureOnData")).unwrap();
+    assert_eq!(direct.der(), decode(signature).unwrap());
+    let snapshot = proof.capture_resource().unwrap();
+    std::fs::write(f.dir.path().join("CATALOG.XML"), b"replaced").unwrap();
+    std::fs::write(f.dir.path().join("DATA.H5"), b"replaced").unwrap();
+    assert_eq!(proof.catalogue_bytes(), original);
+    assert_eq!(std::fs::read(snapshot.path()).unwrap(), b"authentic bathymetry bytes\x00\xff");
+    assert!(proof.capture_resource().is_err());
+}
+#[test]
+fn public_report_edits_cannot_forge_snapshot_authentication() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let mut report = f.verify(NOW).unwrap();
+    let forged = f.dir.path().join("OTHER.H5");
+    std::fs::write(&forged, b"forged").unwrap();
+    report.resources[0].path = forged.canonicalize().unwrap();
+    report.resources[0].size = 6;
+    report.resources[0].sha384 = hex(&hash(MessageDigest::sha384(), b"forged").unwrap());
+    assert!(report.resources[0].snapshot().is_err());
+    let proof = report.dataset_discovery.values().next().unwrap().original_authentication();
+    assert_eq!(proof.resource_size(), 28);
+    assert!(proof.capture_resource().is_ok());
+}
+
+#[test]
+fn signature_trace_labels_cannot_be_rewritten_on_snapshot_report() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let mut report = f.verify(NOW).unwrap();
+    report.resources[0].signature_ids[0] = "OTHER".into();
+    assert!(report.resources[0].snapshot().is_err());
+    report.resources[0].signature_ids[0] = "DATA".into();
+    report.resources[0].certificate_ids[0] = "OTHER".into();
+    assert!(report.resources[0].snapshot().is_err());
+}
+
+#[test]
+fn catalogue_only_authentication_is_not_missing_resource_authentication() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    std::fs::remove_file(f.dir.path().join("DATA.H5")).unwrap();
+    let original = std::fs::read(f.dir.path().join("CATALOG.XML")).unwrap();
+    let proof = verify_exchange_catalogue(f.dir.path(), &f.anchors, NOW).unwrap();
+    assert_eq!(proof.catalogue_bytes(), original);
+    assert_eq!(proof.verified_unix_seconds(), NOW);
+    assert!(!proof.revocation_checked());
+    assert_eq!(proof.signatures().len(), 1);
+    assert_eq!(proof.discovery_view().unwrap().dataset_entries().count(), 1);
+    assert!(f.verify(NOW).is_err(), "Physical resource verification must still fail");
+    std::fs::write(f.dir.path().join("CATALOG.XML"), b"tampered").unwrap();
+    assert_eq!(proof.catalogue_bytes(), original);
+    assert!(verify_exchange_catalogue(f.dir.path(), &f.anchors, NOW).is_err());
+    let debug = format!("{proof:?}");
+    assert!(!debug.contains("S100_ExchangeCatalogue") && !debug.contains("catalogue_bytes"));
+}
+
+#[test]
+fn original_entry_preserves_namespaces_utf8_byte_range_and_signer_der() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", true, "LEAF", "unencrypted");
+    let original = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let modified = original.replace("<xc:datasetDiscoveryMetadata>",
+        "<!--해도 Ω--><xc:datasetDiscoveryMetadata>").replace("xc:", "other:")
+        .replace("xmlns:xc=", "xmlns:other=");
+    f.catalogue(modified.as_bytes());
+    let report = f.verify(NOW).unwrap();
+    let proof = report.dataset_discovery.values().next().unwrap().original_authentication();
+    std::fs::remove_file(f.dir.path().join("CATALOG.XML")).unwrap();
+    let view = proof.original_entry_view().unwrap();
+    assert_eq!(view.entry().range(), proof.discovery_range());
+    assert_eq!(view.entry().tag_name().namespace(), Some(XC));
+    assert_eq!(text(unique_child(view.entry(), XC, "fileName").unwrap()).unwrap(), "file:/DATA.H5");
+    for s in proof.signatures() {
+        let cert = X509::from_der(s.signer_certificate_der()).unwrap();
+        assert_eq!(cert.to_der().unwrap(), s.signer_certificate_der());
+        assert_eq!(hex(&cert.digest(MessageDigest::sha256()).unwrap()), s.signer_certificate_sha256());
+    }
+    assert!(std::sync::Arc::ptr_eq(&proof.signatures()[0].signer_certificate_der,
+        &proof.signatures()[1].signer_certificate_der));
+}
+
+#[test]
+fn authenticated_discovery_layout_rejects_nested_spoof_aliases_and_wrong_namespace() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let original = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let d = xml(original.as_bytes()).unwrap();
+    let entry = d.descendants().find(|n| is(*n, XC, "S100_DatasetDiscoveryMetadata")).unwrap();
+    let entry = &original[entry.range()];
+    for bad in [
+        original.replace("<xc:datasetDiscoveryMetadata>", "<xc:fake><xc:datasetDiscoveryMetadata>")
+            .replace("</xc:datasetDiscoveryMetadata>", "</xc:datasetDiscoveryMetadata></xc:fake>"),
+        original.replace(entry, &format!("{entry}{}", entry.replace("file:/DATA.H5", "D%41TA.H5"))),
+        original.replace("<xc:S100_DatasetDiscoveryMetadata>", "<bad:S100_DatasetDiscoveryMetadata xmlns:bad=\"urn:spoof\">")
+            .replace("</xc:S100_DatasetDiscoveryMetadata>", "</bad:S100_DatasetDiscoveryMetadata>"),
+    ] {
+        f.catalogue(bad.as_bytes());
+        assert!(verify_exchange_catalogue(f.dir.path(), &f.anchors, NOW).is_err());
+        assert!(f.verify(NOW).is_err());
+    }
+}
+
+#[test]
+fn original_entry_cannot_select_other_range_or_resource_uri() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let proof = report.dataset_discovery.values().next().unwrap().original_authentication();
+    let mut altered = proof.clone();
+    altered.discovery_range = 0..1;
+    assert!(altered.original_entry_view().is_err());
+    altered = proof.clone(); altered.resource_uri = "file:/OTHER.H5".into();
+    assert!(altered.original_entry_view().is_err());
+}
+
+#[test]
+fn signed_catalogue_and_resource_receiver_budget_is_checked_before_streaming() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let raw = std::fs::read(f.dir.path().join("CATALOG.XML")).unwrap();
+    let doc = xml(&raw).unwrap();
+    let certificates = Certificates::parse(doc.root_element()).unwrap().verified(&f.anchors, NOW).unwrap();
+    let data = b"authentic bathymetry bytes\x00\xff";
+    let make = || vec![Signature { id: "DATA".into(), certificate: "LEAF".into(),
+        bytes: signature(&f.key, data), target: None }];
+    let path = f.dir.path().join("DATA.H5");
+    assert!(verify_resource_with_limit(path.clone(), make(), &certificates, Some(27)).is_err());
+    assert_eq!(verify_resource_with_limit(path, make(), &certificates, Some(28)).unwrap().size, 28);
+    let excessive = vec![b' '; MAX_XML as usize + 1];
+    std::fs::write(f.dir.path().join("CATALOG.XML"), excessive).unwrap();
+    assert!(verify_exchange_catalogue(f.dir.path(), &f.anchors, NOW).is_err());
+}

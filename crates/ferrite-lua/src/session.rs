@@ -311,6 +311,11 @@ impl LuaSession {
         self.host.from_cell_data(cell_data);
     }
 
+    /// Consume all cell data without deep-cloning attributes or geometries.
+    pub fn set_owned_cell_data(&mut self, cell_data: CellData) -> Result<()> {
+        self.host.from_owned_cell_data(cell_data)
+    }
+
     /// Set type catalogue (from Feature Catalogue)
     pub fn set_type_catalogue(&mut self, catalogue: TypeCatalogue) {
         self.host.set_type_catalogue(catalogue);
@@ -598,6 +603,26 @@ impl PortrayalEngine {
         cell_data: &CellData,
         context: ContextParameters,
     ) -> Result<Vec<PortrayalResult>> {
+        self.process_cell_with_loader(context, |session| {
+            session.set_cell_data(cell_data);
+            Ok(())
+        })
+    }
+
+    /// Consume cell data while retaining the same fresh-VM portrayal lifecycle.
+    pub fn process_owned_cell(
+        &mut self,
+        cell_data: CellData,
+        context: ContextParameters,
+    ) -> Result<Vec<PortrayalResult>> {
+        self.process_cell_with_loader(context, |session| session.set_owned_cell_data(cell_data))
+    }
+
+    fn process_cell_with_loader(
+        &mut self,
+        context: ContextParameters,
+        load: impl FnOnce(&mut LuaSession) -> Result<()>,
+    ) -> Result<Vec<PortrayalResult>> {
         // Reset Lua state to clear all caches (feature, information, spatial)
         // This prevents cross-cell contamination from cached feature data
         self.session.reset_for_new_cell()?;
@@ -610,7 +635,7 @@ impl PortrayalEngine {
         }
 
         // Set cell data BEFORE initializing context (so HostGetFeatureIDs works)
-        self.session.set_cell_data(cell_data);
+        load(&mut self.session)?;
         self.session.set_context(context.clone());
 
         // Initialize portrayal context to populate FeaturePortrayalItems
@@ -900,5 +925,60 @@ mod immutable_source_tests {
         assert!(a.session().load_file(root.join("outside.lua")).is_err());
         b.session_mut().reset_for_new_cell().unwrap();
         assert_eq!(b.session().eval::<String>("loaded.tag").unwrap(), "B");
+    }
+}
+
+#[cfg(test)]
+mod owned_engine_tests {
+    use super::*;
+    use crate::PrimitiveType;
+    fn data(id:i64) -> CellData {
+        CellData {features:HashMap::from([(id,FeatureInfo {id,code:format!("Cell{id}"),
+            primitive_type:PrimitiveType::None,attributes:HashMap::new(),complex_attributes:HashMap::new(),spatial_refs:Vec::new()})]),
+            information_types:HashMap::new(),spatials:HashMap::new(),feature_associations:HashMap::new(),
+            information_associations:HashMap::new(),spatial_to_features:HashMap::new()}
+    }
+    #[test]
+    fn owned_and_borrowed_engines_agree_and_reset_data_globals_fc_context_and_failed_results() {
+        let root=std::env::temp_dir().join(format!("ferrite-owned-cell-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("Rules")).unwrap();
+        std::fs::write(root.join("Rules/main.lua"),r#"
+            iteration=0
+            function PortrayalCreateContextParameter(name,kind,value) return {name=name,kind=kind,value=value} end
+            function PortrayalInitializeContextParameters(params) end
+            function PortrayalMain()
+                iteration=iteration+1
+                for _,id in ipairs(HostGetFeatureIDs()) do
+                    HostPortrayalEmit(tostring(id), 'TextInstruction:'..HostFeatureGetCode(id)..':'..HostGetFeatureTypeCodes()[1]..':'..tostring(iteration), 'IsolatedDangers')
+                end
+                if not HostGetContextParameter('IsolatedDangers') then return false end
+                return true
+            end
+        "#).unwrap();
+        let sources=ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
+        let mut borrowed=PortrayalEngine::new_with_sources(Arc::clone(&sources)).unwrap();
+        let mut owned=PortrayalEngine::new_with_sources(sources).unwrap();
+        for (id,code,danger) in [(7,"First",true),(3,"Second",true),(9,"Failed",false),(2,"Recovery",true)] {
+            for engine in [&mut borrowed,&mut owned] {
+                engine.set_type_catalogue(TypeCatalogue {feature_codes:vec![code.into()],..Default::default()});
+            }
+            let data=data(id);
+            let ctx=ContextParameters {isolated_dangers:danger,..Default::default()};
+            let a=borrowed.process_cell(&data,ctx.clone());
+            assert_eq!(data.features[&id].code,format!("Cell{id}"));
+            let b=owned.process_owned_cell(data,ctx);
+            if danger {
+                let a=a.unwrap();let b=b.unwrap();
+                assert_eq!(format!("{a:?}"),format!("{b:?}"));
+                assert_eq!(a.len(),1);assert_eq!(a[0].feature_id,id.to_string());
+                assert!(format!("{a:?}").contains(&format!("Cell{id}:{code}:1")));
+            } else {
+                assert!(a.is_err());assert!(b.is_err());
+                assert!(borrowed.session.host.get_results().is_empty());
+                assert!(owned.session.host.get_results().is_empty());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

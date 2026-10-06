@@ -63,8 +63,13 @@ pub struct AuthenticatedDatasetDiscovery {
     resource_size: u64,
     catalogue_path: PathBuf,
     catalogue_sha384: String,
+    #[serde(skip)]
+    original_authentication: std::sync::Arc<OriginalDatasetAuthentication>,
 }
 impl AuthenticatedDatasetDiscovery {
+    pub fn original_authentication(&self) -> &OriginalDatasetAuthentication {
+        &self.original_authentication
+    }
     pub fn discovery(&self) -> &DatasetDiscovery {
         &self.discovery
     }
@@ -87,8 +92,18 @@ impl AuthenticatedDatasetDiscovery {
         discovery: DatasetDiscovery,
         resource: &VerifiedResource,
         catalogue: &VerifiedResource,
+        catalogue_bytes: std::sync::Arc<[u8]>,
+        verified_unix_seconds: i64,
+        trust_anchor_sha256: std::sync::Arc<HashMap<String, String>>,
+        resource_uri: String,
+        discovery_range: std::ops::Range<usize>,
     ) -> Self {
         Self {
+            original_authentication: std::sync::Arc::new(OriginalDatasetAuthentication {
+                resource: resource.authentication.clone(),
+                catalogue: catalogue.authentication.clone(), catalogue_bytes,
+                verified_unix_seconds, trust_anchor_sha256, resource_uri, discovery_range,
+            }),
             discovery,
             resource_path: resource.path.clone(),
             resource_sha384: resource.sha384.clone(),

@@ -497,6 +497,30 @@ impl HostFunctions {
         }
     }
 
+    /// Consume complete cell data, moving attribute and geometry allocations.
+    /// Acquire all destinations before installation so lock failure leaves the
+    /// previous host intact. This method does not retain another CellData copy.
+    pub fn from_owned_cell_data(&self, data: CellData) -> crate::Result<()> {
+        let error = || crate::LuaError::Portrayal("Host cell data lock poisoned".into());
+        let mut features = self.features.write().map_err(|_| error())?;
+        let mut information = self.information_types.write().map_err(|_| error())?;
+        let mut spatials = self.spatials.write().map_err(|_| error())?;
+        let mut associations = self.feature_associations.write().map_err(|_| error())?;
+        let mut info_associations = self.information_associations.write().map_err(|_| error())?;
+        let mut reverse = self.spatial_to_features.write().map_err(|_| error())?;
+        *features = data.features;
+        *information = data.information_types;
+        *spatials = data.spatials;
+        *associations = data.feature_associations.into_iter().map(|(key, values)|
+            (key, values.into_iter().map(|a|
+                (a.target_id, a.association_code, a.role_code)).collect())).collect();
+        *info_associations = data.information_associations.into_iter().map(|(key, values)|
+            (key, values.into_iter().map(|a|
+                (a.info_id, a.association_code, a.role_code)).collect())).collect();
+        *reverse = data.spatial_to_features;
+        Ok(())
+    }
+
     /// Get collected results
     pub fn get_results(&self) -> Vec<PortrayalResult> {
         let mut results = self.results.read().map(|r| r.clone()).unwrap_or_default();
@@ -2260,5 +2284,53 @@ mod catalogue_setup_benchmark {
             timings.sort_by(f64::total_cmp);
             println!("CATALOGUE mode={} samples={} features={} simple={} complex={} p50_ms={:.6} p95_ms={:.6}", if mode == 0 { "deep_clone" } else { "shared_arc" }, timings.len(), catalogue.feature_type_info.len(), catalogue.simple_attribute_info.len(), catalogue.complex_attribute_info.len(), timings[timings.len()/2], timings[(timings.len()*95/100).min(timings.len()-1)]);
         }
+    }
+}
+
+#[cfg(test)]
+mod owned_cell_data_tests {
+    use super::*;
+    use crate::context::{AttributeValue,ComplexAttribute,FeatureAssociation,InformationAssociation,InformationInfo,PrimitiveType};
+    fn data() -> CellData {
+        let mut nested=ComplexAttribute::new("nested".into());
+        nested.simple_attrs.insert("values".into(),vec![AttributeValue::Text("retained value".into()),AttributeValue::Integer(9)]);
+        CellData {
+            features:HashMap::from([(7,FeatureInfo {id:7,code:"Wreck".into(),primitive_type:PrimitiveType::Point,
+                attributes:HashMap::from([("name".into(),AttributeValue::Text("unchanged text".into()))]),
+                complex_attributes:HashMap::from([("nested".into(),vec![nested])]),spatial_refs:Vec::new()})]),
+            information_types:HashMap::from([(8,InformationInfo {id:8,code:"Info".into(),attributes:HashMap::new(),complex_attributes:HashMap::new()})]),
+            spatials:HashMap::from([(9,SpatialInfo {id:9,spatial_type:PrimitiveType::Point,coordinates:vec![(1.5,2.5)],z_coordinates:vec![Some(-3.5)],curve_associations:Vec::new(),interior_curve_associations:Vec::new()})]),
+            feature_associations:HashMap::from([(7,vec![FeatureAssociation {target_id:4,association_code:"first".into(),role_code:"role1".into()},FeatureAssociation {target_id:2,association_code:"second".into(),role_code:"role2".into()}])]),
+            information_associations:HashMap::from([(7,vec![InformationAssociation {info_id:8,association_code:"info".into(),role_code:"info role".into()}])]),
+            spatial_to_features:HashMap::from([(9,vec![7,3,7])]),
+        }
+    }
+    #[test]
+    fn moved_data_equals_borrowed_data_preserves_buffers_and_association_order() {
+        let data=data();
+        let coordinates=data.spatials[&9].coordinates.as_ptr();
+        let association=data.feature_associations[&7][0].association_code.as_ptr();
+        let text=match &data.features[&7].attributes["name"] {AttributeValue::Text(s)=>s.as_ptr(),_=>unreachable!()};
+        let borrowed=HostFunctions::new();borrowed.from_cell_data(&data);
+        let owned=HostFunctions::new();owned.from_owned_cell_data(data).unwrap();
+        assert_eq!(owned.spatials.read().unwrap()[&9].coordinates.as_ptr(),coordinates);
+        assert_eq!(owned.feature_associations.read().unwrap()[&7][0].1.as_ptr(),association);
+        let actual=owned.features.read().unwrap();
+        assert_eq!(match &actual[&7].attributes["name"] {AttributeValue::Text(s)=>s.as_ptr(),_=>unreachable!()},text);
+        assert_eq!(format!("{:?}",actual[&7]),format!("{:?}",borrowed.features.read().unwrap()[&7]));
+        assert_eq!(format!("{:?}",owned.information_types.read().unwrap()[&8]),format!("{:?}",borrowed.information_types.read().unwrap()[&8]));
+        assert_eq!(format!("{:?}",owned.spatials.read().unwrap()[&9]),format!("{:?}",borrowed.spatials.read().unwrap()[&9]));
+        assert_eq!(*owned.feature_associations.read().unwrap(),*borrowed.feature_associations.read().unwrap());
+        assert_eq!(*owned.information_associations.read().unwrap(),*borrowed.information_associations.read().unwrap());
+        assert_eq!(*owned.spatial_to_features.read().unwrap(),*borrowed.spatial_to_features.read().unwrap());
+    }
+    #[test]
+    fn owned_lock_failure_leaves_previous_maps_intact() {
+        let host=HostFunctions::new();host.from_owned_cell_data(data()).unwrap();
+        let poisoned=Arc::clone(&host.spatials);
+        let _=std::thread::spawn(move || {let _guard=poisoned.write().unwrap();panic!("poison fixture");}).join();
+        let mut replacement=data();replacement.features.clear();
+        assert!(host.from_owned_cell_data(replacement).is_err());
+        assert!(host.features.read().unwrap().contains_key(&7));
     }
 }

@@ -6919,11 +6919,10 @@ fn try_lua_portrayal(
 
         // Create portrayal context for this cell
         let portrayal_context = PortrayalContext::from_cell(cell, context.clone());
-        let cell_data_arc = portrayal_context.cell_data();
-        let cell_data_guard = cell_data_arc.read().unwrap();
+        let cell_data = portrayal_context.into_cell_data()?;
 
         let results = engine
-            .process_cell(&cell_data_guard, context.clone())
+            .process_owned_cell(cell_data, context.clone())
             .with_context(|| {
                 format!(
                     "Cell {} portrayal failed: {}",

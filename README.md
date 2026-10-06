@@ -591,7 +591,7 @@ Mac native pointer/menu/keyboard tests loaded the signed SHOM four-cell set and 
 
 ### Current integration validation (macOS, 2D)
 
-The current 318-file integration removes the globe/sphere camera, UI mode, CLI
+The current 320-file integration removes the globe/sphere camera, UI mode, CLI
 path and rendering modules and retains the 2D S-101/S-102 chart view. General
 WGS84 geodesy and Mercator navigation remain. Historical globe reports in
 `TestResults/` describe the older implementation.
@@ -616,6 +616,26 @@ completed with exact final RGBA, instructions and all exported raw geometry buff
 passed six hidden loading cases over two complete SHOM base/update chains, with
 exact image, drawing-instruction and raw-buffer parity. All three executable
 profiles use the default coverage cache.
+
+The current integration moves owned `CellData` into each fresh Lua host instead
+of cloning all feature, attribute, geometry and association maps a second time.
+The borrowed public API remains available. Five ownership/isolation tests and
+actual 5,059-feature full/selected/context/source-change comparisons passed. An
+eight-run same-binary paired experiment measured 211.32 vs 208.90 ms median
+inclusive conversion and Lua processing; the small 1.14% change is not a robust
+FPS improvement claim.
+
+The security module retains opaque original resource authentication, canonical
+signature values, signer certificate DER, catalogue bytes and discovery byte
+ranges. `verify_exchange_catalogue` authenticates bounded catalogue bytes only;
+physical exchange verification continues to require every resource. Catalogue
+proofs do not establish missing-file ownership, complete product metadata,
+producer cancellation authority or revocation status. Thirty security tests and
+two real signed S-101 update-chain tests passed. Eight hidden OFF/ON loading
+controls matched the preceding installed version exactly. Full S-102 fileless
+cancellation admission and SECOM-to-viewer publication remain unfinished. Debug, Release
+and Release-fast also passed six hidden loading controls over both SHOM chains,
+with exact image, instruction and raw-buffer parity.
 
 V12 enables the exact immutable coverage source-binding cache by default.
 `FERRITE_FLAT_COVERAGE_BINDING_CACHE=0` explicitly selects the uncached control

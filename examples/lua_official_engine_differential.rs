@@ -132,6 +132,13 @@ fn compare(
                 "Unexpected selected result ID"
             );
         }
+        // Functional parity includes the complete host input and selected rerun.
+        // This clone prepares the test fixture, not the production owned path.
+        let mut owned_engine = engine(Arc::clone(&sources), fc, shared)?;
+        let owned_full = owned_engine.process_owned_cell(data.clone(), ctx.clone())?;
+        let owned_partial = owned_engine.session_mut().execute_portrayal_for(selected.clone())?;
+        ensure!(canonical(&full) == canonical(&owned_full), "Owned full typed mismatch in {label}");
+        ensure!(canonical(&partial) == canonical(&owned_partial), "Owned selected typed mismatch in {label}");
         let full = canonical(&full);
         let partial = canonical(&partial);
         let stats = e.session().chunk_cache_stats();
@@ -195,6 +202,55 @@ fn compare(
         serde_json::json!({"label":label,"fc_digest":hex(fc.source_digest()),"pc_digest":hex(sources.digest()),"context":ctx.to_lua_params(),"features":data.features.len(),"derived_feature_input_change":feature_input_change,"comparison":"complete ordered typed bytes, not hashes","modes":measures,"context_diagnostics":ferrite_s101::validate_portrayal_context(pc,&ctx)?.1}),
     )
 }
+fn owned_abba(
+    fc: &BoundFeatureCatalogue,
+    pc: &BoundPortrayalCatalogue,
+    cell: &S101Cell,
+    out: &Path,
+) -> Result<()> {
+    let sources = pc.sources();
+    let mut ctx = ContextParameters::from_pc_context(pc.get_context_parameters());
+    ferrite_s101::synchronize_legacy_context(pc, &mut ctx);
+    ferrite_s101::validate_portrayal_context(pc, &ctx)?;
+    let before = format!("{cell:?}");
+    let mut warm = engine(Arc::clone(&sources), fc, true)?;
+    let warm_context = PortrayalContext::from_cell(cell, ctx.clone());
+    let warm_data = warm_context.cell_data();
+    let expected = canonical(&warm.process_cell(&warm_data.read().unwrap(), ctx.clone())?);
+    drop(warm_data); drop(warm_context); drop(warm);
+    let mut rows = Vec::new();
+    for (index, owned) in [false,true,true,false,true,false,false,true].into_iter().enumerate() {
+        let stats_before = ChunkCache::process_shared().stats();
+        let start = Instant::now();
+        // Includes conversion from original S101Cell, engine/FC metadata preparation,
+        // context acquisition, all host-data preparation/cloning and full portrayal.
+        let context = PortrayalContext::from_cell(cell, ctx.clone());
+        let mut current = engine(Arc::clone(&sources), fc, true)?;
+        let results = if owned {
+            current.process_owned_cell(context.into_cell_data()?, ctx.clone())?
+        } else {
+            let data = context.cell_data();
+            let result = current.process_cell(&data.read().unwrap(), ctx.clone())?;
+            drop(data); drop(context);
+            result
+        };
+        let elapsed_ms = start.elapsed().as_secs_f64()*1000.;
+        let stats = ChunkCache::process_shared().stats();
+        ensure!(stats.compiled_chunks == stats_before.compiled_chunks, "Unexpected compilation in ABBA");
+        let bytes = canonical(&results); // comparison/file IO excluded from timer
+        ensure!(bytes == expected, "Owned ABBA full ordered typed mismatch {index}");
+        ensure!(format!("{cell:?}") == before, "ABBA mutated original attributes");
+        rows.push(serde_json::json!({"index":index,"owned":owned,"elapsed_ms":elapsed_ms,
+            "compiled_delta":stats.compiled_chunks-stats_before.compiled_chunks,
+            "hit_delta":stats.bytecode_hits-stats_before.bytecode_hits,
+            "full_bytes":bytes.len(),"full_sha256":hex(&Sha256::digest(&bytes))}));
+    }
+    fs::write(out.join("owned-cell-abba.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "scope":"samebinary ABBA+BAAB, fresh VM; includes S101Cell->CellData conversion, FC metadata/engine preparation, context and borrowed clone or owned handoff, full Lua portrayal. Excludes first compiler warmup, canonical formatting/equality, IO and output conversion. Not native/FPS.",
+        "order":"borrowed owned owned borrowed owned borrowed borrowed owned", "rows":rows}))?)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     ensure!(
@@ -350,6 +406,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    owned_abba(&fc, &pc, &cell, &out)?;
     // Copy only the official retained Rules bytes to an owned miniature PC map.
     // A/B use the SAME chunk path; original files are never modified.
     let private = out.join("owned-pc");
@@ -409,7 +466,7 @@ fn main() -> Result<()> {
     fs::write(
         out.join("report.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"scope":"CPU Lua compilation/portrayal equivalence only; no renderer palette conversion, native frames or FPS","authentication":"local CPU fixture retained unauthenticated snapshots; no signature claim","source_identity_sha256":hex(identity.sha256()),"source_key":source_key,"expected_audit":expected_audit,"dataset":format!("{:?}",cell.dsid),"complete_chain":chain,"alternate_fc":alternate_fc_evidence,"materialized_features":cell.features.len(),"rows":rows,"same_path_changed_source_rejected":true,"retained_a_survives_b":true,"all_original_inputs_unchanged":true,"runtime_identity":format!("{:?}",ferrite_lua::runtime_identity())}),
+            &serde_json::json!({"scope":"CPU Lua compilation/portrayal equivalence only; no renderer palette conversion, native frames or FPS","authentication":"local CPU fixture retained unauthenticated snapshots; no signature claim","source_identity_sha256":hex(identity.sha256()),"source_key":source_key,"expected_audit":expected_audit,"dataset":format!("{:?}",cell.dsid),"complete_chain":chain,"alternate_fc":alternate_fc_evidence,"materialized_features":cell.features.len(),"rows":rows,"owned_borrowed_full_selected_differential":true,"owned_abba_file":"owned-cell-abba.json","same_path_changed_source_rejected":true,"retained_a_survives_b":true,"all_original_inputs_unchanged":true,"runtime_identity":format!("{:?}",ferrite_lua::runtime_identity())}),
         )?,
     )?;
     Ok(())

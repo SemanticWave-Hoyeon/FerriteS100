@@ -362,6 +362,7 @@ pub struct PortrayalContext {
 }
 
 /// Cell data holder for Lua access
+#[derive(Clone)]
 pub struct CellData {
     /// Feature ID → Feature Record mapping
     pub features: HashMap<i64, FeatureInfo>,
@@ -967,6 +968,21 @@ impl PortrayalContext {
             .unwrap_or_default()
     }
 
+    /// Consume this context without copying data when it has no external owners.
+    /// Existing shared access remains supported via a snapshot clone. Poisoned
+    /// data is rejected rather than silently replacing it with empty maps.
+    pub fn into_cell_data(self) -> crate::Result<CellData> {
+        match Arc::try_unwrap(self.cell) {
+            Ok(lock) => lock.into_inner().map_err(|_| crate::LuaError::Portrayal(
+                "Cell data lock poisoned".into())),
+            Err(shared) => {
+                let data = shared.read().map_err(|_| crate::LuaError::Portrayal(
+                    "Cell data lock poisoned".into()))?;
+                Ok(data.clone())
+            }
+        }
+    }
+
     /// Get access to cell data (for host functions)
     pub fn cell_data(&self) -> Arc<RwLock<CellData>> {
         self.cell.clone()
@@ -1034,6 +1050,44 @@ mod curve_conversion_benchmark {
                 timings[timings.len() / 2],
                 timings[(timings.len() * 95 / 100).min(timings.len() - 1)]
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod owned_context_tests {
+    use super::*;
+    fn context() -> PortrayalContext {
+        PortrayalContext {parameters:ContextParameters::default(),features:Vec::new(),
+            cell:Arc::new(RwLock::new(CellData {
+                features:HashMap::new(),information_types:HashMap::new(),spatials:HashMap::new(),
+                feature_associations:HashMap::new(),information_associations:HashMap::new(),
+                spatial_to_features:HashMap::from([(9,vec![7,3,7])]),
+            }))}
+    }
+    #[test]
+    fn consuming_unique_context_moves_allocation_shared_context_keeps_independent_snapshot() {
+        let unique=context();
+        let pointer=unique.cell.read().unwrap().spatial_to_features[&9].as_ptr();
+        let moved=unique.into_cell_data().unwrap();
+        assert_eq!(moved.spatial_to_features[&9].as_ptr(),pointer);
+        let shared=context();
+        let external=shared.cell_data();
+        let pointer=external.read().unwrap().spatial_to_features[&9].as_ptr();
+        let mut copied=shared.into_cell_data().unwrap();
+        assert_ne!(copied.spatial_to_features[&9].as_ptr(),pointer);
+        copied.spatial_to_features.get_mut(&9).unwrap()[0]=100;
+        assert_eq!(external.read().unwrap().spatial_to_features[&9],[7,3,7]);
+    }
+    #[test]
+    fn poisoned_context_rejects_both_unique_and_shared_extraction() {
+        for shared in [false,true] {
+            let context=context();
+            let external=context.cell_data();
+            let poison=Arc::clone(&external);
+            let _=std::thread::spawn(move || {let _guard=poison.write().unwrap();panic!("poison fixture");}).join();
+            if !shared {drop(external);}
+            assert!(context.into_cell_data().is_err());
         }
     }
 }
