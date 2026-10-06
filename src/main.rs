@@ -6938,9 +6938,9 @@ fn try_lua_portrayal(
             cell.file_path.display()
         );
 
-        // Create portrayal context for this cell
-        let portrayal_context = PortrayalContext::from_cell(cell, context.clone());
-        let cell_data = portrayal_context.into_cell_data()?;
+        // Build the owned host input directly; fresh private context metadata
+        // was immediately discarded here and cannot affect Lua initialization.
+        let cell_data = ferrite_lua::CellData::from_cell(cell);
 
         let results = engine
             .process_owned_cell(cell_data, context.clone())

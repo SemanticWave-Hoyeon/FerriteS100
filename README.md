@@ -829,3 +829,23 @@ navigation experiment. Installation uses guarded profile receipts and an atomic
 rollback journal. Installed copies are compared with their qualified archives,
 preserving TestData, Trust, catalogues, launchers, historical TestResults and
 unmanaged assets.
+
+
+The App now builds owned Lua host `CellData` directly from each loaded cell.
+The public `PortrayalContext` and borrowed APIs remain available; every cell
+still receives a fresh VM and executes the complete official rules. The change
+removes unused Rust feature metadata, two extra code strings per feature and
+a temporary Arc/RwLock on this owning path. It does not remove Lua feature items
+or cache portrayal results.
+
+The complete 5,059-feature SHOM base/update chain matched the independent
+original extraction path across all CellData fields and ordered typed outputs.
+The qualified candidate passed 136 CPU tests, the all-targets check and 24 hidden
+signed native controls over two chains at Dusk/Night and 1/20/200x, including
+selection and failed-publication recovery. An eight-block extraction-only
+comparison measured 2.718 versus 2.518 ms median of block medians, a 7.36%
+reduction in that stage. Original unused metadata capacity totalled 904,952
+bytes; this is owned payload capacity, not an RSS or allocator-overhead measure.
+The inclusive conversion-plus-Lua experiment showed roughly 0.5% median change
+with a paired regression, so it does not establish a robust whole-load or FPS
+improvement. Current foreground 60 FPS and Windows validation remain unproven.

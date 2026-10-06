@@ -1,11 +1,13 @@
 //! CPU only. Usage: <FC.xml> <PC-root> <new-output-dir> <base> [ordered updates...]
 //! Compare engine-local and process-shared compiler retention with identical
 //! retained inputs, fresh VMs, and complete ordered typed portrayal outputs.
+#[path = "controls/direct_cell_data_legacy_oracle.rs"]
+mod direct_cell_data_legacy_oracle;
 use anyhow::{ensure, Context, Result};
 use ferrite_feature_catalog::{BoundFeatureCatalogue, FeatureCatalogue};
 use ferrite_lua::{
-    ChunkCache, ContextParameters, PortrayalContext, PortrayalEngine, PortrayalResult,
-    TypeCatalogue,
+    CellData, ChunkCache, ComplexAttribute, ContextParameters, PortrayalContext, PortrayalEngine,
+    PortrayalResult, TypeCatalogue,
 };
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, CatalogueSources, PortrayalCatalogue};
 use ferrite_s100_core::S101Cell;
@@ -45,6 +47,65 @@ fn canonical(results: &[PortrayalResult]) -> Vec<u8> {
     // a same-binary differential representation, not a persisted wire format.
     format!("{results:#?}").into_bytes()
 }
+fn ordered<K: Ord + Clone, V>(
+    map: &std::collections::HashMap<K, V>,
+    f: impl Fn(&V) -> String,
+) -> Vec<(K, String)> {
+    let mut values: Vec<_> = map.iter().map(|(k, v)| (k.clone(), f(v))).collect();
+    values.sort_by(|a, b| a.0.cmp(&b.0));
+    values
+}
+fn complex(value: &ComplexAttribute) -> String {
+    format!(
+        "{:?}",
+        (
+            &value.code,
+            ordered(&value.simple_attrs, |v| format!("{v:?}")),
+            ordered(&value.complex_attrs, |v| format!(
+                "{:?}",
+                v.iter().map(complex).collect::<Vec<_>>()
+            ))
+        )
+    )
+}
+fn canonical_cell_data(data: &CellData) -> String {
+    format!(
+        "{:?}",
+        (
+            ordered(&data.features, |v| format!(
+                "{:?}",
+                (
+                    v.id,
+                    &v.code,
+                    v.primitive_type,
+                    ordered(&v.attributes, |a| format!("{a:?}")),
+                    ordered(&v.complex_attributes, |a| format!(
+                        "{:?}",
+                        a.iter().map(complex).collect::<Vec<_>>()
+                    )),
+                    &v.spatial_refs
+                )
+            )),
+            ordered(&data.information_types, |v| format!(
+                "{:?}",
+                (
+                    v.id,
+                    &v.code,
+                    ordered(&v.attributes, |a| format!("{a:?}")),
+                    ordered(&v.complex_attributes, |a| format!(
+                        "{:?}",
+                        a.iter().map(complex).collect::<Vec<_>>()
+                    ))
+                )
+            )),
+            ordered(&data.spatials, |v| format!("{v:?}")),
+            ordered(&data.feature_associations, |v| format!("{v:?}")),
+            ordered(&data.information_associations, |v| format!("{v:?}")),
+            ordered(&data.spatial_to_features, |v| format!("{v:?}"))
+        )
+    )
+}
+
 fn engine(
     sources: Arc<CatalogueSources>,
     fc: &BoundFeatureCatalogue,
@@ -69,7 +130,7 @@ fn compare(
     label: &str,
     out: &Path,
 ) -> Result<serde_json::Value> {
-    let portrayal = PortrayalContext::from_cell(cell, ctx.clone());
+    let portrayal = direct_cell_data_legacy_oracle::from_cell(cell, ctx.clone());
     let data = portrayal.cell_data();
     let feature_input_change = if label == "feature-input-change" {
         let mut changed = data.write().unwrap();
@@ -136,9 +197,53 @@ fn compare(
         // This clone prepares the test fixture, not the production owned path.
         let mut owned_engine = engine(Arc::clone(&sources), fc, shared)?;
         let owned_full = owned_engine.process_owned_cell(data.clone(), ctx.clone())?;
-        let owned_partial = owned_engine.session_mut().execute_portrayal_for(selected.clone())?;
-        ensure!(canonical(&full) == canonical(&owned_full), "Owned full typed mismatch in {label}");
-        ensure!(canonical(&partial) == canonical(&owned_partial), "Owned selected typed mismatch in {label}");
+        let owned_partial = owned_engine
+            .session_mut()
+            .execute_portrayal_for(selected.clone())?;
+        let mut direct_data = CellData::from_cell(cell);
+        if let Some(evidence) = feature_input_change.as_ref() {
+            let id = evidence["feature_id"]
+                .as_i64()
+                .context("Changed feature ID")?;
+            let value = evidence["after"]
+                .as_f64()
+                .context("Changed feature value")?;
+            direct_data
+                .features
+                .get_mut(&id)
+                .context("Missing changed direct feature")?
+                .attributes
+                .insert(
+                    "valueOfSounding".into(),
+                    ferrite_lua::AttributeValue::Real(value),
+                );
+        }
+        ensure!(
+            canonical_cell_data(&direct_data) == canonical_cell_data(&data),
+            "Complete owned CellData mismatch {label}"
+        );
+        let mut direct_engine = engine(Arc::clone(&sources), fc, shared)?;
+        let direct_full = direct_engine.process_owned_cell(direct_data, ctx.clone())?;
+        let direct_partial = direct_engine
+            .session_mut()
+            .execute_portrayal_for(selected.clone())?;
+        ensure!(
+            canonical(&direct_full) == canonical(&owned_full),
+            "Direct builder full result mismatch {label}"
+        );
+        ensure!(
+            canonical(&direct_partial) == canonical(&owned_partial),
+            "Direct builder selected result mismatch {label}"
+        );
+
+        ensure!(
+            canonical(&full) == canonical(&owned_full),
+            "Owned full typed mismatch in {label}"
+        );
+        ensure!(
+            canonical(&partial) == canonical(&owned_partial),
+            "Owned selected typed mismatch in {label}"
+        );
         let full = canonical(&full);
         let partial = canonical(&partial);
         let stats = e.session().chunk_cache_stats();
@@ -217,9 +322,14 @@ fn owned_abba(
     let warm_context = PortrayalContext::from_cell(cell, ctx.clone());
     let warm_data = warm_context.cell_data();
     let expected = canonical(&warm.process_cell(&warm_data.read().unwrap(), ctx.clone())?);
-    drop(warm_data); drop(warm_context); drop(warm);
+    drop(warm_data);
+    drop(warm_context);
+    drop(warm);
     let mut rows = Vec::new();
-    for (index, owned) in [false,true,true,false,true,false,false,true].into_iter().enumerate() {
+    for (index, owned) in [false, true, true, false, true, false, false, true]
+        .into_iter()
+        .enumerate()
+    {
         let stats_before = ChunkCache::process_shared().stats();
         let start = Instant::now();
         // Includes conversion from original S101Cell, engine/FC metadata preparation,
@@ -231,23 +341,88 @@ fn owned_abba(
         } else {
             let data = context.cell_data();
             let result = current.process_cell(&data.read().unwrap(), ctx.clone())?;
-            drop(data); drop(context);
+            drop(data);
+            drop(context);
             result
         };
-        let elapsed_ms = start.elapsed().as_secs_f64()*1000.;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
         let stats = ChunkCache::process_shared().stats();
-        ensure!(stats.compiled_chunks == stats_before.compiled_chunks, "Unexpected compilation in ABBA");
+        ensure!(
+            stats.compiled_chunks == stats_before.compiled_chunks,
+            "Unexpected compilation in ABBA"
+        );
         let bytes = canonical(&results); // comparison/file IO excluded from timer
-        ensure!(bytes == expected, "Owned ABBA full ordered typed mismatch {index}");
-        ensure!(format!("{cell:?}") == before, "ABBA mutated original attributes");
-        rows.push(serde_json::json!({"index":index,"owned":owned,"elapsed_ms":elapsed_ms,
+        ensure!(
+            bytes == expected,
+            "Owned ABBA full ordered typed mismatch {index}"
+        );
+        ensure!(
+            format!("{cell:?}") == before,
+            "ABBA mutated original attributes"
+        );
+        rows.push(
+            serde_json::json!({"index":index,"owned":owned,"elapsed_ms":elapsed_ms,
             "compiled_delta":stats.compiled_chunks-stats_before.compiled_chunks,
             "hit_delta":stats.bytecode_hits-stats_before.bytecode_hits,
-            "full_bytes":bytes.len(),"full_sha256":hex(&Sha256::digest(&bytes))}));
+            "full_bytes":bytes.len(),"full_sha256":hex(&Sha256::digest(&bytes))}),
+        );
     }
-    fs::write(out.join("owned-cell-abba.json"),serde_json::to_vec_pretty(&serde_json::json!({
+    fs::write(
+        out.join("owned-cell-abba.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
         "scope":"samebinary ABBA+BAAB, fresh VM; includes S101Cell->CellData conversion, FC metadata/engine preparation, context and borrowed clone or owned handoff, full Lua portrayal. Excludes first compiler warmup, canonical formatting/equality, IO and output conversion. Not native/FPS.",
-        "order":"borrowed owned owned borrowed owned borrowed borrowed owned", "rows":rows}))?)?;
+        "order":"borrowed owned owned borrowed owned borrowed borrowed owned", "rows":rows}))?,
+    )?;
+    Ok(())
+}
+
+fn direct_cell_data_abba(
+    fc: &BoundFeatureCatalogue,
+    pc: &BoundPortrayalCatalogue,
+    cell: &S101Cell,
+    out: &Path,
+) -> Result<()> {
+    let mut ctx = ContextParameters::from_pc_context(pc.get_context_parameters());
+    ferrite_s101::synchronize_legacy_context(pc, &mut ctx);
+    ferrite_s101::validate_portrayal_context(pc, &ctx)?;
+    let mut warm = engine(pc.sources(), fc, true)?;
+    let expected = canonical(&warm.process_owned_cell(CellData::from_cell(cell), ctx.clone())?);
+    let mut rows = Vec::new();
+    let before = format!("{cell:?}");
+    for (index, direct) in [false, true, true, false, true, false, false, true]
+        .into_iter()
+        .enumerate()
+    {
+        let stats_before = ChunkCache::process_shared().stats();
+        let started = Instant::now();
+        let data = if direct {
+            CellData::from_cell(cell)
+        } else {
+            direct_cell_data_legacy_oracle::from_cell(cell, ctx.clone()).into_cell_data()?
+        };
+        let mut current = engine(pc.sources(), fc, true)?;
+        let results = current.process_owned_cell(data, ctx.clone())?;
+        std::hint::black_box(&results);
+        let ms = started.elapsed().as_secs_f64() * 1000.;
+        let stats = ChunkCache::process_shared().stats();
+        ensure!(
+            stats.compiled_chunks == stats_before.compiled_chunks,
+            "Unexpected compilation in direct ABBA"
+        );
+        let bytes = canonical(&results);
+        ensure!(bytes == expected, "Direct ABBA full typed result mismatch");
+        ensure!(
+            format!("{cell:?}") == before,
+            "Direct builder source mutated"
+        );
+        rows.push(serde_json::json!({"index":index,"direct":direct,"elapsed_ms":ms,"features":cell.features.len(),"results":results.len(),"full_bytes":bytes.len(),"full_sha256":hex(&Sha256::digest(&bytes)),"compiled_delta":stats.compiled_chunks-stats_before.compiled_chunks,"hit_delta":stats.bytecode_hits-stats_before.bytecode_hits}));
+    }
+    fs::write(
+        out.join("direct-cell-data-abba.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"rows":rows,"scope":"Samebinary ABBA+BAAB current legacy owningcontext path versus direct CellData. Includes fullcell host extraction, engine/FCmetadata/reset/freshVM/fullLua portrayal; excludes canonical serialization/equality/IO/outputconversion/destruction. Not native/FPS. Both use same owned hostloader; borrowed API remains separate existing control."}),
+        )?,
+    )?;
     Ok(())
 }
 
@@ -407,6 +582,7 @@ fn main() -> Result<()> {
         None
     };
     owned_abba(&fc, &pc, &cell, &out)?;
+    direct_cell_data_abba(&fc, &pc, &cell, &out)?;
     // Copy only the official retained Rules bytes to an owned miniature PC map.
     // A/B use the SAME chunk path; original files are never modified.
     let private = out.join("owned-pc");

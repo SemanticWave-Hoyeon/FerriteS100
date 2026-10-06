@@ -629,9 +629,14 @@ fn extract_attributes(
     (simple_attrs, complex_attrs)
 }
 
-impl PortrayalContext {
-    /// Create new portrayal context from S101 cell
-    pub fn from_cell(cell: &S101Cell, parameters: ContextParameters) -> Self {
+impl CellData {
+    /// Build owned host input directly without unused Rust portrayal items or
+    /// a temporary shared context. Extraction and source ordering are identical
+    /// to PortrayalContext::from_cell; VM initialization remains the caller's job.
+    pub fn from_cell(cell: &S101Cell) -> Self { build_owned_cell_data(cell, false).0 }
+}
+
+fn build_owned_cell_data(cell: &S101Cell, retain_items: bool) -> (CellData, Vec<FeaturePortrayalItem>) {
         let mut features = Vec::new();
         let mut cell_data = CellData {
             features: HashMap::new(),
@@ -644,7 +649,7 @@ impl PortrayalContext {
 
         // Extract features
         for (key, feature) in &cell.features {
-            let feature_code = feature
+            let mut feature_code = feature
                 .feature_code
                 .clone()
                 .unwrap_or_else(|| format!("UNKNOWN_{}", feature.frid.nftc));
@@ -719,7 +724,7 @@ impl PortrayalContext {
 
             let feature_info = FeatureInfo {
                 id: *key,
-                code: feature_code.clone(),
+                code: if retain_items { feature_code.clone() } else { std::mem::take(&mut feature_code) },
                 primitive_type,
                 attributes,
                 complex_attributes,
@@ -728,6 +733,7 @@ impl PortrayalContext {
 
             cell_data.features.insert(*key, feature_info);
 
+            if retain_items {
             features.push(FeaturePortrayalItem {
                 feature_id: *key,
                 feature_code: feature_code.clone(),
@@ -738,6 +744,7 @@ impl PortrayalContext {
                 },
                 observed_parameters: Vec::new(),
             });
+            }
         }
 
         // Extract information types
@@ -875,11 +882,14 @@ impl PortrayalContext {
             );
         }
 
-        PortrayalContext {
-            parameters,
-            features,
-            cell: Arc::new(RwLock::new(cell_data)),
-        }
+    (cell_data, features)
+}
+
+impl PortrayalContext {
+    /// Create new portrayal context from S101 cell
+    pub fn from_cell(cell: &S101Cell, parameters: ContextParameters) -> Self {
+        let (cell_data, features) = build_owned_cell_data(cell, true);
+        PortrayalContext { parameters, features, cell: Arc::new(RwLock::new(cell_data)) }
     }
 
     /// Get feature info by ID
@@ -1091,3 +1101,7 @@ mod owned_context_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "direct_cell_data_controls.rs"]
+mod direct_cell_data_controls;
