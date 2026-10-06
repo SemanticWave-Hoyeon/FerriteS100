@@ -30,6 +30,20 @@ enum FlatBoundSource {
     NonPoint(usize),
     Point(usize, Arc<PointOriginGeometry>),
 }
+/// Default-on qualified northing reuse. Every explicit invalid value fails closed.
+/// Read only when creating an immutable source binding; never changes view rights.
+fn flat_source_northing_cache_enabled() -> bool {
+    let value = std::env::var("FERRITE_FLAT_SOURCE_NORTHING_CACHE");
+    flat_source_northing_cache_policy(value.as_deref())
+}
+fn flat_source_northing_cache_policy(value: Result<&str, &std::env::VarError>) -> bool {
+    match value {
+        Ok(value) => value == "1",
+        Err(std::env::VarError::NotPresent) => true,
+        Err(std::env::VarError::NotUnicode(_)) => false,
+    }
+}
+
 #[derive(Debug)]
 struct FlatSourceBinding {
     revision: u64,
@@ -37,6 +51,16 @@ struct FlatSourceBinding {
     exemptions: BTreeSet<usize>,
     slots: Vec<usize>,
     sources: Vec<FlatBoundSource>,
+    northings: Mutex<Option<Arc<FlatAnchorNorthings>>>,
+    northings_enabled: bool,
+    northing_requests: AtomicU64,
+    northing_hits: AtomicU64,
+}
+#[derive(Debug)]
+struct FlatAnchorNorthings {
+    projection: ferrite_render::FlatProjection,
+    values: Vec<Option<ferrite_kernel::map_camera::PreparedFlatNorthing>>,
+    ready_count: usize,
 }
 #[derive(Debug, Hash, PartialEq, Eq)]
 enum FlatSourceKey {
@@ -51,6 +75,38 @@ impl FlatSourceBinding {
             .checked_mul(128)
             .and_then(|n| exemptions.checked_mul(32).and_then(|e| n.checked_add(e)))
             .is_some_and(|n| n <= Self::MAX_LOGICAL_BYTES)
+    }
+    // Logical payload cap, not whole-process RSS. No errors or screen decisions cached.
+    const MAX_NORTHING_BYTES: usize = 1024 * 1024;
+    fn northings(&self, scaler: &Scaler) -> Option<Arc<FlatAnchorNorthings>> {
+        if !self.northings_enabled
+            || scaler.projection() != ferrite_render::FlatProjection::EllipsoidalMercator
+            || !Self::northing_admitted(self.sources.len()) { return None; }
+        self.northing_requests.fetch_add(1, Ordering::Relaxed);
+        let mut cache = self.northings.lock().ok()?;
+        if let Some(value) = cache.as_ref().filter(|v| v.projection == scaler.projection()) {
+            self.northing_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(value.clone());
+        }
+        let values: Vec<_> = self.sources.iter().map(|source| {
+            let latitude = match source {
+                FlatBoundSource::Point(_, p) => match p.as_ref() {
+                    PointOriginGeometry::FeaturePoint(p) => Some(p.y),
+                    PointOriginGeometry::AugmentedPoint { crs: ferrite_render::PointOriginCrs::Geographic, coordinates } => Some(coordinates[1]),
+                    PointOriginGeometry::AugmentedLocalPoint { reference_point, .. } => Some(reference_point.y),
+                    _ => None,
+                },
+                _ => None,
+            };
+            latitude.and_then(|lat| scaler.prepare_flat_northing(lat).ok())
+        }).collect();
+        let ready_count = values.iter().filter(|value| value.is_some()).count();
+        let value = Arc::new(FlatAnchorNorthings { projection: scaler.projection(), values, ready_count });
+        *cache = Some(value.clone());
+        Some(value)
+    }
+    fn northing_admitted(count: usize) -> bool {
+        count.checked_mul(64).is_some_and(|n| n <= Self::MAX_NORTHING_BYTES)
     }
     fn matches(&self, context: &RenderContext, exempt: &BTreeSet<usize>) -> bool {
         context.instructions_are_sorted()
@@ -314,6 +370,15 @@ impl GeographicCoverageInventory {
             sources,
         )
     }
+    /// Diagnostic only; no geometry/visibility authorization and no frame allocation.
+    pub fn flat_northing_cache_statistics(&self) -> (bool, u64, u64, usize, usize) {
+        let Ok(cache) = self.binding_cache.lock() else { return (false, 0, 0, 0, 0); };
+        let Some(binding) = cache.as_ref() else { return (false, 0, 0, 0, 0); };
+        let retained = binding.northings.lock().ok()
+            .and_then(|value| value.as_ref().map(|value| (value.values.len(), value.ready_count))).unwrap_or((0,0));
+        (binding.northings_enabled, binding.northing_requests.load(Ordering::Relaxed),
+            binding.northing_hits.load(Ordering::Relaxed), retained.0, retained.1)
+    }
     fn build_flat_binding(
         &self,
         context: &RenderContext,
@@ -372,6 +437,10 @@ impl GeographicCoverageInventory {
             exemptions: exempt.clone(),
             slots,
             sources,
+            northings: Mutex::new(None),
+            northings_enabled: flat_source_northing_cache_enabled(),
+            northing_requests: AtomicU64::new(0),
+            northing_hits: AtomicU64::new(0),
         })
     }
     fn flat_binding(
@@ -491,14 +560,15 @@ impl GeographicCoverageInventory {
             pixel_budget,
         )?);
         // PreparedCoverage and its caller share the already-sorted raw order.
+        let northings = binding.as_ref().and_then(|binding| binding.northings(scaler));
         let mut passes = Vec::new();
         for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
             if let Some(binding) = binding.as_ref() {
                 // Project unique immutable source metadata in THIS actual view.
                 let sources = binding
                     .sources
-                    .iter()
-                    .map(|source| -> ferrite_render::Result<(CoverageSource, bool)> {
+                    .iter().enumerate()
+                    .map(|(source_index, source)| -> ferrite_render::Result<(CoverageSource, bool)> {
                         Ok(match source {
                             FlatBoundSource::Exempt => (CoverageSource::Exempt, false),
                             FlatBoundSource::NonPoint(dataset_id) => (
@@ -509,7 +579,8 @@ impl GeographicCoverageInventory {
                                 false,
                             ),
                             FlatBoundSource::Point(dataset_id, origin) => {
-                                match PortrayalOrigin::project_flat_source(origin, scaler, shift)? {
+                                match PortrayalOrigin::project_flat_source_with_northing(origin, scaler, shift,
+                                    northings.as_ref().and_then(|n| n.values[source_index].as_ref()))? {
                                     Some(p) => (
                                         CoverageSource::Dataset {
                                             dataset_id: *dataset_id,
@@ -950,5 +1021,78 @@ mod projected_view_tests {
                 |_, _| Ok(Some([9., 15.]))
             )
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod northing_cache_contract_tests {
+    use super::*;
+    #[test]
+    fn default_on_and_explicit_opt_out_policy_are_exact() {
+        assert!(flat_source_northing_cache_policy(Err(&std::env::VarError::NotPresent)));
+        assert!(flat_source_northing_cache_policy(Ok("1")));
+        for value in ["0", "", "true", "false", "2", "01", " 1", "1 ", "1\n"] {
+            assert!(!flat_source_northing_cache_policy(Ok(value)), "{value:?}");
+        }
+    }
+    #[test]
+    fn non_unicode_failure_is_distinct_from_absent_default() {
+        // Pure input: no shared process environment mutation or OS-specific test race.
+        let invalid = std::env::VarError::NotUnicode(std::ffi::OsString::from("invalid marker"));
+        assert!(!flat_source_northing_cache_policy(Err(&invalid)));
+        assert!(flat_source_northing_cache_policy(Err(&std::env::VarError::NotPresent)));
+        assert!(!flat_source_northing_cache_policy(Ok("0")));
+    }
+
+    fn binding(latitude: f64, dataset: usize) -> FlatSourceBinding {
+        FlatSourceBinding { revision: 1, count: 1, exemptions: BTreeSet::new(), slots: vec![0],
+            sources: vec![FlatBoundSource::Point(dataset, Arc::new(PointOriginGeometry::FeaturePoint(WorldPoint::new(179.,latitude))))],
+            northings: Mutex::new(None), northings_enabled: true,
+            northing_requests: AtomicU64::new(0), northing_hits: AtomicU64::new(0) }
+    }
+    #[test]
+    fn owner_source_projection_and_decline_contracts() {
+        let mut scaler = ferrite_render::RenderContext::new(ferrite_render::Viewport::new(64.,40.)).scaler;
+        scaler.set_bounds(ferrite_render::GeoBounds::new(-10.,30.,10.,60.));
+        scaler.set_projection(ferrite_render::FlatProjection::EllipsoidalMercator);
+        let first = binding(48.65,0);
+        let a = first.northings(&scaler).unwrap();
+        let b = first.northings(&scaler).unwrap();
+        assert!(Arc::ptr_eq(&a,&b));
+        assert_eq!(first.northing_hits.load(Ordering::Relaxed),1);
+        let next = binding(48.66,1);
+        let c = next.northings(&scaler).unwrap();
+        assert!(!Arc::ptr_eq(&a,&c));
+        scaler.set_bounds(ferrite_render::GeoBounds::new(-10.,30.,10.,60.));
+        assert!(Arc::ptr_eq(&a,&first.northings(&scaler).unwrap()));
+        scaler.set_projection(ferrite_render::FlatProjection::LocalGeographic);
+        assert!(first.northings(&scaler).is_none());
+        scaler.set_projection(ferrite_render::FlatProjection::EllipsoidalMercator);
+        let invalid = binding(91.,0).northings(&scaler).unwrap();
+        assert!(invalid.values[0].is_none()); // Legacy conversion still runs; no cached error.
+        let mut off = binding(48.65,0); off.northings_enabled=false;
+        assert!(off.northings(&scaler).is_none());
+        assert!(off.northings.lock().unwrap().is_none());
+    }
+    #[test]
+    fn whole_overcap_binding_declines_without_cached_prefix() {
+        let mut scaler=ferrite_render::RenderContext::new(ferrite_render::Viewport::new(64.,40.)).scaler;
+        scaler.set_bounds(ferrite_render::GeoBounds::new(-10.,30.,10.,60.));
+        scaler.set_projection(ferrite_render::FlatProjection::EllipsoidalMercator);
+        let mut source=binding(48.65,0);
+        source.sources.resize_with(16385, || FlatBoundSource::NonPoint(0));
+        assert!(source.northings(&scaler).is_none());
+        assert!(source.northings.lock().unwrap().is_none());
+        assert_eq!(source.northing_requests.load(Ordering::Relaxed),0);
+        let FlatBoundSource::Point(_,origin)=&source.sources[0] else { panic!(); };
+        let old=PortrayalOrigin::project_flat_source(origin,&scaler,0.).unwrap().unwrap();
+        let next=PortrayalOrigin::project_flat_source_with_northing(origin,&scaler,0.,None).unwrap().unwrap();
+        assert_eq!([old.x.to_bits(),old.y.to_bits()],[next.x.to_bits(),next.y.to_bits()]);
+    }
+    #[test]
+    fn cap_precedes_allocation_and_overflow_falls_back() {
+        assert!(FlatSourceBinding::northing_admitted(16384));
+        assert!(!FlatSourceBinding::northing_admitted(16385));
+        assert!(!FlatSourceBinding::northing_admitted(usize::MAX));
     }
 }

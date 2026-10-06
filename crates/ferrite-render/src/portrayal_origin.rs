@@ -173,6 +173,13 @@ impl PortrayalOrigin {
         scaler: &crate::Scaler,
         shift: f64,
     ) -> Result<Option<crate::ScreenPoint>> {
+        Self::project_flat_source_with_northing(p, scaler, shift, None)
+    }
+    /// Same source conversion, optionally reusing an opaque exact projection result.
+    pub fn project_flat_source_with_northing(
+        p: &PointOriginGeometry, scaler: &crate::Scaler, shift: f64,
+        prepared: Option<&ferrite_kernel::map_camera::PreparedFlatNorthing>,
+    ) -> Result<Option<crate::ScreenPoint>> {
         use ferrite_kernel::portrayal_position::{AugmentedPointPosition, PortrayalDevice};
         if !shift.is_finite() {
             return Err(RenderError::Transform("Non-finite longitude shift".into()));
@@ -221,7 +228,11 @@ impl PortrayalOrigin {
         .map_err(|e| RenderError::Transform(e.to_string()))?;
         let resolved = device
             .resolve(authored, |p| {
-                let p = scaler.world_to_screen(WorldPoint::new(p[0], p[1]));
+                let world = WorldPoint::new(p[0], p[1]);
+                let p = match prepared {
+                    Some(value) => scaler.world_to_screen_with_prepared_northing(world, value),
+                    None => scaler.world_to_screen(world),
+                };
                 Ok(Some([p.x as f64, p.y as f64]))
             })
             .map_err(|e| RenderError::Transform(e.to_string()))?;
@@ -465,5 +476,110 @@ mod device_point_tests {
         assert!(overflow.flat_source_position(&s, 0.).is_err());
         let missing = PortrayalOrigin::augmented_point(PointOriginCrs::Local, [1., 2.]).unwrap();
         assert!(missing.flat_source_position(&s, 0.).is_err());
+    }
+}
+
+#[cfg(test)]
+mod northing_source_conversion_tests {
+    use super::*;
+    use crate::{FlatProjection, GeoBounds, Scaler, Viewport};
+    fn result_bits(result: Result<Option<crate::ScreenPoint>>) -> std::result::Result<Option<[u32;2]>, String> {
+        result.map(|value| value.map(|p| [p.x.to_bits(),p.y.to_bits()])).map_err(|e|e.to_string())
+    }
+    fn legacy_project_flat_source(
+        p: &PointOriginGeometry,
+        scaler: &crate::Scaler,
+        shift: f64,
+    ) -> Result<Option<crate::ScreenPoint>> {
+        use ferrite_kernel::portrayal_position::{AugmentedPointPosition, PortrayalDevice};
+        if !shift.is_finite() {
+            return Err(RenderError::Transform("Non-finite longitude shift".into()));
+        }
+        let authored = match p {
+            PointOriginGeometry::FeaturePoint(p) => {
+                AugmentedPointPosition::Geographic([p.x + shift, p.y])
+            }
+            PointOriginGeometry::AugmentedPoint {
+                crs: PointOriginCrs::Geographic,
+                coordinates,
+            } => AugmentedPointPosition::Geographic([coordinates[0] + shift, coordinates[1]]),
+            PointOriginGeometry::AugmentedLocalPoint {
+                reference_point,
+                millimetres,
+            } => AugmentedPointPosition::Local {
+                reference_point: [reference_point.x + shift, reference_point.y],
+                millimetres: *millimetres,
+            },
+            PointOriginGeometry::AugmentedPoint {
+                crs: PointOriginCrs::Portrayal,
+                coordinates,
+            } => {
+                if shift != 0. {
+                    return Ok(None);
+                }
+                AugmentedPointPosition::Portrayal {
+                    millimetres: *coordinates,
+                }
+            }
+            PointOriginGeometry::AugmentedPoint {
+                crs: PointOriginCrs::Local,
+                ..
+            } => {
+                return Err(RenderError::Transform(
+                    "Local source lacks geographic reference point".into(),
+                ))
+            }
+        };
+        let v = scaler.viewport;
+        let density = scaler.pixels_per_mm();
+        let device = PortrayalDevice::new(
+            [v.x as f64, v.y as f64 + v.height as f64],
+            [density, density],
+        )
+        .map_err(|e| RenderError::Transform(e.to_string()))?;
+        let resolved = device
+            .resolve(authored, |p| {
+                let p = scaler.world_to_screen(WorldPoint::new(p[0], p[1]));
+                Ok(Some([p.x as f64, p.y as f64]))
+            })
+            .map_err(|e| RenderError::Transform(e.to_string()))?;
+        resolved
+            .map(|p| {
+                let p = crate::ScreenPoint::new(p[0] as f32, p[1] as f32);
+                if !p.x.is_finite() || !p.y.is_finite() {
+                    return Err(RenderError::Transform(
+                        "Physical point exceeds screen coordinate range".into(),
+                    ));
+                }
+                Ok(p)
+            })
+            .transpose()
+    }
+    #[test]
+    fn legacy_physical_crs_wrap_rounding_and_errors_remain_exact() {
+        for projection in [FlatProjection::LocalGeographic,FlatProjection::EllipsoidalMercator] {
+            for ratio in [1.,1.5,2.] {
+                let mut scaler = crate::RenderContext::new(Viewport::new(1280.,852.)).scaler;
+                scaler.set_bounds(GeoBounds::new(-5.,45.,5.,55.));
+                scaler.set_projection(projection); scaler.set_pixel_ratio(ratio);
+                for lat in [-90.,90.,f64::from_bits(90f64.to_bits()-1),f64::from_bits(90f64.to_bits()+1),
+                    f64::from_bits((-90f64).to_bits()-1),f64::from_bits((-90f64).to_bits()+1),
+                    -89.5,-0.,0.,48.65,89.5,f64::NAN,91.] {
+                    for bounds in [GeoBounds::new(-5.,45.,5.,55.),GeoBounds::new(-4.2,48.1,-4.1,48.2),GeoBounds::new(178.,45.,180.,50.)] {
+                    scaler.zoom_to_fit(bounds);
+                    let origins = [PointOriginGeometry::FeaturePoint(crate::WorldPoint::new(179.,lat)),
+                        PointOriginGeometry::AugmentedPoint { crs: PointOriginCrs::Geographic, coordinates: [179.,lat] },
+                        PointOriginGeometry::AugmentedLocalPoint { reference_point: crate::WorldPoint::new(179.,lat), millimetres: [3.2,-1.5] },
+                        PointOriginGeometry::AugmentedPoint { crs: PointOriginCrs::Portrayal, coordinates: [3.2,-1.5] },
+                        PointOriginGeometry::AugmentedPoint { crs: PointOriginCrs::Local, coordinates: [3.2,-1.5] }];
+                    let prepared = scaler.prepare_flat_northing(lat).ok();
+                    for origin in &origins { for shift in [-360.,0.,360.,f64::NAN] {
+                        assert_eq!(result_bits(legacy_project_flat_source(origin,&scaler,shift)),
+                            result_bits(PortrayalOrigin::project_flat_source_with_northing(origin,&scaler,shift,prepared.as_ref())));
+                    }}
+                    }
+                }
+            }
+        }
     }
 }

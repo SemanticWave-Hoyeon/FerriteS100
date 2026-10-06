@@ -1893,6 +1893,7 @@ impl ChartApp {
                 "render_stats": format!("{:?}",renderer.statistics()),
                 "area_triangulation_reuse": renderer.area_triangulation_reuse_statistics(),
                 "flat_coverage_binding_cache": self.coverage_inventory.as_ref().map(|i|i.flat_binding_cache_statistics()),
+                "flat_source_northing_cache": self.coverage_inventory.as_ref().map(|i|i.flat_northing_cache_statistics()),
                 "source_cells": self.cells.iter().map(|c| &c.file_path).collect::<Vec<_>>(),
                 "native_physical_input_verified": false,
                 "debug_statistics": {"cpu_percent": renderer.ui_state.debug_cpu_usage,

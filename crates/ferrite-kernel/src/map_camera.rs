@@ -10,6 +10,12 @@ pub enum AngularProjection {
     EllipsoidalMercator,
 }
 impl AngularProjection {
+    fn northing_identity(self) -> [u64; 3] {
+        // The only non-angular projection supported by this camera is fixed
+        // Mercator::World on WGS84. No zone, custom ellipsoid or datum is implicit.
+        [match self { Self::Geographic => 0, Self::EllipsoidalMercator => 1 },
+            crate::geodesy::WGS84_A.to_bits(), crate::geodesy::WGS84_F.to_bits()]
+    }
     pub fn northing(self, lat: f64) -> Result<f64> {
         ensure!(lat.is_finite(), "Non-finite camera latitude");
         if self == Self::Geographic {
@@ -26,6 +32,14 @@ impl AngularProjection {
             .unproject([0., q.to_radians() * WGS84_A])?
             .latitude())
     }
+}
+/// Immutable output of the exact current projection, tied to authored latitude bits.
+/// Not a coverage permission or numeric error certificate. Constructor is private.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedFlatNorthing {
+    projection_identity: [u64; 3],
+    latitude_bits: u64,
+    northing: f64,
 }
 #[derive(Debug, Clone)]
 pub struct FlatMapCamera {
@@ -81,6 +95,21 @@ impl FlatMapCamera {
         );
         Ok(p)
     }
+    fn prepare_northing(&self, latitude: f64) -> Result<PreparedFlatNorthing> {
+        let northing = self.projection.northing(latitude)?;
+        ensure!(northing.is_finite(), "Non-finite prepared northing");
+        Ok(PreparedFlatNorthing { projection_identity: self.projection.northing_identity(), latitude_bits: latitude.to_bits(), northing })
+    }
+    fn project_prepared(&self, point: [f64; 2], prepared: &PreparedFlatNorthing) -> Result<[f64; 2]> {
+        ensure!(prepared.projection_identity == self.projection.northing_identity() && prepared.latitude_bits == point[1].to_bits(),
+            "Prepared northing projection/source mismatch");
+        ensure!(point.iter().all(|v| v.is_finite()), "Non-finite camera position");
+        // Exact same operation order as project; only northing evaluation is retained.
+        let p = [(point[0] - self.origin[0]) * self.scale[0] + self.offset[0],
+            (self.origin[1] - prepared.northing) * self.scale[1] + self.offset[1]];
+        ensure!(p.iter().all(|v| v.is_finite()), "Camera screen coordinate overflow");
+        Ok(p)
+    }
     fn unproject(&self, point: [f64; 2]) -> Result<[f64; 2]> {
         ensure!(
             point.iter().all(|v| v.is_finite()),
@@ -108,6 +137,14 @@ impl MapCamera {
     pub fn project(&self, point: [f64; 2]) -> Result<Option<[f64; 2]>> {
         let Self::Flat(camera) = self;
         Ok(Some(camera.project(point)?))
+    }
+    pub fn prepare_flat_northing(&self, latitude: f64) -> Result<PreparedFlatNorthing> {
+        let Self::Flat(camera) = self;
+        camera.prepare_northing(latitude)
+    }
+    pub fn project_with_prepared_northing(&self, point: [f64; 2], prepared: &PreparedFlatNorthing) -> Result<Option<[f64; 2]>> {
+        let Self::Flat(camera) = self;
+        Ok(Some(camera.project_prepared(point, prepared)?))
     }
     pub fn unproject(&self, point: [f64; 2]) -> Result<Option<[f64; 2]>> {
         let Self::Flat(camera) = self;
@@ -141,5 +178,55 @@ mod tests {
             [0., 0.]
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_northing_tests {
+    use super::*;
+    fn bits(p: [f64; 2]) -> [u64; 2] { [p[0].to_bits(), p[1].to_bits()] }
+    #[test]
+    fn retained_northing_matches_independent_legacy_operation_order() {
+        for projection in [AngularProjection::Geographic, AngularProjection::EllipsoidalMercator] {
+            for lat in [-89.5, -80., -0., 0., 48.65, 80., 89.5] {
+                // Independent original projector call; do not use retained token here.
+                let q = projection.northing(lat).unwrap();
+                for scale in [0.01, 1., 20., 200., 1e7] {
+                    for offset in [[0., 0.], [117.25, -307.898], [-1e6, 1e6]] {
+                        let c = FlatMapCamera::new(projection, [-185., 80.], [scale, scale*1.25], offset).unwrap();
+                        let n = c.prepare_northing(lat).unwrap();
+                        for shift in [-360., 0., 360.] {
+                            let point = [179. + shift, lat];
+                            let expected = [(point[0]-c.origin[0])*c.scale[0]+c.offset[0],
+                                (c.origin[1]-q)*c.scale[1]+c.offset[1]];
+                            assert_eq!(bits(c.project(point).unwrap()), bits(expected));
+                            assert_eq!(bits(c.project_prepared(point, &n).unwrap()), bits(expected));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn source_bits_projection_and_malformed_inputs_cannot_rebind() {
+        let merc = FlatMapCamera::new(AngularProjection::EllipsoidalMercator, [0.,80.],[100.,100.],[0.,0.]).unwrap();
+        let geo = FlatMapCamera::new(AngularProjection::Geographic, [0.,80.],[100.,100.],[0.,0.]).unwrap();
+        let n = merc.prepare_northing(0.).unwrap();
+        assert!(merc.project_prepared([0., -0.], &n).is_err());
+        assert!(merc.project_prepared([0., 1.], &n).is_err());
+        assert!(geo.project_prepared([0., 0.], &n).is_err());
+        let mut changed_model = n;
+        changed_model.projection_identity[2] ^= 1;
+        assert!(merc.project_prepared([0., 0.], &changed_model).is_err());
+        assert!(std::mem::size_of::<Option<PreparedFlatNorthing>>() <= 64);
+        for lat in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 91., -91.] {
+            assert!(merc.prepare_northing(lat).is_err());
+            assert!(merc.project([0., lat]).is_err());
+        }
+        // Overflow remains fallible despite a valid retained projection.
+        let c = FlatMapCamera::new(AngularProjection::Geographic,[0.,0.],[f64::MAX,1.],[0.,0.]).unwrap();
+        let n = c.prepare_northing(0.).unwrap();
+        assert!(c.project_prepared([2.,0.], &n).is_err());
+        assert!(c.project([2.,0.]).is_err());
     }
 }

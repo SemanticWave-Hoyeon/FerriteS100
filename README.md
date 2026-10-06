@@ -773,3 +773,59 @@ artifacts is a separate guarded step performed by the integration owner; this
 qualification does not itself assert that the Desktop installation was updated.
 The installer preserves historical TestResults, TestData, Trust, local catalogues,
 unchanged launchers and other unmanaged assets.
+
+
+### Exact Mercator source northing reuse (macOS, 2D)
+
+The renderer enables exact camera-independent Mercator source northing
+reuse when `FERRITE_FLAT_SOURCE_NORTHING_CACHE` is unset. Set it to `0` to opt out
+and use the original conversion path, or `1` to enable it explicitly. Other values,
+including non-Unicode values, disable reuse. The policy is read when an immutable
+source binding is created; changing the environment does not retroactively change
+an existing binding. Camera affine transforms, wrap handling, physical-mm/DPI
+conversion, scale/visibility rights, source identity, coverage and picking remain
+on their existing paths. The opaque prepared value validates projection, original
+latitude bits and fixed WGS84 parameters before reuse; ineligible or over-budget
+bindings use the original conversion without dropping objects.
+
+Admission is limited to 16,384 source slots and 1 MiB of charged record payload per
+binding, checked before allocation. This excludes allocator/Arc overhead, active
+binding generations, the existing source-binding cache and process RSS; it is not
+a global memory limit. The large signed-chain measurement charged 644,288 bytes
+(10,067 slots), and the small chain 9,280 bytes (145 slots). Measured token-building
+wall time was 0.170–0.192 ms and 0.00275–0.00300 ms, respectively. That cold timer
+starts after locking and covers token construction only, not complete initial
+loading, lock wait or first-frame cost.
+
+Prior opt-in production qualification passed 60 hidden native launches, including
+24 actual production launches, over two signed SHOM chains, Dusk/Night and
+1x/20x/200x cameras. Separate OFF/ON tests compared 20 captured poses per run,
+including seam-crossing poses: full chart pixels, ordered instructions, all eight
+raw GPU buffers, source/symbol metadata, selected attributes, original/indexed
+picks and CPU prepared coverage masks/decisions matched. These are sampled
+correctness controls, not a proof of every animation frame or actual hardware-DPI
+changes. Windows is offline and was not requalified.
+
+The separate same-binary timing experiment retained all 32 runs and 16,000 rows,
+with ABBA and BAAB orders, first-use, warm and outside-pan samples kept separate.
+On the large chain, median warm per-run mean preparation fell from 5.0069 to
+4.4238 ms in Dusk (11.65%) and 5.0005 to 4.4313 ms in Night (11.38%). The derived
+main CPU coverage component fell from 1.8435 to 1.1861 ms and 1.8366 to 1.1778 ms
+(35.66–35.87%); the combined coverage stage also includes a separately measured
+host binding/plan/upload span, which is not GPU execution time. All eight large-chain
+paired preparation comparisons improved. Small-chain preparation results were
+mixed and do not establish a robust benefit. Mean total hidden handler time stayed
+near 8.3 ms and did not materially improve; handler p95 increased about 1.6–1.8%.
+All outliers were retained. Surface acquisition/FIFO pacing can absorb CPU savings.
+Hidden cadence is not physical display FPS, completed GPU duration or a foreground
+60 FPS guarantee.
+
+The shipping default-policy CPU tests, all-targets check and fresh Debug,
+Release and Release-fast builds passed. The separate 48-launch default/unset/
+explicit-ON/OFF/original control gate and 12 three-profile native comparisons
+passed. A fresh publication's first cache request constructs the token table;
+zero hits at that point is valid, while warm reuse was verified separately in the
+navigation experiment. Installation uses guarded profile receipts and an atomic
+rollback journal. Installed copies are compared with their qualified archives,
+preserving TestData, Trust, catalogues, launchers, historical TestResults and
+unmanaged assets.

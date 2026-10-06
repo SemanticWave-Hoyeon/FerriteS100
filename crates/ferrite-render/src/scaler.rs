@@ -521,6 +521,14 @@ impl Scaler {
         p
     }
 
+    pub fn prepare_flat_northing(&self, latitude: f64) -> anyhow::Result<ferrite_kernel::map_camera::PreparedFlatNorthing> {
+        self.camera.prepare_flat_northing(latitude)
+    }
+    pub fn world_to_screen_with_prepared_northing(&self, world: WorldPoint, prepared: &ferrite_kernel::map_camera::PreparedFlatNorthing) -> ScreenPoint {
+        let p = self.camera.project_with_prepared_northing([world.x, world.y], prepared)
+            .ok().flatten().unwrap_or([f64::NAN; 2]);
+        ScreenPoint::new(p[0] as f32, p[1] as f32)
+    }
     /// Convert screen coordinate to world coordinate
     #[inline]
     pub fn screen_to_world(&self, screen: ScreenPoint) -> WorldPoint {
