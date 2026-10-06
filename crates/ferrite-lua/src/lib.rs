@@ -46,3 +46,10 @@ pub use error::*;
 pub use host::*;
 pub use instruction::*;
 pub use session::*;
+
+// Re-export runtime types for product adapters without a second Lua version.
+pub use ferrite_lua_runtime::{mlua, selected_version};
+pub use ferrite_lua_runtime::{selected_version as lua_runtime_version, RuntimeVersion};
+
+// Exact linked interpreter release plus conservative build-input fingerprint.
+pub use ferrite_lua_runtime::{runtime_identity, RuntimeIdentity};

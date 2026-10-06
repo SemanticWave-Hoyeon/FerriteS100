@@ -3,9 +3,43 @@
 use crate::{AttributeBinding, Multiplicity, RoleType, SpatialPrimitive};
 use serde::{Deserialize, Serialize};
 
+/// S-100 2a-4.2.5 and Part 5 Table 5-A-8 feature classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeatureUseType {
+    Geographic,
+    Meta,
+    Cartographic,
+    Theme,
+}
+impl FeatureUseType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Geographic => "geographic",
+            Self::Meta => "meta",
+            Self::Cartographic => "cartographic",
+            Self::Theme => "theme",
+        }
+    }
+    pub fn parse(value: &str) -> crate::Result<Self> {
+        match value.trim() {
+            "geographic" => Ok(Self::Geographic),
+            "meta" => Ok(Self::Meta),
+            "cartographic" => Ok(Self::Cartographic),
+            "theme" => Ok(Self::Theme),
+            other => Err(crate::FCError::InvalidValue(format!(
+                "featureUseType: {other}"
+            ))),
+        }
+    }
+}
+
 /// Feature type definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureType {
+    /// None means absent in a legacy/incomplete catalogue; never assume geographic.
+    #[serde(default)]
+    pub feature_use_type: Option<FeatureUseType>,
     pub code: String,
     pub name: String,
     #[serde(default)]

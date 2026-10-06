@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-interoperability"
+version.workspace = true
+edition.workspace = true
+description = "Product-neutral, bounded S-100 interoperability catalogue reader"
+[dependencies]
+anyhow.workspace = true
+ferrite-kernel.workspace = true
+roxmltree = "=0.20.0"
+
+ferrite-security.workspace = true

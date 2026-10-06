@@ -38,10 +38,22 @@ pub struct ComplexAttribute {
     pub sub_attributes: Vec<AttributeBinding>,
 }
 
+/// Visibility metadata from S-100 Part 5, Table 5-A-21.
+/// Protected visibility requires a product-specific policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttributeVisibility {
+    #[default]
+    Public,
+    Protected,
+    Private,
+}
+
 /// Attribute binding in feature/complex attribute
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttributeBinding {
     pub attribute_code: String,
+    #[serde(default)]
+    pub visibility: AttributeVisibility,
     #[serde(default)]
     pub multiplicity: Multiplicity,
     #[serde(default)]

@@ -5,6 +5,7 @@ edition.workspace = true
 description = "wgpu-based renderer for S-100 charts"
 
 [dependencies]
+ferrite-kernel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rayon.workspace = true
@@ -19,6 +20,7 @@ winit.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
 image.workspace = true
+lyon_tessellation = "=1.0.20"
 earcutr.workspace = true  # Polygon triangulation
 resvg.workspace = true  # SVG rendering
 

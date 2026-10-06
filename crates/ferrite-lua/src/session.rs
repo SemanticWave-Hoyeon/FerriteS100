@@ -3,8 +3,10 @@
 //! Wraps the Lua state and provides high-level API for executing portrayal rules.
 //! Based on S-100 standard's lua_session.cpp
 
+use crate::mlua;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mlua::Lua;
 
@@ -18,13 +20,15 @@ pub struct LuaSession {
     lua: Lua,
     host: HostFunctions,
     rules_path: PathBuf,
+    sources: Option<Arc<ferrite_portrayal_catalog::CatalogueSources>>,
     initialized: bool,
+    chunk_cache: ferrite_lua_runtime::ChunkCache,
 }
 
 impl LuaSession {
     /// Create new Lua session with sandboxed environment
     pub fn new() -> Result<Self> {
-        let lua = Lua::new();
+        let lua = ferrite_lua_runtime::new_vm();
 
         // Sandbox: Disable dangerous package library functions
         // This prevents loading arbitrary C modules or searching system paths
@@ -39,7 +43,9 @@ impl LuaSession {
             lua,
             host,
             rules_path: PathBuf::new(),
+            sources: None,
             initialized: false,
+            chunk_cache: Default::default(),
         })
     }
 
@@ -47,6 +53,10 @@ impl LuaSession {
     /// Disables dangerous functions that could be exploited
     fn sandbox_lua(lua: &Lua) -> Result<()> {
         let globals = lua.globals();
+
+        // Older IHO catalogues target Lua 5.1 and call the global unpack.
+        let table: mlua::Table = globals.get("table")?;
+        globals.set("unpack", table.get::<mlua::Function>("unpack")?)?;
 
         // Disable loadfile/dofile (load arbitrary files)
         globals.set("loadfile", mlua::Value::Nil)?;
@@ -99,20 +109,55 @@ impl LuaSession {
         }
 
         self.rules_path = path.clone();
+        self.sources = None;
 
         // Install a custom safe searcher that validates resolved paths
         // stay within the rules directory (prevents require("../../evil") escapes)
-        Self::install_safe_searcher(&self.lua, &path)?;
+        Self::install_safe_searcher(&self.lua, &path, self.chunk_cache.clone(), None)?;
 
         tracing::debug!("Lua rules path set to: {}", path.display());
 
         Ok(())
     }
 
+    /// Use a retained immutable PC map; no live disk fallback is permitted.
+    pub fn set_rules_sources(&mut self, sources: Arc<ferrite_portrayal_catalog::CatalogueSources>) -> Result<()> {
+        let path = sources.root_path().join("Rules");
+        self.rules_path = path.clone();
+        self.sources = Some(Arc::clone(&sources));
+        Self::install_safe_searcher(&self.lua, &path, self.chunk_cache.clone(), Some(sources))
+    }
+
+    fn main_available(&self, path: &Path) -> bool {
+        match &self.sources { Some(s) => s.read_path(path).is_ok(), None => path.exists() }
+    }
+
     /// Install a custom Lua searcher that validates resolved file paths
     /// stay within the allowed rules directory. This prevents `require("../../evil")`
     /// from escaping the sandbox via path traversal in module names.
-    fn install_safe_searcher(lua: &Lua, rules_dir: &Path) -> Result<()> {
+    fn install_safe_searcher(
+        lua: &Lua,
+        rules_dir: &Path,
+        cache: ferrite_lua_runtime::ChunkCache,
+        sources: Option<Arc<ferrite_portrayal_catalog::CatalogueSources>>,
+    ) -> Result<()> {
+        if let Some(sources) = sources {
+            let rules = rules_dir.to_path_buf();
+            let searcher = lua.create_function(move |lua, module_name: String| {
+                if module_name.contains('/') || module_name.contains('\\') || module_name.split('.').any(str::is_empty) {
+                    return Err(mlua::Error::RuntimeError("PC snapshot require path escape rejected".into()));
+                }
+                let relative = module_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+                let path = rules.join(format!("{relative}.lua"));
+                let source = sources.read_path(&path).map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                cache.compile(lua, &source, &format!("@{}", path.display())).map(mlua::Value::Function)
+            })?;
+            let package: mlua::Table = lua.globals().get("package")?;
+            let searchers: mlua::Table = package.get("searchers")?;
+            searchers.set(2, searcher)?;
+            package.set("path", "")?;
+            return Ok(());
+        }
         let canonical_rules = rules_dir.canonicalize().map_err(|e| {
             LuaError::ScriptNotFound(format!("Cannot canonicalize rules path: {}", e))
         })?;
@@ -141,17 +186,13 @@ impl LuaSession {
             }
 
             // Read and return a loader function
-            let source = match std::fs::read_to_string(&canonical) {
+            let source = match std::fs::read(&canonical) {
                 Ok(s) => s,
                 Err(_) => return Ok(mlua::Value::Nil),
             };
 
             let chunk_name = format!("@{}", canonical.display());
-            let func = lua
-                .load(&source)
-                .set_name(chunk_name)
-                .into_function()
-                .map_err(mlua::Error::external)?;
+            let func = cache.compile(lua, &source, &chunk_name)?;
 
             Ok(mlua::Value::Function(func))
         })?;
@@ -167,6 +208,30 @@ impl LuaSession {
         Ok(())
     }
 
+    fn read_main_source(&self, main_path: &Path) -> Result<Vec<u8>> {
+        if let Some(sources) = &self.sources {
+            if main_path.parent() != Some(self.rules_path.as_path()) {
+                return Err(LuaError::ScriptNotFound("PC snapshot main path escapes rules root".into()));
+            }
+            return sources.read_path(main_path).map(|b| b.to_vec()).map_err(|e| LuaError::ScriptNotFound(e.to_string()));
+        }
+        let root = self
+            .rules_path
+            .canonicalize()
+            .map_err(|e| LuaError::ScriptNotFound(e.to_string()))?;
+        let main = main_path
+            .canonicalize()
+            .map_err(|e| LuaError::ScriptNotFound(e.to_string()))?;
+        if main.parent() != Some(root.as_path()) {
+            return Err(LuaError::ScriptNotFound(format!(
+                "Security: main script {} escapes rules root {}",
+                main.display(),
+                root.display()
+            )));
+        }
+        std::fs::read(main).map_err(|e| LuaError::ScriptNotFound(e.to_string()))
+    }
+
     /// Load the main portrayal script.
     ///
     /// Security: verifies the script file is a direct child of `rules_path`
@@ -174,7 +239,7 @@ impl LuaSession {
     pub fn load_main(&mut self) -> Result<()> {
         let main_path = self.rules_path.join("main.lua");
 
-        if !main_path.exists() {
+        if !self.main_available(&main_path) {
             return Err(LuaError::ScriptNotFound(main_path.display().to_string()));
         }
 
@@ -189,17 +254,45 @@ impl LuaSession {
             }
         }
 
-        let script = std::fs::read_to_string(&main_path)
-            .map_err(|e| LuaError::ScriptNotFound(e.to_string()))?;
+        let script = self.read_main_source(&main_path)?;
 
-        self.lua
-            .load(&script)
-            .set_name(main_path.to_string_lossy())
-            .exec()?;
+        self.chunk_cache
+            .compile(&self.lua, &script, &main_path.to_string_lossy())?
+            .call::<()>(())?;
 
+        self.install_decimal_equality_compatibility()?;
         self.initialized = true;
         tracing::info!("Loaded main portrayal script: {}", main_path.display());
 
+        Ok(())
+    }
+
+    /// Lua 5.1 only invokes table equality when both operands share __eq.
+    /// Lua 5.4 invokes either operand's method. Legacy PC compares a scaled
+    /// decimal with the unknown-value sentinel and assumes the 5.1 behavior.
+    fn install_decimal_equality_compatibility(&self) -> Result<()> {
+        self.lua
+            .load(
+                r#"
+            if CreateScaledDecimal then
+                local sample = CreateScaledDecimal(0, 0)
+                local mt = getmetatable(sample)
+                if mt and mt.__eq then
+                    local original = mt.__eq
+                    mt.__eq = function(a, b)
+                        if type(a) ~= 'table' or type(b) ~= 'table'
+                            or rawget(a, 'Type') ~= 'ScaledDecimal'
+                            or rawget(b, 'Type') ~= 'ScaledDecimal' then
+                            return false
+                        end
+                        return original(a, b)
+                    end
+                end
+            end
+        "#,
+            )
+            .set_name("@host-decimal-compatibility")
+            .exec()?;
         Ok(())
     }
 
@@ -274,7 +367,7 @@ impl LuaSession {
     /// This clears all caches (feature, information, spatial) to prevent cross-cell contamination
     pub fn reset_for_new_cell(&mut self) -> Result<()> {
         // Create fresh Lua state
-        self.lua = Lua::new();
+        self.lua = ferrite_lua_runtime::new_vm();
 
         // Apply sandbox to new Lua state
         Self::sandbox_lua(&self.lua)?;
@@ -289,20 +382,24 @@ impl LuaSession {
 
         // Re-install safe searcher
         if !self.rules_path.as_os_str().is_empty() {
-            Self::install_safe_searcher(&self.lua, &self.rules_path.clone())?;
+            Self::install_safe_searcher(
+                &self.lua,
+                &self.rules_path.clone(),
+                self.chunk_cache.clone(),
+                self.sources.clone(),
+            )?;
         }
 
         // Re-load main script
         let main_path = self.rules_path.join("main.lua");
-        if main_path.exists() {
-            let script = std::fs::read_to_string(&main_path)
-                .map_err(|e| LuaError::ScriptNotFound(e.to_string()))?;
+        if self.main_available(&main_path) {
+            let script = self.read_main_source(&main_path)?;
 
-            self.lua
-                .load(&script)
-                .set_name(main_path.to_string_lossy())
-                .exec()?;
+            self.chunk_cache
+                .compile(&self.lua, &script, &main_path.to_string_lossy())?
+                .call::<()>(())?;
 
+            self.install_decimal_equality_compatibility()?;
             self.initialized = true;
         }
 
@@ -325,13 +422,8 @@ impl LuaSession {
             .get("PortrayalMain")
             .map_err(|_| LuaError::FunctionNotFound("PortrayalMain".to_string()))?;
 
-        let result: bool = portrayal_main.call(mlua::Value::Nil)?;
-
-        if !result {
-            tracing::warn!("PortrayalMain returned false");
-        }
-
-        Ok(self.host.get_results())
+        let result = portrayal_main.call::<bool>(mlua::Value::Nil);
+        self.completed_results(result)
     }
 
     /// Execute portrayal for specific feature IDs
@@ -355,9 +447,25 @@ impl LuaSession {
             .get("PortrayalMain")
             .map_err(|_| LuaError::FunctionNotFound("PortrayalMain".to_string()))?;
 
-        let _: bool = portrayal_main.call(ids_table)?;
+        let result = portrayal_main.call::<bool>(ids_table);
+        self.completed_results(result)
+    }
 
-        Ok(self.host.get_results())
+    /// S-100 9a-14.1.1: false means terminated, never a completed portrayal.
+    fn completed_results(&self, result: mlua::Result<bool>) -> Result<Vec<PortrayalResult>> {
+        match result {
+            Ok(true) => Ok(self.host.take_results()),
+            Ok(false) => {
+                self.host.clear_results();
+                Err(LuaError::Portrayal(
+                    "PortrayalMain terminated before completion".into(),
+                ))
+            }
+            Err(error) => {
+                self.host.clear_results();
+                Err(error.into())
+            }
+        }
     }
 
     /// Execute a simple Lua expression
@@ -368,11 +476,14 @@ impl LuaSession {
     /// Load and execute a Lua file
     pub fn load_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let script = std::fs::read_to_string(path)
+        let script = match &self.sources {
+            Some(s) => s.read_path(path.as_ref()).map(|b| b.to_vec()).map_err(|e| std::io::Error::other(e.to_string())),
+            None => std::fs::read(path),
+        }
             .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
 
         self.lua
-            .load(&script)
+            .load(script.as_slice())
             .set_name(path.to_string_lossy())
             .exec()?;
 
@@ -399,6 +510,10 @@ impl LuaSession {
         self.lua.globals().get::<mlua::Function>(name).is_ok()
     }
 
+    pub fn chunk_cache_stats(&self) -> ferrite_lua_runtime::ChunkCacheStats {
+        self.chunk_cache.stats()
+    }
+
     /// Get the Lua state for advanced usage
     pub fn lua(&self) -> &Lua {
         &self.lua
@@ -415,7 +530,7 @@ impl Default for LuaSession {
 pub struct PortrayalEngine {
     session: LuaSession,
     /// Stored type catalogue for re-application after reset
-    type_catalogue: Option<TypeCatalogue>,
+    type_catalogue: Option<Arc<TypeCatalogue>>,
 }
 
 impl PortrayalEngine {
@@ -430,6 +545,12 @@ impl PortrayalEngine {
         })
     }
 
+    pub fn new_with_sources(sources: Arc<ferrite_portrayal_catalog::CatalogueSources>) -> Result<Self> {
+        let mut session = LuaSession::new()?;
+        session.set_rules_sources(sources)?;
+        Ok(Self { session, type_catalogue: None })
+    }
+
     /// Initialize the engine (load main script)
     pub fn initialize(&mut self) -> Result<()> {
         self.session.load_main()
@@ -442,8 +563,9 @@ impl PortrayalEngine {
 
     /// Set type catalogue (from Feature Catalogue)
     pub fn set_type_catalogue(&mut self, catalogue: TypeCatalogue) {
-        self.type_catalogue = Some(catalogue.clone());
-        self.session.set_type_catalogue(catalogue);
+        let catalogue = Arc::new(catalogue);
+        self.type_catalogue = Some(Arc::clone(&catalogue));
+        self.session.host.set_shared_type_catalogue(catalogue);
     }
 
     /// Process features and generate drawing instructions
@@ -471,7 +593,9 @@ impl PortrayalEngine {
 
         // Re-apply type catalogue after reset
         if let Some(ref catalogue) = self.type_catalogue {
-            self.session.set_type_catalogue(catalogue.clone());
+            self.session
+                .host
+                .set_shared_type_catalogue(Arc::clone(catalogue));
         }
 
         // Set cell data BEFORE initializing context (so HostGetFeatureIDs works)
@@ -481,8 +605,12 @@ impl PortrayalEngine {
         // Initialize portrayal context to populate FeaturePortrayalItems
         self.session.initialize_context(&context)?;
 
-        // Execute portrayal
-        self.session.execute_portrayal()
+        // Execute against fresh host data even when compiler output is reused.
+        let result = self.session.execute_portrayal();
+        let stats = self.session.chunk_cache_stats();
+        tracing::info!("Lua compiler cache: compiled={} hits={} entries={} retained_payload_bytes={} bypasses={}",
+            stats.compiled_chunks, stats.bytecode_hits, stats.entries, stats.retained_payload_bytes, stats.bypasses);
+        result
     }
 
     /// Get session for advanced usage
@@ -493,5 +621,251 @@ impl PortrayalEngine {
     /// Get mutable session
     pub fn session_mut(&mut self) -> &mut LuaSession {
         &mut self.session
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    #[test]
+    fn legacy_decimal_sentinel_equality_and_unpack() {
+        let session = LuaSession::new().unwrap();
+        session.lua.load(r#"
+            local mt={__eq=function(a,b) return a.Scale == b.Scale and a.Value == b.Value end}
+            function CreateScaledDecimal(v,s) return setmetatable({Type='ScaledDecimal',Value=v,Scale=s},mt) end
+        "#).exec().unwrap();
+        session.install_decimal_equality_compatibility().unwrap();
+        let ok: bool = session
+            .lua
+            .load(
+                r#"
+            local a=CreateScaledDecimal(10,1)
+            local b=CreateScaledDecimal(10,1)
+            local c=CreateScaledDecimal(20,1)
+            local x,y=unpack({3,4})
+            return a == b and a ~= c and a ~= {Type='UnknownValue'} and x == 3 and y == 4
+        "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    #[test]
+    fn successful_repeated_execution_returns_independent_output_without_retained_copy() {
+        for selected in [false, true] {
+            let mut session = LuaSession::new().unwrap();
+            session.initialized = true;
+            session.lua.load("iteration = 0; function PortrayalMain(ids) iteration = iteration + 1; HostPortrayalEmit(tostring(iteration), 'PointInstruction:WRECKS01', 'SafetyDepth'); return true end").exec().unwrap();
+            let first = if selected {
+                session.execute_portrayal_for(vec![1])
+            } else {
+                session.execute_portrayal()
+            }
+            .unwrap();
+            assert!(session.host.get_results().is_empty());
+            let second = if selected {
+                session.execute_portrayal_for(vec![2])
+            } else {
+                session.execute_portrayal()
+            }
+            .unwrap();
+            assert_eq!(first[0].feature_id, "1");
+            assert_eq!(second[0].feature_id, "2");
+            assert_eq!(first[0].observed_parameters, ["SafetyDepth"]);
+            assert!(session.host.get_results().is_empty());
+        }
+    }
+
+    #[test]
+    fn incomplete_portrayal_discards_emitted_results_for_all_and_selected_features() {
+        for selected in [false, true] {
+            for ending in [
+                "return false",
+                "error('injected failure')",
+                "HostPortrayalEmit('2', 'ColorFill:DEPVS,2', ''); return true",
+            ] {
+                let mut session = LuaSession::new().unwrap();
+                session.initialized = true;
+                session.lua.load(format!("function PortrayalMain(ids) HostPortrayalEmit('1','PointInstruction:WRECKS01',''); {ending} end")).exec().unwrap();
+                let result = if selected {
+                    session.execute_portrayal_for(vec![1, 2])
+                } else {
+                    session.execute_portrayal()
+                };
+                assert!(result.is_err(), "{selected}: {ending}");
+                assert!(
+                    session.host.get_results().is_empty(),
+                    "Partial results survived failure"
+                );
+                session.lua.load("function PortrayalMain(ids) HostPortrayalEmit('3','PointInstruction:WRECKS01',''); return true end").exec().unwrap();
+                let results = if selected {
+                    session.execute_portrayal_for(vec![3])
+                } else {
+                    session.execute_portrayal()
+                }
+                .unwrap();
+                assert_eq!(
+                    results.len(),
+                    1,
+                    "Successful retry contains stale partial results"
+                );
+                assert_eq!(results[0].feature_id, "3");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod chunk_cache_tests {
+    use super::*;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn directory() -> PathBuf {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("ferrite-chunk-{}-{n}", std::process::id()));
+        std::fs::create_dir(&p).unwrap();
+        p
+    }
+    #[test]
+    fn resetting_cells_reuses_compilation_but_not_global_or_module_state() {
+        let dir = directory();
+        std::fs::write(
+            dir.join("main.lua"),
+            "counter=(counter or 0)+1; require('child')",
+        )
+        .unwrap();
+        std::fs::write(dir.join("child.lua"), "child=(child or 0)+1").unwrap();
+        let mut s = LuaSession::new().unwrap();
+        s.set_rules_path(&dir).unwrap();
+        s.load_main().unwrap();
+        for _ in 0..2 {
+            s.reset_for_new_cell().unwrap();
+            assert_eq!(s.lua.globals().get::<i64>("counter").unwrap(), 1);
+            assert_eq!(s.lua.globals().get::<i64>("child").unwrap(), 1);
+        }
+        assert_eq!(s.chunk_cache_stats().compiled_chunks, 2);
+        assert_eq!(s.chunk_cache_stats().bytecode_hits, 4);
+        std::fs::write(dir.join("child.lua"), "child=77").unwrap();
+        s.reset_for_new_cell().unwrap();
+        assert_eq!(s.lua.globals().get::<i64>("child").unwrap(), 77);
+        assert_eq!(s.chunk_cache_stats().compiled_chunks, 3);
+        std::fs::write(dir.join("child.lua"), "syntax ???").unwrap();
+        assert!(s.reset_for_new_cell().is_err());
+        assert!(!s.initialized);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cached_main_and_modules_cannot_follow_symlinks_outside_rules_root() {
+        let dir = directory();
+        let outside = directory();
+        std::fs::write(dir.join("main.lua"), "return true").unwrap();
+        std::fs::write(outside.join("outside.lua"), "escaped=true").unwrap();
+        let mut s = LuaSession::new().unwrap();
+        s.set_rules_path(&dir).unwrap();
+        s.load_main().unwrap();
+        std::fs::remove_file(dir.join("main.lua")).unwrap();
+        std::os::unix::fs::symlink(outside.join("outside.lua"), dir.join("main.lua")).unwrap();
+        assert!(s.load_main().unwrap_err().to_string().contains("escapes"));
+        assert!(s
+            .reset_for_new_cell()
+            .unwrap_err()
+            .to_string()
+            .contains("escapes"));
+        std::fs::remove_file(dir.join("main.lua")).unwrap();
+        std::fs::write(dir.join("main.lua"), "require('escaped')").unwrap();
+        std::os::unix::fs::symlink(outside.join("outside.lua"), dir.join("escaped.lua")).unwrap();
+        assert!(s.reset_for_new_cell().is_err());
+        assert!(s
+            .lua
+            .globals()
+            .get::<Option<bool>>("escaped")
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod engine_catalogue_transfer_tests {
+    use super::*;
+    #[test]
+    fn engine_metadata_survives_vm_reset_and_replacement_without_extra_catalogue_copy() {
+        let mut engine = PortrayalEngine {
+            session: LuaSession::new().unwrap(),
+            type_catalogue: None,
+        };
+        engine.set_type_catalogue(TypeCatalogue {
+            feature_codes: vec!["Wreck".into()],
+            ..Default::default()
+        });
+        let old = Arc::clone(engine.type_catalogue.as_ref().unwrap());
+        assert_eq!(Arc::strong_count(&old), 3);
+        engine.session.reset_for_new_cell().unwrap();
+        assert_eq!(Arc::strong_count(&old), 2);
+        engine
+            .session
+            .host
+            .set_shared_type_catalogue(Arc::clone(&old));
+        assert_eq!(
+            engine
+                .session
+                .eval::<String>("return HostGetFeatureTypeCodes()[1]")
+                .unwrap(),
+            "Wreck"
+        );
+        engine.set_type_catalogue(TypeCatalogue {
+            feature_codes: vec!["Sounding".into()],
+            ..Default::default()
+        });
+        assert_eq!(Arc::strong_count(&old), 1);
+        assert_eq!(old.feature_codes, ["Wreck"]);
+        assert_eq!(
+            engine
+                .session
+                .eval::<String>("return HostGetFeatureTypeCodes()[1]")
+                .unwrap(),
+            "Sounding"
+        );
+    }
+}
+
+#[cfg(test)]
+mod immutable_source_tests {
+    use super::*;
+    #[test]
+    fn main_require_reset_and_vm_tables_use_retained_sources_after_original_changes() {
+        let root = std::env::temp_dir().join(format!("ferrite-lua-source-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("Rules")).unwrap();
+        let main = "loaded = require('dep'); function PortrayalMain() return true end";
+        std::fs::write(root.join("Rules/main.lua"), main).unwrap();
+        std::fs::write(root.join("Rules/dep.lua"), "return {tag='A'}").unwrap();
+        let source_a = ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
+        let mut a = PortrayalEngine::new_with_sources(Arc::clone(&source_a)).unwrap();
+        a.initialize().unwrap();
+        assert_eq!(a.session().eval::<String>("loaded.tag").unwrap(), "A");
+        a.session().lua.load("loaded.tag = 'mutated'; leak = true").exec().unwrap();
+        std::fs::write(root.join("Rules/main.lua"), main).unwrap();
+        std::fs::write(root.join("Rules/dep.lua"), "return {tag='B'}").unwrap();
+        let source_b = ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
+        assert_ne!(source_a.digest(), source_b.digest());
+        let mut b = PortrayalEngine::new_with_sources(source_b).unwrap();
+        b.initialize().unwrap();
+        assert_eq!(b.session().eval::<String>("loaded.tag").unwrap(), "B");
+        std::fs::remove_dir_all(&root).unwrap();
+        a.session_mut().reset_for_new_cell().unwrap();
+        assert_eq!(a.session().eval::<String>("loaded.tag").unwrap(), "A");
+        assert!(a.session().eval::<bool>("leak == nil").unwrap());
+        assert!(a.session().lua.load("require('../escape')").exec().is_err());
+        assert!(a.session().lua.load("require('missing')").exec().is_err());
+        a.session().load_file(root.join("Rules/dep.lua")).unwrap();
+        assert!(a.session().load_file(root.join("outside.lua")).is_err());
+        b.session_mut().reset_for_new_cell().unwrap();
+        assert_eq!(b.session().eval::<String>("loaded.tag").unwrap(), "B");
     }
 }

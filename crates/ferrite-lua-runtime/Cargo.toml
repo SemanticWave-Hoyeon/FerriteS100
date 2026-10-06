@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-lua-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Product-independent Lua VM package with build-time backend selection"
+
+[features]
+default = ["lua54"]
+lua54 = ["mlua/lua54"]
+lua55 = ["mlua/lua55"]
+
+[dependencies]
+mlua = { version = "=0.11.6", default-features = false, features = ["vendored", "send"] }
+
+[build-dependencies]
+sha2.workspace = true
+cc = "1"

@@ -5,6 +5,7 @@
 //!
 //! Based on S-100 standard's host_functions.cpp
 
+use crate::mlua;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -355,7 +356,7 @@ pub struct HostFunctions {
     /// Context parameters
     context: Arc<RwLock<ContextParameters>>,
     /// Type catalogue (from Feature Catalogue)
-    type_catalogue: Arc<RwLock<TypeCatalogue>>,
+    type_catalogue: Arc<RwLock<Arc<TypeCatalogue>>>,
 }
 
 impl HostFunctions {
@@ -369,7 +370,7 @@ impl HostFunctions {
             spatial_to_features: Arc::new(RwLock::new(HashMap::new())),
             results: Arc::new(RwLock::new(Vec::new())),
             context: Arc::new(RwLock::new(ContextParameters::default())),
-            type_catalogue: Arc::new(RwLock::new(TypeCatalogue::default())),
+            type_catalogue: Arc::new(RwLock::new(Arc::new(TypeCatalogue::default()))),
         }
     }
 
@@ -424,6 +425,11 @@ impl HostFunctions {
 
     /// Set type catalogue
     pub fn set_type_catalogue(&self, catalogue: TypeCatalogue) {
+        self.set_shared_type_catalogue(Arc::new(catalogue));
+    }
+
+    /// Share immutable Rust metadata; Lua tables are still newly created per VM/call.
+    pub(crate) fn set_shared_type_catalogue(&self, catalogue: Arc<TypeCatalogue>) {
         if let Ok(mut c) = self.type_catalogue.write() {
             *c = catalogue;
         }
@@ -493,7 +499,33 @@ impl HostFunctions {
 
     /// Get collected results
     pub fn get_results(&self) -> Vec<PortrayalResult> {
-        self.results.read().map(|r| r.clone()).unwrap_or_default()
+        let mut results = self.results.read().map(|r| r.clone()).unwrap_or_default();
+        Self::sort_results(&mut results);
+        results
+    }
+
+    /// Transfer completed results out of the host without duplicating their command trees.
+    /// Used only after PortrayalMain reports success; failure paths discard partial output.
+    pub(crate) fn take_results(&self) -> Vec<PortrayalResult> {
+        let mut results = self
+            .results
+            .write()
+            .map(|mut results| std::mem::take(&mut *results))
+            .unwrap_or_default();
+        Self::sort_results(&mut results);
+        results
+    }
+
+    fn sort_results(results: &mut [PortrayalResult]) {
+        // Lua table traversal and Rust hash-map seeds must not choose declutter winners.
+        results.sort_by(
+            |a, b| match (a.feature_id.parse::<i64>(), b.feature_id.parse::<i64>()) {
+                (Ok(na), Ok(nb)) => na.cmp(&nb).then_with(|| a.feature_id.cmp(&b.feature_id)),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => a.feature_id.cmp(&b.feature_id),
+            },
+        );
     }
 
     /// Clear results
@@ -516,10 +548,11 @@ impl HostFunctions {
         globals.set(
             "HostGetFeatureIDs",
             lua.create_function(move |lua, ()| {
-                let ids: Vec<i64> = features
+                let mut ids: Vec<i64> = features
                     .read()
                     .map(|f| f.keys().cloned().collect())
                     .unwrap_or_default();
+                ids.sort_unstable();
 
                 let table = lua.create_table()?;
                 for (i, id) in ids.iter().enumerate() {
@@ -936,8 +969,8 @@ impl HostFunctions {
                                 spatial_type_name,
                                 spatial_id_str,
                                 orientation,
-                                Value::Nil, // scaleMinimum
-                                Value::Nil, // scaleMaximum
+                                spatial_ref.scale_minimum,
+                                spatial_ref.scale_maximum,
                             ))?;
 
                             table.set(i + 1, sa)?;
@@ -1151,9 +1184,26 @@ impl HostFunctions {
                 }
 
                 let spatial_type = parts[0];
-                let id: i64 = match parts[1].parse() {
-                    Ok(id) => id,
-                    Err(_) => return Ok(Value::Nil),
+                // Virtual ring references retain a real surface ID and ring index.
+                // The geometry behind them is the actual oriented boundary, not a placeholder.
+                let (id, ring) = if let Some(value) = parts[1].strip_prefix("exterior_") {
+                    match value.parse() {
+                        Ok(id) => (id, Some(None)),
+                        Err(_) => return Ok(Value::Nil),
+                    }
+                } else if let Some(value) = parts[1].strip_prefix("interior_") {
+                    let Some((id, index)) = value.rsplit_once('_') else {
+                        return Ok(Value::Nil);
+                    };
+                    match (id.parse(), index.parse::<usize>()) {
+                        (Ok(id), Ok(index)) => (id, Some(Some(index))),
+                        _ => return Ok(Value::Nil),
+                    }
+                } else {
+                    match parts[1].parse() {
+                        Ok(id) => (id, None),
+                        Err(_) => return Ok(Value::Nil),
+                    }
                 };
 
                 if let Ok(spatials) = spatials.read() {
@@ -1279,7 +1329,16 @@ impl HostFunctions {
                                 let create_sa_fn: mlua::Function =
                                     lua.globals().get("CreateSpatialAssociation")?;
 
-                                for (i, assoc) in spatial.curve_associations.iter().enumerate() {
+                                let associations = match ring {
+                                    Some(Some(index)) => {
+                                        match spatial.interior_curve_associations.get(index) {
+                                            Some(ring) => ring,
+                                            None => return Ok(Value::Nil),
+                                        }
+                                    }
+                                    _ => &spatial.curve_associations,
+                                };
+                                for (i, assoc) in associations.iter().enumerate() {
                                     // Determine spatial type from RCNM
                                     // Reference: S-100 standard/GISLibrary/host_data.cpp - get_spatial_association(CUCO* cuco)
                                     let assoc_spatial_type = match assoc.rcnm {
@@ -1316,21 +1375,53 @@ impl HostFunctions {
                                 return Ok(composite);
                             }
                             "Surface" => {
-                                // Surface has exterior ring and optional interior rings
-                                // For now, create with empty exterior ring
                                 let create_sa_fn: mlua::Function =
                                     lua.globals().get("CreateSpatialAssociation")?;
-                                let exterior_ring: Value = create_sa_fn.call((
-                                    "Curve",
-                                    format!("Curve|exterior_{}", id),
-                                    "Forward",
-                                    Value::Nil,
-                                    Value::Nil,
-                                ))?;
-
+                                let ring_association =
+                                    |members: &[crate::CurveAssociation],
+                                     virtual_id: String|
+                                     -> mlua::Result<Value> {
+                                        let (kind, id, orientation) = if members.len() == 1 {
+                                            let c = &members[0];
+                                            (
+                                                if c.rcnm == 125 {
+                                                    "CompositeCurve"
+                                                } else {
+                                                    "Curve"
+                                                },
+                                                c.curve_id.to_string(),
+                                                if c.orientation { "Forward" } else { "Reverse" },
+                                            )
+                                        } else {
+                                            ("CompositeCurve", virtual_id, "Forward")
+                                        };
+                                        create_sa_fn.call((
+                                            kind,
+                                            format!("{}|{}", kind, id),
+                                            orientation,
+                                            Value::Nil,
+                                            Value::Nil,
+                                        ))
+                                    };
+                                let exterior = ring_association(
+                                    &spatial.curve_associations,
+                                    format!("exterior_{}", id),
+                                )?;
+                                let interiors = lua.create_table()?;
+                                for (index, members) in
+                                    spatial.interior_curve_associations.iter().enumerate()
+                                {
+                                    interiors.set(
+                                        index + 1,
+                                        ring_association(
+                                            members,
+                                            format!("interior_{}_{}", id, index),
+                                        )?,
+                                    )?;
+                                }
                                 let create_fn: mlua::Function =
                                     lua.globals().get("CreateSurface")?;
-                                let surface: Value = create_fn.call((exterior_ring, Value::Nil))?;
+                                let surface: Value = create_fn.call((exterior, interiors))?;
                                 return Ok(surface);
                             }
                             _ => {}
@@ -1665,13 +1756,13 @@ impl HostFunctions {
                         instructions.chars().take(50).collect::<String>()
                     );
 
-                    if let Ok(result) =
+                    let result =
                         crate::PortrayalResult::parse(&feature_ref, &instructions, &observed)
-                    {
-                        if let Ok(mut r) = results.write() {
-                            r.push(result);
-                        }
-                    }
+                            .map_err(mlua::Error::external)?;
+                    results
+                        .write()
+                        .map_err(|_| mlua::Error::external("Portrayal results lock poisoned"))?
+                        .push(result);
                     Ok(true)
                 },
             )?,
@@ -1826,5 +1917,348 @@ impl HostFunctions {
 impl Default for HostFunctions {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    #[test]
+    fn feature_enumeration_and_results_do_not_depend_on_insertion_order() {
+        for ids in [[30, 1, 20], [20, 30, 1]] {
+            let host = HostFunctions::new();
+            for id in ids {
+                host.features.write().unwrap().insert(
+                    id,
+                    FeatureInfo {
+                        id,
+                        code: "Wreck".into(),
+                        primitive_type: crate::PrimitiveType::Point,
+                        attributes: HashMap::new(),
+                        complex_attributes: HashMap::new(),
+                        spatial_refs: Vec::new(),
+                    },
+                );
+                host.results
+                    .write()
+                    .unwrap()
+                    .push(PortrayalResult::new(id.to_string()));
+            }
+            host.results
+                .write()
+                .unwrap()
+                .push(PortrayalResult::new("1a".into()));
+            let lua = Lua::new();
+            host.register(&lua).unwrap();
+            let ids: mlua::Table = lua
+                .globals()
+                .get::<mlua::Function>("HostGetFeatureIDs")
+                .unwrap()
+                .call(())
+                .unwrap();
+            assert_eq!(
+                ids.sequence_values::<i64>()
+                    .collect::<mlua::Result<Vec<_>>>()
+                    .unwrap(),
+                [1, 20, 30]
+            );
+            assert_eq!(
+                host.get_results()
+                    .iter()
+                    .map(|r| r.feature_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["1", "20", "30", "1a"]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod surface_geometry_tests {
+    use super::*;
+    #[test]
+    fn surface_host_exposes_real_boundaries_and_resolvable_virtual_composites() {
+        let host = HostFunctions::new();
+        let id = (130i64 << 32) | 1;
+        let curve = |n, orientation| crate::CurveAssociation {
+            curve_id: (120i64 << 32) | n,
+            rcnm: 120,
+            orientation,
+        };
+        host.set_spatials(HashMap::from([(
+            id,
+            SpatialInfo {
+                id,
+                spatial_type: PrimitiveType::Surface,
+                coordinates: vec![],
+                z_coordinates: vec![],
+                curve_associations: vec![curve(1, true), curve(2, false)],
+                interior_curve_associations: vec![
+                    vec![curve(3, false)],
+                    vec![curve(4, true), curve(5, false)],
+                ],
+            },
+        )]));
+        let lua = Lua::new();
+        host.register(&lua).unwrap();
+        lua.load(r#"
+            function CreateSpatialAssociation(kind,id,orientation) return {kind=kind,id=id,orientation=orientation} end
+            function CreateCompositeCurve(associations) return {associations=associations} end
+            function CreateSurface(exterior,interiors) return {exterior=exterior,interiors=interiors} end
+        "#).exec().unwrap();
+        let get: mlua::Function = lua.globals().get("HostGetSpatial").unwrap();
+        let surface: mlua::Table = get.call(format!("Surface|{id}")).unwrap();
+        let exterior: mlua::Table = surface.get("exterior").unwrap();
+        assert_eq!(exterior.get::<String>("kind").unwrap(), "CompositeCurve");
+        let resolved: mlua::Table = get.call(exterior.get::<String>("id").unwrap()).unwrap();
+        let members: mlua::Table = resolved.get("associations").unwrap();
+        assert_eq!(members.raw_len(), 2);
+        let member: mlua::Table = members.get(2).unwrap();
+        assert_eq!(member.get::<String>("orientation").unwrap(), "Reverse");
+        let interiors: mlua::Table = surface.get("interiors").unwrap();
+        assert_eq!(interiors.raw_len(), 2);
+        let single: mlua::Table = interiors.get(1).unwrap();
+        assert_eq!(
+            single.get::<String>("id").unwrap(),
+            format!("Curve|{}", (120i64 << 32) | 3)
+        );
+        assert_eq!(single.get::<String>("orientation").unwrap(), "Reverse");
+        let composite: mlua::Table = interiors.get(2).unwrap();
+        let resolved: mlua::Table = get.call(composite.get::<String>("id").unwrap()).unwrap();
+        assert_eq!(
+            resolved
+                .get::<mlua::Table>("associations")
+                .unwrap()
+                .raw_len(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod result_transfer_tests {
+    use super::*;
+    #[test]
+    fn completed_results_transfer_owned_buffers_and_preserve_stable_order() {
+        let host = HostFunctions::new();
+        let mut pointers = HashMap::new();
+        for (id, observed) in [
+            ("text", "first"),
+            ("2", "second"),
+            ("01", "third"),
+            ("1", "fourth"),
+            ("2", "fifth"),
+        ] {
+            let result = PortrayalResult::parse(
+                id,
+                "ViewingGroup:31011;PointInstruction:WRECKS01",
+                observed,
+            )
+            .unwrap();
+            pointers.insert(
+                observed,
+                (
+                    result.instructions.as_ptr(),
+                    result.instructions[0].commands.as_ptr(),
+                ),
+            );
+            host.results.write().unwrap().push(result);
+        }
+        // Snapshot remains non-destructive for existing public users.
+        assert_eq!(host.get_results().len(), 5);
+        let results = host.take_results();
+        assert!(host.get_results().is_empty());
+        assert!(host.take_results().is_empty());
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.feature_id.as_str())
+                .collect::<Vec<_>>(),
+            ["01", "1", "2", "2", "text"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.observed_parameters[0].as_str())
+                .collect::<Vec<_>>(),
+            ["third", "fourth", "second", "fifth", "first"]
+        );
+        for result in &results {
+            assert_eq!(
+                (
+                    result.instructions.as_ptr(),
+                    result.instructions[0].commands.as_ptr()
+                ),
+                pointers[result.observed_parameters[0].as_str()]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod result_transfer_benchmark {
+    use super::*;
+    #[test]
+    #[ignore = "CPU benchmark; run alone in release mode"]
+    fn completed_result_handoff_abba() {
+        let host = HostFunctions::new();
+        let instruction = "ViewingGroup:31011;DrawingPriority:20;PointInstruction:WRECKS01;PointInstruction:ISODGR01;PointInstruction:WRECKS01;PointInstruction:ISODGR01;PointInstruction:WRECKS01;PointInstruction:ISODGR01";
+        for id in (1..=17_337).rev() {
+            host.results.write().unwrap().push(
+                PortrayalResult::parse(
+                    &id.to_string(),
+                    instruction,
+                    "SafetyDepth,DisplayCategory,ViewingGroups",
+                )
+                .unwrap(),
+            );
+        }
+        let expected_commands: usize = host
+            .results
+            .read()
+            .unwrap()
+            .iter()
+            .flat_map(|r| &r.instructions)
+            .map(|i| i.commands.len())
+            .sum();
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..8 {
+            for mode in [0, 1, 1, 0] {
+                // Restore reverse order outside the timed region for each measurement.
+                host.results
+                    .write()
+                    .unwrap()
+                    .sort_by_key(|r| std::cmp::Reverse(r.feature_id.parse::<i64>().unwrap()));
+                let started = std::time::Instant::now();
+                let results = if mode == 0 {
+                    host.get_results()
+                } else {
+                    host.take_results()
+                };
+                let elapsed = started.elapsed().as_secs_f64() * 1000.;
+                assert_eq!(results.len(), 17_337);
+                assert_eq!(results.first().unwrap().feature_id, "1");
+                assert_eq!(results.last().unwrap().feature_id, "17337");
+                assert_eq!(
+                    results
+                        .iter()
+                        .flat_map(|r| &r.instructions)
+                        .map(|i| i.commands.len())
+                        .sum::<usize>(),
+                    expected_commands
+                );
+                if mode == 1 {
+                    assert!(host.results.read().unwrap().is_empty());
+                    *host.results.write().unwrap() = results;
+                } else {
+                    std::hint::black_box(&results);
+                }
+                if round > 0 {
+                    samples[mode].push(elapsed);
+                }
+            }
+        }
+        for (mode, timings) in samples.iter_mut().enumerate() {
+            timings.sort_by(f64::total_cmp);
+            println!(
+                "HANDOFF mode={} samples={} features=17337 commands={} p50_ms={:.6} p95_ms={:.6}",
+                if mode == 0 { "clone" } else { "transfer" },
+                timings.len(),
+                expected_commands,
+                timings[timings.len() / 2],
+                timings[(timings.len() * 95 / 100).min(timings.len() - 1)]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_catalogue_tests {
+    use super::*;
+    #[test]
+    fn catalogue_shares_rust_metadata_but_not_lua_tables_and_replacement_is_local() {
+        let first = HostFunctions::new();
+        let second = HostFunctions::new();
+        let catalogue = Arc::new(TypeCatalogue {
+            feature_codes: vec!["Wreck".into(), "Obstruction".into()],
+            ..Default::default()
+        });
+        first.set_shared_type_catalogue(Arc::clone(&catalogue));
+        second.set_shared_type_catalogue(Arc::clone(&catalogue));
+        assert!(Arc::ptr_eq(
+            &first.type_catalogue.read().unwrap(),
+            &second.type_catalogue.read().unwrap()
+        ));
+        let first_vm = ferrite_lua_runtime::new_vm();
+        let second_vm = ferrite_lua_runtime::new_vm();
+        first.register(&first_vm).unwrap();
+        second.register(&second_vm).unwrap();
+        first_vm.load("local codes=HostGetFeatureTypeCodes(); codes[1]='mutated Lua table'; assert(HostGetFeatureTypeCodes()[1]=='Wreck')").exec().unwrap();
+        assert_eq!(
+            second_vm
+                .load("return HostGetFeatureTypeCodes()[1]")
+                .eval::<String>()
+                .unwrap(),
+            "Wreck"
+        );
+        first.set_type_catalogue(TypeCatalogue {
+            feature_codes: vec!["Sounding".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            first_vm
+                .load("return HostGetFeatureTypeCodes()[1]")
+                .eval::<String>()
+                .unwrap(),
+            "Sounding"
+        );
+        assert_eq!(
+            second_vm
+                .load("return HostGetFeatureTypeCodes()[1]")
+                .eval::<String>()
+                .unwrap(),
+            "Wreck"
+        );
+        assert_eq!(catalogue.feature_codes, ["Wreck", "Obstruction"]);
+    }
+}
+
+#[cfg(test)]
+mod catalogue_setup_benchmark {
+    use super::*;
+    #[test]
+    #[ignore = "CPU benchmark with real FC; run alone in release mode"]
+    fn real_feature_catalogue_setup_abba() {
+        let path =
+            std::env::var("FERRITE_FC_BENCHMARK").expect("Pass an actual feature catalogue path");
+        let fc = ferrite_feature_catalog::FeatureCatalogue::load(path).unwrap();
+        let catalogue = Arc::new(TypeCatalogue::from_feature_catalogue(&fc));
+        let host = HostFunctions::new();
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..8 {
+            for mode in [0, 1, 1, 0] {
+                let start = std::time::Instant::now();
+                for _ in 0..100 {
+                    if mode == 0 {
+                        host.set_type_catalogue((*catalogue).clone());
+                    } else {
+                        host.set_shared_type_catalogue(Arc::clone(&catalogue));
+                    }
+                    std::hint::black_box(&host);
+                }
+                let elapsed = start.elapsed().as_secs_f64() * 1000. / 100.;
+                assert_eq!(
+                    host.type_catalogue.read().unwrap().feature_codes,
+                    catalogue.feature_codes
+                );
+                if round > 0 {
+                    samples[mode].push(elapsed);
+                }
+            }
+        }
+        for (mode, timings) in samples.iter_mut().enumerate() {
+            timings.sort_by(f64::total_cmp);
+            println!("CATALOGUE mode={} samples={} features={} simple={} complex={} p50_ms={:.6} p95_ms={:.6}", if mode == 0 { "deep_clone" } else { "shared_arc" }, timings.len(), catalogue.feature_type_info.len(), catalogue.simple_attribute_info.len(), catalogue.complex_attribute_info.len(), timings[timings.len()/2], timings[(timings.len()*95/100).min(timings.len()-1)]);
+        }
     }
 }

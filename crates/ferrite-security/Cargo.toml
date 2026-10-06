@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+openssl = { version = "0.10", features = ["vendored"] }
+roxmltree = "=0.20.0"
+base64 = "=0.22.1"
+percent-encoding = "2"
+x509-parser = "0.18"
+
+tempfile = "3"
+
+chrono.workspace = true

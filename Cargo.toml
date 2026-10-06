@@ -3,11 +3,18 @@ resolver = "2"
 members = [
     "crates/ferrite-iso8211",
     "crates/ferrite-s100-core",
+    "crates/ferrite-s101",
+    "crates/ferrite-s102",
+    "crates/ferrite-kernel",
+    "crates/ferrite-interoperability",
+    "crates/ferrite-security",
+    "crates/ferrite-secom",
     "crates/ferrite-feature-catalog",
     "crates/ferrite-portrayal-catalog",
     "crates/ferrite-render",
     "crates/ferrite-wgpu",
     "crates/ferrite-lua",
+    "crates/ferrite-lua-runtime",
     "crates/ferrite-plugin-api",
     "crates/ferrite-plugin-loader",
 ]
@@ -68,7 +75,6 @@ egui-winit = "0.31"
 rfd = "0.15"  # Native file dialogs
 
 # Scripting
-mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 
 # Plugin system
 abi_stable = "0.11"
@@ -81,11 +87,16 @@ bincode = "1"
 # Internal crates
 ferrite-iso8211 = { path = "crates/ferrite-iso8211" }
 ferrite-s100-core = { path = "crates/ferrite-s100-core" }
+ferrite-s101 = { path = "crates/ferrite-s101", default-features = false }
+ferrite-s102 = { path = "crates/ferrite-s102", default-features = false }
+ferrite-kernel = { path = "crates/ferrite-kernel" }
+ferrite-interoperability = { path = "crates/ferrite-interoperability" }
+ferrite-security = { path = "crates/ferrite-security" }
 ferrite-feature-catalog = { path = "crates/ferrite-feature-catalog" }
 ferrite-portrayal-catalog = { path = "crates/ferrite-portrayal-catalog" }
 ferrite-render = { path = "crates/ferrite-render" }
 ferrite-wgpu = { path = "crates/ferrite-wgpu" }
-ferrite-lua = { path = "crates/ferrite-lua" }
+ferrite-lua = { path = "crates/ferrite-lua", default-features = false }
 ferrite-plugin-api = { path = "crates/ferrite-plugin-api" }
 ferrite-plugin-loader = { path = "crates/ferrite-plugin-loader" }
 
@@ -102,9 +113,21 @@ path = "src/main.rs"
 [build-dependencies]
 winres = "0.1"
 
+[features]
+default = ["lua54"]
+lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54"]
+lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55"]
+
 [dependencies]
+roxmltree = "=0.20.0"
+chrono.workspace = true
 ferrite-iso8211.workspace = true
 ferrite-s100-core.workspace = true
+ferrite-s101.workspace = true
+ferrite-s102.workspace = true
+ferrite-kernel.workspace = true
+ferrite-interoperability.workspace = true
+ferrite-security.workspace = true
 ferrite-feature-catalog.workspace = true
 ferrite-portrayal-catalog.workspace = true
 ferrite-render.workspace = true
@@ -127,8 +150,18 @@ image.workspace = true
 rayon.workspace = true
 bincode.workspace = true
 sha2.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 mimalloc = "0.1"
+
+# HDF5 fixture authoring for end-to-end coverage examples only.
+[dev-dependencies]
+wgpu.workspace = true
+egui-wgpu.workspace = true
+hdf5 = { package = "hdf5-metno", version = "=0.14.1", features = ["static", "zlib"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 # Windows system APIs (for debug info)
 [target.'cfg(windows)'.dependencies]
@@ -145,7 +178,8 @@ opt-level = 3          # Maximum optimization
 lto = "fat"            # Full link-time optimization (slower build, fastest runtime)
 codegen-units = 1      # Single codegen unit for better optimization
 strip = "symbols"      # Strip symbols for smaller binary
-panic = "abort"        # Abort on panic (smaller binary, faster)
+# Windows Lua errors unwind through mlua C-unwind callbacks; abort traps that unwind.
+panic = "unwind"
 
 # Development profile: faster compile, some optimization for usable performance
 [profile.dev]
@@ -154,3 +188,10 @@ opt-level = 1          # Basic optimization for better debug performance
 # Optimize dependencies even in dev builds
 [profile.dev.package."*"]
 opt-level = 2
+
+# Frequent optimized builds; final distribution still uses the release profile.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

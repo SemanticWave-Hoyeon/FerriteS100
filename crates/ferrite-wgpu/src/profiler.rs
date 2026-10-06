@@ -138,6 +138,14 @@ impl CpuProfiler {
             .record(elapsed);
     }
 
+    /// Monotonic totals for measuring individual frames independently of log resets.
+    pub fn cumulative_snapshot(&self) -> BTreeMap<&'static str, (f64, u64)> {
+        self.cumulative
+            .iter()
+            .map(|(&name, stat)| (name, (stat.total.as_secs_f64() * 1000.0, stat.count)))
+            .collect()
+    }
+
     /// Mark the beginning of a frame
     pub fn begin_frame(&mut self) {
         self.frame_start = Some(Instant::now());
@@ -360,12 +368,18 @@ impl ScopeTimer {
 pub struct GpuProfilerWrapper {
     pub profiler: wgpu_profiler::GpuProfiler,
     enabled: bool,
+    supported: bool,
+    last_report: Instant,
+    timings: BTreeMap<String, ScopeStat>,
+    completed_samples: u64,
+    last_duration_ms: Option<f64>,
 }
 
 impl GpuProfilerWrapper {
-    pub fn new(_device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let supported = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let profiler = wgpu_profiler::GpuProfiler::new(wgpu_profiler::GpuProfilerSettings {
-            enable_timer_queries: true,
+            enable_timer_queries: supported,
             ..Default::default()
         })
         .unwrap_or_else(|e| {
@@ -383,15 +397,31 @@ impl GpuProfilerWrapper {
         Self {
             profiler,
             enabled: false,
+            supported,
+            last_report: Instant::now(),
+            timings: BTreeMap::new(),
+            completed_samples: 0,
+            last_duration_ms: None,
         }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+        self.enabled = enabled && self.supported;
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn audit_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp_supported": self.supported,
+            "enabled": self.enabled,
+            "scope": "chart_pass",
+            "completed_samples": self.completed_samples,
+            "last_duration_ms": self.last_duration_ms,
+            "includes_surface_wait_or_presentation": false,
+        })
     }
 
     /// Process finished frames and log GPU timing data
@@ -400,42 +430,61 @@ impl GpuProfilerWrapper {
             return;
         }
 
-        if let Some(profiling_data) = self
+        if let Some(entries) = self
             .profiler
             .process_finished_frame(queue.get_timestamp_period())
         {
-            if !profiling_data.is_empty() {
-                let mut report = String::with_capacity(1024);
-                report.push_str("\n┌─────────────────────────────────────────────────┐\n");
-                report.push_str("│              GPU PROFILER REPORT                │\n");
-                report.push_str("├─────────────────────────────────────────────────┤\n");
-
-                fn log_entries(
-                    report: &mut String,
-                    entries: &[wgpu_profiler::GpuTimerQueryResult],
-                    depth: usize,
-                ) {
-                    for entry in entries {
-                        let indent = "  ".repeat(depth);
-                        let duration_ms = entry
-                            .time
-                            .as_ref()
-                            .map(|t| (t.end - t.start) * 1000.0)
-                            .unwrap_or(0.0);
-                        report.push_str(&format!(
-                            "│ {}{:<30} {:>8.3}ms │\n",
-                            indent, entry.label, duration_ms
-                        ));
-                        if !entry.nested_queries.is_empty() {
-                            log_entries(report, &entry.nested_queries, depth + 1);
-                        }
-                    }
+            // Missing/invalid timestamps are unavailable, not zero GPU cost.
+            for entry in entries {
+                if let Some(milliseconds) = valid_gpu_duration_ms(entry.time.as_ref()) {
+                    self.completed_samples = self.completed_samples.saturating_add(1);
+                    self.last_duration_ms = Some(milliseconds);
+                    self.timings
+                        .entry(entry.label)
+                        .or_insert_with(ScopeStat::new)
+                        .record(Duration::from_secs_f64(milliseconds / 1000.0));
                 }
-
-                log_entries(&mut report, &profiling_data, 0);
-                report.push_str("└─────────────────────────────────────────────────┘");
-                tracing::info!("{}", report);
             }
         }
+        if self.last_report.elapsed() >= Duration::from_secs(5) {
+            for (label, stat) in &self.timings {
+                tracing::info!(
+                    "[GPU_PROFILER] {} samples={} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+                    label,
+                    stat.count,
+                    stat.avg().as_secs_f64() * 1000.0,
+                    stat.min.as_secs_f64() * 1000.0,
+                    stat.max.as_secs_f64() * 1000.0,
+                );
+            }
+            self.timings.clear();
+            self.last_report = Instant::now();
+        }
+    }
+}
+
+fn valid_gpu_duration_ms(time: Option<&std::ops::Range<f64>>) -> Option<f64> {
+    let time = time?;
+    let seconds = time.end - time.start;
+    // Bound before Duration conversion; invalid driver samples must not panic.
+    (time.start.is_finite()
+        && time.end.is_finite()
+        && seconds.is_finite()
+        && (0.0..=3600.0).contains(&seconds))
+    .then_some(seconds * 1000.0)
+}
+
+#[cfg(test)]
+mod gpu_timing_tests {
+    use super::valid_gpu_duration_ms;
+
+    #[test]
+    fn unavailable_or_invalid_timestamps_do_not_become_zero_gpu_time() {
+        assert_eq!(valid_gpu_duration_ms(None), None);
+        for range in [2.0..1.0, f64::NAN..1.0, 0.0..f64::INFINITY, 0.0..3601.0] {
+            assert_eq!(valid_gpu_duration_ms(Some(&range)), None);
+        }
+        assert_eq!(valid_gpu_duration_ms(Some(&(4.0..4.0))), Some(0.0));
+        assert!((valid_gpu_duration_ms(Some(&(1.0..1.016))).unwrap() - 16.0).abs() < 1e-9);
     }
 }

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Locally authored test fixture, not an IHO published catalogue. -->
+<ic:S100_IC_InteroperabilityCatalogue xmlns:ic="http://www.iho.int/S100/IC/5.0" xmlns:cat="http://standards.iso.org/iso/19115/-3/cat/1.0" xmlns:gco="http://standards.iso.org/iso/19115/-3/gco/1.0">
+<cat:name><gco:CharacterString>Ferrite display-plane test</gco:CharacterString></cat:name>
+<cat:scope><gco:CharacterString>Test only</gco:CharacterString></cat:scope>
+<cat:versionNumber><gco:CharacterString>1.0.0</gco:CharacterString></cat:versionNumber>
+<cat:versionDate><gco:Date>2026-10-04</gco:Date></cat:versionDate>
+<description>Local test, not for navigation</description><interoperabilityLevel>1</interoperabilityLevel><requirementType>OEM</requirementType>
+<productCovered codeList="urn:ferrite:test:products" codeListValue="S-101">Electronic navigational chart</productCovered>
+<productCovered codeList="urn:ferrite:test:products" codeListValue="S-102">Bathymetry</productCovered>
+<displayPlanes>
+<S100_IC_DisplayPlane><identifier>CoveragePlane</identifier><name>Coverage</name><order>-500</order><description>Bathymetry plane</description>
+<features><S100_IC_Feature><identifier>coverageRule</identifier><featureCode>BathymetryCoverage</featureCode><product codeList="urn:ferrite:test:products" codeListValue="S-102">Bathymetry</product><geometryType>coverage</geometryType><drawingPriority>3</drawingPriority><viewingGroup>11010</viewingGroup></S100_IC_Feature></features><drawingInstructions/>
+</S100_IC_DisplayPlane>
+<S100_IC_DisplayPlane><identifier>DangerPlane</identifier><name>Danger</name><order>-10</order><description>Selected wrecks above coverage</description>
+<features/><drawingInstructions><S100_IC_DrawingInstruction><identifier>wreckRule</identifier><featureCode>Wreck</featureCode><product codeList="urn:ferrite:test:products" codeListValue="S-101">ENC</product><geometryType>point</geometryType><attributeCombination>categoryOfWreck = 1</attributeCombination><drawingPriority>4</drawingPriority><viewingGroup>11010</viewingGroup></S100_IC_DrawingInstruction></drawingInstructions>
+</S100_IC_DisplayPlane>
+</displayPlanes>
+</ic:S100_IC_InteroperabilityCatalogue>

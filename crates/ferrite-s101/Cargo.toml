@@ -1,0 +1,29 @@
+[package]
+name = "ferrite-s101"
+version.workspace = true
+edition.workspace = true
+description = "S-101 product adapter independent of application and graphics backend"
+
+[features]
+default = ["lua54"]
+lua54 = ["ferrite-lua/lua54"]
+lua55 = ["ferrite-lua/lua55"]
+
+[dependencies]
+ferrite-s100-core.workspace = true
+ferrite-feature-catalog.workspace = true
+ferrite-lua.workspace = true
+ferrite-render.workspace = true
+ferrite-portrayal-catalog.workspace = true
+tracing.workspace = true
+
+ferrite-kernel.workspace = true
+
+anyhow.workspace = true
+ferrite-interoperability.workspace = true
+
+ferrite-iso8211.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

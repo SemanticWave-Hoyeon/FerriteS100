@@ -141,14 +141,41 @@ pub enum DisplayPlane {
     #[default]
     UnderRadar,
     OverRadar,
+    /// Display-plane order supplied by an Interoperability Catalogue.
+    /// Negative is below radar, positive above; zero cannot be decoded.
+    Interoperability(std::num::NonZeroI32),
+    /// Display-plane order declared by a product Portrayal Catalogue.
+    Catalogue(std::num::NonZeroI32),
+}
+impl DisplayPlane {
+    pub fn from_catalogue_order(order: std::num::NonZeroI32) -> Self {
+        match order.get() {
+            -1 => Self::UnderRadar,
+            1 => Self::OverRadar,
+            _ => Self::Catalogue(order),
+        }
+    }
+    pub fn order(self) -> std::num::NonZeroI32 {
+        match self {
+            Self::UnderRadar => std::num::NonZeroI32::new(-1).unwrap(),
+            Self::OverRadar => std::num::NonZeroI32::new(1).unwrap(),
+            Self::Interoperability(order) | Self::Catalogue(order) => order,
+        }
+    }
+    pub fn composition_plane(
+        self,
+        stage: ferrite_kernel::CompositionStage,
+    ) -> ferrite_kernel::CompositionPlane {
+        ferrite_kernel::CompositionPlane::new(stage, self.order())
+    }
 }
 
 /// Scale-dependent visibility (S-100 Part 9a ScaleMinimum/ScaleMaximum)
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ScaleRange {
-    /// Scale denominator below which the instruction is hidden (zoomed out too far)
+    /// Scale denominator above which the instruction is hidden (zoomed out too far)
     pub scale_minimum: Option<u32>,
-    /// Scale denominator above which the instruction is hidden (zoomed in too far)
+    /// Scale denominator below which the instruction is hidden (zoomed in too far)
     pub scale_maximum: Option<u32>,
 }
 
@@ -223,14 +250,28 @@ pub struct PointInstruction {
     pub symbol_ref: String,
     /// Position in world coordinates
     pub position: WorldPoint,
-    /// Rotation angle in degrees (clockwise from north)
+    /// Clockwise degrees relative to rotation_crs, not always true north.
     pub rotation: f32,
+    #[serde(default)]
+    pub rotation_crs: crate::RotationCrs,
+    /// Bearing of the source curve tangent. Local/Line positive Y is its left normal.
+    /// None for point/surface local CRS, whose axes parallel portrayal axes.
+    #[serde(default)]
+    pub curve_tangent_bearing: Option<f64>,
+    /// Source curve and view-dependent S-100 placement; resolve at draw time.
+    #[serde(default)]
+    pub line_placement: Option<Box<crate::LineSymbolPlacement>>,
     /// Scale factor
     pub scale: f32,
+    /// Offset in local portrayal coordinates (millimetres, positive Y upwards).
+    pub local_offset: (f32, f32),
     /// Display priority
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Additional groups are conjunctive under S-100 9-11.1.3.
+    #[serde(default)]
+    pub additional_viewing_groups: Box<[ViewingGroup]>,
     /// Scale-dependent visibility range
     pub scale_range: ScaleRange,
     /// Display plane (UnderRadar or OverRadar)
@@ -240,6 +281,14 @@ pub struct PointInstruction {
     /// Cell index this instruction belongs to (for multi-cell hit testing)
     /// Using u32 to save 8 bytes per instruction (Option<u32>=8 vs Option<usize>=16)
     pub cell_index: Option<u32>,
+    /// Accumulated S-100 time intervals; None means no temporal restriction.
+    #[serde(default)]
+    pub time_intervals: Option<Box<[ferrite_kernel::TemporalInterval]>>,
+    #[serde(default)]
+    pub dependency: Option<Box<crate::DrawingDependency>>,
+    /// Source geometry for coverage visibility; independent of portrayal offsets.
+    #[serde(default)]
+    pub portrayal_origin: crate::PortrayalOrigin,
     /// Sounding depth value (meters) - for sounding symbols only
     /// Used to select the shallowest sounding when decluttering
     /// NaN = no depth (saves 8 bytes vs Option<f64>)
@@ -253,13 +302,21 @@ impl PointInstruction {
             symbol_ref,
             position,
             rotation: 0.0,
+            rotation_crs: crate::RotationCrs::Portrayal,
+            curve_tangent_bearing: None,
+            line_placement: None,
             scale: 1.0,
+            local_offset: (0.0, 0.0),
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            additional_viewing_groups: Box::default(),
             scale_range: ScaleRange::default(),
             display_plane: DisplayPlane::default(),
             feature_id: None,
             cell_index: None,
+            time_intervals: None,
+            dependency: None,
+            portrayal_origin: crate::PortrayalOrigin::Unspecified,
             depth: f64::NAN,
         }
     }
@@ -292,9 +349,52 @@ impl PointInstruction {
         self
     }
 
+    /// Copy metadata without cloning the source path for every visible piece.
+    pub fn resolved_at(&self, position: WorldPoint, curve_tangent_bearing: Option<f64>) -> Self {
+        Self {
+            position,
+            curve_tangent_bearing,
+            line_placement: None,
+            symbol_ref: self.symbol_ref.clone(),
+            rotation: self.rotation.clone(),
+            rotation_crs: self.rotation_crs.clone(),
+            scale: self.scale.clone(),
+            local_offset: self.local_offset.clone(),
+            priority: self.priority.clone(),
+            viewing_group: self.viewing_group.clone(),
+            additional_viewing_groups: self.additional_viewing_groups.clone(),
+            scale_range: self.scale_range.clone(),
+            display_plane: self.display_plane.clone(),
+            feature_id: self.feature_id.clone(),
+            cell_index: self.cell_index.clone(),
+            time_intervals: self.time_intervals.clone(),
+            dependency: self.dependency.clone(),
+            portrayal_origin: self.portrayal_origin.clone(),
+            depth: self.depth.clone(),
+        }
+    }
+    pub fn with_line_placement(mut self, value: crate::LineSymbolPlacement) -> Self {
+        self.line_placement = Some(Box::new(value));
+        self
+    }
+    pub fn with_rotation_crs(mut self, crs: crate::RotationCrs) -> Self {
+        self.rotation_crs = crs;
+        self
+    }
+    pub fn with_curve_tangent(mut self, bearing: Option<f64>) -> Self {
+        self.curve_tangent_bearing = bearing;
+        self
+    }
+
     #[inline]
     pub fn with_scale(mut self, scale: f32) -> Self {
         self.scale = scale;
+        self
+    }
+
+    /// Apply S-100 LocalOffset in millimetres.
+    pub fn with_offset(mut self, x: f32, y: f32) -> Self {
+        self.local_offset = (x, y);
         self
     }
 
@@ -304,9 +404,18 @@ impl PointInstruction {
         self
     }
 
+    /// Preserve every PC group; a disabled additional group disables this command.
+    #[inline]
+    pub fn with_viewing_groups(mut self, groups: &[u32]) -> Self {
+        self.viewing_group = ViewingGroup(groups.first().copied().unwrap_or(21010));
+        self.additional_viewing_groups = groups.iter().skip(1).copied().map(ViewingGroup).collect();
+        self
+    }
+
     #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
+        self.additional_viewing_groups = Box::default();
         self
     }
 
@@ -335,6 +444,16 @@ impl PointInstruction {
     }
 }
 
+/// Explicit screen-space units, independent of any S-100 product adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StrokeUnit {
+    /// Device framebuffer pixels, retained for existing programmatic instructions.
+    #[default]
+    PhysicalPixels,
+    /// Portrayal millimetres, converted using the renderer's display metrics.
+    Millimetres,
+}
+
 /// Line style definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineStyle {
@@ -342,14 +461,33 @@ pub struct LineStyle {
     pub color: Color,
     /// Color token for profile remapping (e.g., "CSTLN", "DEPVS")
     pub color_token: Option<String>,
-    /// Width in pixels at nominal scale
+    /// Width expressed in `width_unit`; independent of map zoom.
     pub width: f32,
+    /// Authored opacity multiplier retained across colour profile changes.
+    #[serde(default = "opaque_opacity")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub width_unit: StrokeUnit,
     /// Dash pattern (alternating on/off lengths)
     pub dash_pattern: Vec<f32>,
+    /// Canonical S-100 repeating dash intervals in millimetres.
+    #[serde(default)]
+    pub dash_cycle: Option<ferrite_kernel::DashCycle>,
+    /// Authored physical displacement to the left of the line direction.
+    #[serde(default)]
+    pub offset_mm: f64,
+    #[serde(default)]
+    pub interval_length_mm: f64,
+    #[serde(default)]
+    pub authored_symbols: Vec<ferrite_kernel::StrokeSymbol>,
     /// Cap style
     pub cap: CapStyle,
     /// Join style
     pub join: JoinStyle,
+}
+
+fn opaque_opacity() -> f32 {
+    1.
 }
 
 impl Default for LineStyle {
@@ -358,7 +496,13 @@ impl Default for LineStyle {
             color: Color::BLACK,
             color_token: None,
             width: 1.0,
+            width_unit: StrokeUnit::PhysicalPixels,
+            opacity: 1.,
             dash_pattern: Vec::new(),
+            dash_cycle: None,
+            offset_mm: 0.,
+            interval_length_mm: 0.,
+            authored_symbols: Vec::new(),
             cap: CapStyle::Butt,
             join: JoinStyle::Miter,
         }
@@ -366,14 +510,44 @@ impl Default for LineStyle {
 }
 
 impl LineStyle {
+    pub fn has_visible_stroke(&self) -> bool {
+        self.width.is_finite() && self.width > 0. && self.color.a.is_finite() && self.color.a > 0.
+    }
+
     pub fn solid(color: Color, width: f32) -> Self {
         LineStyle {
             color,
             color_token: None,
             width,
+            width_unit: StrokeUnit::PhysicalPixels,
+            opacity: 1.,
             dash_pattern: Vec::new(),
+            dash_cycle: None,
+            offset_mm: 0.,
+            interval_length_mm: 0.,
+            authored_symbols: Vec::new(),
             cap: CapStyle::Butt,
             join: JoinStyle::Miter,
+        }
+    }
+
+    /// S-100 Part 9-12.2.2.4 and Part 9a PenWidth specify millimetres.
+    pub fn solid_mm(color: Color, width: f32) -> Self {
+        Self {
+            width_unit: StrokeUnit::Millimetres,
+            ..Self::solid(color, width)
+        }
+    }
+
+    pub fn physical_width(&self, pixels_per_mm: f32) -> f32 {
+        let width = match self.width_unit {
+            StrokeUnit::PhysicalPixels => self.width,
+            StrokeUnit::Millimetres => self.width * pixels_per_mm,
+        };
+        if width.is_finite() && width > 0.0 {
+            width
+        } else {
+            0.0
         }
     }
 
@@ -382,7 +556,13 @@ impl LineStyle {
             color,
             color_token: None,
             width,
+            width_unit: StrokeUnit::PhysicalPixels,
+            opacity: 1.,
             dash_pattern: pattern,
+            dash_cycle: None,
+            offset_mm: 0.,
+            interval_length_mm: 0.,
+            authored_symbols: Vec::new(),
             cap: CapStyle::Butt,
             join: JoinStyle::Miter,
         }
@@ -392,6 +572,11 @@ impl LineStyle {
 /// Line instruction - renders a line/polyline
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineInstruction {
+    /// Deferred fixed-size ray in portrayal/local millimetres, resolved with current display metrics.
+    #[serde(default)]
+    pub screen_ray: Option<ScreenRay>,
+    #[serde(default)]
+    pub portrayal_path: Option<crate::PortrayalPath>,
     /// Line style reference ID (from PC) or inline style
     pub style_ref: Option<String>,
     /// Inline style (used if style_ref is None)
@@ -404,12 +589,26 @@ pub struct LineInstruction {
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Additional groups are conjunctive under S-100 9-11.1.3.
+    #[serde(default)]
+    pub additional_viewing_groups: Box<[ViewingGroup]>,
     /// Scale-dependent visibility range
     pub scale_range: ScaleRange,
     /// Display plane (UnderRadar or OverRadar)
     pub display_plane: DisplayPlane,
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
+    /// Source cell identity; feature IDs are only unique within a cell.
+    #[serde(default)]
+    pub cell_index: Option<u32>,
+    /// Accumulated S-100 time intervals; None means no temporal restriction.
+    #[serde(default)]
+    pub time_intervals: Option<Box<[ferrite_kernel::TemporalInterval]>>,
+    #[serde(default)]
+    pub dependency: Option<Box<crate::DrawingDependency>>,
+    /// Source geometry for coverage visibility; independent of portrayal offsets.
+    #[serde(default)]
+    pub portrayal_origin: crate::PortrayalOrigin,
     /// S-100 Part 9-11.1.9: When true (default), this line CAN be suppressed by
     /// higher-priority lines sharing the same curve geometry.
     /// LineInstructionUnsuppressed sets this to false.
@@ -421,14 +620,21 @@ impl LineInstruction {
     pub fn new(points: Vec<WorldPoint>) -> Self {
         LineInstruction {
             style_ref: None,
+            screen_ray: None,
+            portrayal_path: None,
             style: LineStyle::default(),
             color_token: None,
             points,
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            additional_viewing_groups: Box::default(),
             scale_range: ScaleRange::default(),
             display_plane: DisplayPlane::default(),
             feature_id: None,
+            cell_index: None,
+            time_intervals: None,
+            dependency: None,
+            portrayal_origin: crate::PortrayalOrigin::Unspecified,
             suppressible: true,
         }
     }
@@ -460,9 +666,24 @@ impl LineInstruction {
         self
     }
 
+    /// Preserve every PC group; a disabled additional group disables this command.
+    #[inline]
+    pub fn with_viewing_groups(mut self, groups: &[u32]) -> Self {
+        self.viewing_group = ViewingGroup(groups.first().copied().unwrap_or(21010));
+        self.additional_viewing_groups = groups.iter().skip(1).copied().map(ViewingGroup).collect();
+        self
+    }
+
     #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
+        self.additional_viewing_groups = Box::default();
+        self
+    }
+
+    #[inline]
+    pub fn with_cell_index(mut self, index: usize) -> Self {
+        self.cell_index = Some(index as u32);
         self
     }
 
@@ -527,6 +748,23 @@ pub struct AreaInstruction {
     pub fill_ref: Option<String>,
     /// Fill type
     pub fill: AreaFillType,
+    /// Authored S-100 AreaCRS; retained independently of source geometry.
+    #[serde(default)]
+    pub pattern_crs: crate::PatternCrs,
+    /// S-100 9a SymbolFill: true clips motifs at the area boundary; false
+    /// requires complete motifs. Missing values use the normative true default.
+    #[serde(default = "default_pattern_clip_symbols")]
+    pub pattern_clip_symbols: bool,
+    /// Both authored hatch line references in painter order. Product-neutral
+    /// renderer resource resolution must not silently replace the second style.
+    #[serde(default)]
+    pub hatch_line_style_refs: Box<[String]>,
+    /// Fully resolved ordered hatch strokes, including independent dash cycles.
+    #[serde(default)]
+    pub hatch_strokes: Box<[crate::HatchStroke]>,
+    /// Authored alpha multiplier, separate from palette alpha.
+    #[serde(default = "opaque_opacity")]
+    pub fill_opacity: f32,
     /// Color token for solid fill remapping (e.g., "DEPVS", "LANDA")
     pub fill_color_token: Option<String>,
     /// Color token for hatch fill line color
@@ -541,20 +779,47 @@ pub struct AreaInstruction {
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Additional groups are conjunctive under S-100 9-11.1.3.
+    #[serde(default)]
+    pub additional_viewing_groups: Box<[ViewingGroup]>,
     /// Scale-dependent visibility range
     pub scale_range: ScaleRange,
     /// Display plane (UnderRadar or OverRadar)
     pub display_plane: DisplayPlane,
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
+    /// Source cell identity; feature IDs are only unique within a cell.
+    #[serde(default)]
+    pub cell_index: Option<u32>,
+    /// Accumulated S-100 time intervals; None means no temporal restriction.
+    #[serde(default)]
+    pub time_intervals: Option<Box<[ferrite_kernel::TemporalInterval]>>,
+    #[serde(default)]
+    pub dependency: Option<Box<crate::DrawingDependency>>,
+    /// Source geometry for coverage visibility; independent of portrayal offsets.
+    #[serde(default)]
+    pub portrayal_origin: crate::PortrayalOrigin,
 }
 
+fn default_pattern_clip_symbols() -> bool { true }
+
 impl AreaInstruction {
+    #[inline]
+    pub fn with_pattern_clip_symbols(mut self, clip: bool) -> Self {
+        self.pattern_clip_symbols = clip;
+        self
+    }
+
     #[inline]
     pub fn new(exterior: Vec<WorldPoint>) -> Self {
         AreaInstruction {
             fill_ref: None,
             fill: AreaFillType::default(),
+            pattern_crs: crate::PatternCrs::default(),
+            pattern_clip_symbols: true,
+            hatch_line_style_refs: Box::default(),
+            hatch_strokes: Box::default(),
+            fill_opacity: 1.,
             fill_color_token: None,
             hatch_color_token: None,
             exterior,
@@ -562,10 +827,29 @@ impl AreaInstruction {
             outline: None,
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            additional_viewing_groups: Box::default(),
             scale_range: ScaleRange::default(),
             display_plane: DisplayPlane::default(),
             feature_id: None,
+            cell_index: None,
+            time_intervals: None,
+            dependency: None,
+            portrayal_origin: crate::PortrayalOrigin::Unspecified,
         }
+    }
+
+    pub fn with_pattern_crs(mut self, crs: crate::PatternCrs) -> Self {
+        self.pattern_crs = crs;
+        self
+    }
+    pub fn with_hatch_line_style_refs(mut self, refs: &[String]) -> Self {
+        self.hatch_line_style_refs = refs.to_vec().into_boxed_slice();
+        self
+    }
+
+    pub fn with_hatch_strokes(mut self, strokes: Vec<crate::HatchStroke>) -> Self {
+        self.hatch_strokes = strokes.into_boxed_slice();
+        self
     }
 
     #[inline]
@@ -584,6 +868,19 @@ impl AreaInstruction {
     pub fn with_solid_fill_token(mut self, color: Color, token: &str) -> Self {
         self.fill = AreaFillType::Solid(color);
         self.fill_color_token = Some(token.to_string());
+        self
+    }
+
+    /// Resolve palette alpha and retain the authored command opacity.
+    pub fn with_solid_fill_token_opacity(
+        mut self,
+        color: Color,
+        token: &str,
+        opacity: f32,
+    ) -> Self {
+        self.fill = AreaFillType::Solid(color.with_alpha(opacity));
+        self.fill_color_token = Some(token.into());
+        self.fill_opacity = opacity;
         self
     }
 
@@ -641,9 +938,24 @@ impl AreaInstruction {
         self
     }
 
+    /// Preserve every PC group; a disabled additional group disables this command.
+    #[inline]
+    pub fn with_viewing_groups(mut self, groups: &[u32]) -> Self {
+        self.viewing_group = ViewingGroup(groups.first().copied().unwrap_or(21010));
+        self.additional_viewing_groups = groups.iter().skip(1).copied().map(ViewingGroup).collect();
+        self
+    }
+
     #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
+        self.additional_viewing_groups = Box::default();
+        self
+    }
+
+    #[inline]
+    pub fn with_cell_index(mut self, index: usize) -> Self {
+        self.cell_index = Some(index as u32);
         self
     }
 
@@ -683,28 +995,53 @@ pub struct TextInstruction {
     pub italic: bool,
     /// Text color
     pub color: Color,
+    #[serde(default = "opaque_opacity")]
+    pub color_opacity: f32,
     /// Color token for text color remapping
     pub color_token: Option<String>,
     /// Background color (None = transparent)
     pub background: Option<Color>,
+    #[serde(default)]
+    pub background_color_token: Option<String>,
+    #[serde(default = "opaque_opacity")]
+    pub background_opacity: f32,
     /// Horizontal alignment
     pub h_align: HAlign,
     /// Vertical alignment
     pub v_align: VAlign,
-    /// Rotation angle in degrees
+    /// Clockwise degrees in the authored S-100 rotation basis.
     pub rotation: f32,
-    /// Offset from position (in screen pixels)
+    #[serde(default)]
+    pub rotation_crs: crate::RotationCrs,
+    /// Authored source curve tangent, when placement supplies one.
+    #[serde(default)]
+    pub curve_tangent_bearing: Option<f64>,
+    /// LocalOffset in millimetres (positive y upwards).
     pub offset: ScreenPoint,
     /// Display priority
     pub priority: DisplayPriority,
     /// Viewing group
     pub viewing_group: ViewingGroup,
+    /// Additional groups are conjunctive under S-100 9-11.1.3.
+    #[serde(default)]
+    pub additional_viewing_groups: Box<[ViewingGroup]>,
     /// Scale-dependent visibility range
     pub scale_range: ScaleRange,
     /// Display plane (UnderRadar or OverRadar)
     pub display_plane: DisplayPlane,
     /// Feature ID this instruction belongs to
     pub feature_id: Option<i64>,
+    /// Source cell identity; feature IDs are only unique within a cell.
+    #[serde(default)]
+    pub cell_index: Option<u32>,
+    /// Accumulated S-100 time intervals; None means no temporal restriction.
+    #[serde(default)]
+    pub time_intervals: Option<Box<[ferrite_kernel::TemporalInterval]>>,
+    #[serde(default)]
+    pub dependency: Option<Box<crate::DrawingDependency>>,
+    /// Source geometry for coverage visibility; independent of portrayal offsets.
+    #[serde(default)]
+    pub portrayal_origin: crate::PortrayalOrigin,
 }
 
 impl TextInstruction {
@@ -718,16 +1055,26 @@ impl TextInstruction {
             bold: false,
             italic: false,
             color: Color::BLACK,
+            color_opacity: 1.,
             background: None,
+            background_color_token: None,
+            background_opacity: 1.,
             h_align: HAlign::Left,
             v_align: VAlign::Middle,
             rotation: 0.0,
+            rotation_crs: crate::RotationCrs::Portrayal,
+            curve_tangent_bearing: None,
             offset: ScreenPoint::zero(),
             priority: DisplayPriority::default(),
             viewing_group: ViewingGroup::default(),
+            additional_viewing_groups: Box::default(),
             scale_range: ScaleRange::default(),
             display_plane: DisplayPlane::default(),
             feature_id: None,
+            cell_index: None,
+            time_intervals: None,
+            dependency: None,
+            portrayal_origin: crate::PortrayalOrigin::Unspecified,
             color_token: None,
         }
     }
@@ -744,6 +1091,36 @@ impl TextInstruction {
         self
     }
 
+    pub fn with_color_token_opacity(mut self, color: Color, token: &str, opacity: f32) -> Self {
+        self.color = color.with_alpha(opacity);
+        self.color_token = Some(token.into());
+        self.color_opacity = opacity;
+        self
+    }
+
+    pub fn with_background_token_opacity(
+        mut self,
+        color: Color,
+        token: &str,
+        opacity: f32,
+    ) -> Self {
+        self.background = Some(color.with_alpha(opacity));
+        self.background_color_token = Some(token.into());
+        self.background_opacity = opacity;
+        self
+    }
+
+    /// Invisible text must not reserve space in the decluttering index.
+    pub fn has_visible_content(&self) -> bool {
+        // An empty label has no glyphs or nonzero background extent. Counting
+        // it as an executed parent would incorrectly enable dependent marks.
+        if self.text.is_empty() {
+            return false;
+        }
+        let visible = |c: Color| c.a.is_finite() && c.a > 0.;
+        visible(self.color) || self.background.is_some_and(visible)
+    }
+
     #[inline]
     pub fn with_alignment(mut self, h: HAlign, v: VAlign) -> Self {
         self.h_align = h;
@@ -757,6 +1134,14 @@ impl TextInstruction {
         self
     }
 
+    pub fn with_rotation_crs(mut self, crs: crate::RotationCrs) -> Self {
+        self.rotation_crs = crs;
+        self
+    }
+    pub fn with_curve_tangent(mut self, bearing: Option<f64>) -> Self {
+        self.curve_tangent_bearing = bearing;
+        self
+    }
     #[inline]
     pub fn with_offset(mut self, x: f32, y: f32) -> Self {
         self.offset = ScreenPoint::new(x, y);
@@ -769,9 +1154,24 @@ impl TextInstruction {
         self
     }
 
+    /// Preserve every PC group; a disabled additional group disables this command.
+    #[inline]
+    pub fn with_viewing_groups(mut self, groups: &[u32]) -> Self {
+        self.viewing_group = ViewingGroup(groups.first().copied().unwrap_or(21010));
+        self.additional_viewing_groups = groups.iter().skip(1).copied().map(ViewingGroup).collect();
+        self
+    }
+
     #[inline]
     pub fn with_viewing_group(mut self, vg: u32) -> Self {
         self.viewing_group = ViewingGroup(vg);
+        self.additional_viewing_groups = Box::default();
+        self
+    }
+
+    #[inline]
+    pub fn with_cell_index(mut self, index: usize) -> Self {
+        self.cell_index = Some(index as u32);
         self
     }
 
@@ -804,6 +1204,66 @@ pub enum DrawingInstruction {
 }
 
 impl DrawingInstruction {
+    pub fn portrayal_origin(&self) -> &crate::PortrayalOrigin {
+        match self {
+            Self::Point(i) => &i.portrayal_origin,
+            Self::Line(i) => &i.portrayal_origin,
+            Self::Area(i) => &i.portrayal_origin,
+            Self::Text(i) => &i.portrayal_origin,
+        }
+    }
+    pub fn set_portrayal_origin(&mut self, origin: crate::PortrayalOrigin) {
+        match self {
+            Self::Point(i) => i.portrayal_origin = origin,
+            Self::Line(i) => i.portrayal_origin = origin,
+            Self::Area(i) => i.portrayal_origin = origin,
+            Self::Text(i) => i.portrayal_origin = origin,
+        }
+    }
+
+    /// Apply a validated composition plan without changing geometry, scale or temporal visibility.
+    pub fn set_display_parameters(
+        &mut self,
+        plane: DisplayPlane,
+        priority: i32,
+        viewing_group: u32,
+    ) {
+        match self {
+            Self::Point(i) => {
+                i.display_plane = plane;
+                i.priority = DisplayPriority(priority);
+                i.viewing_group = ViewingGroup(viewing_group);
+                i.additional_viewing_groups = Box::default();
+            }
+            Self::Line(i) => {
+                i.display_plane = plane;
+                i.priority = DisplayPriority(priority);
+                i.viewing_group = ViewingGroup(viewing_group);
+                i.additional_viewing_groups = Box::default();
+            }
+            Self::Area(i) => {
+                i.display_plane = plane;
+                i.priority = DisplayPriority(priority);
+                i.viewing_group = ViewingGroup(viewing_group);
+                i.additional_viewing_groups = Box::default();
+            }
+            Self::Text(i) => {
+                i.display_plane = plane;
+                i.priority = DisplayPriority(priority);
+                i.viewing_group = ViewingGroup(viewing_group);
+                i.additional_viewing_groups = Box::default();
+            }
+        }
+    }
+    pub fn cell_index(&self) -> Option<u32> {
+        match self {
+            Self::Point(i) => i.cell_index,
+            Self::Line(i) => i.cell_index,
+            Self::Area(i) => i.cell_index,
+            Self::Text(i) => i.cell_index,
+        }
+    }
+
     pub fn priority(&self) -> DisplayPriority {
         match self {
             DrawingInstruction::Point(i) => i.priority,
@@ -819,6 +1279,59 @@ impl DrawingInstruction {
             DrawingInstruction::Line(i) => i.viewing_group,
             DrawingInstruction::Area(i) => i.viewing_group,
             DrawingInstruction::Text(i) => i.viewing_group,
+        }
+    }
+
+    /// Iteration is allocation-free for both single and multiple viewing groups.
+    pub fn viewing_groups(&self) -> impl Iterator<Item = ViewingGroup> + '_ {
+        let extra = match self {
+            Self::Point(i) => &i.additional_viewing_groups,
+            Self::Line(i) => &i.additional_viewing_groups,
+            Self::Area(i) => &i.additional_viewing_groups,
+            Self::Text(i) => &i.additional_viewing_groups,
+        };
+        std::iter::once(self.viewing_group()).chain(extra.iter().copied())
+    }
+
+    pub fn time_intervals(&self) -> &[ferrite_kernel::TemporalInterval] {
+        match self {
+            Self::Point(i) => i.time_intervals.as_deref(),
+            Self::Line(i) => i.time_intervals.as_deref(),
+            Self::Area(i) => i.time_intervals.as_deref(),
+            Self::Text(i) => i.time_intervals.as_deref(),
+        }
+        .unwrap_or(&[])
+    }
+
+    pub fn dependency(&self) -> Option<&crate::DrawingDependency> {
+        match self {
+            Self::Point(i) => i.dependency.as_deref(),
+            Self::Line(i) => i.dependency.as_deref(),
+            Self::Area(i) => i.dependency.as_deref(),
+            Self::Text(i) => i.dependency.as_deref(),
+        }
+    }
+    pub fn set_dependency(&mut self, dependency: Option<crate::DrawingDependency>) {
+        let value = dependency.map(Box::new);
+        match self {
+            Self::Point(i) => i.dependency = value,
+            Self::Line(i) => i.dependency = value,
+            Self::Area(i) => i.dependency = value,
+            Self::Text(i) => i.dependency = value,
+        }
+    }
+
+    pub fn set_time_intervals(&mut self, intervals: &[ferrite_kernel::TemporalInterval]) {
+        let value = if intervals.is_empty() {
+            None
+        } else {
+            Some(intervals.into())
+        };
+        match self {
+            Self::Point(i) => i.time_intervals = value,
+            Self::Line(i) => i.time_intervals = value,
+            Self::Area(i) => i.time_intervals = value,
+            Self::Text(i) => i.time_intervals = value,
         }
     }
 
@@ -894,28 +1407,38 @@ impl DrawingInstruction {
             DrawingInstruction::Area(area) => {
                 if let Some(token) = &area.fill_color_token {
                     if let AreaFillType::Solid(ref mut color) = area.fill {
-                        *color = lookup(token);
+                        *color = lookup(token).with_alpha(area.fill_opacity);
                     }
                 }
                 if let Some(token) = &area.hatch_color_token {
                     if let AreaFillType::HatchFill { ref mut color, .. } = area.fill {
-                        *color = lookup(token);
+                        *color = lookup(token).with_alpha(area.fill_opacity);
+                    }
+                }
+                for stroke in &mut area.hatch_strokes {
+                    if let Some(token) = &stroke.style.color_token {
+                        stroke.style.color = lookup(token).with_alpha(stroke.style.opacity);
                     }
                 }
                 if let Some(ref mut outline) = area.outline {
                     if let Some(token) = &outline.color_token {
                         outline.color = lookup(token);
+                        outline.color.a *= outline.opacity;
                     }
                 }
             }
             DrawingInstruction::Line(line) => {
                 if let Some(token) = &line.color_token {
                     line.style.color = lookup(token);
+                    line.style.color.a *= line.style.opacity;
                 }
             }
             DrawingInstruction::Text(text) => {
                 if let Some(token) = &text.color_token {
-                    text.color = lookup(token);
+                    text.color = lookup(token).with_alpha(text.color_opacity);
+                }
+                if let Some(token) = &text.background_color_token {
+                    text.background = Some(lookup(token).with_alpha(text.background_opacity));
                 }
             }
             DrawingInstruction::Point(_) => {
@@ -970,5 +1493,287 @@ impl FeatureInstructions {
     /// Sort by display priority
     pub fn sort_by_priority(&mut self) {
         self.instructions.sort_by_key(|i| i.priority());
+    }
+}
+
+#[cfg(test)]
+mod stroke_unit_tests {
+    use super::*;
+    #[test]
+    fn portrayal_width_respects_display_density_and_legacy_pixels() {
+        let mm = LineStyle::solid_mm(Color::BLACK, 0.32);
+        let one = mm.physical_width(96.0 / 25.4);
+        assert!((one - 1.2094488).abs() < 1e-6);
+        assert_eq!(mm.physical_width(192.0 / 25.4), 2.0 * one);
+        assert_eq!(
+            LineStyle::solid(Color::BLACK, 4.0).physical_width(192.0 / 25.4),
+            4.0
+        );
+        let roundtrip: LineStyle =
+            serde_json::from_str(&serde_json::to_string(&mm).unwrap()).unwrap();
+        assert_eq!(roundtrip.width_unit, StrokeUnit::Millimetres);
+        let mut legacy = serde_json::to_value(LineStyle::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("width_unit");
+        let legacy: LineStyle = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.width_unit, StrokeUnit::PhysicalPixels);
+    }
+    #[test]
+    fn invalid_width_emits_no_stroke() {
+        for width in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                LineStyle::solid_mm(Color::BLACK, width).physical_width(4.0),
+                0.0
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ScreenRay {
+    pub direction: f64,
+    pub length_mm: f64,
+    pub geographic_direction: bool,
+}
+/// Ordinary world lines borrow their original points without heap allocation.
+pub enum ResolvedLinePaths<'a> {
+    Single(Option<std::borrow::Cow<'a, [WorldPoint]>>),
+    Multiple(std::vec::IntoIter<Vec<WorldPoint>>),
+}
+impl<'a> Iterator for ResolvedLinePaths<'a> {
+    type Item = std::borrow::Cow<'a, [WorldPoint]>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(p) => p.take(),
+            Self::Multiple(p) => p.next().map(std::borrow::Cow::Owned),
+        }
+    }
+}
+impl LineInstruction {
+    pub fn render_paths<'a>(&'a self, scaler: &crate::Scaler) -> ResolvedLinePaths<'a> {
+        if let (Some(path @ crate::PortrayalPath::Group(_)), Some(&origin)) =
+            (&self.portrayal_path, self.points.first())
+        {
+            ResolvedLinePaths::Multiple(path.world_paths(origin, scaler).into_iter())
+        } else {
+            ResolvedLinePaths::Single(Some(self.render_points(scaler)))
+        }
+    }
+    pub fn render_points<'a>(
+        &'a self,
+        scaler: &crate::Scaler,
+    ) -> std::borrow::Cow<'a, [WorldPoint]> {
+        if let (Some(path), Some(&origin)) = (&self.portrayal_path, self.points.first()) {
+            return std::borrow::Cow::Owned(path.world_points(origin, scaler));
+        }
+        let Some(ray) = self.screen_ray else {
+            return std::borrow::Cow::Borrowed(&self.points);
+        };
+        let Some(&origin) = self.points.first() else {
+            return std::borrow::Cow::Borrowed(&self.points);
+        };
+        if !ray.direction.is_finite() || !ray.length_mm.is_finite() || ray.length_mm < 0. {
+            return std::borrow::Cow::Borrowed(&[]);
+        }
+        let angle = ray.direction.to_radians();
+        let (mut dx, mut dy) = (angle.sin(), -angle.cos());
+        if ray.geographic_direction && scaler.projection() == crate::FlatProjection::LocalGeographic
+        {
+            dx = dx
+                / scaler
+                    .geo_bounds
+                    .center()
+                    .y
+                    .to_radians()
+                    .cos()
+                    .abs()
+                    .max(1e-6)
+                * scaler.scale_x();
+            dy *= scaler.scale_y();
+            let norm = dx.hypot(dy);
+            dx /= norm;
+            dy /= norm;
+        }
+        let start = scaler.world_to_screen(origin);
+        let length = ray.length_mm * scaler.pixels_per_mm();
+        let end = scaler.screen_to_world(crate::ScreenPoint::new(
+            start.x + (dx * length) as f32,
+            start.y + (dy * length) as f32,
+        ));
+        std::borrow::Cow::Owned(vec![origin, end])
+    }
+}
+
+#[cfg(test)]
+mod authored_opacity_tests {
+    use super::*;
+    #[test]
+    fn palette_switch_preserves_authored_fill_glyph_and_background_alpha() {
+        let mut area = DrawingInstruction::Area(
+            AreaInstruction::new(vec![]).with_solid_fill_token_opacity(Color::RED, "FILL", 0.5),
+        );
+        let mut text = DrawingInstruction::Text(
+            TextInstruction::new("label".into(), WorldPoint::new(0., 0.))
+                .with_color_token_opacity(Color::BLACK, "GLYPH", 0.25)
+                .with_background_token_opacity(Color::WHITE, "BG", 0.75),
+        );
+        for rgb in [Color::BLUE, Color::GREEN, Color::RED] {
+            let lookup = |_: &str| rgb.with_alpha(0.8);
+            area.remap_colors(&lookup);
+            text.remap_colors(&lookup);
+            let DrawingInstruction::Area(a) = &area else {
+                panic!()
+            };
+            let AreaFillType::Solid(c) = a.fill else {
+                panic!()
+            };
+            assert!((c.a - 0.4).abs() < 1e-6);
+            let DrawingInstruction::Text(t) = &text else {
+                panic!()
+            };
+            assert!((t.color.a - 0.2).abs() < 1e-6);
+            assert!((t.background.unwrap().a - 0.6).abs() < 1e-6);
+            assert_eq!(t.color.r, rgb.r);
+        }
+        // A cache round-trip must retain command opacity, not just current alpha.
+        let mut restored: DrawingInstruction =
+            serde_json::from_str(&serde_json::to_string(&text).unwrap()).unwrap();
+        restored.remap_colors(&|_| Color::WHITE);
+        let DrawingInstruction::Text(t) = restored else {
+            panic!()
+        };
+        assert_eq!(t.color.a, 0.25);
+        assert_eq!(t.background.unwrap().a, 0.75);
+    }
+    #[test]
+    fn transparent_glyphs_with_visible_background_are_visible_but_empty_alpha_is_not() {
+        let mut t = TextInstruction::new("label".into(), WorldPoint::new(0., 0.))
+            .with_color(Color::TRANSPARENT);
+        assert!(!t.has_visible_content());
+        t.background = Some(Color::RED.with_alpha(0.5));
+        assert!(t.has_visible_content());
+        t.background = Some(Color::TRANSPARENT);
+        assert!(!t.has_visible_content());
+        t.color.a = f32::NAN;
+        assert!(!t.has_visible_content());
+    }
+}
+
+#[cfg(test)]
+mod interop_plane_tests {
+    use super::*;
+    #[test]
+    fn signed_planes_preserve_full_order_and_reject_radar_zero() {
+        let p = |n| DisplayPlane::Interoperability(std::num::NonZeroI32::new(n).unwrap());
+        assert!(
+            p(-10000).composition_plane(ferrite_kernel::CompositionStage::Chart)
+                < p(-500).composition_plane(ferrite_kernel::CompositionStage::Chart)
+        );
+        assert!(p(-500).order() < p(10000).order());
+        assert!(serde_json::from_str::<DisplayPlane>(r#"{"Interoperability":0}"#).is_err());
+        let plane = p(i32::MIN);
+        assert_eq!(
+            serde_json::from_str::<DisplayPlane>(&serde_json::to_string(&plane).unwrap()).unwrap(),
+            plane
+        );
+        assert!(
+            DisplayPlane::OverRadar.composition_plane(ferrite_kernel::CompositionStage::Chart)
+                < DisplayPlane::UnderRadar
+                    .composition_plane(ferrite_kernel::CompositionStage::Overlay)
+        );
+    }
+}
+
+#[cfg(test)]
+mod multiple_group_tests {
+    use super::*;
+    use std::collections::HashSet;
+    #[test]
+    fn every_instruction_requires_all_groups_and_ic_replaces_them() {
+        let p = WorldPoint::new(0., 0.);
+        let items = [
+            DrawingInstruction::Point(
+                PointInstruction::new("X".into(), p).with_viewing_groups(&[27070, 90020]),
+            ),
+            DrawingInstruction::Line(
+                LineInstruction::new(vec![p, WorldPoint::new(1., 1.)])
+                    .with_viewing_groups(&[27070, 90020]),
+            ),
+            DrawingInstruction::Area(
+                AreaInstruction::new(vec![p, WorldPoint::new(1., 0.), WorldPoint::new(1., 1.)])
+                    .with_viewing_groups(&[27070, 90020]),
+            ),
+            DrawingInstruction::Text(
+                TextInstruction::new("X".into(), p).with_viewing_groups(&[27070, 90020]),
+            ),
+        ];
+        let primary = HashSet::from([27070]);
+        let both = HashSet::from([27070, 90020]);
+        for item in items {
+            assert_eq!(
+                item.viewing_groups().map(|g| g.0).collect::<Vec<_>>(),
+                [27070, 90020]
+            );
+            assert!(crate::instruction_visible(&item, 1000, Some(&both), None));
+            assert!(!crate::instruction_visible(
+                &item,
+                1000,
+                Some(&primary),
+                None
+            ));
+            assert!(!crate::instruction_visible(
+                &item,
+                1000,
+                Some(&HashSet::new()),
+                Some(27070)
+            ));
+            let bytes = bincode::serialize(&item).unwrap();
+            let mut restored: DrawingInstruction = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(
+                restored.viewing_groups().map(|g| g.0).collect::<Vec<_>>(),
+                [27070, 90020]
+            );
+            let mut context = crate::RenderContext::new(crate::Viewport::new(100., 100.));
+            context.viewing_groups.set_visible(90020, false);
+            context.add_instruction(item);
+            assert_eq!(context.instruction_count(), 0);
+            restored.set_display_parameters(DisplayPlane::UnderRadar, 5, 11010);
+            assert_eq!(
+                restored.viewing_groups().map(|g| g.0).collect::<Vec<_>>(),
+                [11010]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_text_tests {
+    use super::*;
+    #[test]
+    fn empty_text_has_no_executable_glyph_or_background_extent() {
+        let mut label = TextInstruction::new(String::new(), WorldPoint::new(0., 0.));
+        assert!(!label.has_visible_content());
+        label.background = Some(Color::RED);
+        assert!(!label.has_visible_content());
+        label.text = "label".into();
+        assert!(label.has_visible_content());
+    }
+}
+
+#[cfg(test)]
+mod catalogue_plane_tests {
+    use super::*;
+    #[test]
+    fn catalogue_plane_orders_share_composition_sorting_and_roundtrip_without_truncation() {
+        let mut planes=Vec::new();
+        for value in [i32::MIN,-701,-1,1,90000,i32::MAX] {
+            let p=DisplayPlane::from_catalogue_order(std::num::NonZeroI32::new(value).unwrap());
+            assert_eq!(p.order().get(),value);
+            let restored:DisplayPlane=serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+            assert_eq!(restored,p);
+            assert_eq!(p.composition_plane(ferrite_kernel::CompositionStage::Chart),DisplayPlane::Interoperability(p.order()).composition_plane(ferrite_kernel::CompositionStage::Chart));
+            planes.push(p.composition_plane(ferrite_kernel::CompositionStage::Chart));
+        }
+        assert!(planes.windows(2).all(|p|p[0]<p[1]));
+        assert!(serde_json::from_str::<DisplayPlane>(r#"{"Catalogue":0}"#).is_err());
     }
 }

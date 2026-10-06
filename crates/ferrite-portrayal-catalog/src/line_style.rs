@@ -47,10 +47,24 @@ pub struct Dash {
 }
 
 /// Symbol on line from XML
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LineSymbol {
     pub reference: String,
     pub position: f64,
+    pub rotation: f64,
+    pub crs_type: ferrite_kernel::LineSymbolCrs,
+    pub scale_factor: f64,
+}
+impl Default for LineSymbol {
+    fn default() -> Self {
+        Self {
+            reference: String::new(),
+            position: 0.,
+            rotation: 0.,
+            crs_type: Default::default(),
+            scale_factor: 1.,
+        }
+    }
 }
 
 /// Dash pattern element (for rendering - gap-based)
@@ -63,6 +77,7 @@ pub struct DashElement {
 /// Pen specification
 #[derive(Debug, Clone, Default)]
 pub struct Pen {
+    /// Millimetres, per S-100 Part 9-12.2.2.4.
     pub width: f64,
     pub color_token: String,
     pub cap_style: CapStyle,
@@ -74,6 +89,7 @@ pub struct Pen {
 pub struct SimpleLineStyle {
     pub id: String,
     pub interval_length: f64,
+    pub offset_mm: f64,
     pub pen: Pen,
     pub dashes: Vec<Dash>,
     pub symbols: Vec<LineSymbol>,
@@ -85,37 +101,17 @@ impl SimpleLineStyle {
         self.dashes.is_empty()
     }
 
-    /// Get dash array for rendering (converts start/length to gap-based)
-    pub fn dash_array(&self) -> Vec<f64> {
+    /// Preserve S-100 start positions; alternating arrays cannot encode an initial gap safely.
+    pub fn dash_cycle(&self) -> Result<Option<ferrite_kernel::DashCycle>, &'static str> {
         if self.dashes.is_empty() {
-            return Vec::new();
+            Ok(None)
+        } else {
+            ferrite_kernel::DashCycle::new(
+                self.interval_length,
+                self.dashes.iter().map(|d| (d.start, d.length)),
+            )
+            .map(Some)
         }
-
-        // Convert start/length format to length/gap format
-        let mut result = Vec::new();
-        let mut sorted_dashes: Vec<_> = self.dashes.iter().collect();
-        sorted_dashes.sort_by(|a, b| {
-            a.start
-                .partial_cmp(&b.start)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut current_pos = 0.0;
-        for dash in sorted_dashes {
-            let gap = dash.start - current_pos;
-            if gap > 0.0 {
-                result.push(gap); // gap before dash
-            }
-            result.push(dash.length); // dash length
-            current_pos = dash.start + dash.length;
-        }
-
-        // Final gap to complete the interval
-        if self.interval_length > current_pos {
-            result.push(self.interval_length - current_pos);
-        }
-
-        result
     }
 }
 
@@ -148,5 +144,31 @@ impl LineStyle {
             LineStyle::Complex(c) => &c.id,
             LineStyle::Composite(c) => &c.id,
         }
+    }
+}
+
+#[cfg(test)]
+mod dash_cycle_tests {
+    use super::*;
+    #[test]
+    fn pc_initial_gap_and_multiple_dashes_keep_their_positions() {
+        let style = SimpleLineStyle {
+            interval_length: 10.,
+            dashes: vec![
+                Dash {
+                    start: 2.,
+                    length: 2.,
+                },
+                Dash {
+                    start: 6.,
+                    length: 1.,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            style.dash_cycle().unwrap().unwrap().intervals,
+            vec![(2., 4.), (6., 7.)]
+        );
     }
 }

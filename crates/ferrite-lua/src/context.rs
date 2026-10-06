@@ -384,6 +384,8 @@ pub struct SpatialRef {
     pub spatial_type: PrimitiveType,
     /// Orientation: 1 = Forward, 2 = Reverse
     pub orientation: i8,
+    pub scale_minimum: Option<u32>,
+    pub scale_maximum: Option<u32>,
 }
 
 /// Feature info for Lua
@@ -520,6 +522,8 @@ pub struct SpatialInfo {
     pub z_coordinates: Vec<Option<f64>>,
     /// Curve associations for CompositeCurve types
     pub curve_associations: Vec<CurveAssociation>,
+    /// Surface interior rings, preserving child IDs and orientation.
+    pub interior_curve_associations: Vec<Vec<CurveAssociation>>,
 }
 
 /// Extract attributes from S-100 attribute list, building nested complex attribute trees
@@ -669,6 +673,8 @@ impl PortrayalContext {
                         spatial_id: sa.spatial_id.key(),
                         spatial_type,
                         orientation: sa.ornt,
+                        scale_minimum: sa.scale_minimum,
+                        scale_maximum: sa.scale_maximum,
                     }
                 })
                 .collect();
@@ -764,6 +770,7 @@ impl PortrayalContext {
                     coordinates: vec![(point.position.x, point.position.y)],
                     z_coordinates: vec![point.position.depth()],
                     curve_associations: Vec::new(),
+                    interior_curve_associations: Vec::new(),
                 },
             );
         }
@@ -783,14 +790,14 @@ impl PortrayalContext {
                     coordinates: coords,
                     z_coordinates: z_coords,
                     curve_associations: Vec::new(),
+                    interior_curve_associations: Vec::new(),
                 },
             );
         }
 
         // Extract curve spatials
         for (key, curve) in &cell.curves {
-            let coords: Vec<(f64, f64)> =
-                curve.all_positions().iter().map(|c| (c.x, c.y)).collect();
+            let coords: Vec<(f64, f64)> = curve.positions_iter().map(|c| (c.x, c.y)).collect();
             cell_data.spatials.insert(
                 *key,
                 SpatialInfo {
@@ -799,6 +806,7 @@ impl PortrayalContext {
                     coordinates: coords,
                     z_coordinates: Vec::new(), // Curves don't have Z
                     curve_associations: Vec::new(),
+                    interior_curve_associations: Vec::new(),
                 },
             );
         }
@@ -825,13 +833,14 @@ impl PortrayalContext {
                     coordinates: Vec::new(), // CompositeCurve derives coords from member curves
                     z_coordinates: Vec::new(),
                     curve_associations: associations,
+                    interior_curve_associations: Vec::new(),
                 },
             );
         }
 
         // Extract surface spatials (for Surface primitive type)
-        for key in cell.surfaces.keys() {
-            // Surface coordinates are derived from curves, just register the ID
+        for (key, surface) in &cell.surfaces {
+            // Preserve real surface boundary references for Lua geometry access
             cell_data.spatials.insert(
                 *key,
                 SpatialInfo {
@@ -839,7 +848,28 @@ impl PortrayalContext {
                     spatial_type: PrimitiveType::Surface,
                     coordinates: Vec::new(), // Surfaces derive coords from ring curves
                     z_coordinates: Vec::new(),
-                    curve_associations: Vec::new(),
+                    curve_associations: surface
+                        .exterior_ring
+                        .iter()
+                        .map(|c| CurveAssociation {
+                            curve_id: c.curve_id.key(),
+                            rcnm: c.curve_id.rcnm,
+                            orientation: c.orientation,
+                        })
+                        .collect(),
+                    interior_curve_associations: surface
+                        .interior_rings
+                        .iter()
+                        .map(|ring| {
+                            ring.iter()
+                                .map(|c| CurveAssociation {
+                                    curve_id: c.curve_id.key(),
+                                    rcnm: c.curve_id.rcnm,
+                                    orientation: c.orientation,
+                                })
+                                .collect()
+                        })
+                        .collect(),
                 },
             );
         }
@@ -940,5 +970,70 @@ impl PortrayalContext {
     /// Get access to cell data (for host functions)
     pub fn cell_data(&self) -> Arc<RwLock<CellData>> {
         self.cell.clone()
+    }
+}
+
+#[cfg(test)]
+mod curve_conversion_benchmark {
+    use super::*;
+    #[test]
+    #[ignore = "CPU benchmark with actual chart; run alone in release mode"]
+    fn real_cell_curve_conversion_abba() {
+        let path = std::env::var("FERRITE_CURVE_BENCHMARK").expect("Pass an actual chart path");
+        let cell = S101Cell::load(path).unwrap();
+        let mut curves: Vec<_> = cell.curves.iter().collect();
+        curves.sort_by_key(|(key, _)| **key);
+        let collect = |mode| -> Vec<Vec<(f64, f64)>> {
+            curves
+                .iter()
+                .map(|(_, curve)| {
+                    if mode == 0 {
+                        curve.all_positions().iter().map(|c| (c.x, c.y)).collect()
+                    } else {
+                        curve.positions_iter().map(|c| (c.x, c.y)).collect()
+                    }
+                })
+                .collect()
+        };
+        let expected = collect(0);
+        let expected_bits: Vec<Vec<_>> = expected
+            .iter()
+            .map(|v| v.iter().map(|(x, y)| (x.to_bits(), y.to_bits())).collect())
+            .collect();
+        let positions: usize = expected.iter().map(Vec::len).sum();
+        assert!(positions > 0);
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..8 {
+            for mode in [0, 1, 1, 0] {
+                let start = std::time::Instant::now();
+                let result = collect(mode);
+                let elapsed = start.elapsed().as_secs_f64() * 1000.;
+                let bits: Vec<Vec<_>> = result
+                    .iter()
+                    .map(|v| v.iter().map(|(x, y)| (x.to_bits(), y.to_bits())).collect())
+                    .collect();
+                assert_eq!(bits, expected_bits);
+                std::hint::black_box(&result);
+                if round > 0 {
+                    samples[mode].push(elapsed);
+                }
+            }
+        }
+        for (mode, timings) in samples.iter_mut().enumerate() {
+            timings.sort_by(f64::total_cmp);
+            println!(
+                "CURVES mode={} samples={} curves={} positions={} p50_ms={:.6} p95_ms={:.6}",
+                if mode == 0 {
+                    "intermediate_clone"
+                } else {
+                    "direct_iter"
+                },
+                timings.len(),
+                curves.len(),
+                positions,
+                timings[timings.len() / 2],
+                timings[(timings.len() * 95 / 100).min(timings.len() - 1)]
+            );
+        }
     }
 }

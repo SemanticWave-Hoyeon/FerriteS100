@@ -1,0 +1,3 @@
+# Keep this directory tracked so Lua build identity observes config creation,
+# replacement and removal without watching generated target files.
+# Build behavior uses Cargo defaults; this file sets no configuration options.

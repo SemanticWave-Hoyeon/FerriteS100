@@ -5,6 +5,7 @@ edition.workspace = true
 description = "S-100 rendering abstractions and drawing instructions"
 
 [dependencies]
+anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
@@ -15,3 +16,15 @@ geo-types.workspace = true
 # Internal crates
 ferrite-s100-core = { workspace = true }
 ferrite-portrayal-catalog = { workspace = true }
+
+ferrite-kernel.workspace = true
+
+sha2.workspace = true
+
+rstar = "0.12.2"
+robust = "1.2.0"
+chrono.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+bincode.workspace = true

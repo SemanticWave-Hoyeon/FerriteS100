@@ -28,7 +28,7 @@ pub struct InformationRecord {
 impl InformationRecord {
     /// Get record ID
     pub fn record_id(&self) -> RecordId {
-        RecordId::new(110, self.irid.rcid) // 110 = information record name
+        RecordId::new(150, self.irid.rcid) // 150 = information record name
     }
 
     /// Get attribute by code

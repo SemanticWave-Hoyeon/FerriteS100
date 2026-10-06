@@ -79,13 +79,11 @@ impl RawField {
 
     /// Get data without terminator
     pub fn data_trimmed(&self) -> &[u8] {
-        let mut end = self.data.len();
-        while end > 0
-            && (self.data[end - 1] == FIELD_TERMINATOR || self.data[end - 1] == UNIT_TERMINATOR)
-        {
-            end -= 1;
-        }
-        &self.data[..end]
+        // Remove only the field delimiter. Binary payload bytes may themselves
+        // equal 0x1e or 0x1f; repeatedly trimming them corrupts coordinates.
+        self.data
+            .strip_suffix(&[FIELD_TERMINATOR])
+            .unwrap_or(&self.data)
     }
 }
 
@@ -146,4 +144,16 @@ pub fn read_coordinate_factor(data: &[u8]) -> Result<(f64, usize)> {
 
     let factor = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     Ok((10f64.powi(-factor), 4))
+}
+
+#[cfg(test)]
+mod raw_field_tests {
+    use super::*;
+    #[test]
+    fn preserves_binary_bytes_that_look_like_delimiters() {
+        for byte in [FIELD_TERMINATOR, UNIT_TERMINATOR] {
+            let field = RawField::new("C2IL".into(), vec![1, 2, byte, FIELD_TERMINATOR]);
+            assert_eq!(field.data_trimmed(), &[1, 2, byte]);
+        }
+    }
 }

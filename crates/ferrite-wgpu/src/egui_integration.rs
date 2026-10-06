@@ -2,6 +2,9 @@
 //!
 //! Provides egui GUI overlay for the chart viewer.
 
+use crate::object_details::{detail_section, draw_selected_object_details, ObjectDetailSections};
+use crate::ui_chrome::{icon_button, selection_emphasis, Icon, Theme};
+use ferrite_render::{TemporalView, TemporalViewMode};
 use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::window::Window;
@@ -54,6 +57,9 @@ pub struct SettingsState {
     pub plain_boundaries: bool,
     /// Display mode (Base/Standard/All)
     pub display_mode: DisplayMode,
+    /// Additional catalogue layer IDs, independent of display modes.
+    pub viewing_layers: std::collections::BTreeSet<String>,
+    pub interoperability_enabled: bool,
     /// Show shallow water pattern overlay (DIAMOND1 - areas less than safety contour)
     pub show_shallow_pattern: bool,
 }
@@ -72,6 +78,8 @@ impl Default for SettingsState {
             ignore_scale_minimum: false,
             plain_boundaries: false,
             display_mode: DisplayMode::Standard,
+            viewing_layers: Default::default(),
+            interoperability_enabled: true,
             show_shallow_pattern: true,
         }
     }
@@ -106,6 +114,21 @@ pub struct PluginButton {
 /// Application state shared between egui UI and main app
 #[derive(Debug, Clone, Default)]
 pub struct AppUiState {
+    pub reduced_motion: bool,
+    pub globe_preview: bool,
+    pub view_mode_changed: bool,
+    pub globe_summary: String,
+    pub globe_tilt_deg: f64,
+    pub globe_range_factor: f64,
+    pub globe_pose: Option<ferrite_kernel::globe_navigation::GlobePose>,
+    pub fit_globe_requested: bool,
+    pub object_detail_sections: ObjectDetailSections,
+    pub object_attribute_query: String,
+    pub open_exchange_requested: bool,
+    pub close_requested: bool,
+    pub notice: Option<String>,
+    selection_ui_identity: Option<(Option<u32>, i64)>,
+    selection_ui_started: f64,
     /// Application version
     pub version: String,
     /// Current cursor position in world coordinates (lon, lat)
@@ -122,12 +145,25 @@ pub struct AppUiState {
     pub chart_count: usize,
     /// Selected feature info
     pub selected_feature: Option<SelectedFeature>,
+    pub selection_candidates: Vec<SelectedFeature>,
+    pub selection_requested: Option<usize>,
+    pub bathymetry_count: usize,
+    pub coverage_info: Option<String>,
+    pub security_status: String,
+    /// Application load policy, separate from portrayal settings. Default OFF.
+    pub verify_dataset_signatures: bool,
+    pub interoperability_status: String,
+    pub interoperability_available: bool,
+    pub interoperability_active: bool,
+    pub security_details: String,
     /// Request to open file dialog (chart files)
     pub open_file_requested: bool,
     /// Request to open Feature Catalogue
     pub open_fc_requested: bool,
     /// Request to open Portrayal Catalogue
     pub open_pc_requested: bool,
+    /// Request to switch an FC/PC pair together.
+    pub open_catalogue_set_requested: bool,
     /// Request to save screenshot
     pub screenshot_requested: bool,
     /// Request to zoom in
@@ -154,8 +190,14 @@ pub struct AppUiState {
     pub loading_progress: Option<(usize, usize)>,
     /// Show settings dialog
     pub show_settings: bool,
+    pub show_temporal: bool,
+    pub temporal_view: TemporalView,
+    pub pending_temporal_view: Option<TemporalView>,
+    pub temporal_changed: bool,
     /// Current settings state
     pub settings: SettingsState,
+    /// Installed catalogue optional layer IDs and user-facing names.
+    pub optional_viewing_layers: Vec<(String, String)>,
     /// Settings were changed (triggers Lua re-run + re-render)
     pub settings_changed: bool,
     /// Settings are dirty (waiting for pointer release to apply)
@@ -180,14 +222,14 @@ pub struct AppUiState {
     route_editing: Option<(u32, String)>,
     /// Waypoint being edited (waypoint_id, current_edit_text)
     waypoint_editing: Option<(u32, String)>,
-    /// Debug mode enabled (--debug flag)
+    /// Debug overlay and profiling enabled (toolbar, F12, or --debug).
     pub debug_mode: bool,
     /// Debug stats: FPS
     pub debug_fps: f32,
     /// Debug stats: CPU usage percentage
-    pub debug_cpu_usage: f32,
+    pub debug_cpu_usage: Option<f32>,
     /// Debug stats: Memory usage in MB
-    pub debug_memory_mb: f32,
+    pub debug_memory_mb: Option<f32>,
     /// Debug stats: Render instruction count
     pub debug_instruction_count: usize,
     /// Debug stats: Symbol count
@@ -199,9 +241,14 @@ pub struct AppUiState {
 pub struct SelectedFeature {
     pub feature_type: String,
     pub feature_id: i64,
+    pub foid: Option<String>,
+    pub cell_index: Option<u32>,
     pub primitive_type: String,
+    pub source: Option<String>,
     pub attributes: Vec<(String, String)>,
     pub world_pos: (f64, f64),
+    /// Display copy; source coordinates and identity remain unchanged.
+    pub longitude_shift: f64,
     /// Definition from Feature Catalogue
     pub definition: Option<String>,
     /// Symbol name (e.g., "ISODGR01", "SOUNDG10")
@@ -210,31 +257,48 @@ pub struct SelectedFeature {
 
 /// Convert decimal degrees to degrees, minutes, seconds format
 /// Latitude uses 2 digits (00-90), Longitude uses 3 digits (000-180)
-fn format_dms(decimal_degrees: f64, is_lat: bool) -> String {
-    let abs_deg = decimal_degrees.abs();
-    let degrees = abs_deg.floor() as i32;
-    let minutes_full = (abs_deg - degrees as f64) * 60.0;
-    let minutes = minutes_full.floor() as i32;
-    let seconds = (minutes_full - minutes as f64) * 60.0;
-
-    let dir = if is_lat {
-        if decimal_degrees >= 0.0 {
-            "N"
+pub(crate) fn format_dms(decimal_degrees: f64, is_lat: bool) -> String {
+    let limit = if is_lat { 90. } else { 180. };
+    if !decimal_degrees.is_finite() || decimal_degrees.abs() > limit {
+        return if is_lat {
+            "Invalid WGS84 latitude"
         } else {
-            "S"
+            "Invalid WGS84 longitude"
         }
-    } else if decimal_degrees >= 0.0 {
-        "E"
-    } else {
-        "W"
+        .into();
+    }
+    // Round once in integer hundredths of an arc-second. Carry propagates into
+    // minutes and degrees, so a binary value just below a minute never prints 60s.
+    let total = (decimal_degrees.abs() * 360_000.).round() as u64;
+    let degrees = total / 360_000;
+    let minutes = (total / 6_000) % 60;
+    let seconds = (total % 6_000) as f64 / 100.;
+    let direction = match (is_lat, decimal_degrees >= 0.) {
+        (true, true) => "N",
+        (true, false) => "S",
+        (false, true) => "E",
+        (false, false) => "W",
     };
-
     if is_lat {
-        // Latitude: 2 digits for degrees (00-90)
-        format!("{:02}°{:02}'{:05.2}\"{}", degrees, minutes, seconds, dir)
+        format!("{degrees:02}°{minutes:02}'{seconds:05.2}\"{direction}")
     } else {
-        // Longitude: 3 digits for degrees (000-180)
-        format!("{:03}°{:02}'{:05.2}\"{}", degrees, minutes, seconds, dir)
+        format!("{degrees:03}°{minutes:02}'{seconds:05.2}\"{direction}")
+    }
+}
+
+#[cfg(test)]
+mod coordinate_format_tests {
+    use super::format_dms;
+    #[test]
+    fn seconds_round_with_carry_and_invalid_positions_are_disclosed() {
+        assert_eq!(format_dms(50.8, true), "50°48'00.00\"N");
+        assert_eq!(format_dms(-1.1, false), "001°06'00.00\"W");
+        assert_eq!(format_dms(-0.5, true), "00°30'00.00\"S");
+        assert_eq!(format_dms(89.999_999_999, true), "90°00'00.00\"N");
+        assert_eq!(format_dms(-179.999_999_999, false), "180°00'00.00\"W");
+        assert!(format_dms(f64::NAN, true).starts_with("Invalid"));
+        assert!(format_dms(91., true).starts_with("Invalid"));
+        assert!(format_dms(181., false).starts_with("Invalid"));
     }
 }
 
@@ -243,6 +307,8 @@ pub struct EguiIntegration {
     pub ctx: egui::Context,
     state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
+    font_metrics_ready: bool,
+    pending_font_textures: egui::TexturesDelta,
 }
 
 impl EguiIntegration {
@@ -254,11 +320,26 @@ impl EguiIntegration {
         window: Arc<Window>,
     ) -> Self {
         let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "ChartBold".into(),
+            egui::FontData::from_static(include_bytes!(
+                "../../../Catalogues/PC/S-421/Fonts/OpenSans-Bold.ttf"
+            ))
+            .into(),
+        );
+        let mut bold_fallbacks = fonts.families[&egui::FontFamily::Proportional].clone();
+        bold_fallbacks.insert(0, "ChartBold".into());
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("ChartBold".into()), bold_fallbacks);
+        ctx.set_fonts(fonts);
 
         // Configure egui style for dark theme
         let mut style = (*ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         ctx.set_style(style);
+        Theme::for_profile("Day").apply(&ctx, false);
 
         let viewport_id = ctx.viewport_id();
         let state = egui_winit::State::new(
@@ -276,12 +357,46 @@ impl EguiIntegration {
             ctx,
             state,
             renderer,
+            font_metrics_ready: false,
+            pending_font_textures: Default::default(),
         }
+    }
+
+    /// Initialize font metrics for dependency evaluation before the first GUI
+    /// frame. Retain atlas uploads; do not consume queued window/input events.
+    pub fn ensure_font_metrics(&mut self, window: &Window) {
+        if self.font_metrics_ready {
+            return;
+        }
+        let density = window.scale_factor() as f32;
+        let size = window.inner_size();
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size.width as f32 / density, size.height as f32 / density),
+            )),
+            ..Default::default()
+        };
+        raw.viewports
+            .entry(self.ctx.viewport_id())
+            .or_default()
+            .native_pixels_per_point = Some(density);
+        let output = self.ctx.run(raw, |_| {});
+        self.pending_font_textures.append(output.textures_delta);
+        self.font_metrics_ready = true;
     }
 
     /// Handle winit window event, returns true if egui consumed the event
     pub fn handle_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         let response = self.state.on_window_event(window, event);
+        // Consumed pointer/key events may not enter chart-navigation branches.
+        // Honour egui's repaint signal so queued button releases are processed
+        // even while the event-driven chart is otherwise idle.
+        // The redraw event already satisfies the request; scheduling another
+        // here would create an idle rendering loop.
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
+            window.request_redraw();
+        }
         response.consumed
     }
 
@@ -289,11 +404,15 @@ impl EguiIntegration {
     pub fn begin_frame(&mut self, window: &Window) {
         let raw_input = self.state.take_egui_input(window);
         self.ctx.begin_pass(raw_input);
+        self.font_metrics_ready = true;
     }
 
     /// End egui frame and get render output
     pub fn end_frame(&mut self, window: &Window) -> egui::FullOutput {
-        let output = self.ctx.end_pass();
+        let mut output = self.ctx.end_pass();
+        let mut textures = std::mem::take(&mut self.pending_font_textures);
+        textures.append(output.textures_delta);
+        output.textures_delta = textures;
         self.state
             .handle_platform_output(window, output.platform_output.clone());
         output
@@ -319,6 +438,11 @@ impl EguiIntegration {
         screen_descriptor: egui_wgpu::ScreenDescriptor,
         full_output: egui::FullOutput,
     ) {
+        // UI zoom can differ from the native OS scale. Match tessellation.
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            pixels_per_point: full_output.pixels_per_point,
+            ..screen_descriptor
+        };
         // Process texture deltas
         for (id, delta) in &full_output.textures_delta.set {
             self.renderer.update_texture(device, queue, *id, delta);
@@ -388,17 +512,136 @@ impl EguiIntegration {
         }
     }
 
+    /// Upload chart/UI atlas deltas once, before ordered chart glyph draws.
+    pub fn prepare_chart_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        output: &mut egui::FullOutput,
+    ) {
+        for (id, delta) in output.textures_delta.set.drain(..) {
+            self.renderer.update_texture(device, queue, id, &delta);
+        }
+    }
+    /// Flush font changes without an extra UI pass or consuming native input.
+    pub(crate) fn flush_chart_fonts(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        for (id, delta) in std::mem::take(&mut self.pending_font_textures).set {
+            self.renderer.update_texture(device, queue, id, &delta);
+        }
+        if let Some(delta) = self.ctx.fonts(|fonts| fonts.font_image_delta()) {
+            self.ctx
+                .tex_manager()
+                .write()
+                .set(egui::TextureId::default(), delta);
+        }
+        let delta = self.ctx.tex_manager().write().take_delta();
+        for (id, image) in delta.set {
+            self.renderer.update_texture(device, queue, id, &image);
+        }
+        for id in delta.free {
+            self.renderer.free_texture(&id);
+        }
+    }
+    pub fn chart_atlas_bind_group(&self, id: egui::TextureId) -> Option<wgpu::BindGroup> {
+        self.renderer
+            .texture(&id)
+            .map(|texture| texture.bind_group.clone())
+    }
+
     /// Draw the UI and return the app state changes
+    fn draw_temporal_dialog(ctx: &egui::Context, state: &mut AppUiState) {
+        let theme = Theme::current(ctx);
+        if state.pending_temporal_view.is_none() {
+            state.pending_temporal_view = Some(state.temporal_view.clone());
+        }
+        let mut open = state.show_temporal;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Viewing date and time").open(&mut open).resizable(false).default_width(480.0).show(ctx, |ui| {
+            let draft = state.pending_temporal_view.as_mut().unwrap();
+            egui::ComboBox::from_id_salt("temporal_mode").selected_text(draft.mode.label()).show_ui(ui, |ui| {
+                for mode in [TemporalViewMode::Live,TemporalViewMode::Date,TemporalViewMode::Instant,TemporalViewMode::All] {
+                    ui.selectable_value(&mut draft.mode,mode,mode.label());
+                }
+            });
+            ui.add_space(8.0);
+            match draft.mode {
+                TemporalViewMode::Live => {ui.label("Uses the current clock. Objects refresh when their time conditions change.");}
+                TemporalViewMode::Date => {
+                    ui.label("Date (YYYY-MM-DD)");
+                    ui.text_edit_singleline(&mut draft.date);
+                    ui.label("Evaluated at midnight in the source-local offset below.");
+                }
+                TemporalViewMode::Instant => {
+                    ui.label("Date and time, including Z or a UTC offset");
+                    ui.text_edit_singleline(&mut draft.instant);
+                    ui.weak("Example: 2026-10-04T09:30:00+09:00");
+                }
+                TemporalViewMode::All => {ui.label("Shows objects regardless of their date and time conditions.");}
+            }
+            ui.separator();
+            ui.label("Source-local UTC offset");
+            ui.text_edit_singleline(&mut draft.source_offset);
+            ui.weak("Z, +09:00 or -03:30. Applies to source dates and times without a zone; it does not change the viewing instant's offset.");
+            let error = draft.validation_error();
+            if let Some(error) = &error {ui.colored_label(theme.error,error);}
+            ui.separator();
+            ui.horizontal(|ui| {
+                apply = ui.add_enabled(error.is_none(),egui::Button::new("Apply")).clicked();
+                cancel = ui.button("Cancel").clicked();
+                if ui.button("Use live clock").clicked() {draft.mode = TemporalViewMode::Live;}
+            });
+        });
+        if apply {
+            let draft = state.pending_temporal_view.take().unwrap();
+            if draft.validation_error().is_none() {
+                state.temporal_changed = draft != state.temporal_view;
+                state.temporal_view = draft;
+                open = false;
+            }
+        }
+        if cancel {
+            open = false;
+        }
+        if !open {
+            state.pending_temporal_view = None;
+        }
+        state.show_temporal = open;
+    }
+
     pub fn draw_ui(&self, ui_state: &mut AppUiState) {
+        let theme = Theme::for_profile(&ui_state.color_profile);
+        theme.apply(&self.ctx, ui_state.reduced_motion);
+        let now = self.ctx.input(|i| i.time);
+        let identity = ui_state
+            .selected_feature
+            .as_ref()
+            .map(|f| (f.cell_index, f.feature_id));
+        if identity != ui_state.selection_ui_identity {
+            ui_state.selection_ui_identity = identity;
+            ui_state.object_attribute_query.clear();
+            ui_state.selection_ui_started = now;
+        }
+        let emphasis =
+            selection_emphasis(now - ui_state.selection_ui_started, ui_state.reduced_motion);
+        if emphasis < 1. && identity.is_some() {
+            self.ctx
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
         // Combined toolbar with menu and buttons
         egui::TopBottomPanel::top("toolbar")
-            .min_height(32.0)
+            .min_height(40.0)
             .show(&self.ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
                     // File menu
                     ui.menu_button("File", |ui| {
-                        if ui.button("Open Chart...").clicked() {
+                        if ui.button("Open datasets…").clicked() {
                             ui_state.open_file_requested = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Open exchange set folder…").clicked() {
+                            ui_state.open_exchange_requested = true;
                             ui.close_menu();
                         }
                         if ui_state.chart_count > 0 && ui.button("Clear All Charts").clicked() {
@@ -406,6 +649,10 @@ impl EguiIntegration {
                             ui.close_menu();
                         }
                         ui.separator();
+                        if ui.button("Open catalogue set (FC + PC)…").clicked() {
+                            ui_state.open_catalogue_set_requested = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Open Feature Catalogue...").clicked() {
                             ui_state.open_fc_requested = true;
                             ui.close_menu();
@@ -421,12 +668,76 @@ impl EguiIntegration {
                         }
                         ui.separator();
                         if ui.button("Exit").clicked() {
-                            std::process::exit(0);
+                            ui_state.close_requested = true;
+                            ui.close_menu();
                         }
                     });
 
+                    if icon_button(ui, Icon::Open, "Open S-101 / S-102 datasets").clicked() {
+                        ui_state.open_file_requested = true;
+                    }
+
+                    if ui
+                        .selectable_label(ui_state.debug_mode, "DEBUG MODE")
+                        .on_hover_text("Toggle performance statistics and profiling (F12)")
+                        .clicked()
+                    {
+                        ui_state.debug_mode = !ui_state.debug_mode;
+                    }
+
                     // View menu
                     ui.menu_button("View", |ui| {
+                        for (globe, label) in [(false, "2D Chart"), (true, "3D Globe")] {
+                            if ui
+                                .selectable_label(ui_state.globe_preview == globe, label)
+                                .clicked()
+                            {
+                                if ui_state.globe_preview != globe {
+                                    ui_state.globe_preview = globe;
+                                    ui_state.view_mode_changed = true;
+                                }
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        if ui_state.globe_preview {
+                            if ui.button("Whole Earth").clicked() {
+                                ui_state.fit_globe_requested = true;
+                                ui.close_menu();
+                            }
+                            for (tilt, label) in
+                                [(0., "Look straight down"), (45., "Tilt toward horizon")]
+                            {
+                                if ui
+                                    .selectable_label(ui_state.globe_tilt_deg == tilt, label)
+                                    .clicked()
+                                {
+                                    ui_state.globe_tilt_deg = tilt;
+                                    ui_state.view_mode_changed = true;
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                        ui.menu_button("Color palette", |ui| {
+                            for profile in ["Day", "Dusk", "Night"] {
+                                if ui
+                                    .selectable_label(ui_state.color_profile == profile, profile)
+                                    .clicked()
+                                {
+                                    if ui_state.color_profile != profile {
+                                        ui_state.color_profile = profile.into();
+                                        ui_state.color_profile_changed = true;
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        if ui.button("Viewing date and time…").clicked() {
+                            ui_state.show_temporal = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+
                         if ui.button("Zoom In").clicked() {
                             ui_state.zoom_in_requested = true;
                             ui.close_menu();
@@ -442,8 +753,29 @@ impl EguiIntegration {
                         }
                     });
 
+                    if ui
+                        .button(ui_state.temporal_view.summary())
+                        .on_hover_text(format!(
+                            "{}; source-local offset {}. Click to change viewing time.",
+                            ui_state.temporal_view.mode.label(),
+                            ui_state.temporal_view.source_offset
+                        ))
+                        .clicked()
+                    {
+                        ui_state.show_temporal = true;
+                    }
+
                     // Settings menu (independent top-level menu)
                     ui.menu_button("Settings", |ui| {
+                        if ui
+                            .checkbox(&mut ui_state.reduced_motion, "Reduce UI motion")
+                            .changed()
+                        {
+                            ui.ctx().request_repaint();
+                        }
+                        ui.separator();
+                        signature_verification_toggle(ui, &mut ui_state.verify_dataset_signatures);
+                        ui.separator();
                         if ui.button("Display Settings...").clicked() {
                             ui_state.show_settings = true;
                             ui.close_menu();
@@ -465,39 +797,65 @@ impl EguiIntegration {
 
                     ui.separator();
 
+                    // Keep the view choice visible without opening a menu.
+                    ui.horizontal(|ui| {
+                        for (globe, label, help) in [
+                            (false, "2D Chart", "View the chart as a flat map"),
+                            (true, "3D Globe", "View the chart on the WGS84 globe"),
+                        ] {
+                            if ui
+                                .selectable_label(ui_state.globe_preview == globe, label)
+                                .on_hover_text(help)
+                                .clicked()
+                                && ui_state.globe_preview != globe
+                            {
+                                ui_state.globe_preview = globe;
+                                ui_state.view_mode_changed = true;
+                            }
+                        }
+                    });
+                    ui.separator();
                     // Zoom controls
-                    if ui.button("+").on_hover_text("Zoom In").clicked() {
+                    if icon_button(ui, Icon::Plus, "Zoom in").clicked() {
                         ui_state.zoom_in_requested = true;
                     }
-                    if ui.button("-").on_hover_text("Zoom Out").clicked() {
+                    if icon_button(ui, Icon::Minus, "Zoom out").clicked() {
                         ui_state.zoom_out_requested = true;
                     }
-                    if ui.button("Fit").on_hover_text("Reset View").clicked() {
+                    if icon_button(ui, Icon::Fit, "Fit chart to view").clicked() {
                         ui_state.reset_view_requested = true;
                     }
 
                     ui.separator();
 
                     // Color profile selector (Day/Dusk/Night)
-                    ui.label("Mode:");
-                    let profiles = ["Day", "Dusk", "Night"];
-                    let current = if ui_state.color_profile.is_empty() {
-                        "Day".to_string()
-                    } else {
-                        ui_state.color_profile.clone()
-                    };
-                    egui::ComboBox::from_id_salt("color_profile")
-                        .selected_text(&current)
-                        .show_ui(ui, |ui| {
-                            for profile in profiles {
-                                if ui.selectable_label(current == profile, profile).clicked()
-                                    && current != profile
-                                {
-                                    ui_state.color_profile = profile.to_string();
-                                    ui_state.color_profile_changed = true;
-                                }
-                            }
-                        });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(168.0, 30.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label("Palette:");
+                            let profiles = ["Day", "Dusk", "Night"];
+                            let current = if ui_state.color_profile.is_empty() {
+                                "Day".to_string()
+                            } else {
+                                ui_state.color_profile.clone()
+                            };
+                            egui::ComboBox::from_id_salt("color_profile")
+                                .selected_text(&current)
+                                .show_ui(ui, |ui| {
+                                    for profile in profiles {
+                                        if ui
+                                            .selectable_label(current == profile, profile)
+                                            .clicked()
+                                            && current != profile
+                                        {
+                                            ui_state.color_profile = profile.to_string();
+                                            ui_state.color_profile_changed = true;
+                                        }
+                                    }
+                                });
+                        },
+                    );
 
                     // Plugin toolbar buttons (disabled when no chart loaded)
                     if !ui_state.plugin_buttons.is_empty() {
@@ -532,9 +890,13 @@ impl EguiIntegration {
         egui::TopBottomPanel::bottom("status_bar")
             .min_height(28.0)
             .show(&self.ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     // Coordinate display (only show valid coords when chart is loaded)
-                    if ui_state.chart_count > 0 {
+                    if ui_state.chart_count > 0
+                        && ui_state.cursor_world.0.is_finite()
+                        && ui_state.cursor_world.1.is_finite()
+                        && ui_state.cursor_world.1.abs() <= 90.0
+                    {
                         let (lon, lat) = ui_state.cursor_world;
                         let lat_dms = format_dms(lat, true);
                         let lon_dms = format_dms(lon, false);
@@ -563,7 +925,7 @@ impl EguiIntegration {
                         ui.label(
                             egui::RichText::new(format!("Loading... ({}/{})", loaded, total))
                                 .size(14.0)
-                                .color(egui::Color32::from_rgb(100, 180, 255)),
+                                .color(theme.accent),
                         );
                     } else if ui_state.chart_count > 0 {
                         ui.label(
@@ -588,112 +950,83 @@ impl EguiIntegration {
         // Feature info panel (right side)
         egui::SidePanel::right("feature_panel")
             .default_width(320.0)
+            .min_width(260.0)
             .resizable(true)
             .show(&self.ctx, |ui| {
                 // Panel title with larger font
                 ui.vertical_centered(|ui| {
-                    ui.heading(egui::RichText::new("Feature Info").size(18.0).strong());
+                    ui.heading(egui::RichText::new("Object details").size(18.0).strong());
+                });
+                ui.horizontal(|ui| {
+                    if ui.small_button("Expand all").clicked() { ui_state.object_detail_sections.set_all(true); }
+                    if ui.small_button("Collapse all").clicked() { ui_state.object_detail_sections.set_all(false); }
                 });
                 ui.separator();
 
-                if let Some(ref feature) = ui_state.selected_feature {
-                    // Feature type - prominent display
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Type:").size(14.0).strong());
-                        ui.label(
-                            egui::RichText::new(&feature.feature_type)
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(100, 149, 237)),
-                        );
-                    });
-
-                    // Symbol name (if available)
-                    if let Some(ref symbol) = feature.symbol_name {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Symbol:").size(13.0).strong());
-                            ui.label(
-                                egui::RichText::new(symbol)
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(144, 238, 144)),
-                            );
+                egui::ScrollArea::vertical().id_salt("object_details_scroll").auto_shrink([false,false]).show(ui,|ui| {
+                if ui_state.globe_preview {
+                    ui.colored_label(theme.error, "Globe preview: patterns, bathymetry, line text placement remain unavailable.");
+                    ui.label(&ui_state.globe_summary);
+                    ui.separator();
+                }
+                if let Some(notice)=ui_state.notice.clone() {
+                    ui.colored_label(theme.error,&notice);
+                    if ui.small_button("Dismiss message").clicked(){ui_state.notice=None;}
+                    ui.separator();
+                }
+                if !ui_state.interoperability_status.is_empty() {
+                    ui.label(&ui_state.interoperability_status);
+                }
+                if !ui_state.security_status.is_empty() {
+                    ui.label(&ui_state.security_status);
+                    if !ui_state.security_details.is_empty() {
+                        detail_section(ui,"Verification details","security",&mut ui_state.object_detail_sections.security,|ui| {
+                            ui.add(egui::Label::new(&ui_state.security_details).wrap().selectable(true));
                         });
                     }
-
-                    // Definition (if available) - displayed in a styled box for better readability
-                    if let Some(ref definition) = feature.definition {
-                        ui.add_space(4.0);
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_rgb(45, 55, 72))
-                            .corner_radius(4.0)
-                            .inner_margin(egui::Margin::symmetric(8, 6))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(definition)
-                                        .size(12.5)
-                                        .color(egui::Color32::from_rgb(200, 210, 225)),
-                                );
-                            });
-                    }
-
-                    ui.add_space(4.0);
-
-                    // Feature ID
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("ID:").size(13.0).strong());
-                        ui.label(egui::RichText::new(format!("{}", feature.feature_id)).size(13.0));
-                    });
-
-                    // Primitive type
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Primitive:").size(13.0).strong());
-                        ui.label(egui::RichText::new(&feature.primitive_type).size(13.0));
-                    });
-
-                    ui.add_space(4.0);
-
-                    // Position with better formatting (DMS)
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("Position").size(13.0).strong());
-                        let (lon, lat) = feature.world_pos;
-                        ui.label(
-                            egui::RichText::new(format!("  LAT: {}", format_dms(lat, true)))
-                                .size(12.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("  LON: {}", format_dms(lon, false)))
-                                .size(12.0),
-                        );
-                    });
-
-                    ui.add_space(8.0);
                     ui.separator();
-                    ui.add_space(4.0);
-
-                    // Attributes section
-                    ui.label(egui::RichText::new("Attributes").size(14.0).strong());
-
-                    if feature.attributes.is_empty() {
-                        ui.label(
-                            egui::RichText::new("  (No attributes)")
-                                .size(12.0)
-                                .italics(),
-                        );
+                }
+                if ui_state.bathymetry_count > 0 {
+                    ui.label(format!("S-102 layers: {}", ui_state.bathymetry_count));
+                    if ui_state.interoperability_active {
+                        ui.label("Display: authenticated interoperability catalogue");
                     } else {
-                        egui::ScrollArea::vertical()
-                            .max_height(300.0)
-                            .show(ui, |ui| {
-                                for (key, value) in &feature.attributes {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("{}:", key))
-                                                .size(12.0)
-                                                .strong(),
-                                        );
-                                        ui.label(egui::RichText::new(value).size(12.0));
-                                    });
-                                }
-                            });
+                        ui.label("Display: ordinary overlays")
+                            .on_hover_text("S-102 follows its portrayal catalogue. Opaque depth colours can cover ENC symbols. No active IC interleaving is applied.");
                     }
+                    ui.label("Click the map for depth, uncertainty and survey quality.");
+                }
+                if let Some(info) = &ui_state.coverage_info {
+                    if info.lines().any(|line|line.starts_with("Source encoding warning:")) {
+                        ui.colored_label(theme.warning,"Source text encoding issue; original bytes retained. See details.");
+                    }
+                    detail_section(ui,"Depth and survey quality","coverage",&mut ui_state.object_detail_sections.coverage,|ui| {
+                        ui.add(egui::Label::new(info).wrap().selectable(true));
+                    });
+                    ui.separator();
+                }
+                if ui_state.selection_candidates.len() > 1 {
+                    detail_section(ui,format!("Objects at this position ({})",ui_state.selection_candidates.len()),"nearby",&mut ui_state.object_detail_sections.nearby,|ui| {
+                    egui::ScrollArea::vertical().id_salt("overlapping_features").max_height(140.0).show(ui,|ui| {
+                        for (index, candidate) in ui_state.selection_candidates.iter().enumerate() {
+                            let active = ui_state.selected_feature.as_ref().is_some_and(|f|f.feature_id == candidate.feature_id && f.cell_index == candidate.cell_index);
+                            let chart = candidate.source.as_deref().and_then(|s|std::path::Path::new(s).file_name()).map(|s|s.to_string_lossy()).unwrap_or_default();
+                            let label = format!("{} · {} · {}",candidate.feature_type,candidate.primitive_type,chart);
+                            if ui.selectable_label(active,label).on_hover_text(format!("Object ID {}",candidate.feature_id)).clicked() {
+                                ui_state.selection_requested=Some(index); ui.ctx().request_repaint();
+                            }
+                        }
+                    });
+                    });
+                    ui.separator();
+                }
+                if let Some(ref feature) = ui_state.selected_feature {
+                    let (accent_rect,_) = ui.allocate_exact_size(egui::vec2(ui.available_width(),3.),egui::Sense::hover());
+                    ui.painter().rect_filled(accent_rect,1.5,theme.accent.gamma_multiply(0.35+0.65*emphasis));
+                    ui.label(egui::RichText::new("SELECTED OBJECT").small().color(theme.muted));
+
+                    draw_selected_object_details(ui, feature, &mut ui_state.object_detail_sections,
+                        &mut ui_state.object_attribute_query, ui_state.settings.safety_contour);
                 } else {
                     // No feature selected - show help
                     ui.vertical_centered(|ui| {
@@ -729,11 +1062,20 @@ impl EguiIntegration {
                             ui.label(egui::RichText::new("Select").size(12.0));
                             ui.end_row();
 
+                            ui.label(egui::RichText::new("Tab / Shift+Tab").size(12.0));
+                            ui.label(egui::RichText::new("Move keyboard focus").size(12.0));
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("F12").size(12.0));
+                            ui.label(egui::RichText::new("Performance details").size(12.0));
+                            ui.end_row();
+
                             ui.label(egui::RichText::new("Right click").size(12.0));
                             ui.label(egui::RichText::new("Reset view").size(12.0));
                             ui.end_row();
                         });
                 }
+                });
             });
 
         // About dialog
@@ -800,25 +1142,20 @@ impl EguiIntegration {
             Self::draw_settings_dialog(&self.ctx, ui_state);
         }
 
-        // Calculate actual chart area from screen size and known panel dimensions
-        // This avoids using CentralPanel which would consume mouse events
-        let screen_rect = self.ctx.screen_rect();
-        let top_panel_height = 32.0; // toolbar min_height
-        let bottom_panel_height = 28.0; // status bar min_height
-        let right_panel_width = 320.0; // feature panel default_width
+        if ui_state.show_temporal {
+            Self::draw_temporal_dialog(&self.ctx, ui_state);
+        } else {
+            ui_state.pending_temporal_view = None;
+        }
 
-        // Check if route panel is active (adds left panel width)
-        let route_active = ui_state
-            .plugin_buttons
-            .iter()
-            .any(|b| b.plugin_id.contains("route") && b.active);
-        let left_panel_width = if route_active { 280.0 } else { 0.0 }; // route panel default_width
-
-        let chart_x = left_panel_width;
-        let chart_y = top_panel_height;
-        let chart_width = (screen_rect.width() - left_panel_width - right_panel_width).max(100.0);
-        let chart_height =
-            (screen_rect.height() - top_panel_height - bottom_panel_height).max(100.0);
+        // Use the space actually left by panels, including user resizing,
+        // borders, wrapped toolbar rows and the current UI scale.
+        // Reading available_rect does not install a mouse-consuming CentralPanel.
+        let available = self.ctx.available_rect();
+        let chart_x = available.min.x;
+        let chart_y = available.min.y;
+        let chart_width = available.width().max(0.);
+        let chart_height = available.height().max(0.);
 
         // Detect chart_x change (panel opened/closed) and calculate pan adjustment
         // to keep the visual center in the same position
@@ -839,15 +1176,15 @@ impl EguiIntegration {
 
     /// Draw debug overlay on chart (top-left corner, green text)
     fn draw_debug_overlay(ctx: &egui::Context, ui_state: &AppUiState, chart_x: f32, chart_y: f32) {
+        let theme = Theme::current(ctx);
         egui::Area::new(egui::Id::new("debug_overlay"))
             .fixed_pos(egui::pos2(chart_x + 10.0, chart_y + 10.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.style_mut().visuals.override_text_color =
-                    Some(egui::Color32::from_rgb(0, 255, 0));
+                ui.style_mut().visuals.override_text_color = Some(theme.success);
 
                 let frame_response = egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180))
+                    .fill(theme.panel)
                     .inner_margin(egui::Margin::same(8))
                     .corner_radius(4.0)
                     .show(ui, |ui| {
@@ -858,8 +1195,10 @@ impl EguiIntegration {
 
                         // Performance stats
                         ui.label(format!("FPS: {:.1}", ui_state.debug_fps));
-                        ui.label(format!("CPU: {:.1}%", ui_state.debug_cpu_usage));
-                        ui.label(format!("RAM: {:.1} MB", ui_state.debug_memory_mb));
+                        ui.label(ui_state.debug_cpu_usage.map_or_else(|| "CPU: —".into(), |v| format!("CPU: {v:.1}%")))
+                            .on_hover_text("Process CPU share of available logical CPU capacity (100% uses all cores)");
+                        ui.label(ui_state.debug_memory_mb.map_or_else(|| "RAM: —".into(), |v| format!("RAM: {v:.1} MiB")))
+                            .on_hover_text("Current resident memory used by this process");
 
                         ui.separator();
 
@@ -896,6 +1235,7 @@ impl EguiIntegration {
 
     /// Draw the Route panel (for route plugin)
     fn draw_route_panel(ctx: &egui::Context, ui_state: &mut AppUiState) {
+        let theme = Theme::current(ctx);
         // Check if route plugin is active
         let route_active = ui_state
             .plugin_buttons
@@ -927,7 +1267,7 @@ impl EguiIntegration {
                             if editing {
                                 ui.label(egui::RichText::new("Click on chart to add waypoints")
                                     .size(12.0)
-                                    .color(egui::Color32::from_rgb(100, 200, 100)));
+                                    .color(theme.success));
                             }
                         });
                         ui.separator();
@@ -938,9 +1278,9 @@ impl EguiIntegration {
                             ui.label("Route Display:");
                             let btn_text = if rendering_enabled { "ON" } else { "OFF" };
                             let btn_color = if rendering_enabled {
-                                egui::Color32::from_rgb(100, 200, 100)
+                                theme.success
                             } else {
-                                egui::Color32::from_rgb(200, 100, 100)
+                                theme.error
                             };
                             if ui.add(egui::Button::new(egui::RichText::new(btn_text).color(btn_color))).clicked() {
                                 ui_state.plugin_ui_events.push((
@@ -966,9 +1306,9 @@ impl EguiIntegration {
                                             let is_active = route.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
 
                                             let bg_color = if is_active {
-                                                egui::Color32::from_rgb(60, 80, 100)
+                                                theme.selection
                                             } else {
-                                                egui::Color32::from_rgb(45, 55, 72)
+                                                theme.raised
                                             };
 
                                             // Check if this route is being edited
@@ -1020,7 +1360,7 @@ impl EguiIntegration {
                                                             }
                                                             ui.label(egui::RichText::new(format!("{} WP • {}", wp_count, dist))
                                                                 .size(11.0)
-                                                                .color(egui::Color32::LIGHT_GRAY));
+                                                                .color(theme.muted));
                                                         });
 
                                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1095,7 +1435,7 @@ impl EguiIntegration {
                                         let is_wp_editing = ui_state.waypoint_editing.as_ref().is_some_and(|(id, _)| *id == wp_id);
 
                                         egui::Frame::new()
-                                            .fill(egui::Color32::from_rgb(45, 55, 72))
+                                            .fill(theme.raised)
                                             .corner_radius(4.0)
                                             .inner_margin(egui::Margin::symmetric(8, 4))
                                             .show(ui, |ui| {
@@ -1133,9 +1473,9 @@ impl EguiIntegration {
                                                         } else {
                                                             ui.label(egui::RichText::new(name).strong());
                                                         }
-                                                        ui.label(egui::RichText::new(pos).size(11.0).color(egui::Color32::LIGHT_GRAY));
+                                                        ui.label(egui::RichText::new(pos).size(11.0).color(theme.muted));
                                                         if let Some(d) = leg {
-                                                            ui.label(egui::RichText::new(format!("Leg: {}", d)).size(11.0).color(egui::Color32::from_rgb(100, 180, 255)));
+                                                            ui.label(egui::RichText::new(format!("Leg: {}", d)).size(11.0).color(theme.accent));
                                                         }
                                                     });
 
@@ -1164,7 +1504,7 @@ impl EguiIntegration {
                                 });
                             }
                         } else if route_ui.get("routes").and_then(|v| v.as_array()).is_some_and(|r| r.is_empty()) {
-                            ui.label(egui::RichText::new("No routes. Click 'New' to create one.").size(12.0).color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("No routes. Click 'New' to create one.").size(12.0).color(theme.muted));
                         }
 
                         ui.add_space(8.0);
@@ -1212,13 +1552,13 @@ impl EguiIntegration {
                                         let loaded = fc.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let message = fc.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown");
                                         let color = if loaded {
-                                            egui::Color32::from_rgb(100, 200, 100)
+                                            theme.success
                                         } else {
-                                            egui::Color32::from_rgb(200, 100, 100)
+                                            theme.error
                                         };
                                         ui.label(egui::RichText::new(message).color(color).size(11.0));
                                     } else {
-                                        ui.label(egui::RichText::new("Not loaded").color(egui::Color32::GRAY).size(11.0));
+                                        ui.label(egui::RichText::new("Not loaded").color(theme.muted).size(11.0));
                                     }
                                 });
 
@@ -1229,18 +1569,18 @@ impl EguiIntegration {
                                         let loaded = pc.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let message = pc.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown");
                                         let color = if loaded {
-                                            egui::Color32::from_rgb(100, 200, 100)
+                                            theme.success
                                         } else {
-                                            egui::Color32::from_rgb(200, 100, 100)
+                                            theme.error
                                         };
                                         ui.label(egui::RichText::new(message).color(color).size(11.0));
                                     } else {
-                                        ui.label(egui::RichText::new("Not loaded").color(egui::Color32::GRAY).size(11.0));
+                                        ui.label(egui::RichText::new("Not loaded").color(theme.muted).size(11.0));
                                     }
                                 });
 
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new("Catalogue path: ./Catalogues/*/S-421/").size(10.0).color(egui::Color32::GRAY));
+                                ui.label(egui::RichText::new("Catalogue path: ./Catalogues/*/S-421/").size(10.0).color(theme.muted));
                             });
 
                         ui.add_space(4.0);
@@ -1252,9 +1592,9 @@ impl EguiIntegration {
                             ui.label(egui::RichText::new("• Right click: Remove last").size(11.0));
                             ui.label(egui::RichText::new("• Click 'Finish' when done").size(11.0));
                         } else if route_ui.get("active_route_index").is_some() {
-                            ui.label(egui::RichText::new("Click 'New' to add another route").size(12.0).color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("Click 'New' to add another route").size(12.0).color(theme.muted));
                         } else {
-                            ui.label(egui::RichText::new("Click 'New' to start a route").size(12.0).color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("Click 'New' to start a route").size(12.0).color(theme.muted));
                         }
                     }
                 } else {
@@ -1269,6 +1609,7 @@ impl EguiIntegration {
 
     /// Draw the Settings dialog
     fn draw_settings_dialog(ctx: &egui::Context, ui_state: &mut AppUiState) {
+        let theme = Theme::current(ctx);
         // Initialize pending settings when dialog opens
         if ui_state.pending_settings.is_none() {
             ui_state.pending_settings = Some(ui_state.settings.clone());
@@ -1286,6 +1627,13 @@ impl EguiIntegration {
                 let pending = ui_state.pending_settings.as_mut().unwrap();
 
                 ui.add_space(4.0);
+
+                ui.heading("Digital signatures");
+                signature_verification_toggle(ui, &mut ui_state.verify_dataset_signatures);
+                ui.label(if ui_state.verify_dataset_signatures { "ON" } else { "OFF" });
+                ui.label("Applies immediately to newly opened S-100 datasets.");
+                ui.label("Reload existing charts to verify their signatures.");
+                ui.separator();
 
                 // Display Mode section
                 ui.heading("Display Mode");
@@ -1311,12 +1659,29 @@ impl EguiIntegration {
                         DisplayMode::All => "All available chart information",
                     })
                     .size(11.0)
-                    .color(egui::Color32::GRAY),
+                    .color(theme.muted),
                 );
 
+                if !ui_state.optional_viewing_layers.is_empty() {
+                    ui.collapsing("Chart text and additional layers", |ui| {
+                        for (id,name) in &ui_state.optional_viewing_layers {
+                            let mut selected=pending.viewing_layers.contains(id);
+                            if ui.checkbox(&mut selected,name).changed() {
+                                if selected {pending.viewing_layers.insert(id.clone());}
+                                else {pending.viewing_layers.remove(id);}
+                            }
+                        }
+                    });
+                }
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
+
+                if ui_state.interoperability_available {
+                    ui.checkbox(&mut pending.interoperability_enabled, "Combine products using interoperability rules");
+                    ui.label(egui::RichText::new("Turn off to use each product's original portrayal.").size(11.0).color(theme.muted));
+                    ui.separator();
+                }
 
                 // Depth Contours section
                 ui.heading("Depth Contours (meters)");
@@ -1337,7 +1702,7 @@ impl EguiIntegration {
                         ui.end_row();
 
                         // Safety Contour
-                        ui.label("Safety Contour:");
+                        ui.label("Safety Contour:").on_hover_text("Depth boundary used to classify underwater dangers. The magenta X marks an isolated danger at or shallower than this setting.");
                         ui.add(
                             egui::DragValue::new(&mut pending.safety_contour)
                                 .speed(0.5)
@@ -1395,8 +1760,8 @@ impl EguiIntegration {
                             );
 
                         // Isolated Dangers
-                        ui.checkbox(&mut pending.isolated_dangers, "Isolated Dangers")
-                            .on_hover_text("Highlight isolated dangers in shallow water");
+                        ui.checkbox(&mut pending.isolated_dangers, "Shallow Water Dangers")
+                            .on_hover_text("Show the magenta isolated-danger symbol in shallow water too. Dangers surrounded by water at or deeper than the safety contour remain displayed.");
                         ui.end_row();
 
                         // Full Light Sectors
@@ -1437,6 +1802,7 @@ impl EguiIntegration {
                 ui.horizontal(|ui| {
                     if ui.button("Reset to Defaults").clicked() {
                         ui_state.pending_settings = Some(SettingsState::default());
+                        ui_state.verify_dataset_signatures = false;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1471,6 +1837,7 @@ impl EguiIntegration {
 
     /// Draw catalogue status information
     fn draw_catalogue_status(ui: &mut egui::Ui, status: &CatalogueStatus, item_label: &str) {
+        let theme = Theme::current(ui.ctx());
         egui::Grid::new(format!("catalogue_grid_{}", item_label))
             .num_columns(2)
             .spacing([12.0, 4.0])
@@ -1478,14 +1845,9 @@ impl EguiIntegration {
                 // Status indicator
                 ui.label(egui::RichText::new("Status:").strong());
                 if status.loaded {
-                    ui.label(
-                        egui::RichText::new("Loaded").color(egui::Color32::from_rgb(100, 200, 100)),
-                    );
+                    ui.label(egui::RichText::new("Loaded").color(theme.success));
                 } else {
-                    ui.label(
-                        egui::RichText::new("Not Loaded")
-                            .color(egui::Color32::from_rgb(200, 100, 100)),
-                    );
+                    ui.label(egui::RichText::new("Not Loaded").color(theme.error));
                 }
                 ui.end_row();
 
@@ -1510,7 +1872,7 @@ impl EguiIntegration {
                     ui.label(
                         egui::RichText::new(&status.path)
                             .size(11.0)
-                            .color(egui::Color32::GRAY),
+                            .color(theme.muted),
                     );
                     ui.end_row();
 
@@ -1518,14 +1880,154 @@ impl EguiIntegration {
                     if let Some(ref msg) = status.validation_message {
                         ui.label(egui::RichText::new("Validation:").strong());
                         let color = if msg.starts_with("Valid") {
-                            egui::Color32::from_rgb(100, 200, 100)
+                            theme.success
                         } else {
-                            egui::Color32::from_rgb(255, 200, 100)
+                            theme.warning
                         };
                         ui.label(egui::RichText::new(msg).color(color));
                         ui.end_row();
                     }
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod temporal_dialog_tests {
+    use super::*;
+    fn texts(shape: &egui::Shape, output: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => output.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    texts(shape, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[test]
+    fn dialogs_show_mode_help_and_keep_unapplied_edits_separate() {
+        for (mode, help) in [
+            (TemporalViewMode::Live, "Uses the current clock"),
+            (TemporalViewMode::Date, "Date (YYYY-MM-DD)"),
+            (TemporalViewMode::Instant, "Date and time, including Z"),
+            (TemporalViewMode::All, "Shows objects regardless"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut state = AppUiState::default();
+            state.show_temporal = true;
+            let active = state.temporal_view.clone();
+            state.pending_temporal_view = Some(TemporalView {
+                mode,
+                ..active.clone()
+            });
+            let mut output = Vec::new();
+            // First egui pass sizes the window; second paints it at its measured size.
+            for _ in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 600.),
+                    )),
+                    ..Default::default()
+                };
+                let frame = ctx.run(raw, |ctx| {
+                    EguiIntegration::draw_temporal_dialog(ctx, &mut state)
+                });
+                for clipped in &frame.shapes {
+                    texts(&clipped.shape, &mut output);
+                }
+            }
+            assert!(
+                output.iter().any(|text| text.contains(help)),
+                "mode {mode:?}: {output:?}"
+            );
+            assert!(output
+                .iter()
+                .any(|text| text.contains("Source-local UTC offset")));
+            assert_eq!(state.temporal_view, active);
+            assert!(!state.temporal_changed);
+            assert_eq!(state.pending_temporal_view.as_ref().unwrap().mode, mode);
+        }
+    }
+    #[test]
+    fn invalid_instant_is_visible_in_dialog_without_changing_active_view() {
+        let ctx = egui::Context::default();
+        let mut state = AppUiState::default();
+        state.show_temporal = true;
+        let active = state.temporal_view.clone();
+        state.pending_temporal_view = Some(TemporalView {
+            mode: TemporalViewMode::Instant,
+            instant: "2026-10-04T09:30:00".into(),
+            ..active.clone()
+        });
+        let mut output = Vec::new();
+        for _ in 0..2 {
+            let frame = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 600.),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| EguiIntegration::draw_temporal_dialog(ctx, &mut state),
+            );
+            for clipped in &frame.shapes {
+                texts(&clipped.shape, &mut output);
+            }
+        }
+        assert!(
+            output.iter().any(|text| text.starts_with("Date and time:")),
+            "{output:?}"
+        );
+        assert_eq!(state.temporal_view, active);
+        assert!(!state.temporal_changed);
+    }
+}
+
+fn signature_verification_toggle(ui: &mut egui::Ui, enabled: &mut bool) -> egui::Response {
+    ui.checkbox(enabled, "Verify digital signatures")
+        .on_hover_text("Applies to newly opened S-100 datasets. Reload existing charts to verify them.")
+}
+
+#[cfg(test)]
+mod signature_setting_tests {
+    use super::*;
+    #[test]
+    fn digital_signature_verification_defaults_off() {
+        assert!(!AppUiState::default().verify_dataset_signatures);
+    }
+    #[test]
+    fn settings_signature_widget_clicks_toggle_both_ways_without_portrayal_rebuild() {
+        let context = egui::Context::default();
+        let mut state = AppUiState::default();
+        let portrayal = state.settings.clone();
+        let frame = |events, state: &mut AppUiState| {
+            let mut rect = egui::Rect::NOTHING;
+            let _ = context.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    rect = signature_verification_toggle(ui, &mut state.verify_dataset_signatures).rect;
+                });
+            });
+            rect
+        };
+        let center = frame(Vec::new(), &mut state).center();
+        for expected in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton { pos: center, button: egui::PointerButton::Primary,
+                    pressed: true, modifiers: egui::Modifiers::default() },
+            ], &mut state);
+            frame(vec![
+                egui::Event::PointerButton { pos: center, button: egui::PointerButton::Primary,
+                    pressed: false, modifiers: egui::Modifiers::default() },
+            ], &mut state);
+            assert_eq!(state.verify_dataset_signatures, expected);
+            assert_eq!(state.settings, portrayal);
+            assert!(!state.settings_changed);
+            assert!(state.pending_settings.is_none());
+        }
     }
 }

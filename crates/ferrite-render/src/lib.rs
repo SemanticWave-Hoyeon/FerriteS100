@@ -20,3 +20,73 @@ pub use error::*;
 pub use instruction::*;
 pub use intern::*;
 pub use scaler::*;
+
+mod raster;
+pub use raster::*;
+
+mod selection;
+pub use selection::{
+    hit_geometry, hit_geometry_visible, hit_geometry_wrapped_visible, GeometryHit,
+    WrappedGeometryHit,
+};
+
+mod suppression;
+pub use suppression::{
+    instruction_visible, LineSpan, LineSuppressionCache, LineSuppressionPlan,
+    PreparedLineSuppression,
+};
+
+mod temporal_view;
+pub use temporal_view::{TemporalView, TemporalViewMode};
+
+mod text_placement;
+pub use text_placement::{TextFootprint, TextPlacement};
+
+mod line_pattern;
+pub use line_pattern::{
+    dash_line_spans, dash_projected_line_spans, dash_projected_line_spans_clipped,
+};
+
+mod portrayal_path;
+pub use portrayal_path::PortrayalPath;
+
+mod selection_index;
+pub use selection_index::{SelectionIndex, SelectionIndexStats};
+
+mod drawing_dependencies;
+pub use drawing_dependencies::{DependencyResolution, DrawingDependency, DrawingDependencyGraph};
+
+mod rotation;
+pub use rotation::{
+    flat_rotation, flat_text_rotation, screen_rotation, screen_text_rotation, RotationCrs,
+};
+
+mod line_symbol_placement;
+pub use line_symbol_placement::{
+    clip_curve_components, placed_curve_points, resolve_flat_line_symbol, sample_curve_position,
+    CurveSample, LinePlacementMode, LineSymbolPlacement,
+};
+
+mod triangle_clip;
+pub use triangle_clip::{clip_triangle_to_rect, ClippedTriangle};
+
+mod background_coastline;
+pub use background_coastline::{BackgroundCoastlines, CoastlineChunk};
+
+mod scene_spatial;
+pub use scene_spatial::SceneSpatialIndex;
+
+mod portrayal_origin;
+pub use portrayal_origin::{PointOriginCrs, PointOriginGeometry, PortrayalOrigin};
+
+mod globe_coverage_provider;
+pub use globe_coverage_provider::{GlobeCoverageProvider, GlobeCoverageView};
+
+pub mod prepared_coverage;
+pub use prepared_coverage::{InstructionCoverageClass, PreparedCoverage, PreparedCoveragePass};
+
+mod pattern_crs;
+pub use pattern_crs::{PatternCrs, HatchStroke, HatchLineSymbol};
+
+mod pattern_lattice;
+pub use pattern_lattice::{PatternLattice, PatternCellLimits, PatternCellPlan};

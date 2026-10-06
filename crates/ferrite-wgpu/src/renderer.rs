@@ -31,6 +31,7 @@ const SCREEN_PX_PER_MM: f32 = 96.0 / 25.4;
 //    (which recovers the original user-unit size = physical mm size at 96 DPI)
 // The formula is: display_scale = instance.scale / tex.render_scale * self.symbol_scale
 
+use ferrite_kernel::{CompositionPlane, CompositionStage};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -40,6 +41,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::egui_integration;
+use crate::draw_range_index::{DrawKind, DrawRangeIndex, selected_indices};
 use crate::profiler::{CpuProfiler, GpuProfilerWrapper, ScopeTimer};
 use ferrite_portrayal_catalog::ColorProfile;
 use ferrite_render::{
@@ -48,7 +50,9 @@ use ferrite_render::{
 
 use crate::egui_integration::{AppUiState, EguiIntegration, SettingsState};
 use crate::pipeline::{PatternVertex, TextureVertex};
-use crate::{GpuState, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError};
+use crate::{
+    GpuState, LineVertex, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError,
+};
 
 // === Symbol Classification Flags ===
 // Cached per SymbolId to avoid repeated starts_with() string matching in hot paths.
@@ -192,21 +196,29 @@ struct PatternTexture {
 }
 
 /// Cached GPU texture for a symbol
-struct SymbolTexture {
+pub(crate) struct SymbolTexture {
     #[allow(dead_code)]
     texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
-    width: u32,
-    height: u32,
+    pub(crate) bind_group: wgpu::BindGroup,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Pivot position within texture (in pixels from top-left at render_scale)
-    pivot_in_texture: (f32, f32),
-    render_scale: f32,
+    pub(crate) pivot_in_texture: (f32, f32),
+    pub(crate) render_scale: f32,
+    pub(crate) has_coverage: bool,
 }
 
 /// Symbol instance to render
 /// Memory optimized: uses interned SymbolId (4 bytes) instead of String (24 bytes)
 #[derive(Clone, Copy)]
 struct SymbolInstance {
+    source: Option<usize>,
+    plane: CompositionPlane,
+    feature_id: Option<i64>,
+    cell_index: Option<u32>,
+    world: ferrite_render::WorldPoint,
+    priority: i32,
+    anchor: [f32; 2],
     symbol_id: ferrite_render::SymbolId,
     screen_x: f32,
     screen_y: f32,
@@ -216,64 +228,311 @@ struct SymbolInstance {
 
 /// Pending text label to render via egui painter overlay
 struct TextLabel {
+    source: Option<usize>,
+    plane: CompositionPlane,
+    priority: i32,
+    anchor: [f32; 2],
+    rotation: f32,
     screen_x: f32,
     screen_y: f32,
     text: String,
     font_size: f32,
     color: [f32; 4],
-    #[allow(dead_code)]
+    background: Option<[f32; 4]>,
     bold: bool,
     italic: bool,
     h_align: ferrite_render::HAlign,
     v_align: ferrite_render::VAlign,
 }
 
-/// Grid-based text collision avoidance (S-100 Part 9: overplot removal)
-struct TextCollisionGrid {
-    occupied: FxHashSet<(i32, i32)>,
-    cell_size: f32,
+/// wgpu-based chart renderer
+#[derive(Clone, Copy)]
+enum CoveragePrimitive {
+    Area,
+    Line,
+    Symbol,
+    Pattern,
+    Text,
+}
+struct GpuChartText {
+    source: Option<usize>,
+    wrap_pass: u8,
+    plane: CompositionPlane,
+    priority: i32,
+    scissor: [u32; 4],
+    bind_group: wgpu::BindGroup,
+    vertices: Arc<wgpu::Buffer>,
+    indices: Arc<wgpu::Buffer>,
+    index_count: u32,
+}
+/// Retain a bounded set of ordered glyph buffers instead of allocating every frame.
+/// Each active draw retains an Arc; queue writes and submissions share one GPU queue.
+#[derive(Default)]
+struct ChartTextBufferPool {
+    slots: Vec<(Arc<wgpu::Buffer>, Arc<wgpu::Buffer>)>,
+    cursor: usize,
+    retained_bytes: u64,
+    allocations: u64,
+    writes: u64,
+}
+impl ChartTextBufferPool {
+    const BUDGET: u64 = 16 * 1024 * 1024;
+    fn begin(&mut self) {
+        self.cursor = 0;
+    }
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[crate::ChartTextVertex],
+        indices: &[u32],
+    ) -> (Arc<wgpu::Buffer>, Arc<wgpu::Buffer>) {
+        let vb = bytemuck::cast_slice(vertices);
+        let ib = bytemuck::cast_slice(indices);
+        let sizes = [
+            (vb.len() as u64).max(4).next_power_of_two(),
+            (ib.len() as u64).max(4).next_power_of_two(),
+        ];
+        let fits = self
+            .slots
+            .get(self.cursor)
+            .is_some_and(|(v, i)| v.size() >= vb.len() as u64 && i.size() >= ib.len() as u64);
+        let pair = if fits {
+            self.slots[self.cursor].clone()
+        } else {
+            let make = |size, usage, label| {
+                Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size,
+                    usage: usage | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }))
+            };
+            let pair = (
+                make(sizes[0], wgpu::BufferUsages::VERTEX, "pooled-chart-glyphs"),
+                make(
+                    sizes[1],
+                    wgpu::BufferUsages::INDEX,
+                    "pooled-chart-glyph-indices",
+                ),
+            );
+            self.allocations += 2;
+            let previous = self
+                .slots
+                .get(self.cursor)
+                .map_or(0, |(v, i)| v.size() + i.size());
+            let total = self.retained_bytes - previous + sizes[0] + sizes[1];
+            if total <= Self::BUDGET {
+                if self.cursor < self.slots.len() {
+                    self.slots[self.cursor] = pair.clone();
+                } else {
+                    self.slots.push(pair.clone());
+                }
+                self.retained_bytes = total;
+            }
+            pair
+        };
+        queue.write_buffer(&pair.0, 0, vb);
+        queue.write_buffer(&pair.1, 0, ib);
+        self.writes += 2;
+        self.cursor += 1;
+        pair
+    }
+}
+struct GpuRasterLayer {
+    continuous_identity: Option<crate::continuous_frame_binding::PreparedContinuousIdentity>,
+    index_count: u32,
+    continuous: Option<ferrite_render::ContinuousRasterMetadata>,
+    viewing_groups: Vec<u32>,
+    draw_order: ferrite_render::RasterDrawOrder,
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    bounds: ferrite_render::GeoBounds,
+    grid: ferrite_render::RasterGrid,
+    tile_size: [u32; 2],
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
 }
 
-impl TextCollisionGrid {
-    fn new(cell_size: f32) -> Self {
-        Self {
-            occupied: FxHashSet::with_capacity_and_hasher(2000, Default::default()),
-            cell_size: cell_size.max(1.0),
+/// Prepared GPU resources, not an installed scene. Dropping after any producer
+/// failure releases all textures. A qualified promotion token is required later.
+pub struct PreparedRasterMaterialBatch {
+    layers: Vec<GpuRasterLayer>,
+    owner: std::sync::Arc<()>,
+}
+
+/// Backend execution evidence for S-100 Parent dependencies.
+#[derive(Debug, Clone, Default)]
+pub struct DependencyRenderStatus {
+    pub iterations: usize,
+    pub converged: bool,
+    pub missing_parent_count: usize,
+    pub nonconvergent_diagnostic: bool,
+    pub permitted: Vec<bool>,
+    pub executed: Vec<bool>,
+}
+
+impl DependencyRenderStatus {
+    pub fn audit_value(&self) -> serde_json::Value {
+        serde_json::json!({"iterations":self.iterations,"converged":self.converged,
+            "missing_parent_count":self.missing_parent_count,"nonconvergent_diagnostic":self.nonconvergent_diagnostic,
+            "permitted":self.permitted,"executed":self.executed})
+    }
+}
+
+#[derive(Default)]
+struct GlobeSymbolPreparation {
+    symbol_textures: HashMap<SymbolId, SymbolTexture>,
+    globe_pattern_resources: crate::globe_pattern::PatternResources,
+    globe_pattern_epoch: Option<(u64,u64)>,
+    globe_prepared_symbol_epoch: Option<crate::prepared_symbol_epoch::PreparedSymbolEpoch>,
+    globe_pattern_textures: HashMap<String, Arc<crate::globe_pattern::PatternTexture>>,
+    globe_whole_motif_textures: HashMap<String, Arc<crate::whole_motif_gpu::NaturalMotifTexture>>,
+}
+impl GlobeSymbolPreparation {
+    fn ensure_symbol_texture(&mut self,gpu:&GpuState,pipelines:&RenderPipelines,id:SymbolId,name:&str,geom:&crate::SymbolGeometry) {
+        if !self.symbol_textures.contains_key(&id) {self.symbol_textures.insert(id,create_symbol_texture(gpu,pipelines,name,geom));}
+    }
+    fn prepare(&mut self,gpu:&GpuState,pipelines:&RenderPipelines,context:&mut RenderContext,cache:&mut SymbolCache,profile:Option<&ColorProfile>,request_keys_enabled:bool,resource_reuse_enabled:bool)->Result<serde_json::Value> {
+        let symbol_start=std::time::Instant::now();
+        let pattern_count=context.raw_instructions().iter().filter(|i|matches!(i,DrawingInstruction::Area(a) if matches!(a.fill,ferrite_render::AreaFillType::Pattern {..}))).count();
+        // Bound map metadata by bytes, rather than rejecting ordinary multi-cell
+        // charts at an arbitrary small command count. Include a conservative
+        // hash-table bucket/capacity factor and track diagnostic payload separately.
+        let entry_bytes=2*std::mem::size_of::<(usize,std::result::Result<crate::globe_pattern::PreparedPatternResource,String>)>();
+        if pattern_count.checked_mul(entry_bytes).is_none_or(|n|n>32*1024*1024) {
+            return Err(WgpuError::Render("Globe pattern instruction metadata budget exceeded".into()));
         }
-    }
-
-    fn clear(&mut self) {
-        self.occupied.clear();
-    }
-
-    /// Try to place a text label. Returns true if space is available.
-    fn try_place(&mut self, x: f32, y: f32, width: f32, height: f32) -> bool {
-        let x0 = (x / self.cell_size).floor() as i32;
-        let y0 = (y / self.cell_size).floor() as i32;
-        let x1 = ((x + width) / self.cell_size).floor() as i32;
-        let y1 = ((y + height) / self.cell_size).floor() as i32;
-
-        // Check if any cell in the bounding box is occupied
-        for gx in x0..=x1 {
-            for gy in y0..=y1 {
-                if self.occupied.contains(&(gx, gy)) {
-                    return false;
+        let mut diagnostic_bytes=0usize;
+        // Resource ordinals must use the same sorted stream as the scene and ID pass.
+        context.get_sorted_instructions();
+        context.scaler.set_pixel_ratio(gpu.window.scale_factor());
+        let epoch_inputs=crate::prepared_symbol_epoch::Inputs{source_epoch:context.geometry_revision(),instruction_count:context.instruction_count(),resource_revision:cache.resource_revision(),ppm_bits:context.scaler.pixels_per_mm().to_bits(),whole_motifs:std::env::var("FERRITE_EXPERIMENTAL_WHOLE_MOTIFS").as_deref()==Ok("1"),request_keys:request_keys_enabled};
+        if resource_reuse_enabled && self.globe_pattern_epoch==Some((epoch_inputs.source_epoch,epoch_inputs.ppm_bits)) && self.globe_prepared_symbol_epoch.as_ref().is_some_and(|e|e.matches(epoch_inputs,profile)) {
+            let e=self.globe_prepared_symbol_epoch.as_ref().unwrap();
+            return Ok(serde_json::json!({"symbol_resources_ms":symbol_start.elapsed().as_secs_f64()*1000.,"prepared_request_keys_enabled":request_keys_enabled,
+                "prepared_request_keys":if request_keys_enabled {serde_json::json!({"hits":0,"misses":0,"refusals":0,"entries":0,"accounted_bytes":0,"budget_bytes":1048576,"entry_limit":256})}else{serde_json::Value::Null},
+                "prepared_symbol_resources":{"enabled":true,"hit":true,"identity_bytes":e.bytes(),"identity_budget_bytes":1048576,"resource_preparation_calls":0},
+                "pattern_resource_count":self.globe_pattern_resources.len(),"pattern_texture_count":self.globe_pattern_textures.len()+self.globe_whole_motif_textures.len(),"pattern_retained_resource_bytes":e.pattern_payload_bytes}));
+        }
+        self.globe_prepared_symbol_epoch=None;
+        let mut symbol_preparation_complete=true;
+        self.globe_pattern_resources.clear();
+        let mut current_textures = HashMap::new();
+        let mut current_whole_textures = HashMap::new();
+        let mut pattern_bytes = 0usize;
+        let mut request_keys_diagnostics=serde_json::Value::Null;
+        if let Some(profile) = profile {
+            let mut request_keys=request_keys_enabled.then(||crate::symbol_cache::PreparedLatticeKeys::new(profile));
+            for (ordinal, instruction) in context.raw_instructions().iter().enumerate() {
+                if let DrawingInstruction::Area(area) = instruction {
+                    if let ferrite_render::AreaFillType::Pattern {symbol_ref,v1,v2} = &area.fill {
+                        let resource = (|| -> std::result::Result<crate::globe_pattern::PreparedPatternResource,String> {
+                            let lattice = ferrite_render::PatternLattice::from_mm(*v1,*v2,context.scaler.pixels_per_mm())?;
+                            if !area.pattern_clip_symbols {
+                                if std::env::var("FERRITE_EXPERIMENTAL_WHOLE_MOTIFS").as_deref()!=Ok("1") {return Err("Pattern clipSymbols=false requires whole-motif containment conformance gate".into());}
+                                let motif=cache.get_whole_motif(symbol_ref,profile,context.scaler.pixels_per_mm(),Default::default(),Default::default())?.ok_or("Whole motif has no painted support")?;
+                                if !current_whole_textures.contains_key(&motif.resource_key) {
+                                    if current_textures.len()+current_whole_textures.len()>=256 {return Err("Globe pattern resource entry budget exceeded".into());}
+                                    let bytes=motif.retained_payload_bytes.checked_add(motif.resource_key.len()*2).ok_or("Whole motif resource byte overflow")?;
+                                    let total=pattern_bytes.checked_add(bytes).filter(|n|*n<=64*1024*1024).ok_or("Globe pattern aggregate resource budget exceeded")?;
+                                    let texture=if let Some(existing)=self.globe_whole_motif_textures.get(&motif.resource_key) {existing.clone()} else {Arc::new(crate::whole_motif_gpu::NaturalMotifTexture::upload(&gpu.device,&gpu.queue,&motif)?)};
+                                    current_whole_textures.insert(motif.resource_key.clone(),texture);pattern_bytes=total;
+                                }
+                                return Ok(crate::globe_pattern::PreparedPatternResource{texture:None,whole:Some(crate::globe_pattern::PreparedWholeResource{texture:current_whole_textures[&motif.resource_key].clone(),resource:motif}),lattice});
+                            }
+                            let cell = if let Some(keys)=request_keys.as_mut() {cache.get_symbol_for_lattice_request_keys(symbol_ref,keys,lattice,context.scaler.pixels_per_mm())?} else {cache.get_symbol_for_lattice(symbol_ref,profile,lattice,context.scaler.pixels_per_mm())?};
+                            if !current_textures.contains_key(&cell.name) {
+                                // Bound aggregate retained textures and their exact resource keys.
+                                if current_textures.len()+current_whole_textures.len() >= 256 {return Err("Globe pattern resource entry budget exceeded".into());}
+                                let bytes = cell.pixels.len().checked_add(cell.name.len()*2).ok_or("Globe pattern resource byte overflow")?;
+                                let total = pattern_bytes.checked_add(bytes).filter(|n|*n<=64*1024*1024).ok_or("Globe pattern aggregate resource budget exceeded")?;
+                                let texture = if let Some(existing) = self.globe_pattern_textures.get(&cell.name) {existing.clone()} else {Arc::new(crate::globe_pattern::PatternTexture::upload(&gpu.device,&gpu.queue,cell)?)};
+                                current_textures.insert(cell.name.clone(),texture);
+                                pattern_bytes=total;
+                            }
+                            Ok(crate::globe_pattern::PreparedPatternResource {texture:Some(current_textures[&cell.name].clone()),whole:None,lattice})
+                        })();
+                        if let Some(error)=resource.as_ref().err() {
+                            symbol_preparation_complete=false;
+                            diagnostic_bytes=diagnostic_bytes.checked_add(error.len()).filter(|n|*n<=16*1024*1024).ok_or_else(||WgpuError::Render("Globe pattern aggregate diagnostic budget exceeded".into()))?;
+                            if error.len()>4096 {return Err(WgpuError::Render("Globe pattern diagnostic budget exceeded".into()));}
+                        }
+                        self.globe_pattern_resources.insert(ordinal,resource);
+                    }
+                }
+                if let DrawingInstruction::Point(p) = instruction {
+                    let id = intern_symbol(&p.symbol_ref);
+                    if let Some(geom) = cache.get_symbol(&p.symbol_ref, profile) {
+                        self.ensure_symbol_texture(gpu, pipelines, id, &p.symbol_ref, geom);
+                    } else {symbol_preparation_complete=false;}
                 }
             }
+            if let Some(keys)=request_keys {request_keys_diagnostics=keys.diagnostics();}
         }
-
-        // Claim cells
-        for gx in x0..=x1 {
-            for gy in y0..=y1 {
-                self.occupied.insert((gx, gy));
-            }
-        }
-        true
+        self.globe_pattern_textures = current_textures;
+        self.globe_whole_motif_textures = current_whole_textures;
+        self.globe_pattern_epoch = Some((context.geometry_revision(),context.scaler.pixels_per_mm().to_bits()));
+        if resource_reuse_enabled && symbol_preparation_complete {self.globe_prepared_symbol_epoch=crate::prepared_symbol_epoch::PreparedSymbolEpoch::capture(epoch_inputs,profile,pattern_bytes);}
+        Ok(serde_json::json!({"symbol_resources_ms":symbol_start.elapsed().as_secs_f64()*1000.,"prepared_symbol_resources":{"enabled":resource_reuse_enabled,"hit":false,"identity_bytes":self.globe_prepared_symbol_epoch.as_ref().map_or(0,|e|e.bytes()),"identity_budget_bytes":1048576,"resource_preparation_calls":context.instruction_count()},
+            "prepared_request_keys_enabled":request_keys_enabled,"prepared_request_keys":request_keys_diagnostics,
+            "pattern_resource_count":self.globe_pattern_resources.len(),"pattern_texture_count":self.globe_pattern_textures.len()+self.globe_whole_motif_textures.len(),"pattern_retained_resource_bytes":pattern_bytes}))
     }
 }
+fn create_symbol_texture(gpu:&GpuState,pipelines:&RenderPipelines,name:&str,geom:&crate::SymbolGeometry)->SymbolTexture {
+    let (texture,view)=gpu.create_texture_from_rgba(&geom.pixels,geom.width,geom.height,&format!("symbol_{name}"));
+    SymbolTexture {texture,bind_group:pipelines.create_texture_bind_group(&gpu.device,&view),width:geom.width,height:geom.height,pivot_in_texture:geom.pivot_in_texture(),render_scale:geom.render_scale,has_coverage:geom.pixels.chunks_exact(4).any(|p|p[3]!=0)}
+}
+/// Unpublished scene using independent targets and chart font atlas.
+/// Preparation may warm the supplied CPU cache, but does not mutate renderer.
+pub struct PreparedGlobePublication {
+    owner: Arc<()>, binding:GlobePublicationBinding,
+    pane:crate::globe_view::GlobePane,resources:Option<crate::globe_view::GlobeResources>,fonts:EguiIntegration,
+    symbols:GlobeSymbolPreparation,resource_revision:u64,
+    provider:Arc<dyn ferrite_render::GlobeCoverageProvider>,viewport:ferrite_render::Viewport,display_scale:u32,summary:String,
+}
+#[derive(Clone,PartialEq,Eq,Debug)]
+struct GlobePublicationBinding {
+    extent:[u32;2],format:wgpu::TextureFormat,density:u64,samples:u32,symbol_scale:u32,
+    tilt:u64,range_factor:u64,pose:Option<[u64;5]>,flags:[bool;9],
+}
+fn globe_publication_binding_matches(owner:&Arc<()>,expected_owner:&Arc<()>,binding:&GlobePublicationBinding,expected:&GlobePublicationBinding)->bool {
+    Arc::ptr_eq(owner,expected_owner)&&binding==expected
+}
+fn merge_symbol_diagnostics(target:&mut serde_json::Value,diagnostics:serde_json::Value) {
+    if let (Some(target),Some(source))=(target.as_object_mut(),diagnostics.as_object()) {target.extend(source.iter().map(|(k,v)|(k.clone(),v.clone())));}
+}
 
-/// wgpu-based chart renderer
 pub struct WgpuRenderer {
+    draw_range_index_enabled: bool,
+    globe_sample_count: u32,
+    globe_area_cache_enabled: bool,
+    globe_curve_cache_enabled: bool,
+    globe_curve_bounds_cache_enabled: bool,
+    globe_dyadic_sample_cache_enabled: bool,
+    globe_curve_scratch_reuse_enabled: bool,
+    globe_gpu_projection_enabled: bool,
+    spatial_hierarchy_enabled: bool,
+    globe_pane: Option<crate::globe_view::GlobePane>,
+    globe_coverage_provider: Option<Arc<dyn ferrite_render::GlobeCoverageProvider>>,
+    globe_resources: Option<crate::globe_view::GlobeResources>,
+    globe_publication_fonts: Option<EguiIntegration>,
+    globe_pattern_resources: crate::globe_pattern::PatternResources,
+    globe_pattern_epoch: Option<(u64,u64)>,
+    globe_prepared_symbol_epoch: Option<crate::prepared_symbol_epoch::PreparedSymbolEpoch>,
+    diagnostic_prepared_symbol_reuse: Option<bool>,
+    diagnostic_pattern_request_keys: Option<bool>,
+    globe_symbol_resource_revision: Option<u64>,
+    globe_pattern_textures: HashMap<String, Arc<crate::globe_pattern::PatternTexture>>,
+    globe_whole_motif_textures: HashMap<String, Arc<crate::whole_motif_gpu::NaturalMotifTexture>>,
+    geometry_transform: Option<ferrite_render::FlatTransform>,
+    raster_layers: Vec<GpuRasterLayer>,
+    continuous_owner: std::sync::Arc<()>,
+    continuous_uniforms: [Option<ViewUniforms>;3],
+    continuous_frame: Option<crate::ValidatedContinuousFrame>,
+    // Updated only on scene commit: regular frames avoid scanning raster materials.
+    continuous_layer_count: usize,
+    raster_enabled_groups: Option<std::collections::HashSet<u32>>,
     pub state: GpuState,
     pub pipelines: RenderPipelines,
     pub view_buffer: wgpu::Buffer,
@@ -282,7 +541,9 @@ pub struct WgpuRenderer {
     area_vertices: Vec<Vertex2D>,
     area_indices: Vec<u32>,
     /// Collected line vertices
-    line_vertices: Vec<Vertex2D>,
+    line_vertices: Vec<LineVertex>,
+    temporal_visibility_counts: (usize, usize),
+    temporal_visibility_mask: Vec<bool>,
     line_indices: Vec<u32>,
     /// GPU texture cache for symbols (keyed by interned SymbolId for cache efficiency)
     symbol_textures: HashMap<ferrite_render::SymbolId, SymbolTexture>,
@@ -298,6 +559,7 @@ pub struct WgpuRenderer {
     pub show_soundings: bool,
     /// Current zoom level (1.0 = default, higher = zoomed in)
     pub zoom_level: f64,
+    display_scale: u32,
     /// Chart compilation scale (e.g., 22000 for 1:22000)
     /// Used to calculate viewing scale for S-101 feature filtering
     pub compilation_scale: u32,
@@ -328,8 +590,17 @@ pub struct WgpuRenderer {
     skip_screen_declutter: bool,
     /// Screen-space pan offset (pixels) for fast panning during drag
     screen_pan_offset: (f32, f32),
+    selection_anchor: Option<[f32; 2]>,
+    selection_device_anchor: Option<(Option<u32>, i64, [f64; 2])>,
+    selection_world_geometry: Vec<Vec<WorldPoint>>,
+    selection_screen_geometry: Vec<Vec<[f32; 2]>>,
+    displayed_geometry: Vec<usize>,
+    selection_index: std::cell::OnceCell<ferrite_render::SelectionIndex>,
+    empty_selection_stats: ferrite_render::SelectionIndexStats,
+    dependency_status: DependencyRenderStatus,
     /// GPU zoom scale for smooth zooming (1.0 = no zoom delta, rebuilt at this level)
     screen_zoom_scale: f32,
+    screen_zoom_scale_y: f32,
     /// Zoom pivot point in screen coordinates
     screen_zoom_pivot: (f32, f32),
     /// egui integration for UI overlay
@@ -337,10 +608,12 @@ pub struct WgpuRenderer {
     /// UI state shared with main app
     pub ui_state: AppUiState,
     // === OPTIMIZATION FIELDS ===
-    /// Cached triangulations by feature ID (optimization)
-    triangulation_cache: HashMap<i64, CachedTriangulation>,
+    /// Geometry allocations are unique only within an unchanged instruction lifetime.
+    triangulation_cache:
+        HashMap<(usize, usize, ferrite_render::FlatProjection), CachedTriangulation>,
+    triangulation_revision: Option<u64>,
+    triangulation_failures: FxHashSet<(usize, usize, ferrite_render::FlatProjection)>,
     /// Batched symbols by texture (optimization, keyed by interned SymbolId)
-    symbol_batches: FxHashMap<SymbolId, (Vec<TextureVertex>, Vec<u32>)>,
     /// Packed symbol vertices for single-buffer rendering
     packed_symbol_vertices: Vec<TextureVertex>,
     /// Packed symbol indices for single-buffer rendering
@@ -349,30 +622,53 @@ pub struct WgpuRenderer {
     packed_symbol_ranges: Vec<(SymbolId, u32, u32)>,
     /// Animation/drag mode - enables fast-path rendering
     pub animation_mode: bool,
+    view_dependent_symbols: bool,
+    view_clipped_patterns: bool,
     /// LOD level (0=full detail, 1=medium, 2=low)
-    lod_level: u8,
     /// Viewport bounds in world coordinates for culling
     viewport_world_bounds: Option<(f64, f64, f64, f64)>,
+    prepared_coverage: Option<Arc<ferrite_render::PreparedCoverage>>,
+    coverage_frame: Option<crate::coverage_gpu_frame::CoverageGpuFrame>,
+    coverage_pipelines: Option<crate::coverage_pipeline::CoveragePipelines>,
+    coverage_failed: bool,
+    emitting_coverage_source: Option<usize>,
+    device_fixed_sources: FxHashSet<usize>,
     // === S-101 PRIORITY GROUP RENDERING ===
     /// Area index ranges by priority: (display_plane, priority, start_index, end_index)
-    area_priority_ranges: Vec<(u8, i32, usize, usize)>,
+    area_priority_ranges: Vec<(CompositionPlane, i32, usize, usize, Option<usize>)>,
     /// Line index ranges by priority: (display_plane, priority, start_index, end_index)
-    line_priority_ranges: Vec<(u8, i32, usize, usize)>,
+    line_priority_ranges: Vec<(CompositionPlane, i32, usize, usize, Option<usize>)>,
     /// Symbol instance ranges by priority: (display_plane, priority, start_index, end_index)
-    symbol_priority_ranges: Vec<(u8, i32, usize, usize)>,
+    symbol_priority_ranges: Vec<(CompositionPlane, i32, usize, usize, Option<usize>)>,
     // === PATTERN FILL (S-100 GPU texture-repeat tiling) ===
     /// Pattern fill vertices (TextureVertex: position + inv_tile_size)
     pattern_vertices: Vec<PatternVertex>,
     /// Pattern fill indices
     pattern_indices: Vec<u32>,
     /// Pattern fill ranges: (display_plane, priority, index_start, index_end, pattern_texture_key)
-    pattern_ranges: Vec<(u8, i32, usize, usize, String)>,
+    pattern_ranges: Vec<(
+        CompositionPlane,
+        i32,
+        usize,
+        usize,
+        String,
+        u8,
+        Option<usize>,
+    )>,
     /// Pattern fill GPU textures (keyed by "{symbol}_pat")
     pattern_textures: HashMap<String, PatternTexture>,
     /// Pending text labels to render via egui painter
     text_labels: Vec<TextLabel>,
+    chart_text_shapes: Vec<(
+        CompositionPlane,
+        i32,
+        Option<usize>,
+        u8,
+        egui::epaint::ClippedShape,
+    )>,
+    chart_text_meshes: Vec<GpuChartText>,
+    chart_text_buffers: ChartTextBufferPool,
     /// Grid for text collision avoidance
-    text_collision_grid: TextCollisionGrid,
     // === CACHED GPU BUFFERS (avoid recreating every frame) ===
     /// Cached area vertex buffer (rebuilt only when geometry changes)
     cached_area_vb: Option<wgpu::Buffer>,
@@ -391,7 +687,7 @@ pub struct WgpuRenderer {
     /// Cached symbol GPU buffers per priority range (avoid recreating every frame)
     #[allow(clippy::type_complexity)]
     cached_symbol_buffers: Vec<(
-        u8,
+        CompositionPlane,
         i32,
         usize,
         usize,
@@ -400,8 +696,8 @@ pub struct WgpuRenderer {
         Vec<(SymbolId, u32, u32)>,
     )>,
     // === INSTRUCTION CACHE (reused across rebuilds when only view changes) ===
-    /// Cached line suppression set (stable between rebuilds, only invalidated on chart reload)
-    cached_suppressed_lines: Option<(usize, usize, FxHashSet<usize>)>, // (ptr, len, set)
+    /// Content- and visibility-aware shared suppression plan.
+    line_suppression: ferrite_render::LineSuppressionCache,
     // === PROFILING ===
     /// CPU-side performance profiler
     pub cpu_profiler: CpuProfiler,
@@ -410,12 +706,15 @@ pub struct WgpuRenderer {
     // === BACKGROUND WORLD MAP (Natural Earth) ===
     /// Pre-parsed coastline segments from Natural Earth 110m GeoJSON
     /// Each inner Vec is a line string: list of [longitude, latitude] pairs
-    world_map_coastlines: Vec<Vec<[f64; 2]>>,
+    world_map_coastlines: ferrite_render::BackgroundCoastlines,
+    world_map_detailed: ferrite_render::BackgroundCoastlines,
+    /// Geometry viewport shared by native and exported chart passes.
+    chart_geometry_viewport: Option<ferrite_render::Viewport>,
     /// Bounding boxes of loaded chart cells (world coords).
     /// Used to draw opaque background rectangles that mask world map under charts.
     world_map_chart_boxes: Vec<(f64, f64, f64, f64)>,
     /// World map line vertices (separate from chart line_vertices)
-    world_map_line_vertices: Vec<Vertex2D>,
+    world_map_line_vertices: Vec<LineVertex>,
     world_map_line_indices: Vec<u32>,
     /// Opaque background rectangles over chart bboxes (mask world map under charts)
     world_map_mask_vertices: Vec<Vertex2D>,
@@ -467,6 +766,7 @@ impl WgpuRenderer {
         );
 
         Ok(WgpuRenderer {
+            draw_range_index_enabled: std::env::var("FERRITE_DRAW_RANGE_INDEX").as_deref() == Ok("1"),
             state,
             pipelines,
             view_buffer,
@@ -475,13 +775,22 @@ impl WgpuRenderer {
             area_vertices: Vec::with_capacity(10000),
             area_indices: Vec::with_capacity(30000),
             line_vertices: Vec::with_capacity(5000),
+            temporal_visibility_counts: (0, 0),
+            temporal_visibility_mask: Vec::new(),
             line_indices: Vec::with_capacity(15000),
+            raster_layers: Vec::new(),
+            continuous_owner: std::sync::Arc::new(()),
+            continuous_uniforms: [Some(uniforms),None,None],
+            continuous_frame: None,
+            continuous_layer_count: 0,
+            raster_enabled_groups: None,
             symbol_textures: HashMap::with_capacity(100),
             symbol_instances: Vec::with_capacity(2000),
             background_color: Color::from_u8(201, 237, 255, 255), // DEPDW (deep water) — matches S-101 default
             symbol_scale: 1.0, // S-100 standard: 1.0 = nominal symbol size at 0.3mm/pixel
             show_soundings: true, // Visibility controlled by S-101 viewing groups
             zoom_level: 1.0,
+            display_scale: 1,
             compilation_scale: 22000, // Default compilation scale (1:22000)
             symbol_grid: FxHashSet::with_capacity_and_hasher(1000, Default::default()),
             sounding_screen_grid: FxHashMap::with_capacity_and_hasher(2000, Default::default()),
@@ -495,19 +804,36 @@ impl WgpuRenderer {
             sounding_cell_size_px: 150.0, // Fixed pixel spacing between soundings
             skip_screen_declutter: false,
             screen_pan_offset: (0.0, 0.0),
+            selection_anchor: None,
+            selection_device_anchor: None,
+            selection_world_geometry: Vec::new(),
+            selection_screen_geometry: Vec::new(),
+            displayed_geometry: Vec::new(),
+            selection_index: std::cell::OnceCell::new(),
+            empty_selection_stats: ferrite_render::SelectionIndexStats::default(),
+            dependency_status: DependencyRenderStatus::default(),
             screen_zoom_scale: 1.0,
+            screen_zoom_scale_y: 1.0,
             screen_zoom_pivot: (0.0, 0.0),
             egui,
             ui_state: AppUiState::default(),
             // Optimization fields
             triangulation_cache: HashMap::with_capacity(500),
-            symbol_batches: FxHashMap::with_capacity_and_hasher(50, Default::default()),
+            triangulation_failures: FxHashSet::default(),
+            triangulation_revision: None,
             packed_symbol_vertices: Vec::with_capacity(4000),
             packed_symbol_indices: Vec::with_capacity(6000),
             packed_symbol_ranges: Vec::with_capacity(50),
             animation_mode: false,
-            lod_level: 0,
+            view_dependent_symbols: false,
+            view_clipped_patterns: false,
             viewport_world_bounds: None,
+            prepared_coverage: None,
+            coverage_frame: None,
+            coverage_pipelines: None,
+            coverage_failed: false,
+            emitting_coverage_source: None,
+            device_fixed_sources: FxHashSet::default(),
             // S-101 priority group rendering
             area_priority_ranges: Vec::with_capacity(10),
             line_priority_ranges: Vec::with_capacity(10),
@@ -518,7 +844,9 @@ impl WgpuRenderer {
             pattern_ranges: Vec::with_capacity(10),
             pattern_textures: HashMap::new(),
             text_labels: Vec::with_capacity(500),
-            text_collision_grid: TextCollisionGrid::new(12.0),
+            chart_text_shapes: Vec::new(),
+            chart_text_meshes: Vec::new(),
+            chart_text_buffers: ChartTextBufferPool::default(),
             // GPU buffer cache
             cached_area_vb: None,
             cached_area_ib: None,
@@ -530,13 +858,37 @@ impl WgpuRenderer {
             cached_pattern_ib: None,
             cached_pattern_index_count: 0,
             gpu_buffers_dirty: true,
+            geometry_transform: None,
             cached_symbol_buffers: Vec::new(),
-            cached_suppressed_lines: None,
+            line_suppression: ferrite_render::LineSuppressionCache::default(),
             // Profiling
             cpu_profiler: CpuProfiler::new(),
             gpu_profiler,
             // Background world map (empty until set_world_map is called)
-            world_map_coastlines: Vec::new(),
+            world_map_coastlines: Default::default(),
+            world_map_detailed: Default::default(),
+            chart_geometry_viewport: None,
+            globe_sample_count: crate::state::MSAA_SAMPLE_COUNT,
+            globe_area_cache_enabled: true,
+            globe_curve_cache_enabled: true,
+            globe_curve_bounds_cache_enabled: true,
+            globe_dyadic_sample_cache_enabled: false,
+            globe_curve_scratch_reuse_enabled: false,
+            // Keep opt-in until representative frame-time gates pass.
+            spatial_hierarchy_enabled: false,
+            globe_gpu_projection_enabled: false,
+            globe_pane: None,
+            globe_coverage_provider: None,
+            globe_resources: None,
+            globe_publication_fonts: None,
+            globe_pattern_resources: Default::default(),
+            globe_pattern_epoch: None,
+            globe_prepared_symbol_epoch: None,
+            diagnostic_prepared_symbol_reuse: None,
+            diagnostic_pattern_request_keys: None,
+            globe_symbol_resource_revision: None,
+            globe_pattern_textures: Default::default(),
+            globe_whole_motif_textures: Default::default(),
             world_map_chart_boxes: Vec::new(),
             world_map_line_vertices: Vec::with_capacity(2000),
             world_map_line_indices: Vec::with_capacity(6000),
@@ -570,8 +922,25 @@ impl WgpuRenderer {
     #[inline]
     pub fn set_animation_mode(&mut self, animating: bool) {
         self.animation_mode = animating;
-        // During animation, use lower LOD
-        self.lod_level = if animating { 1 } else { 0 };
+    }
+
+    /// CPU chart geometry must have been built with the currently requested view.
+    pub fn geometry_matches_view(&self, scaler: &ferrite_render::Scaler) -> bool {
+        if self.ui_state.globe_preview {
+            return self.globe_pane.as_ref().is_some_and(|p| {
+                p.matches(
+                    scaler,
+                    self.ui_state.globe_tilt_deg,
+                    self.ui_state.globe_pose,
+                    if self.ui_state.globe_range_factor > 0. {
+                        self.ui_state.globe_range_factor
+                    } else {
+                        1.
+                    },
+                )
+            });
+        }
+        self.geometry_transform == Some(Self::scaler_transform(scaler))
     }
 
     /// Update viewport world bounds for frustum culling
@@ -587,99 +956,75 @@ impl WgpuRenderer {
         ));
     }
 
-    /// Check if a world point is within the viewport (with margin)
+    /// Culling uses the same three longitude copies as the GPU geometry pass.
     #[inline]
     fn is_point_visible(&self, x: f64, y: f64) -> bool {
-        if let Some((min_x, min_y, max_x, max_y)) = self.viewport_world_bounds {
-            // Add 50% margin to accommodate GPU pan offset during drag/inertia.
-            // Without this, symbols near the viewport edge get culled and then
-            // "pop in" when the view rebuilds after drag ends.
-            let margin_x = (max_x - min_x) * 0.5;
-            let margin_y = (max_y - min_y) * 0.5;
-            x >= min_x - margin_x
-                && x <= max_x + margin_x
-                && y >= min_y - margin_y
-                && y <= max_y + margin_y
-        } else {
-            true // No bounds set, assume visible
-        }
+        longitude_bounds_visible(
+            (x, y, x, y),
+            self.viewport_world_bounds,
+            self.lon_wrap_screen_px > 0.0,
+        )
     }
-
-    /// Check if a world-space AABB intersects the viewport (with margin for GPU pan/zoom)
     #[inline]
-    fn is_aabb_visible(
-        &self,
-        aabb_min_x: f64,
-        aabb_min_y: f64,
-        aabb_max_x: f64,
-        aabb_max_y: f64,
-    ) -> bool {
-        if let Some((vp_min_x, vp_min_y, vp_max_x, vp_max_y)) = self.viewport_world_bounds {
-            let margin_x = (vp_max_x - vp_min_x) * 0.5;
-            let margin_y = (vp_max_y - vp_min_y) * 0.5;
-            // Standard AABB intersection test with margin
-            aabb_max_x >= vp_min_x - margin_x
-                && aabb_min_x <= vp_max_x + margin_x
-                && aabb_max_y >= vp_min_y - margin_y
-                && aabb_min_y <= vp_max_y + margin_y
-        } else {
-            true
-        }
+    fn is_aabb_visible(&self, ax: f64, ay: f64, bx: f64, by: f64) -> bool {
+        longitude_bounds_visible(
+            (ax, ay, bx, by),
+            self.viewport_world_bounds,
+            self.lon_wrap_screen_px > 0.0,
+        )
     }
-
-    /// Static frustum culling for a ring of world points against viewport bounds.
-    /// Used by tile_area_with_pattern/hatch where &self is already mutably borrowed.
-    #[inline]
     fn is_ring_visible_static(
         ring: &[WorldPoint],
-        viewport_world_bounds: Option<(f64, f64, f64, f64)>,
+        bounds: Option<(f64, f64, f64, f64)>,
+        wrapping: bool,
     ) -> bool {
-        if let Some((vp_min_x, vp_min_y, vp_max_x, vp_max_y)) = viewport_world_bounds {
-            let margin_x = (vp_max_x - vp_min_x) * 0.5;
-            let margin_y = (vp_max_y - vp_min_y) * 0.5;
-            let mut ax = f64::MAX;
-            let mut ay = f64::MAX;
-            let mut bx = f64::MIN;
-            let mut by = f64::MIN;
-            for p in ring {
-                if p.x < ax {
-                    ax = p.x;
-                }
-                if p.y < ay {
-                    ay = p.y;
-                }
-                if p.x > bx {
-                    bx = p.x;
-                }
-                if p.y > by {
-                    by = p.y;
-                }
-            }
-            bx >= vp_min_x - margin_x
-                && ax <= vp_max_x + margin_x
-                && by >= vp_min_y - margin_y
-                && ay <= vp_max_y + margin_y
-        } else {
-            true
+        let mut aabb = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for p in ring {
+            aabb.0 = aabb.0.min(p.x);
+            aabb.1 = aabb.1.min(p.y);
+            aabb.2 = aabb.2.max(p.x);
+            aabb.3 = aabb.3.max(p.y);
         }
+        longitude_bounds_visible(aabb, bounds, wrapping)
     }
 
     /// Clear triangulation cache (call when chart data changes)
+    /// Distinct rejected area/projection pairs in the current geometry revision.
+    pub fn rejected_area_fill_count(&self) -> usize {
+        self.triangulation_failures.len()
+    }
     pub fn clear_triangulation_cache(&mut self) {
         self.triangulation_cache.clear();
-        self.cached_suppressed_lines = None; // Invalidate when chart data changes
+        self.triangulation_failures.clear();
+        self.triangulation_revision = None;
+        self.line_suppression.clear();
+    }
+
+    fn bind_triangulation_context(&mut self, context: &RenderContext) {
+        let revision = context.geometry_revision();
+        if self.triangulation_revision != Some(revision) {
+            self.triangulation_cache.clear();
+            self.triangulation_failures.clear();
+            self.triangulation_revision = Some(revision);
+        }
     }
 
     /// Pre-compute triangulations for all area instructions.
     /// Call after chart load to avoid cold-path stalls during first render frame.
-    pub fn precompute_triangulations(
-        &mut self,
-        instructions: &[ferrite_render::DrawingInstruction],
-    ) {
+    pub fn precompute_triangulations(&mut self, context: &RenderContext) {
+        self.bind_triangulation_context(context);
         let mut count = 0;
-        for instr in instructions {
+        for instr in context.raw_instructions() {
             if let ferrite_render::DrawingInstruction::Area(area) = instr {
-                if self.ensure_triangulated(area).is_some() {
+                if self
+                    .ensure_triangulated(area, context.scaler.projection())
+                    .is_some()
+                {
                     count += 1;
                 }
             }
@@ -687,9 +1032,585 @@ impl WgpuRenderer {
         tracing::info!("Pre-computed {} area triangulations", count);
     }
 
+    pub fn longitude_wrapping_enabled(&self) -> bool {
+        self.lon_wrap_screen_px > 0.0
+    }
+
+    pub fn selected_geometry_vertex_count(&self) -> usize {
+        self.selection_world_geometry.iter().map(Vec::len).sum()
+    }
+
+    pub fn displayed_geometry(&self) -> &[usize] {
+        &self.displayed_geometry
+    }
+
+    /// Conservative broad-phase candidates in original displayed order.
+    /// Stale transforms fall back to the complete current draw list.
+    pub fn selection_candidates(
+        &self,
+        scaler: &ferrite_render::Scaler,
+        query: ferrite_render::ScreenPoint,
+        radius: f64,
+    ) -> Vec<usize> {
+        match self.selection_index.get() {
+            Some(index) if index.matches_scaler(scaler) => {
+                index.candidates(scaler, query, radius, self.longitude_wrapping_enabled())
+            }
+            _ => self.displayed_geometry.clone(),
+        }
+    }
+    /// Build the spatial broad phase on the first pick, never during navigation.
+    /// The exact hit predicates and displayed source order remain authoritative.
+    pub fn selection_candidates_in_context(
+        &self,
+        context: &RenderContext,
+        query: ferrite_render::ScreenPoint,
+        radius: f64,
+    ) -> Vec<usize> {
+        if self.triangulation_revision == Some(context.geometry_revision()) {
+            self.selection_index.get_or_init(|| {
+                let mut index = ferrite_render::SelectionIndex::default();
+                let plan = self.line_suppression.current();
+                index.rebuild(
+                    context.raw_instructions(),
+                    &self.displayed_geometry,
+                    &context.scaler,
+                    |i| plan.and_then(|p| p.spans(i)),
+                );
+                index
+            });
+        }
+        self.selection_candidates(&context.scaler, query, radius)
+    }
+    pub fn selection_index_stats(&self) -> &ferrite_render::SelectionIndexStats {
+        self.selection_index
+            .get()
+            .map(|index| index.statistics())
+            .unwrap_or(&self.empty_selection_stats)
+    }
+
+    pub fn set_selection_geometry(
+        &mut self,
+        geometry: Vec<Vec<WorldPoint>>,
+        scaler: &ferrite_render::Scaler,
+    ) {
+        self.selection_world_geometry = geometry;
+        self.update_selection(scaler);
+    }
+
+    pub fn update_selection(&mut self, scaler: &ferrite_render::Scaler) {
+        if self.ui_state.selected_feature.is_none() {
+            self.selection_world_geometry.clear();
+        }
+        if self.ui_state.globe_preview {
+            self.selection_screen_geometry.clear();
+            self.selection_anchor = self.ui_state.selected_feature.as_ref().and_then(|f| {
+                let pane = self.globe_pane.as_ref()?;
+                if let Some((cell, id, mm)) = self
+                    .selection_device_anchor
+                    .filter(|(cell, id, _)| *cell == f.cell_index && *id == f.feature_id)
+                {
+                    let _ = (cell, id);
+                    let v = pane.diagnostics.viewport;
+                    let ppm = pane.pixels_per_mm();
+                    Some([
+                        (v[0] + mm[0] * ppm) as f32,
+                        (v[1] + v[3] - mm[1] * ppm) as f32,
+                    ])
+                } else {
+                    pane.project_world([f.world_pos.0, f.world_pos.1])
+                        .map(|p| p.map(|x| x as f32))
+                }
+            });
+            return;
+        }
+        let shift = self
+            .ui_state
+            .selected_feature
+            .as_ref()
+            .map_or(0., |f| f.longitude_shift);
+        self.selection_screen_geometry = self
+            .selection_world_geometry
+            .iter()
+            .map(|path| {
+                path.iter()
+                    .map(|p| {
+                        let p = scaler.world_to_screen(WorldPoint::new(p.x + shift, p.y));
+                        [p.x, p.y]
+                    })
+                    .collect()
+            })
+            .collect();
+        self.selection_anchor = self.ui_state.selected_feature.as_ref().map(|f| {
+            let p = scaler.world_to_screen(ferrite_render::WorldPoint::new(
+                f.world_pos.0 + f.longitude_shift,
+                f.world_pos.1,
+            ));
+            [p.x, p.y]
+        });
+    }
+
+    /// Upload a product-neutral raster. CPU pixels are released after upload.
+    pub fn add_raster_layer(
+        &mut self,
+        layer: ferrite_render::RasterLayer,
+        scaler: &ferrite_render::Scaler,
+    ) -> crate::Result<()> {
+        let uploaded = self.prepare_raster_layer(layer, scaler)?;
+        self.raster_layers.push(uploaded);
+        self.globe_pane=None;
+        Ok(())
+    }
+    pub fn raster_texture_limit(&self) -> u32 {
+        self.state.device.limits().max_texture_dimension_2d
+    }
+    /// Stage GPU textures while releasing each CPU tile. Commit only after the producer succeeds.
+    pub fn raster_batch<E: From<crate::WgpuError>>(
+        &mut self,
+        scaler: &ferrite_render::Scaler,
+        replace: bool,
+        producer: impl FnOnce(
+            &mut dyn FnMut(ferrite_render::RasterLayer) -> std::result::Result<(), E>,
+        ) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let mut staged = Vec::new();
+        producer(&mut |layer| {
+            staged.push(self.prepare_raster_layer(layer, scaler)?);
+            Ok(())
+        })?;
+        self.globe_pane=None;
+        if replace {
+            self.raster_layers = staged;
+            self.continuous_layer_count = 0;
+            self.continuous_frame = None;
+        } else {
+            self.raster_layers.extend(staged);
+        }
+        Ok(())
+    }
+    /// Bounded transactional staging; the regular raster_batch API is preserved.
+    /// Continuous bytes are copied to an unorm texture without premultiplication.
+    pub fn stage_raster_material_batch<E:From<crate::WgpuError>>(
+        &mut self,scaler:&ferrite_render::Scaler,
+        producer:impl FnOnce(&mut dyn FnMut(ferrite_render::RasterMaterialLayer)->std::result::Result<(),E>)->std::result::Result<(),E>,
+    )->std::result::Result<PreparedRasterMaterialBatch,E> {
+        let mut layers=Vec::new();let mut bytes=0usize;
+        producer(&mut |input| {
+            let (layer,continuous)=match input {
+                ferrite_render::RasterMaterialLayer::Regular(layer)=>(layer,None),
+                ferrite_render::RasterMaterialLayer::Continuous(layer)=>{let (layer,metadata)=layer.into_parts();(layer,Some(metadata))},
+            };
+            bytes=bytes.checked_add(layer.rgba.len()).ok_or_else(||crate::WgpuError::Render("Raster material batch size overflow".into()))?;
+            if bytes>256*1024*1024 || layers.len()>=4096 {return Err(crate::WgpuError::Render("Raster material batch exceeds 256MiB/4096-layer budget".into()).into());}
+            if continuous.is_some() {
+                if scaler.projection()!=ferrite_render::FlatProjection::LocalGeographic {
+                    return Err(crate::WgpuError::Render("Continuous Mercator-domain material requires a qualified inverse-projection bound".into()).into());
+                }
+                self.pipelines.ensure_continuous_raster_pipeline(&self.state);
+            }
+            layers.push(self.prepare_raster_material(layer,scaler,continuous)?);Ok(())
+        })?;
+        Ok(PreparedRasterMaterialBatch{layers,owner:std::sync::Arc::clone(&self.continuous_owner)})
+    }
+    fn continuous_binding_matches<'a>(&self,binding:&crate::continuous_frame_binding::ContinuousFrameBinding,
+        layers:impl Iterator<Item=&'a GpuRasterLayer>)->bool {
+        binding.matches_current(&self.continuous_owner,
+            self.continuous_uniforms.iter().flatten().map(bytemuck::bytes_of),
+            [self.state.size.width,self.state.size.height],crate::state::MSAA_SAMPLE_COUNT,
+            self.state.config.format,layers.filter_map(|l|l.continuous_identity.as_ref()))
+    }
+    fn continuous_transform_key(&self)->[u32;9] {
+        let (width,height)=self.state.viewport_size();
+        [width.to_bits(),height.to_bits(),self.screen_pan_offset.0.to_bits(),self.screen_pan_offset.1.to_bits(),self.screen_zoom_scale.to_bits(),
+            self.screen_zoom_scale_y.to_bits(),self.screen_zoom_pivot.0.to_bits(),self.screen_zoom_pivot.1.to_bits(),self.lon_wrap_screen_px.to_bits()]
+    }
+    pub fn commit_raster_material_batch(&mut self,batch:PreparedRasterMaterialBatch,replace:bool,
+        proof:Option<crate::ValidatedContinuousFrame>)->crate::Result<()> {
+        if !std::sync::Arc::ptr_eq(&batch.owner,&self.continuous_owner) {return Err(crate::WgpuError::Render("Raster material batch belongs to another renderer".into()));}
+        let has_continuous=batch.layers.iter().any(|l|l.continuous.is_some());
+        if has_continuous {
+            let certificate=proof.as_ref().ok_or_else(||crate::WgpuError::Render("Continuous selector is staged: validated projection/interpolant/hardware bound required".into()))?;
+            if !self.continuous_binding_matches(&certificate.binding,self.raster_layers.iter().filter(|_|!replace).chain(batch.layers.iter())) || certificate.transform_key!=self.continuous_transform_key() || !certificate.error().is_finite() || certificate.error()<0. {
+                return Err(crate::WgpuError::Render("Continuous frame qualification does not match this viewport".into()));
+            }
+            if batch.layers.iter().filter_map(|layer|layer.continuous).chain(self.raster_layers.iter().filter(|_|!replace).filter_map(|layer|layer.continuous))
+                .any(|material| !certificate.material_keys.contains(&material.content_digest)) {
+                return Err(crate::WgpuError::Render("Continuous frame proof does not cover these source/material bytes".into()));
+            }
+            // Append can requalify existing layers; apply the same bound to all covered atlases.
+            for layer in batch.layers.iter().chain(self.raster_layers.iter().filter(|_|!replace)) {if layer.continuous.is_some() {
+                let mut bytes=Vec::with_capacity(8);bytes.extend(certificate.error().to_bits().to_le_bytes());bytes.extend(1u32.to_le_bytes());
+                self.state.queue.write_texture(wgpu::TexelCopyTextureInfo{texture:&layer._texture,mip_level:0,origin:wgpu::Origin3d{x:13,y:0,z:0},aspect:wgpu::TextureAspect::All},
+                    &bytes,wgpu::TexelCopyBufferLayout{offset:0,bytes_per_row:Some(8),rows_per_image:Some(1)},wgpu::Extent3d{width:2,height:1,depth_or_array_layers:1});
+            }}
+        }
+        if has_continuous {self.continuous_frame=proof;}else if replace {self.continuous_frame=None;}
+        if replace {self.raster_layers=batch.layers;}else {self.raster_layers.extend(batch.layers);}
+        self.continuous_layer_count=self.raster_layers.iter().filter(|layer|layer.continuous.is_some()).count();
+        self.globe_pane=None;Ok(())
+    }
+    fn validate_continuous_frame(&self)->crate::Result<()> {
+        if self.continuous_layer_count == 0 { return Ok(()); }
+        if self.continuous_frame.as_ref().is_none_or(|p|
+            !self.continuous_binding_matches(&p.binding,self.raster_layers.iter()) || p.transform_key!=self.continuous_transform_key() || self.raster_layers.iter().filter_map(|l|l.continuous).any(|m|!p.material_keys.contains(&m.content_digest))) {
+            return Err(crate::WgpuError::Render("Continuous material requires a new qualified frame after viewport/transform change".into()));
+        }
+        Ok(())
+    }
+    fn prepare_raster_layer(&self, layer:ferrite_render::RasterLayer, scaler:&ferrite_render::Scaler)->crate::Result<GpuRasterLayer> {
+        self.prepare_raster_material(layer,scaler,None)
+    }
+    fn prepare_raster_material(
+        &self,
+        mut layer: ferrite_render::RasterLayer,
+        scaler: &ferrite_render::Scaler,
+        continuous: Option<ferrite_render::ContinuousRasterMetadata>,
+    ) -> crate::Result<GpuRasterLayer> {
+        let required = (layer.width as usize)
+            .checked_mul(layer.height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if layer.width == 0 || layer.height == 0 || required != Some(layer.rgba.len()) {
+            return Err(crate::WgpuError::Render("Invalid raster dimensions".into()));
+        }
+        let limit = self.state.device.limits().max_texture_dimension_2d;
+        if layer.width > limit || layer.height > limit {
+            return Err(crate::WgpuError::Render(format!(
+                "Raster exceeds GPU texture limit {limit}; tiling required"
+            )));
+        }
+        if ![
+            layer.bounds.min_x,
+            layer.bounds.min_y,
+            layer.bounds.max_x,
+            layer.bounds.max_y,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            || layer.bounds.min_x >= layer.bounds.max_x
+            || layer.bounds.min_y >= layer.bounds.max_y
+        {
+            return Err(crate::WgpuError::Render(
+                "Invalid raster geographic bounds".into(),
+            ));
+        }
+        let grid = layer.grid.unwrap_or(ferrite_render::RasterGrid {
+            bounds: layer.bounds,
+            width: layer.width,
+            height: layer.height,
+            column: 0,
+            row: 0,
+        });
+        let logical_size=continuous.map(|m|m.logical_size).unwrap_or([layer.width,layer.height]);
+        if grid.width == 0
+            || grid.height == 0
+            || grid
+                .column
+                .checked_add(logical_size[0])
+                .is_none_or(|x| x > grid.width)
+            || grid
+                .row
+                .checked_add(logical_size[1])
+                .is_none_or(|y| y > grid.height)
+            || ![
+                grid.bounds.min_x,
+                grid.bounds.max_x,
+                grid.bounds.min_y,
+                grid.bounds.max_y,
+            ]
+            .iter()
+            .all(|x| x.is_finite())
+            || grid.bounds.min_x >= grid.bounds.max_x
+            || grid.bounds.min_y >= grid.bounds.max_y
+        {
+            return Err(crate::WgpuError::Render(
+                "Invalid raster source lattice".into(),
+            ));
+        }
+        // Texture pipeline uses premultiplied alpha.
+        if continuous.is_none() {
+            for p in layer.rgba.chunks_exact_mut(4) {
+                for i in 0..3 {p[i]=((p[i] as u16*p[3] as u16+127)/255) as u8;}
+            }
+        }
+        let (texture, view) =
+            self.state
+                .create_texture_from_rgba(&layer.rgba, layer.width, layer.height, &layer.id);
+        let bind_group = self
+            .pipelines
+            .create_raster_bind_group(&self.state.device, &view);
+        let vertices =
+            self.raster_vertices(layer.bounds, grid, logical_size, scaler);
+        let vb = self
+            .state
+            .create_vertex_buffer(&vertices, "coverage-raster-vertices");
+        let indices = Self::raster_indices(vertices.len());
+        let continuous_identity = if let Some(material) = continuous {
+            Some(crate::continuous_frame_binding::PreparedContinuousIdentity {
+                camera:scaler.flat_encoded_identity().ok_or_else(||crate::WgpuError::Render("Continuous identity requires an actual flat camera".into()))?,
+                vertex_bytes:bytemuck::cast_slice(&vertices).to_vec(),
+                index_bytes:bytemuck::cast_slice(&indices).to_vec(), material:material.content_digest,
+            })
+        } else {None};
+        let ib = self
+            .state
+            .create_index_buffer(&indices, "coverage-raster-indices");
+        Ok(GpuRasterLayer {
+            continuous_identity,
+            index_count: indices.len() as u32,
+            continuous,
+            viewing_groups: layer.viewing_groups,
+            draw_order: layer.draw_order,
+            _texture: texture,
+            bind_group,
+            bounds: layer.bounds,
+            grid,
+            tile_size: logical_size,
+            vertices: vb,
+            indices: ib,
+        })
+    }
+    fn raster_vertices(
+        &self,
+        bounds: ferrite_render::GeoBounds,
+        grid: ferrite_render::RasterGrid,
+        tile_size: [u32; 2],
+        scaler: &ferrite_render::Scaler,
+    ) -> Vec<crate::RasterVertex> {
+        let a = scaler.world_to_screen(WorldPoint::new(bounds.min_x, bounds.max_y));
+        let b = scaler.world_to_screen(WorldPoint::new(bounds.max_x, bounds.min_y));
+        let origin = scaler.world_to_screen(WorldPoint::new(grid.bounds.min_x, grid.bounds.max_y));
+        let end = scaler.world_to_screen(WorldPoint::new(grid.bounds.max_x, grid.bounds.min_y));
+        let step = [
+            (end.x - origin.x) / grid.width as f32,
+            (end.y - origin.y) / grid.height as f32,
+        ];
+        // Extend internal quad edges by one physical pixel. The fragment's global
+        // cell test discards other tiles; this prevents partial MSAA coverage at seams.
+        let left = if grid.column > 0 { 1. } else { 0. };
+        let top = if grid.row > 0 { 1. } else { 0. };
+        let right = if grid.column + tile_size[0] < grid.width {
+            1.
+        } else {
+            0.
+        };
+        let bottom = if grid.row + tile_size[1] < grid.height {
+            1.
+        } else {
+            0.
+        };
+        let vertex = |x, y, dx, dy| crate::RasterVertex {
+            position: [x + dx, y + dy],
+            anchor: [x, y],
+            origin: [origin.x, origin.y],
+            step,
+            offset: [grid.column, grid.row],
+            size: [grid.width, grid.height],
+            row_bounds: [0., 0.],
+            row_index: u32::MAX,
+            padding: 0,
+        };
+        if scaler.projection() == ferrite_render::FlatProjection::LocalGeographic {
+            return vec![
+                vertex(a.x, a.y, -left, -top),
+                vertex(b.x, a.y, right, -top),
+                vertex(b.x, b.y, right, bottom),
+                vertex(a.x, b.y, -left, bottom),
+            ];
+        }
+        // At most one strip per source row: exact cell ownership at all zooms.
+        let mut result = Vec::with_capacity(tile_size[1] as usize * 4);
+        for local in 0..tile_size[1] {
+            let row = grid.row + local;
+            let latitude = |row: u32| {
+                grid.bounds.max_y - grid.bounds.height() * row as f64 / grid.height as f64
+            };
+            let y0 = scaler
+                .world_to_screen(WorldPoint::new(bounds.min_x, latitude(row)))
+                .y;
+            let y1 = scaler
+                .world_to_screen(WorldPoint::new(bounds.min_x, latitude(row + 1)))
+                .y;
+            let pad_top = if row > 0 { 1. } else { 0. };
+            let pad_bottom = if row + 1 < grid.height { 1. } else { 0. };
+            for mut v in [
+                vertex(a.x, y0, -left, -pad_top),
+                vertex(b.x, y0, right, -pad_top),
+                vertex(b.x, y1, right, pad_bottom),
+                vertex(a.x, y1, -left, pad_bottom),
+            ] {
+                v.row_bounds = [y0, y1];
+                v.row_index = row;
+                result.push(v);
+            }
+        }
+        result
+    }
+    fn raster_indices(vertices: usize) -> Vec<u32> {
+        (0..vertices / 4)
+            .flat_map(|q| {
+                let b = q as u32 * 4;
+                [b, b + 1, b + 2, b, b + 2, b + 3]
+            })
+            .collect()
+    }
+    pub fn update_raster_view(&mut self, scaler: &ferrite_render::Scaler) {
+        self.continuous_frame=None;
+        for i in 0..self.raster_layers.len() {
+            let vertices = self.raster_vertices(
+                self.raster_layers[i].bounds,
+                self.raster_layers[i].grid,
+                self.raster_layers[i].tile_size,
+                scaler,
+            );
+            let count = (vertices.len() / 4 * 6) as u32;
+            if count != self.raster_layers[i].index_count {
+                self.raster_layers[i].indices = self.state.create_index_buffer(
+                    &Self::raster_indices(vertices.len()),
+                    "coverage-raster-indices",
+                );
+                self.raster_layers[i].index_count = count;
+            }
+            self.raster_layers[i].vertices = self
+                .state
+                .create_vertex_buffer(&vertices, "coverage-raster-vertices");
+        }
+    }
+    /// Update visibility without re-uploading coverage pixels or geometry.
+    pub fn set_raster_enabled_groups(&mut self, groups: Option<&std::collections::HashSet<u32>>) {
+        self.raster_enabled_groups = groups.cloned();
+    }
+    /// Inspect retained GPU layer composition without copying textures or pixel buffers.
+    pub fn raster_composition_metadata(
+        &self,
+    ) -> impl Iterator<Item = (ferrite_kernel::CompositionPlane, i32, &[u32], bool)> {
+        self.raster_layers.iter().map(|layer| {
+            let (plane, priority) = layer.draw_order.render_key();
+            (
+                plane,
+                priority,
+                layer.viewing_groups.as_slice(),
+                ferrite_render::raster_groups_visible(
+                    &layer.viewing_groups,
+                    self.raster_enabled_groups.as_ref(),
+                ),
+            )
+        })
+    }
+    pub fn clear_raster_layers(&mut self) {
+        self.continuous_frame=None;
+        self.continuous_layer_count=0;
+        self.raster_layers.clear();
+        self.globe_pane=None;
+    }
+    fn draw_rasters<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        view: &'a wgpu::BindGroup,
+        key: (CompositionPlane, i32),
+        draw_index: Option<&DrawRangeIndex>,
+    ) {
+        if self.raster_layers.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.pipelines.raster_pipeline);
+        pass.set_bind_group(0, view, &[]);
+        for layer_index in selected_indices(draw_index, DrawKind::Raster, key, self.raster_layers.len()) {
+            let layer = &self.raster_layers[layer_index];
+            if !(
+
+            layer.draw_order.render_key() == key
+                && ferrite_render::raster_groups_visible(
+                    &layer.viewing_groups,
+                    self.raster_enabled_groups.as_ref(),
+                )
+        ) { continue; }
+            pass.set_pipeline(if layer.continuous.is_some() {self.pipelines.continuous_raster_pipeline.as_ref().expect("staged continuous pipeline")}else{&self.pipelines.raster_pipeline});
+            pass.set_bind_group(1, &layer.bind_group, &[]);
+            pass.set_vertex_buffer(0, layer.vertices.slice(..));
+            pass.set_index_buffer(layer.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..layer.index_count, 0, 0..1);
+        }
+    }
+
     /// Clear symbol textures (call when color profile changes)
     pub fn clear_symbol_textures(&mut self) {
         self.symbol_textures.clear();
+        // Patterns are rasterized with the same PC colour profile as symbols.
+        self.pattern_textures.clear();
+        self.globe_pattern_textures.clear();
+        self.globe_whole_motif_textures.clear();
+        self.globe_pattern_resources.clear();
+        self.globe_pattern_epoch=None;
+        self.globe_prepared_symbol_epoch=None;
+        self.globe_symbol_resource_revision=None;
+        self.globe_pane=None;
+    }
+
+    /// Exactly the quad/culling decision used by both packing and Parent
+    /// execution evidence. Longitude copies must be considered before culling.
+    fn symbol_quad(&self, instance: &SymbolInstance) -> Option<[TextureVertex; 4]> {
+        let tex = self.symbol_textures.get(&instance.symbol_id)?;
+        if !tex.has_coverage {
+            return None;
+        }
+        let (vp_w, vp_h) = self.state.viewport_size();
+        let sym_min_x = -200.;
+        let sym_min_y = -200.;
+        let sym_max_x = vp_w + 200.;
+        let sym_max_y = vp_h + 200.;
+        let display_scale = instance.scale / tex.render_scale
+            * self.symbol_scale
+            * self.state.window.scale_factor() as f32;
+        let half_w = (tex.width as f32 * display_scale) / 2.0;
+        let half_h = (tex.height as f32 * display_scale) / 2.0;
+        let pivot_x = tex.pivot_in_texture.0 * display_scale;
+        let pivot_y = tex.pivot_in_texture.1 * display_scale;
+        let rotation = instance.rotation.to_radians();
+        let cos_r = rotation.cos();
+        let sin_r = rotation.sin();
+
+        let transform = |dx: f32, dy: f32| -> (f32, f32) {
+            let px = dx + half_w - pivot_x;
+            let py = dy + half_h - pivot_y;
+            let rx = px * cos_r - py * sin_r;
+            let ry = px * sin_r + py * cos_r;
+            (instance.screen_x + rx, instance.screen_y + ry)
+        };
+
+        let (x0, y0) = transform(-half_w, -half_h);
+        let (x1, y1) = transform(half_w, -half_h);
+        let (x2, y2) = transform(half_w, half_h);
+        let (x3, y3) = transform(-half_w, half_h);
+
+        let corners = [(x0, y0), (x1, y1), (x2, y2), (x3, y3)];
+        if !corners.iter().all(|(x, y)| x.is_finite() && y.is_finite()) {
+            return None;
+        }
+        let offsets = [0., -self.lon_wrap_screen_px, self.lon_wrap_screen_px];
+        let copies = if self.lon_wrap_screen_px > 0.
+            && !instance
+                .source
+                .is_some_and(|s| self.device_fixed_sources.contains(&s))
+        {
+            3
+        } else {
+            1
+        };
+        let visible = offsets[..copies].iter().any(|offset| {
+            !corners.iter().all(|(x, _)| x + offset < sym_min_x)
+                && !corners.iter().all(|(x, _)| x + offset > sym_max_x)
+                && !corners.iter().all(|(_, y)| *y < sym_min_y)
+                && !corners.iter().all(|(_, y)| *y > sym_max_y)
+        });
+        if !visible {
+            return None;
+        }
+        Some([
+            TextureVertex::new(x0, y0, 0., 0., instance.anchor),
+            TextureVertex::new(x1, y1, 1., 0., instance.anchor),
+            TextureVertex::new(x2, y2, 1., 1., instance.anchor),
+            TextureVertex::new(x3, y3, 0., 1., instance.anchor),
+        ])
     }
 
     /// Pack symbol instances into contiguous vertex/index arrays for single-buffer rendering.
@@ -699,81 +1620,170 @@ impl WgpuRenderer {
         self.packed_symbol_indices.clear();
         self.packed_symbol_ranges.clear();
 
-        // Screen-space guard bounds for symbol culling
-        let (vp_w, vp_h) = self.state.viewport_size();
-        let sym_guard = 200.0_f32;
-        let sym_min_x = -sym_guard;
-        let sym_min_y = -sym_guard;
-        let sym_max_x = vp_w + sym_guard;
-        let sym_max_y = vp_h + sym_guard;
-
-        // First, group by symbol_id using the existing batches map
-        self.symbol_batches.clear();
+        // Pack in portrayal order; merge only consecutive equal textures.
         for instance in &self.symbol_instances[start..end] {
-            if let Some(tex) = self.symbol_textures.get(&instance.symbol_id) {
-                let display_scale = instance.scale / tex.render_scale * self.symbol_scale;
-                let half_w = (tex.width as f32 * display_scale) / 2.0;
-                let half_h = (tex.height as f32 * display_scale) / 2.0;
-                let pivot_x = tex.pivot_in_texture.0 * display_scale;
-                let pivot_y = tex.pivot_in_texture.1 * display_scale;
-                let rotation = instance.rotation.to_radians();
-                let cos_r = rotation.cos();
-                let sin_r = rotation.sin();
-
-                let transform = |dx: f32, dy: f32| -> (f32, f32) {
-                    let px = dx + half_w - pivot_x;
-                    let py = dy + half_h - pivot_y;
-                    let rx = px * cos_r - py * sin_r;
-                    let ry = px * sin_r + py * cos_r;
-                    (instance.screen_x + rx, instance.screen_y + ry)
-                };
-
-                let (x0, y0) = transform(-half_w, -half_h);
-                let (x1, y1) = transform(half_w, -half_h);
-                let (x2, y2) = transform(half_w, half_h);
-                let (x3, y3) = transform(-half_w, half_h);
-
-                // Skip symbols entirely outside viewport guard bounds
-                let all_left = x0 < sym_min_x && x1 < sym_min_x && x2 < sym_min_x && x3 < sym_min_x;
-                let all_right =
-                    x0 > sym_max_x && x1 > sym_max_x && x2 > sym_max_x && x3 > sym_max_x;
-                let all_top = y0 < sym_min_y && y1 < sym_min_y && y2 < sym_min_y && y3 < sym_min_y;
-                let all_bottom =
-                    y0 > sym_max_y && y1 > sym_max_y && y2 > sym_max_y && y3 > sym_max_y;
-                if all_left || all_right || all_top || all_bottom {
-                    continue;
+            if let Some(quad) = self.symbol_quad(instance) {
+                let vertex_offset = self.packed_symbol_vertices.len() as u32;
+                let index_start = self.packed_symbol_indices.len() as u32;
+                self.packed_symbol_vertices.extend_from_slice(&quad);
+                self.packed_symbol_indices.extend_from_slice(&[
+                    vertex_offset,
+                    vertex_offset + 1,
+                    vertex_offset + 2,
+                    vertex_offset,
+                    vertex_offset + 2,
+                    vertex_offset + 3,
+                ]);
+                if let Some((id, start, count)) = self.packed_symbol_ranges.last_mut() {
+                    if *id == instance.symbol_id && *start + *count == index_start {
+                        *count += 6;
+                        continue;
+                    }
                 }
-
-                let batch = self
-                    .symbol_batches
-                    .entry(instance.symbol_id)
-                    .or_insert_with(|| (Vec::new(), Vec::new()));
-                let base = batch.0.len() as u32;
-                batch.0.push(TextureVertex::new(x0, y0, 0.0, 0.0));
-                batch.0.push(TextureVertex::new(x1, y1, 1.0, 0.0));
-                batch.0.push(TextureVertex::new(x2, y2, 1.0, 1.0));
-                batch.0.push(TextureVertex::new(x3, y3, 0.0, 1.0));
-                batch
-                    .1
-                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                self.packed_symbol_ranges
+                    .push((instance.symbol_id, index_start, 6));
             }
         }
+    }
 
-        // Now pack all batches into contiguous arrays
-        for (&sym_id, (verts, idxs)) in &self.symbol_batches {
-            let vertex_offset = self.packed_symbol_vertices.len() as u32;
-            let index_start = self.packed_symbol_indices.len() as u32;
-
-            self.packed_symbol_vertices.extend_from_slice(verts);
-            // Offset indices by vertex_offset
-            for &idx in idxs {
-                self.packed_symbol_indices.push(idx + vertex_offset);
-            }
-
-            let index_count = idxs.len() as u32;
-            self.packed_symbol_ranges
-                .push((sym_id, index_start, index_count));
+    /// Actual draw ranges; consecutive identical textures share a range.
+    /// Explicit diagnostic export; never called by the interactive frame loop.
+    pub fn audit_geometry_buffers(&self, directory: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(directory)?;
+        macro_rules! buffer {
+            ($name:literal, $values:expr) => {
+                std::fs::write(
+                    directory.join(concat!($name, ".bin")),
+                    bytemuck::cast_slice($values),
+                )?;
+            };
         }
+        buffer!("area-vertices", &self.area_vertices);
+        buffer!("area-indices", &self.area_indices);
+        buffer!("line-vertices", &self.line_vertices);
+        buffer!("line-indices", &self.line_indices);
+        buffer!("symbol-vertices", &self.packed_symbol_vertices);
+        buffer!("symbol-indices", &self.packed_symbol_indices);
+        buffer!("pattern-vertices", &self.pattern_vertices);
+        buffer!("pattern-indices", &self.pattern_indices);
+        let metadata = serde_json::json!({
+            "geometry_transform": self.geometry_transform,
+            "fast_view_transform": self.fast_view_transform(),
+            "fast_view_scales": self.fast_view_scales(),
+            "area_ranges": self.area_priority_ranges.iter().map(|&(p,q,a,b,_)| (p,q,a,b)).collect::<Vec<_>>(),
+            "line_ranges": self.line_priority_ranges.iter().map(|&(p,q,a,b,_)| (p,q,a,b)).collect::<Vec<_>>(),
+            "pattern_ranges": self.pattern_ranges.iter().map(|(p,q,a,b,k,w,_)| (p,q,a,b,k,w)).collect::<Vec<_>>(),
+            "packed_symbol_ranges": self.packed_symbol_ranges.iter().map(|&(id,start,count)| (ferrite_render::resolve_symbol(id),start,count)).collect::<Vec<_>>(),
+            "symbol_gpu_buffers": self.symbol_gpu_buffer_statistics(),
+            "symbol_buffer_scope": "last packed plane/priority range; complete displayed symbols are in snapshot.json",
+            "displayed_geometry": self.displayed_geometry,
+            "selection_index": self.selection_index_stats(),
+            "drawing_dependencies": self.dependency_status.audit_value(),
+        });
+        std::fs::write(
+            directory.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )
+    }
+
+    pub fn symbol_gpu_buffer_statistics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "instancing_enabled": self.pipelines.symbol_instance_pipeline.is_some(),
+            "vertex_bytes": self.cached_symbol_buffers.iter().map(|b| b.4.size()).sum::<u64>(),
+            "index_bytes": self.cached_symbol_buffers.iter().map(|b| b.5.size()).sum::<u64>(),
+            "buffer_pairs": self.cached_symbol_buffers.len(),
+            "instance_payload_bytes": 40,
+            "original_payload_per_symbol_bytes": 120,
+            "scope": "2D packed symbols only; globe scene unchanged",
+        })
+    }
+
+    pub fn symbol_draw_batch_count(&self) -> usize {
+        self.cached_symbol_buffers
+            .iter()
+            .map(|batch| batch.6.len())
+            .sum()
+    }
+
+    /// Symbols accepted by the same visibility and collision filters as drawing.
+    pub fn displayed_symbols(
+        &self,
+    ) -> Vec<(
+        String,
+        Option<i64>,
+        ferrite_render::WorldPoint,
+        ferrite_render::ScreenPoint,
+        i32,
+        Option<u32>,
+        CompositionPlane,
+    )> {
+        self.symbol_instances
+            .iter()
+            .map(|s| {
+                (
+                    ferrite_render::resolve_symbol(s.symbol_id),
+                    s.feature_id,
+                    s.world,
+                    ferrite_render::ScreenPoint::new(s.screen_x, s.screen_y),
+                    s.priority,
+                    s.cell_index,
+                    s.plane,
+                )
+            })
+            .collect()
+    }
+
+    /// Symbols accepted by the same visibility and collision filters as drawing.
+    pub fn displayed_symbols_with_sources(
+        &self,
+    ) -> Vec<(
+        String,
+        Option<i64>,
+        ferrite_render::WorldPoint,
+        ferrite_render::ScreenPoint,
+        i32,
+        Option<u32>,
+        CompositionPlane,
+        Option<usize>,
+    )> {
+        self.symbol_instances
+            .iter()
+            .map(|s| {
+                (
+                    ferrite_render::resolve_symbol(s.symbol_id),
+                    s.feature_id,
+                    s.world,
+                    ferrite_render::ScreenPoint::new(s.screen_x, s.screen_y),
+                    s.priority,
+                    s.cell_index,
+                    s.plane,
+                    s.source,
+                )
+            })
+            .collect()
+    }
+
+    /// Chart rectangle in physical pixels, matching GPU and pointer coordinates.
+    pub fn chart_viewport_pixels(&self) -> (f32, f32, f32, f32) {
+        let (x, y, width, height) = self.ui_state.chart_area;
+        let pixels_per_point = self.egui.ctx.pixels_per_point();
+        (
+            x * pixels_per_point,
+            y * pixels_per_point,
+            width * pixels_per_point,
+            height * pixels_per_point,
+        )
+    }
+
+    pub fn ui_pixels_per_point(&self) -> f32 {
+        self.egui.ctx.pixels_per_point()
+    }
+    pub fn fast_view_transform(&self) -> ((f32, f32), f32, (f32, f32)) {
+        (
+            self.screen_pan_offset,
+            self.screen_zoom_scale,
+            self.screen_zoom_pivot,
+        )
     }
 
     /// Handle window resize
@@ -900,7 +1910,10 @@ impl WgpuRenderer {
     /// Take pan adjustment (in pixels) when panel state changes
     #[inline]
     pub fn take_pan_adjust_pixels(&mut self) -> Option<f32> {
-        self.ui_state.pan_adjust_pixels.take()
+        self.ui_state
+            .pan_adjust_pixels
+            .take()
+            .map(|adjust| adjust * self.egui.ctx.pixels_per_point())
     }
 
     /// Get current settings state (read-only)
@@ -940,9 +1953,9 @@ impl WgpuRenderer {
     }
 
     /// Update view uniforms after resize or zoom
-    fn update_view_uniforms(&self) {
+    fn update_view_uniforms(&mut self) {
         let (width, height) = self.state.viewport_size();
-        let uniforms = ViewUniforms::with_pan_zoom(
+        let mut uniforms = ViewUniforms::with_pan_zoom(
             width,
             height,
             1.0,
@@ -952,12 +1965,14 @@ impl WgpuRenderer {
             self.screen_zoom_pivot.0,
             self.screen_zoom_pivot.1,
         );
+        uniforms.zoom_scale_y = self.screen_zoom_scale_y;
+        self.continuous_uniforms=[Some(uniforms),None,None];
         self.state
             .update_view_uniforms(&self.view_buffer, &uniforms);
 
         // Update wrapping view uniforms for ±360° longitude copies
         if self.lon_wrap_screen_px > 0.0 {
-            let left = ViewUniforms::with_pan_zoom(
+            let mut left = ViewUniforms::with_pan_zoom(
                 width,
                 height,
                 1.0,
@@ -967,10 +1982,12 @@ impl WgpuRenderer {
                 self.screen_zoom_pivot.0,
                 self.screen_zoom_pivot.1,
             );
+            left.zoom_scale_y = self.screen_zoom_scale_y;
+            self.continuous_uniforms[1]=Some(left);
             self.state
                 .update_view_uniforms(&self.view_buffer_left, &left);
 
-            let right = ViewUniforms::with_pan_zoom(
+            let mut right = ViewUniforms::with_pan_zoom(
                 width,
                 height,
                 1.0,
@@ -980,26 +1997,121 @@ impl WgpuRenderer {
                 self.screen_zoom_pivot.0,
                 self.screen_zoom_pivot.1,
             );
+            right.zoom_scale_y = self.screen_zoom_scale_y;
+            self.continuous_uniforms[2]=Some(right);
             self.state
                 .update_view_uniforms(&self.view_buffer_right, &right);
         }
+        self.update_coverage_transform();
     }
 
-    /// Set screen-space pan offset for fast panning during drag.
-    /// This only updates the GPU uniform, no vertex rebuild needed.
+    fn coverage_clip_transform(&self) -> Result<crate::coverage_clip::ClipTransform> {
+        let [sx, sy] = [self.screen_zoom_scale, self.screen_zoom_scale_y];
+        let (px, py) = self.screen_zoom_pivot;
+        crate::coverage_clip::ClipTransform::new(
+            [1. / sx, 1. / sy],
+            [
+                px - px / sx - self.screen_pan_offset.0,
+                py - py / sy - self.screen_pan_offset.1,
+            ],
+        )
+    }
+
+    /// Transform a retained symbol anchor exactly as its vertex shader does.
+    pub fn displayed_symbol_screen(&self, anchor: [f32; 2], pass: usize) -> Option<[f32; 2]> {
+        let wrap = match pass {
+            0 => 0.,
+            1 if self.longitude_wrapping_enabled() => -self.lon_wrap_screen_px,
+            2 if self.longitude_wrapping_enabled() => self.lon_wrap_screen_px,
+            _ => return None,
+        };
+        let (px, py) = self.screen_zoom_pivot;
+        let point = [
+            (anchor[0] + self.screen_pan_offset.0 + wrap - px) * self.screen_zoom_scale + px,
+            (anchor[1] + self.screen_pan_offset.1 - py) * self.screen_zoom_scale_y + py,
+        ];
+        point.iter().all(|v| v.is_finite()).then_some(point)
+    }
+
+    /// Sample the retained draw mask using the same inverse affine as the GPU.
+    pub fn coverage_fragment_visible(&self, index: usize, pass: usize, pixel: [f32; 2]) -> bool {
+        if self.coverage_failed
+            || (pass != 0 && self.device_fixed_sources.contains(&index))
+            || !pixel.iter().all(|v| v.is_finite())
+        {
+            return false;
+        }
+        let Some(prepared) = &self.prepared_coverage else {
+            return true;
+        };
+        let Some(frame) = &self.coverage_frame else {
+            return false;
+        };
+        if frame.resolve_instruction(prepared, pass, index).is_err() {
+            return false;
+        }
+        let Ok(transform) = self.coverage_clip_transform() else {
+            return false;
+        };
+        let point = transform.prepared_pixel(pixel).map(f64::from);
+        prepared
+            .pass(pass)
+            .and_then(|p| p.accepts_fragment(index, point))
+            .unwrap_or(false)
+    }
+
+    fn update_coverage_transform(&mut self) {
+        let transform = self.coverage_clip_transform();
+        if let Some(frame) = &mut self.coverage_frame {
+            match transform {
+                Ok(transform) => frame.set_transform(&self.state.queue, transform),
+                Err(error) => {
+                    self.coverage_failed = true;
+                    tracing::error!("Coverage affine rejected: {error}");
+                }
+            }
+        }
+    }
+
+    /// Apply an affine only when all retained geometry supports navigation.
+    /// Validate both directions before changing uniforms or coverage state.
+    fn accepts_gpu_navigation(&self, scale: [f32; 2], pan: [f32; 2], pivot: [f32; 2]) -> bool {
+        if self.ui_state.globe_preview || self.requires_visibility_rebuild_for_navigation() {
+            return false;
+        }
+        (0..2).all(|axis| {
+            let (s, d, p) = (scale[axis], pan[axis], pivot[axis]);
+            s.is_finite()
+                && s > 0.
+                && d.is_finite()
+                && p.is_finite()
+                && (1. / s).is_finite()
+                && ((d - p) * s + p).is_finite()
+                && (p - p / s - d).is_finite()
+        })
+    }
+
+    /// Set screen-space pan. False means the caller must rebuild geometry;
+    /// retained geometry and uniforms remain unchanged on rejection.
     #[inline]
-    pub fn set_pan_offset(&mut self, dx: f32, dy: f32) {
+    pub fn set_pan_offset(&mut self, dx: f32, dy: f32) -> bool {
+        if !self.accepts_gpu_navigation(
+            [self.screen_zoom_scale, self.screen_zoom_scale_y],
+            [dx, dy],
+            [self.screen_zoom_pivot.0, self.screen_zoom_pivot.1],
+        ) {
+            return false;
+        }
         self.screen_pan_offset = (dx, dy);
         self.update_view_uniforms();
+        true
     }
 
-    /// Add to the current screen-space pan offset.
-    /// Returns the new total offset.
-    pub fn add_pan_offset(&mut self, dx: f32, dy: f32) -> (f32, f32) {
-        self.screen_pan_offset.0 += dx;
-        self.screen_pan_offset.1 += dy;
-        self.update_view_uniforms();
-        self.screen_pan_offset
+    /// Add a pan, returning None when geometry must be rebuilt or the
+    /// composed transform is invalid. Rejection never changes the old offset.
+    pub fn add_pan_offset(&mut self, dx: f32, dy: f32) -> Option<(f32, f32)> {
+        let pan = (self.screen_pan_offset.0 + dx, self.screen_pan_offset.1 + dy);
+        self.set_pan_offset(pan.0, pan.1).then_some(pan)
     }
 
     /// Get the current screen-space pan offset
@@ -1013,17 +2125,71 @@ impl WgpuRenderer {
     pub fn reset_pan_offset(&mut self) {
         self.screen_pan_offset = (0.0, 0.0);
         self.screen_zoom_scale = 1.0;
+        self.screen_zoom_scale_y = 1.0;
         self.screen_zoom_pivot = (0.0, 0.0);
         self.update_view_uniforms();
     }
 
-    /// Set GPU zoom scale for smooth zooming without geometry rebuild.
-    /// The shader scales all geometry around the pivot point.
+    /// Set GPU zoom only for geometry that supports an affine navigation.
+    /// False means a full rebuild is required; no state changes on rejection.
     #[inline]
-    pub fn set_gpu_zoom(&mut self, scale: f32, pivot_x: f32, pivot_y: f32) {
+    pub fn set_gpu_zoom(&mut self, scale: f32, pivot_x: f32, pivot_y: f32) -> bool {
+        if !self.accepts_gpu_navigation(
+            [scale, scale],
+            [self.screen_pan_offset.0, self.screen_pan_offset.1],
+            [pivot_x, pivot_y],
+        ) {
+            return false;
+        }
         self.screen_zoom_scale = scale;
+        self.screen_zoom_scale_y = scale;
         self.screen_zoom_pivot = (pivot_x, pivot_y);
         self.update_view_uniforms();
+        true
+    }
+
+    /// Map the existing geometry to exactly the same scaler used by the next
+    /// rebuild. Repeated scroll pivots replace an affine transform rather than
+    /// accumulating scale/pan around a stale cursor.
+    /// Navigation can change date/scale-independent clipping and collisions,
+    /// which in turn can change Parent execution. Re-evaluate those display
+    /// lists rather than reuse a stale fast-path permission mask.
+    pub fn requires_visibility_rebuild_for_navigation(&self) -> bool {
+        self.dependency_status.iterations > 0
+            || self.view_dependent_symbols
+            || self.view_clipped_patterns
+    }
+
+    pub fn set_gpu_view_scaler(&mut self, target: &ferrite_render::Scaler) -> bool {
+        if self.ui_state.globe_preview || self.requires_visibility_rebuild_for_navigation() {
+            return false;
+        }
+        let Some(source) = self.geometry_transform else {
+            return false;
+        };
+        let Some(view) = ferrite_render::ScreenAffine::between_transform(source, target) else {
+            return false;
+        };
+        let pan = [
+            view.translation[0] / view.scale[0],
+            view.translation[1] / view.scale[1],
+        ];
+        if !self.accepts_gpu_navigation(view.scale, pan, [0., 0.]) {
+            return false;
+        }
+        self.screen_zoom_scale = view.scale[0];
+        self.screen_zoom_scale_y = view.scale[1];
+        self.screen_pan_offset = (
+            view.translation[0] / view.scale[0],
+            view.translation[1] / view.scale[1],
+        );
+        self.screen_zoom_pivot = (0., 0.);
+        self.update_view_uniforms();
+        true
+    }
+
+    pub fn fast_view_scales(&self) -> (f32, f32) {
+        (self.screen_zoom_scale, self.screen_zoom_scale_y)
     }
 
     /// Get current GPU zoom scale
@@ -1056,6 +2222,9 @@ impl WgpuRenderer {
         self.line_vertices.clear();
         self.line_indices.clear();
         self.symbol_instances.clear();
+        self.displayed_geometry.clear();
+        self.selection_index.take();
+        self.dependency_status = DependencyRenderStatus::default();
 
         // Reserve capacity based on previous frame (amortized zero reallocs in steady state)
         if prev_area_v > self.area_vertices.capacity() / 2 {
@@ -1071,16 +2240,20 @@ impl WgpuRenderer {
             self.line_indices.reserve(prev_line_i);
         }
         // Clear symbol batches for new frame
-        self.symbol_batches.clear();
         // Clear priority ranges for S-101 compliant rendering
+        self.device_fixed_sources.clear();
+        self.prepared_coverage = None;
+        self.coverage_frame = None;
+        self.coverage_failed = false;
+        self.emitting_coverage_source = None;
         self.area_priority_ranges.clear();
         self.line_priority_ranges.clear();
         self.symbol_priority_ranges.clear();
         self.pattern_vertices.clear();
         self.pattern_indices.clear();
         self.pattern_ranges.clear();
+        self.view_clipped_patterns = false;
         self.text_labels.clear();
-        self.text_collision_grid.clear();
         // World map separate buffers
         self.world_map_line_vertices.clear();
         self.world_map_line_indices.clear();
@@ -1135,14 +2308,27 @@ impl WgpuRenderer {
     /// Example: At zoom 2.0 with 1:22000 chart -> viewing scale is 1:11000
     #[inline]
     pub fn viewing_scale(&self) -> u32 {
-        ((self.compilation_scale as f64) / self.zoom_level.max(0.01)) as u32
+        self.display_scale
     }
 
     /// Set Natural Earth world map coastlines for background rendering.
     /// Each inner Vec is a line string: list of [longitude, latitude] pairs.
     pub fn set_world_map(&mut self, coastlines: Vec<Vec<[f64; 2]>>) {
         tracing::info!("World map loaded: {} coastline segments", coastlines.len());
-        self.world_map_coastlines = coastlines;
+        self.world_map_coastlines = ferrite_render::BackgroundCoastlines::new(coastlines)
+            .unwrap_or_else(|e| {
+                tracing::warn!("{e}");
+                Default::default()
+            });
+    }
+
+    /// More detailed reference coastlines for regional views; never used as ENC data.
+    pub fn set_world_map_detailed(&mut self, coastlines: Vec<Vec<[f64; 2]>>) {
+        self.world_map_detailed = ferrite_render::BackgroundCoastlines::new(coastlines)
+            .unwrap_or_else(|e| {
+                tracing::warn!("{e}");
+                Default::default()
+            });
     }
 
     /// Set chart coverage bounding boxes so world map is masked
@@ -1169,7 +2355,7 @@ impl WgpuRenderer {
     ///
     /// Renders at lon offsets -360°, 0°, +360° for seamless wrapping.
     pub fn add_world_map_lines(&mut self, scaler: &ferrite_render::Scaler) {
-        if self.world_map_coastlines.is_empty() {
+        if self.world_map_coastlines.is_empty() && self.world_map_detailed.is_empty() {
             return;
         }
 
@@ -1180,44 +2366,32 @@ impl WgpuRenderer {
         let vw = scaler.viewport.width;
         let vh = scaler.viewport.height;
         let margin: f32 = 100.0;
-        let clip_x_min = -margin;
-        let clip_y_min = -margin;
-        let clip_x_max = vw + margin;
-        let clip_y_max = vh + margin;
+        let clip_x_min = scaler.viewport.x - margin;
+        let clip_y_min = scaler.viewport.y - margin;
+        let clip_x_max = scaler.viewport.x + vw + margin;
+        let clip_y_max = scaler.viewport.y + vh + margin;
 
-        // Render at 3 longitude offsets for seamless wrapping
+        // Use actual physical viewport corners, including its origin and clip guard.
+        let a = scaler.screen_to_world(ScreenPoint {
+            x: clip_x_min,
+            y: clip_y_min,
+        });
+        let b = scaler.screen_to_world(ScreenPoint {
+            x: clip_x_max,
+            y: clip_y_max,
+        });
+        let view = [a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)];
+        let detailed = ferrite_render::BackgroundCoastlines::use_detailed(scaler.scale_x())
+            && !self.world_map_detailed.is_empty();
+        let coastlines = if detailed {
+            &self.world_map_detailed
+        } else {
+            &self.world_map_coastlines
+        };
         let lon_offsets: [f64; 3] = [-360.0, 0.0, 360.0];
-
         for &lon_offset in &lon_offsets {
-            for coastline in &self.world_map_coastlines {
-                if coastline.len() < 2 {
-                    continue;
-                }
-
-                // Quick AABB frustum cull per coastline (shifted by lon_offset)
-                let mut ax = f64::MAX;
-                let mut ay = f64::MAX;
-                let mut bx = f64::MIN;
-                let mut by = f64::MIN;
-                for pt in coastline.iter() {
-                    let lon = pt[0] + lon_offset;
-                    if lon < ax {
-                        ax = lon;
-                    }
-                    if pt[1] < ay {
-                        ay = pt[1];
-                    }
-                    if lon > bx {
-                        bx = lon;
-                    }
-                    if pt[1] > by {
-                        by = pt[1];
-                    }
-                }
-                if !self.is_aabb_visible(ax, ay, bx, by) {
-                    continue;
-                }
-
+            for chunk in coastlines.visible_chunks(view, lon_offset) {
+                let coastline = &chunk.points;
                 let first_lon = coastline[0][0] + lon_offset;
                 let mut prev = scaler.world_to_screen(WorldPoint::new(first_lon, coastline[0][1]));
 
@@ -1249,26 +2423,14 @@ impl WgpuRenderer {
 
                             let base_index = self.world_map_line_vertices.len() as u32;
 
-                            self.world_map_line_vertices.push(Vertex2D::new(
-                                cx0 - nx,
-                                cy0 - ny,
-                                color,
-                            ));
-                            self.world_map_line_vertices.push(Vertex2D::new(
-                                cx0 + nx,
-                                cy0 + ny,
-                                color,
-                            ));
-                            self.world_map_line_vertices.push(Vertex2D::new(
-                                cx1 + nx,
-                                cy1 + ny,
-                                color,
-                            ));
-                            self.world_map_line_vertices.push(Vertex2D::new(
-                                cx1 - nx,
-                                cy1 - ny,
-                                color,
-                            ));
+                            self.world_map_line_vertices
+                                .push(LineVertex::new(cx0, cy0, -nx, -ny, color));
+                            self.world_map_line_vertices
+                                .push(LineVertex::new(cx0, cy0, nx, ny, color));
+                            self.world_map_line_vertices
+                                .push(LineVertex::new(cx1, cy1, nx, ny, color));
+                            self.world_map_line_vertices
+                                .push(LineVertex::new(cx1, cy1, -nx, -ny, color));
 
                             self.world_map_line_indices.push(base_index);
                             self.world_map_line_indices.push(base_index + 1);
@@ -1337,6 +2499,15 @@ impl WgpuRenderer {
     /// * `color_profile` - Optional color profile for symbol coloring
     /// * `visible_viewing_groups` - Optional set of viewing group IDs that should be visible.
     ///   If None, all viewing groups are visible. Used for Display Mode filtering.
+    /// Retained static overlap graph payload; None means the bounded spatial
+    /// planner fallback is active. This is not total renderer memory usage.
+    pub fn flat_line_suppression_cache_bytes(&self) -> Option<usize> {
+        self.line_suppression.immutable_preparation_bytes()
+    }
+    pub fn dependency_render_status(&self) -> &DependencyRenderStatus {
+        &self.dependency_status
+    }
+
     pub fn add_instructions_with_symbols(
         &mut self,
         context: &mut RenderContext,
@@ -1344,6 +2515,128 @@ impl WgpuRenderer {
         color_profile: Option<&ColorProfile>,
         visible_viewing_groups: Option<&std::collections::HashSet<u32>>,
     ) {
+        context.get_sorted_instructions();
+        let graph = context.dependency_graph();
+        if !graph.has_parents() {
+            self.dependency_status = DependencyRenderStatus {
+                converged: true,
+                ..Default::default()
+            };
+            self.emit_instructions_with_symbols(
+                context,
+                symbol_cache,
+                color_profile,
+                visible_viewing_groups,
+                None,
+                None,
+            );
+            return;
+        }
+
+        // Retain a frame's pre-existing overlay prefix. Cached textures and
+        // triangulation remain reusable; trial geometry is never submitted.
+        let lengths = (
+            self.area_vertices.len(),
+            self.area_indices.len(),
+            self.line_vertices.len(),
+            self.line_indices.len(),
+            self.symbol_instances.len(),
+            self.pattern_vertices.len(),
+            self.pattern_indices.len(),
+            self.text_labels.len(),
+            self.area_priority_ranges.len(),
+            self.line_priority_ranges.len(),
+            self.symbol_priority_ranges.len(),
+            self.pattern_ranges.len(),
+            self.displayed_geometry.len(),
+        );
+        let grids = (
+            self.symbol_grid.clone(),
+            self.sounding_screen_grid.clone(),
+            self.sounding_exact_positions.clone(),
+            self.world_dedup.clone(),
+        );
+        let seed = graph
+            .resolve(&vec![true; graph.len()])
+            .expect("matching dependency graph");
+        let mut permission = seed.executed;
+        let mut executed = vec![false; graph.len()];
+        let mut previous: Option<Vec<bool>> = None;
+        self.dependency_status = DependencyRenderStatus {
+            missing_parent_count: seed.missing_parent_count,
+            ..Default::default()
+        };
+        // Suppression and collision can feed back into parent execution. Bound
+        // trial work and diagnose inconsistent lists rather than hang the UI.
+        for pass in 0..65 {
+            self.area_vertices.truncate(lengths.0);
+            self.area_indices.truncate(lengths.1);
+            self.line_vertices.truncate(lengths.2);
+            self.line_indices.truncate(lengths.3);
+            self.symbol_instances.truncate(lengths.4);
+            self.pattern_vertices.truncate(lengths.5);
+            self.pattern_indices.truncate(lengths.6);
+            self.text_labels.truncate(lengths.7);
+            self.area_priority_ranges.truncate(lengths.8);
+            self.line_priority_ranges.truncate(lengths.9);
+            self.symbol_priority_ranges.truncate(lengths.10);
+            self.pattern_ranges.truncate(lengths.11);
+            self.displayed_geometry.truncate(lengths.12);
+            self.symbol_grid.clone_from(&grids.0);
+            self.sounding_screen_grid.clone_from(&grids.1);
+            self.sounding_exact_positions.clone_from(&grids.2);
+            self.world_dedup.clone_from(&grids.3);
+            self.cached_symbol_buffers.clear();
+            self.gpu_buffers_dirty = true;
+            executed.fill(false);
+            self.emit_instructions_with_symbols(
+                context,
+                symbol_cache.as_deref_mut(),
+                color_profile,
+                visible_viewing_groups,
+                Some(&permission),
+                Some(&mut executed),
+            );
+            self.dependency_status.iterations = pass + 1;
+            if self.dependency_status.nonconvergent_diagnostic {
+                break;
+            }
+            let grounded = graph.resolve(&executed).expect("matching execution mask");
+            let next = graph
+                .permitted_by_executed(&grounded.executed)
+                .expect("matching execution mask");
+            if next == permission {
+                self.dependency_status.converged = true;
+                break;
+            }
+            if previous.as_ref() == Some(&next) || pass == 63 {
+                tracing::error!("S-100 Parent execution did not converge; dependent commands withheld, roots retained");
+                self.dependency_status.nonconvergent_diagnostic = true;
+                permission = context
+                    .raw_instructions()
+                    .iter()
+                    .map(|i| i.dependency().is_none_or(|d| d.parent_id.is_none()))
+                    .collect();
+            } else {
+                previous = Some(std::mem::replace(&mut permission, next));
+            }
+        }
+        self.dependency_status.permitted = permission;
+        self.dependency_status.executed = executed;
+    }
+
+    fn emit_instructions_with_symbols(
+        &mut self,
+        context: &mut RenderContext,
+        mut symbol_cache: Option<&mut SymbolCache>,
+        color_profile: Option<&ColorProfile>,
+        visible_viewing_groups: Option<&std::collections::HashSet<u32>>,
+        dependency_permission: Option<&[bool]>,
+        mut execution: Option<&mut [bool]>,
+    ) {
+        self.set_raster_enabled_groups(visible_viewing_groups);
+        self.chart_geometry_viewport = Some(context.scaler.viewport);
+        self.bind_triangulation_context(context);
         let profiling = crate::profiler::is_profiling_enabled();
         let total_timer = if profiling {
             Some(ScopeTimer::new("add_instructions_total"))
@@ -1355,9 +2648,118 @@ impl WgpuRenderer {
         context.set_animation_mode(self.animation_mode);
         // get_sorted_instructions() sorts in-place on first call, then returns &slice
         // Clone scaler (cheap: a few f64 fields) to avoid borrow conflict with &mut self methods
+        context
+            .scaler
+            .set_pixel_ratio(self.state.window.scale_factor());
         let scaler = context.scaler.clone();
-        let instructions = context.get_sorted_instructions();
+        self.geometry_transform = Some(Self::scaler_transform(&scaler));
+        self.display_scale = scaler.display_scale.round().clamp(1.0, u32::MAX as f64) as u32;
+        context.get_sorted_instructions();
+        let (temporal_visible, hidden, diagnostics) = match context.portrayal_visibility() {
+            Ok(visibility) => visibility,
+            Err(error) => {
+                self.coverage_failed = true;
+                tracing::error!("Coverage execution visibility rejected: {error}");
+                return;
+            }
+        };
+        if diagnostics > 0 && self.temporal_visibility_counts.1 != diagnostics {
+            tracing::warn!("Temporal selector: {diagnostics} primitives preserved due to unsupported or invalid time conditions");
+        }
+        self.temporal_visibility_counts = (hidden, diagnostics);
+        self.device_fixed_sources = context
+            .raw_instructions()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, command)| command.portrayal_origin().is_device_fixed().then_some(i))
+            .collect();
+        self.prepared_coverage = match context.prepared_coverage_binding() {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.coverage_failed = true;
+                tracing::error!("Coverage binding rejected: {error}");
+                return;
+            }
+        };
+        self.emitting_coverage_source = None;
+        self.coverage_frame = None;
+        self.coverage_failed = false;
+        if let Some(prepared) = &self.prepared_coverage {
+            let result = (|| -> Result<crate::coverage_gpu_frame::CoverageGpuFrame> {
+                let plan = crate::coverage_gpu_frame::CoverageGpuPlan::new(
+                    prepared,
+                    context.geometry_revision(),
+                    context.coverage_view_revision(),
+                    context.instruction_count(),
+                    if self.lon_wrap_screen_px > 0. { 3 } else { 1 },
+                    self.state.device.limits().max_texture_dimension_2d,
+                    128 * 1024 * 1024,
+                )?;
+                if plan.mask_count() > 0 && self.coverage_pipelines.is_none() {
+                    self.coverage_pipelines =
+                        Some(crate::coverage_pipeline::CoveragePipelines::new_with_symbol_instancing(
+                            &self.state.device,
+                            self.state.format(),
+                            crate::state::MSAA_SAMPLE_COUNT,
+                            &self.pipelines.view_bind_group_layout,
+                            &self.pipelines.texture_bind_group_layout,
+                            &self.pipelines.pattern_bind_group_layout,
+                            self.pipelines.symbol_instance_pipeline.is_some(),
+                        )?);
+                }
+                let fallback;
+                let layout = if let Some(pipelines) = &self.coverage_pipelines {
+                    &pipelines.clip_layout
+                } else {
+                    fallback = crate::coverage_clip::create_clip_layout(&self.state.device);
+                    &fallback
+                };
+                crate::coverage_gpu_frame::CoverageGpuFrame::upload(
+                    &self.state.device,
+                    &self.state.queue,
+                    layout,
+                    plan,
+                )
+            })();
+            match result {
+                Ok(frame) => self.coverage_frame = Some(frame),
+                Err(error) => {
+                    self.coverage_failed = true;
+                    tracing::error!("Coverage upload rejected: {error}");
+                    return;
+                }
+            }
+        }
+        self.update_coverage_transform();
+        let instructions = context.raw_instructions();
+        let visibility = dependency_permission.map(|permission| {
+            temporal_visible
+                .iter()
+                .zip(permission)
+                .map(|(date, parent)| *date && *parent)
+                .collect::<Vec<_>>()
+        });
+        let execution_visibility = visibility.as_deref().unwrap_or(&temporal_visible);
+
+        self.view_dependent_symbols = instructions.iter().any(|p| {
+            p.portrayal_origin().requires_view_reprojection()
+                || match p {
+                    DrawingInstruction::Point(p) => {
+                        p.line_placement.is_some()
+                            || p.rotation_crs == ferrite_render::RotationCrs::Geographic
+                            || p.curve_tangent_bearing.is_some()
+                    }
+                    DrawingInstruction::Text(t) => {
+                        t.rotation_crs == ferrite_render::RotationCrs::Geographic
+                            || t.curve_tangent_bearing.is_some()
+                    }
+                    _ => false,
+                }
+        });
         let _instruction_count = instructions.len();
+        let mut text_instruction_indices = execution
+            .as_ref()
+            .map(|_| vec![None; self.text_labels.len()]);
 
         // Update viewport bounds for frustum culling
         self.update_viewport_bounds(&scaler);
@@ -1380,20 +2782,17 @@ impl WgpuRenderer {
         } else {
             None
         };
-        let inst_ptr = instructions.as_ptr() as usize;
-        let inst_len = instructions.len();
-
-        // Check if cached suppression set is still valid (same instruction slice)
-        let cache_hit = matches!(
-            &self.cached_suppressed_lines,
-            Some((cached_ptr, cached_len, _)) if *cached_ptr == inst_ptr && *cached_len == inst_len
-        );
-        if !cache_hit {
-            let set = Self::compute_line_suppression(instructions);
-            self.cached_suppressed_lines = Some((inst_ptr, inst_len, set));
-        }
-        // Clone the Arc-like reference for use in the loop (FxHashSet clone is cheap for small sets)
-        let suppressed_lines = self.cached_suppressed_lines.as_ref().unwrap().2.clone();
+        let suppressed_lines = self
+            .line_suppression
+            .plan_immutable_projected_with_visibility(
+                instructions,
+                context.geometry_revision(),
+                self.viewing_scale(),
+                visible_viewing_groups,
+                self.show_soundings.then_some(33010),
+                Some(execution_visibility),
+                scaler.projection(),
+            );
         if let Some(t) = suppression_timer {
             self.cpu_profiler.record("line_suppression", t.elapsed());
         }
@@ -1416,7 +2815,9 @@ impl WgpuRenderer {
 
         // S-101 Priority tracking: track index ranges per (display_plane, priority)
         let mut current_priority: Option<i32> = None;
-        let mut current_plane: u8 = 0; // 0=UnderRadar, 1=OverRadar
+        let mut current_coverage_source: Option<usize> = None;
+        let mut current_plane =
+            ferrite_render::DisplayPlane::UnderRadar.composition_plane(CompositionStage::Chart);
         let mut area_start_idx = 0usize;
         let mut line_start_idx = 0usize;
         let mut symbol_start_idx = 0usize;
@@ -1424,34 +2825,117 @@ impl WgpuRenderer {
         // Pre-compute viewing scale once (constant during entire instruction loop)
         let viewing_scale = self.viewing_scale();
 
-        // When zoomed out far beyond the chart's compilation scale, point symbols
-        // and text become visually meaningless (the entire chart covers only a few
-        // pixels). Suppress them to avoid stray symbols on the world map view.
-        // Threshold: 5× the compilation scale (e.g., 1:22000 chart → hide symbols
-        // beyond 1:110000).
-        let suppress_point_text = viewing_scale > self.compilation_scale.saturating_mul(5);
+        // Retained hierarchy rejects groups of offscreen areas before geometry
+        // key hashing, pattern/hatch preparation or ring scans. Original order,
+        // suppression and exact culling inside the emitting routines are retained.
+        let mut area_candidates = vec![true; instructions.len()];
+        if self.spatial_hierarchy_enabled {
+            let index = context.scene_spatial_index();
+            for id in index.areas.ids() {
+                area_candidates[id] = false;
+            }
+            index.areas.query_classified(
+                |b| {
+                    longitude_bounds_relation(
+                        (b.min[0], b.min[1], b.max[0], b.max[1]),
+                        self.viewport_world_bounds,
+                        self.lon_wrap_screen_px > 0.,
+                    )
+                },
+                |id| area_candidates[id] = true,
+            );
+        }
 
-        for (inst_idx, instruction) in instructions.iter().enumerate() {
-            // Display Mode filtering: skip instructions not in visible viewing groups
-            if let Some(visible) = visible_viewing_groups {
-                let vg = instruction.viewing_group().0;
-                if !visible.contains(&vg) {
-                    // Allow sounding viewing group (33010) through when show_soundings is enabled
-                    if !(self.show_soundings && vg == 33010) {
+        // Select sounding champions BEFORE emitting any texture instances. A later
+        // shallower sounding must not leave the earlier deeper digits on screen.
+        // Tie-breaking by geographic position makes results independent of HashMap order.
+        if !self.skip_screen_declutter && self.sounding_cell_size_px > 0.1 {
+            let cell_px = self.sounding_cell_size_px as f64 * self.state.window.scale_factor();
+            let cell_x = cell_px / scaler.scale_x().abs();
+            let cell_y = cell_px / scaler.scale_y().abs();
+            if cell_x.is_finite() && cell_y.is_finite() && cell_x > 0.0 && cell_y > 0.0 {
+                for (index, instruction) in instructions.iter().enumerate() {
+                    if !execution_visibility[index] {
                         continue;
                     }
+                    let DrawingInstruction::Point(point) = instruction else {
+                        continue;
+                    };
+                    if point.portrayal_origin.is_device_fixed()
+                        || !point.scale_range.is_visible_at(viewing_scale)
+                        || !self.is_point_visible(point.position.x, point.position.y)
+                        || !self.show_soundings
+                    {
+                        continue;
+                    }
+                    if let Some(visible) = visible_viewing_groups {
+                        if !instruction
+                            .viewing_groups()
+                            .all(|g| visible.contains(&g.0) || g.0 == 33010)
+                        {
+                            continue;
+                        }
+                    }
+                    let id = intern_symbol(&point.symbol_ref);
+                    if self.get_symbol_flags(id, &point.symbol_ref) & SYM_SOUNDING == 0 {
+                        continue;
+                    }
+                    let key = (
+                        (point.position.x / cell_x).floor() as i32,
+                        (scaler.projection().project_y(point.position.y) / cell_y).floor() as i32,
+                    );
+                    let exact = (
+                        (point.position.x * 1_000_000.0) as i64,
+                        (point.position.y * 1_000_000.0) as i64,
+                    );
+                    let depth = point.depth().unwrap_or(f64::MAX);
+                    let candidate = (exact, depth);
+                    let entry = self.sounding_screen_grid.entry(key).or_insert(candidate);
+                    if depth.total_cmp(&entry.1).is_lt() || (depth == entry.1 && exact < entry.0) {
+                        *entry = candidate;
+                    }
                 }
+                self.sounding_exact_positions.extend(
+                    self.sounding_screen_grid
+                        .values()
+                        .map(|(position, _)| *position),
+                );
+            }
+        }
+
+        for (inst_idx, instruction) in instructions.iter().enumerate() {
+            if !area_candidates[inst_idx] || !execution_visibility[inst_idx] {
+                continue;
+            }
+            if !ferrite_render::instruction_visible(
+                instruction,
+                viewing_scale,
+                visible_viewing_groups,
+                self.show_soundings.then_some(33010),
+            ) {
+                continue;
             }
 
             let inst_priority = instruction.priority().0;
-            let inst_plane = match instruction.display_plane() {
-                ferrite_render::DisplayPlane::UnderRadar => 0u8,
-                ferrite_render::DisplayPlane::OverRadar => 1u8,
-            };
+            let inst_plane = instruction
+                .display_plane()
+                .composition_plane(CompositionStage::Chart);
 
-            // Check if priority or display plane changed - record ranges for previous group
+            let instruction_source = (self.prepared_coverage.is_some()
+                || self.device_fixed_sources.contains(&inst_idx))
+            .then_some(inst_idx);
+            let same_coverage = (self.device_fixed_sources.contains(&inst_idx)
+                == current_coverage_source.is_some_and(|s| self.device_fixed_sources.contains(&s)))
+                && match (&self.prepared_coverage, current_coverage_source) {
+                    (Some(binding), Some(previous)) => binding
+                        .same_draw_decisions(previous, inst_idx)
+                        .unwrap_or(false),
+                    (None, _) => current_coverage_source.is_none() && instruction_source.is_none(),
+                    _ => false,
+                };
+            // Check if priority, display plane or coverage decisions changed.
             if let Some(prev_priority) = current_priority {
-                if prev_priority != inst_priority || current_plane != inst_plane {
+                if prev_priority != inst_priority || current_plane != inst_plane || !same_coverage {
                     // Record area range if any areas were added for previous group
                     if self.area_indices.len() > area_start_idx {
                         self.area_priority_ranges.push((
@@ -1459,6 +2943,7 @@ impl WgpuRenderer {
                             prev_priority,
                             area_start_idx,
                             self.area_indices.len(),
+                            current_coverage_source,
                         ));
                     }
                     area_start_idx = self.area_indices.len();
@@ -1470,6 +2955,7 @@ impl WgpuRenderer {
                             prev_priority,
                             line_start_idx,
                             self.line_indices.len(),
+                            current_coverage_source,
                         ));
                     }
                     line_start_idx = self.line_indices.len();
@@ -1481,6 +2967,7 @@ impl WgpuRenderer {
                             prev_priority,
                             symbol_start_idx,
                             self.symbol_instances.len(),
+                            current_coverage_source,
                         ));
                     }
                     symbol_start_idx = self.symbol_instances.len();
@@ -1488,6 +2975,8 @@ impl WgpuRenderer {
             }
             current_priority = Some(inst_priority);
             current_plane = inst_plane;
+            current_coverage_source = instruction_source;
+            self.emitting_coverage_source = instruction_source;
 
             // S-100 Scale-dependent visibility: skip instructions outside their scale range
             if !instruction.scale_range().is_visible_at(viewing_scale) {
@@ -1500,17 +2989,22 @@ impl WgpuRenderer {
                 None
             };
 
+            let before_execution = execution.as_ref().map(|_| {
+                (
+                    self.area_indices.len(),
+                    self.line_indices.len(),
+                    self.pattern_indices.len(),
+                    self.symbol_instances.len(),
+                    self.text_labels.len(),
+                )
+            });
             match instruction {
                 DrawingInstruction::Area(area) => {
-                    // LOD: Skip small areas when zoomed out (animation mode)
-                    if self.animation_mode && self.lod_level > 0 {
-                        // Skip areas with few points during animation
-                        if area.exterior.len() < 10 {
-                            _culled_count += 1;
-                            continue;
-                        }
-                    }
-
+                    let before = (
+                        self.area_indices.len(),
+                        self.pattern_indices.len(),
+                        self.symbol_instances.len(),
+                    );
                     // Pattern fills: tile symbols inside the polygon area
                     if let ferrite_render::AreaFillType::Pattern {
                         ref symbol_ref,
@@ -1554,6 +3048,15 @@ impl WgpuRenderer {
                     } else {
                         self.add_area_cached(area, area_transform);
                     }
+                    if before
+                        != (
+                            self.area_indices.len(),
+                            self.pattern_indices.len(),
+                            self.symbol_instances.len(),
+                        )
+                    {
+                        self.displayed_geometry.push(inst_idx);
+                    }
                     if let Some(s) = inst_start {
                         area_time += s.elapsed();
                         area_count += 1;
@@ -1566,12 +3069,11 @@ impl WgpuRenderer {
                         _culled_count += 1;
                         continue;
                     }
-                    // LOD: Skip short lines when zoomed out
-                    if self.animation_mode && self.lod_level > 0 && line.points.len() < 5 {
-                        _culled_count += 1;
-                        continue;
+                    let before = self.line_indices.len();
+                    self.add_line(line, &scaler, suppressed_lines.spans(inst_idx));
+                    if self.line_indices.len() > before {
+                        self.displayed_geometry.push(inst_idx);
                     }
-                    self.add_line(line, &scaler);
                     if let Some(s) = inst_start {
                         line_time += s.elapsed();
                         line_count += 1;
@@ -1579,16 +3081,34 @@ impl WgpuRenderer {
                 }
                 DrawingInstruction::Point(point) => {
                     // Suppress point symbols when zoomed out far beyond chart scale
-                    if suppress_point_text {
-                        continue;
-                    }
 
-                    // Frustum culling: skip points outside viewport
-                    if !self.is_point_visible(point.position.x, point.position.y) {
+                    if point.line_placement.is_none()
+                        && !point.portrayal_origin.requires_view_reprojection()
+                        && !self.is_point_visible(point.position.x, point.position.y)
+                    {
                         _culled_count += 1;
                         continue;
                     }
-
+                    let resolved = if point.line_placement.is_some() {
+                        match ferrite_render::resolve_flat_line_symbol(point, &scaler) {
+                            Ok(p) => p,
+                            Err(error) => {
+                                tracing::warn!("Line symbol placement: {}", error);
+                                continue;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let points: &[ferrite_render::PointInstruction] =
+                        if point.line_placement.is_some() {
+                            &resolved
+                        } else {
+                            std::slice::from_ref(point)
+                        };
+                    if points.is_empty() {
+                        continue;
+                    }
                     // Pre-classify via cached flags (intern is fast: read-lock only)
                     let sym_id = intern_symbol(&point.symbol_ref);
                     let flags = self.get_symbol_flags(sym_id, &point.symbol_ref);
@@ -1599,13 +3119,14 @@ impl WgpuRenderer {
                         continue;
                     }
 
-                    // LOD: Skip non-essential symbols during animation
-                    if self.animation_mode && self.lod_level > 0 {
-                        // Keep only important symbols (soundings, nav aids)
-                        if !is_sounding && (flags & SYM_NAV_AID == 0) {
-                            _culled_count += 1;
-                            continue;
-                        }
+                    // A fully culled point batch has no symbol-render attempt. Do not
+                    // diagnose its resource/profile as missing merely because any=false.
+                    // Device/reprojected anchors still bypass world-position culling.
+                    if !points.iter().any(|point| {
+                        point.portrayal_origin.requires_view_reprojection()
+                            || self.is_point_visible(point.position.x, point.position.y)
+                    }) {
+                        continue;
                     }
 
                     // Try to render the symbol. We require both the cache and an
@@ -1613,7 +3134,16 @@ impl WgpuRenderer {
                     // cannot be resolved and the rendered symbol would be wrong.
                     let rendered = match (symbol_cache.as_mut(), color_profile) {
                         (Some(cache), Some(profile)) => {
-                            self.try_add_symbol(point, &scaler, cache, profile, sym_id)
+                            let mut any = false;
+                            for point in points {
+                                if point.portrayal_origin.requires_view_reprojection()
+                                    || self.is_point_visible(point.position.x, point.position.y)
+                                {
+                                    any |=
+                                        self.try_add_symbol(point, &scaler, cache, profile, sym_id);
+                                }
+                            }
+                            any
                         }
                         _ => false,
                     };
@@ -1630,75 +3160,101 @@ impl WgpuRenderer {
                     }
                 }
                 DrawingInstruction::Text(text) => {
-                    // Suppress text when zoomed out far beyond chart scale
-                    if suppress_point_text {
+                    if !text.has_visible_content() {
                         continue;
                     }
-
-                    // LOD: Skip text during animation for performance
-                    if self.animation_mode {
-                        continue;
-                    }
-
                     // Frustum culling: skip text outside viewport
-                    if !self.is_point_visible(text.position.x, text.position.y) {
+                    if !text.portrayal_origin.requires_view_reprojection()
+                        && !self.is_point_visible(text.position.x, text.position.y)
+                    {
                         continue;
                     }
 
+                    let rotation = match ferrite_render::flat_text_rotation(text, &scaler) {
+                        Ok(value) => value,
+                        Err(reason) => {
+                            tracing::warn!("Text rotation withheld: {reason}");
+                            continue;
+                        }
+                    };
                     // Convert world position to screen coordinates
-                    let screen = scaler.world_to_screen(text.position);
+                    let screen = match text
+                        .portrayal_origin
+                        .flat_glyph_anchor(text.position, &scaler)
+                    {
+                        Ok(p) => p,
+                        Err(error) => {
+                            tracing::warn!("Text device anchor rejected: {error}");
+                            continue;
+                        }
+                    };
 
                     // S-100 Part 9a-11.2.2.4: FontSize is in typographic points (pt).
                     // S-101 Lua rules emit values like 10 (= 10pt standard body text).
                     // Convert points → pixels: pts * (DPI / 72), where 1pt = 1/72 inch.
                     let dpi_scale = self.state.window.scale_factor() as f32;
                     let screen_dpi = 96.0 * dpi_scale;
-                    let font_size_px = (text.font_size * screen_dpi / 72.0).clamp(6.0, 40.0);
+                    let font_size_px = text.font_size * screen_dpi / 72.0;
 
                     // Apply offset (in mm from Lua LocalOffset, convert to pixels)
                     let offset_x = text.offset.x * SCREEN_PX_PER_MM * dpi_scale;
                     let offset_y = text.offset.y * SCREEN_PX_PER_MM * dpi_scale;
                     let sx = screen.x + offset_x;
-                    let sy = screen.y + offset_y;
-
-                    // Estimate text bounding box for collision avoidance
-                    let est_width = font_size_px * 0.6 * text.text.len() as f32;
-                    let est_height = font_size_px * 1.3;
-
-                    // Apply alignment offset for collision box
-                    let box_x = match text.h_align {
-                        ferrite_render::HAlign::Left => sx,
-                        ferrite_render::HAlign::Center => sx - est_width * 0.5,
-                        ferrite_render::HAlign::Right => sx - est_width,
-                    };
-                    let box_y = match text.v_align {
-                        ferrite_render::VAlign::Top => sy,
-                        ferrite_render::VAlign::Middle => sy - est_height * 0.5,
-                        ferrite_render::VAlign::Bottom => sy - est_height,
-                    };
-
-                    // Collision avoidance: skip if overlapping existing text
-                    if !self
-                        .text_collision_grid
-                        .try_place(box_x, box_y, est_width, est_height)
-                    {
-                        continue;
-                    }
+                    let sy = screen.y - offset_y;
 
                     self.text_labels.push(TextLabel {
+                        source: self.emitting_coverage_source,
+                        plane: inst_plane,
+                        priority: inst_priority,
+                        anchor: [screen.x, screen.y],
+                        rotation,
                         screen_x: sx,
                         screen_y: sy,
                         text: text.text.clone(),
                         font_size: font_size_px,
                         color: [text.color.r, text.color.g, text.color.b, text.color.a],
+                        background: text
+                            .background
+                            .filter(|c| c.a.is_finite() && c.a > 0.)
+                            .map(|c| c.to_array()),
                         bold: text.bold,
                         italic: text.italic,
                         h_align: text.h_align,
                         v_align: text.v_align,
                     });
+                    if let Some(indices) = &mut text_instruction_indices {
+                        indices.push(Some(inst_idx));
+                    }
                     if let Some(s) = inst_start {
                         text_time += s.elapsed();
                         text_count += 1;
+                    }
+                }
+            }
+            if let (Some(before), Some(mask)) = (before_execution, execution.as_deref_mut()) {
+                mask[inst_idx] = before
+                    != (
+                        self.area_indices.len(),
+                        self.line_indices.len(),
+                        self.pattern_indices.len(),
+                        self.symbol_instances.len(),
+                        self.text_labels.len(),
+                    );
+                if matches!(instruction, DrawingInstruction::Point(_)) {
+                    mask[inst_idx] = self.symbol_instances[before.3..]
+                        .iter()
+                        .any(|instance| self.symbol_quad(instance).is_some());
+                }
+            }
+        }
+
+        if let (Some(indices), Some(mask)) = (text_instruction_indices, execution.as_deref_mut()) {
+            if !self.text_labels.is_empty() {
+                self.egui.ensure_font_metrics(&self.state.window);
+                let (_, accepted) = self.layout_chart_text(Vec::new(), false);
+                for (i, source) in indices.into_iter().enumerate() {
+                    if let Some(source) = source {
+                        mask[source] = accepted[i];
                     }
                 }
             }
@@ -1739,6 +3295,7 @@ impl WgpuRenderer {
                     final_priority,
                     area_start_idx,
                     self.area_indices.len(),
+                    current_coverage_source,
                 ));
             }
             if self.line_indices.len() > line_start_idx {
@@ -1747,6 +3304,7 @@ impl WgpuRenderer {
                     final_priority,
                     line_start_idx,
                     self.line_indices.len(),
+                    current_coverage_source,
                 ));
             }
             if self.symbol_instances.len() > symbol_start_idx {
@@ -1755,145 +3313,75 @@ impl WgpuRenderer {
                     final_priority,
                     symbol_start_idx,
                     self.symbol_instances.len(),
+                    current_coverage_source,
                 ));
             }
         }
+        // Invalidate intermediate/final picking envelopes without projecting every
+        // polygon again. The first actual pick builds only the final draw list.
+        self.selection_index.take();
+        self.temporal_visibility_mask = temporal_visible;
+        self.emitting_coverage_source = None;
     }
 
-    /// Fast O(1) cache key for area geometry based on slice pointer + length.
-    /// Since instructions are borrowed from a stable slice, the exterior Vec's data pointer
-    /// uniquely identifies the polygon geometry (same data = same pointer).
-    fn area_geometry_key(area: &ferrite_render::AreaInstruction) -> i64 {
-        // Use data pointer as unique identifier (stable while instructions slice is alive)
-        let ptr = area.exterior.as_ptr() as usize;
-        let len = area.exterior.len();
-        // Combine pointer and length into a single i64 key
-        // Pointer is unique per allocation, length adds extra discrimination
-        (ptr as i64) ^ ((len as i64) << 48)
-    }
-
-    /// Clean a ring of world points: remove consecutive duplicates and closing duplicate
-    fn clean_world_ring(points: &[WorldPoint], epsilon: f64) -> Vec<f64> {
-        let mut cleaned: Vec<f64> = Vec::with_capacity(points.len() * 2);
-        for p in points {
-            if !p.x.is_finite() || !p.y.is_finite() {
-                continue;
-            }
-            // Skip consecutive duplicates
-            if cleaned.len() >= 2 {
-                let prev_x = cleaned[cleaned.len() - 2];
-                let prev_y = cleaned[cleaned.len() - 1];
-                if (p.x - prev_x).abs() <= epsilon && (p.y - prev_y).abs() <= epsilon {
-                    continue;
-                }
-            }
-            cleaned.push(p.x);
-            cleaned.push(p.y);
-        }
-        // Remove closing duplicate
-        if cleaned.len() >= 6 {
-            let n = cleaned.len();
-            if (cleaned[0] - cleaned[n - 2]).abs() < epsilon * 10.0
-                && (cleaned[1] - cleaned[n - 1]).abs() < epsilon * 10.0
-            {
-                cleaned.truncate(n - 2);
-            }
-        }
-        cleaned
-    }
-
-    /// Compute signed area of a ring stored as [x0,y0,x1,y1,...] pairs
-    fn ring_signed_area_flat(vertices: &[f64]) -> f64 {
-        let n = vertices.len() / 2;
-        if n < 3 {
-            return 0.0;
-        }
-        let mut area = 0.0;
-        for i in 0..n {
-            let j = (i + 1) % n;
-            area +=
-                (vertices[j * 2] - vertices[i * 2]) * (vertices[j * 2 + 1] + vertices[i * 2 + 1]);
-        }
-        area
+    /// O(1) allocation key, valid only within the bound context geometry revision.
+    /// Interior rings cannot change through the context's immutable instruction API.
+    fn area_geometry_key(
+        area: &ferrite_render::AreaInstruction,
+        projection: ferrite_render::FlatProjection,
+    ) -> (usize, usize, ferrite_render::FlatProjection) {
+        (
+            area.exterior.as_ptr() as usize,
+            area.exterior.len(),
+            projection,
+        )
     }
 
     /// Get or compute cached triangulation for an area polygon.
     /// Triangulation is done in world coordinates so it only needs to run once per unique polygon.
     /// Ensure triangulation is cached for this area, returning the cache key.
     /// Returns None if the area cannot be triangulated.
-    fn ensure_triangulated(&mut self, area: &ferrite_render::AreaInstruction) -> Option<i64> {
-        let cache_key = Self::area_geometry_key(area);
+    fn ensure_triangulated(
+        &mut self,
+        area: &ferrite_render::AreaInstruction,
+        projection: ferrite_render::FlatProjection,
+    ) -> Option<(usize, usize, ferrite_render::FlatProjection)> {
+        let cache_key = Self::area_geometry_key(area, projection);
 
         // Check cache first
         if self.triangulation_cache.contains_key(&cache_key) {
             return Some(cache_key);
         }
 
-        // World-coordinate epsilon (degrees, ~0.01m precision)
-        let epsilon = 1e-8;
-
-        // Clean exterior ring in world coordinates
-        let ext_verts = Self::clean_world_ring(&area.exterior, epsilon);
-        if ext_verts.len() < 6 {
-            return None; // < 3 points
-        }
-
-        let exterior_area = Self::ring_signed_area_flat(&ext_verts);
-        let exterior_is_cw = exterior_area > 0.0;
-
-        let mut vertices = ext_verts;
-        let mut hole_indices: Vec<usize> = Vec::new();
-
-        // Handle interior rings (holes)
-        for hole in &area.interiors {
-            let mut hole_verts = Self::clean_world_ring(hole, epsilon);
-            if hole_verts.len() < 6 {
-                continue;
-            }
-
-            let hole_area = Self::ring_signed_area_flat(&hole_verts);
-            let hole_is_cw = hole_area > 0.0;
-            if hole_is_cw == exterior_is_cw {
-                // Reverse the hole ring
-                let n = hole_verts.len() / 2;
-                for i in 0..n / 2 {
-                    let j = n - 1 - i;
-                    hole_verts.swap(i * 2, j * 2);
-                    hole_verts.swap(i * 2 + 1, j * 2 + 1);
-                }
-            }
-
-            let hole_start = vertices.len() / 2;
-            hole_indices.push(hole_start);
-            vertices.extend_from_slice(&hole_verts);
-        }
-
-        // Triangulate in world coordinates
-        let total_vertex_count = vertices.len() / 2;
-        let indices = match earcutr::earcut(&vertices, &hole_indices, 2) {
-            Ok(idx) if idx.len() >= 3 => idx
-                .into_iter()
-                .filter(|&i| i < total_vertex_count)
-                .collect::<Vec<_>>(),
-            _ => {
-                // Fan triangulation fallback (exterior only)
-                let n = vertices.len().min(area.exterior.len() * 2) / 2;
-                if n < 3 {
-                    return None;
-                }
-                let mut fan = Vec::with_capacity((n - 2) * 3);
-                for i in 1..(n - 1) {
-                    fan.push(0);
-                    fan.push(i);
-                    fan.push(i + 1);
-                }
-                fan
-            }
-        };
-
-        if indices.len() < 3 {
+        if self.triangulation_failures.contains(&cache_key) {
             return None;
         }
+        let triangulated = (|| -> std::result::Result<(Vec<f64>, Vec<usize>), String> {
+            let project_ring = |ring: &[WorldPoint]| {
+                let points: Vec<_> = ring
+                    .iter()
+                    .map(|p| [p.x, projection.project_y(p.y)])
+                    .collect();
+                ferrite_kernel::triangulation::normalize_ring(&points).map_err(|e| e.to_string())
+            };
+            let mut vertices = project_ring(&area.exterior)?;
+            let mut holes = Vec::new();
+            for hole in &area.interiors {
+                holes.push(vertices.len() / 2);
+                vertices.extend(project_ring(hole)?);
+            }
+            let indices = ferrite_kernel::triangulation::triangulate(&vertices, &holes)
+                .map_err(|e| e.to_string())?;
+            Ok((vertices, indices))
+        })();
+        let (vertices, indices) = match triangulated {
+            Ok(result) => result,
+            Err(error) => {
+                self.triangulation_failures.insert(cache_key);
+                tracing::warn!("Area fill rejected without exterior fallback: {error}");
+                return None;
+            }
+        };
 
         // Compute world AABB for frustum culling
         let mut aabb_min_x = f64::MAX;
@@ -1921,7 +3409,12 @@ impl WgpuRenderer {
         let cached = CachedTriangulation {
             indices,
             world_vertices: vertices,
-            world_aabb: (aabb_min_x, aabb_min_y, aabb_max_x, aabb_max_y),
+            world_aabb: (
+                aabb_min_x,
+                projection.unproject_y(aabb_min_y),
+                aabb_max_x,
+                projection.unproject_y(aabb_max_y),
+            ),
         };
 
         self.triangulation_cache.insert(cache_key, cached);
@@ -1930,21 +3423,14 @@ impl WgpuRenderer {
 
     /// Pre-computed world→screen transform parameters (avoids per-area scaler lookups)
     #[inline]
-    fn scaler_transform(scaler: &ferrite_render::Scaler) -> (f64, f64, f64, f64, f64, f64) {
-        (
-            scaler.scale_x(),
-            scaler.scale_y(),
-            scaler.offset_x(),
-            scaler.offset_y(),
-            scaler.geo_bounds.min_x,
-            scaler.geo_bounds.max_y,
-        )
+    fn scaler_transform(scaler: &ferrite_render::Scaler) -> ferrite_render::FlatTransform {
+        scaler.flat_transform()
     }
 
     fn add_area_cached(
         &mut self,
         area: &ferrite_render::AreaInstruction,
-        transform: (f64, f64, f64, f64, f64, f64),
+        transform: ferrite_render::FlatTransform,
     ) {
         // Get fill color — pattern/centroid/hatch fills are overlays, not solid fills
         let color = match &area.fill {
@@ -1954,7 +3440,7 @@ impl WgpuRenderer {
             | ferrite_render::AreaFillType::CentroidSymbol(_) => return,
         };
 
-        let cache_key = Self::area_geometry_key(area);
+        let cache_key = Self::area_geometry_key(area, transform.projection);
 
         // Fast path: triangulation already cached — use cached AABB for O(1) frustum culling
         // (avoids re-scanning entire exterior ring just to compute AABB)
@@ -1964,11 +3450,15 @@ impl WgpuRenderer {
                 let (ax, ay, bx, by) = cached.world_aabb;
                 let margin_x = (vp_max_x - vp_min_x) * 0.5;
                 let margin_y = (vp_max_y - vp_min_y) * 0.5;
-                if bx < vp_min_x - margin_x
-                    || ax > vp_max_x + margin_x
-                    || by < vp_min_y - margin_y
-                    || ay > vp_max_y + margin_y
-                {
+                let copies = if self.lon_wrap_screen_px > 0. {
+                    &[0., -360., 360.][..]
+                } else {
+                    &[0.][..]
+                };
+                let outside_x = copies
+                    .iter()
+                    .all(|dx| bx + dx < vp_min_x - margin_x || ax + dx > vp_max_x + margin_x);
+                if outside_x || by < vp_min_y - margin_y || ay > vp_max_y + margin_y {
                     return;
                 }
             }
@@ -1984,7 +3474,10 @@ impl WgpuRenderer {
             let indices = unsafe { std::slice::from_raw_parts(idx_ptr, idx_len) };
 
             let base_index = self.area_vertices.len() as u32;
-            let (scale_x, scale_y, offset_x, offset_y, min_x, max_y) = transform;
+            let [scale_x, scale_y] = transform.scale;
+            let [offset_x, offset_y] = transform.offset;
+            let [min_x, max_lat] = transform.geographic_origin;
+            let max_y = transform.projection.project_y(max_lat);
 
             self.area_vertices.reserve(total_vertex_count);
             self.area_vertices.extend((0..total_vertex_count).map(|i| {
@@ -2003,12 +3496,19 @@ impl WgpuRenderer {
         }
 
         // Cold path: first-time triangulation — fall back to ring-scan culling
-        if !Self::is_ring_visible_static(&area.exterior, self.viewport_world_bounds) {
+        if !Self::is_ring_visible_static(
+            &area.exterior,
+            self.viewport_world_bounds,
+            self.lon_wrap_screen_px > 0.0,
+        ) {
             return;
         }
 
         // Ensure triangulation is cached
-        if self.ensure_triangulated(area).is_none() {
+        if self
+            .ensure_triangulated(area, transform.projection)
+            .is_none()
+        {
             return;
         }
 
@@ -2034,7 +3534,11 @@ impl WgpuRenderer {
         priority: i32,
     ) {
         // Frustum culling: quick AABB check on exterior ring
-        if !Self::is_ring_visible_static(&area.exterior, self.viewport_world_bounds) {
+        if !Self::is_ring_visible_static(
+            &area.exterior,
+            self.viewport_world_bounds,
+            self.lon_wrap_screen_px > 0.0,
+        ) {
             return;
         }
 
@@ -2052,7 +3556,12 @@ impl WgpuRenderer {
         let shear = if v2.1.abs() > 0.001 { v2.0 / v2.1 } else { 0.0 };
 
         // Ensure pattern texture exists in GPU cache
-        let pat_key = format!("{}_pat", symbol_ref);
+        let pat_key = crate::symbol_cache::pattern_texture_key(
+            symbol_ref,
+            spacing_x_px,
+            spacing_y_px,
+            mm_to_px,
+        );
         if !self.pattern_textures.contains_key(&pat_key) {
             let geom = match symbol_cache.get_symbol_for_pattern(
                 symbol_ref,
@@ -2094,109 +3603,109 @@ impl WgpuRenderer {
         let inv_tx = 1.0 / pat_tex.width as f32;
         let inv_ty = 1.0 / pat_tex.height as f32;
 
-        // Triangulate the polygon — build earcut coords directly (no intermediate Vec)
-        let mut coords: Vec<f64> = Vec::with_capacity(
-            (area.exterior.len() + area.interiors.iter().map(|h| h.len()).sum::<usize>()) * 2,
-        );
-        let mut exterior_count = 0usize;
-        for p in &area.exterior {
-            let s = scaler.world_to_screen(*p);
-            if s.x.is_finite() && s.y.is_finite() {
-                coords.push(s.x as f64);
-                coords.push(s.y as f64);
-                exterior_count += 1;
-            }
-        }
-        if exterior_count < 3 {
+        // Pattern coverage reuses the checked projected polygon, including
+        // every valid hole. Do not drop malformed vertices or holes here.
+        let Some(key) = self.ensure_triangulated(area, scaler.projection()) else {
             return;
-        }
-
-        let mut hole_indices: Vec<usize> = Vec::with_capacity(area.interiors.len());
-        for hole in &area.interiors {
-            let hole_start = coords.len() / 2;
-            let mut hole_count = 0usize;
-            for p in hole {
-                let s = scaler.world_to_screen(*p);
-                if s.x.is_finite() && s.y.is_finite() {
-                    coords.push(s.x as f64);
-                    coords.push(s.y as f64);
-                    hole_count += 1;
-                }
-            }
-            if hole_count >= 3 {
-                hole_indices.push(hole_start);
-            } else {
-                // Remove invalid hole points
-                coords.truncate(hole_start * 2);
-            }
-        }
-
-        let indices = earcutr::earcut(&coords, &hole_indices, 2).unwrap_or_default();
-
-        if indices.is_empty() {
-            return;
-        }
+        };
+        let cached = &self.triangulation_cache[&key];
+        let transform = scaler.flat_transform();
+        let [sx, sy] = transform.scale;
+        let [ox, oy] = transform.offset;
+        let [min_x, max_lat] = transform.geographic_origin;
+        let max_y = transform.projection.project_y(max_lat);
+        let coords: Vec<f64> = cached
+            .world_vertices
+            .chunks_exact(2)
+            .flat_map(|p| [(p[0] - min_x) * sx + ox, (max_y - p[1]) * sy + oy])
+            .collect();
+        let indices = cached.indices.clone();
 
         // S-100: parallelogram shear ratio (dimensionless).
         // shear = v2.x / v2.y: for each pixel of Y movement, X shifts by shear pixels.
         // The shader computes: u = (pos.x - shear * pos.y) * inv_tx
         let shear_screen = shear;
 
-        // Triangle guard bounds: skip triangles with extreme off-screen vertices
-        let extreme_guard = 16000.0_f32;
-        let bnd_min_x = -extreme_guard;
-        let bnd_min_y = -extreme_guard;
-        let bnd_max_x = extreme_guard;
-        let bnd_max_y = extreme_guard;
-
-        let base_index = self.pattern_vertices.len() as u32;
-        let total_points = coords.len() / 2;
-        for i in 0..total_points {
-            let x = coords[i * 2] as f32;
-            let y = coords[i * 2 + 1] as f32;
-            self.pattern_vertices
-                .push(PatternVertex::new(x, y, inv_tx, inv_ty, shear_screen));
-        }
-
+        // Keep existing modest-coordinate geometry byte-identical. Large
+        // triangles are intersected in f64, never rejected by vertex distance.
+        let clipped = coords.iter().any(|v| v.abs() > 16000.);
         let idx_start = self.pattern_indices.len();
-        // Skip triangles with any vertex far off-screen to prevent ray artifacts
-        for tri in indices.chunks(3) {
-            if tri.len() < 3 {
-                break;
+        let plane = area
+            .display_plane
+            .composition_plane(CompositionStage::Chart);
+        if clipped {
+            self.view_clipped_patterns = true;
+            let v = scaler.viewport;
+            let rect = [
+                v.x as f64 - 2.,
+                v.y as f64 - 2.,
+                (v.x + v.width) as f64 + 2.,
+                (v.y + v.height) as f64 + 2.,
+            ];
+            let wraps = if self.lon_wrap_screen_px > 0. {
+                vec![0., -(360. * sx), 360. * sx]
+            } else {
+                vec![0.]
+            };
+            for (wrap_mode, dx) in wraps.into_iter().enumerate() {
+                let start = self.pattern_indices.len();
+                for tri in indices.chunks_exact(3) {
+                    let points =
+                        std::array::from_fn(|i| [coords[2 * tri[i]] + dx, coords[2 * tri[i] + 1]]);
+                    let Ok(polygon) = ferrite_render::clip_triangle_to_rect(points, rect) else {
+                        continue;
+                    };
+                    let points = polygon.points();
+                    if points.len() < 3 {
+                        continue;
+                    }
+                    let base = self.pattern_vertices.len() as u32;
+                    self.pattern_vertices.extend(points.iter().map(|p| {
+                        PatternVertex::new(p[0] as f32, p[1] as f32, inv_tx, inv_ty, shear_screen)
+                    }));
+                    for i in 1..points.len() - 1 {
+                        self.pattern_indices.extend_from_slice(&[
+                            base,
+                            base + i as u32,
+                            base + i as u32 + 1,
+                        ]);
+                    }
+                }
+                let end = self.pattern_indices.len();
+                self.pattern_ranges.push((
+                    plane,
+                    priority,
+                    start,
+                    end,
+                    pat_key.clone(),
+                    wrap_mode as u8,
+                    self.emitting_coverage_source,
+                ));
             }
-            let (i0, i1, i2) = (tri[0], tri[1], tri[2]);
-            let x0 = coords[i0 * 2] as f32;
-            let y0 = coords[i0 * 2 + 1] as f32;
-            let x1 = coords[i1 * 2] as f32;
-            let y1 = coords[i1 * 2 + 1] as f32;
-            let x2 = coords[i2 * 2] as f32;
-            let y2 = coords[i2 * 2 + 1] as f32;
-            if x0 >= bnd_min_x
-                && x0 <= bnd_max_x
-                && y0 >= bnd_min_y
-                && y0 <= bnd_max_y
-                && x1 >= bnd_min_x
-                && x1 <= bnd_max_x
-                && y1 >= bnd_min_y
-                && y1 <= bnd_max_y
-                && x2 >= bnd_min_x
-                && x2 <= bnd_max_x
-                && y2 >= bnd_min_y
-                && y2 <= bnd_max_y
-            {
-                self.pattern_indices.push(base_index + i0 as u32);
-                self.pattern_indices.push(base_index + i1 as u32);
-                self.pattern_indices.push(base_index + i2 as u32);
-            }
+        } else {
+            let base = self.pattern_vertices.len() as u32;
+            self.pattern_vertices
+                .extend(coords.chunks_exact(2).map(|p| {
+                    PatternVertex::new(p[0] as f32, p[1] as f32, inv_tx, inv_ty, shear_screen)
+                }));
+            self.pattern_indices
+                .extend(indices.iter().map(|i| base + *i as u32));
         }
         let idx_end = self.pattern_indices.len();
-
-        let plane = match area.display_plane {
-            ferrite_render::DisplayPlane::OverRadar => 1u8,
-            _ => 0u8,
-        };
-        self.pattern_ranges
-            .push((plane, priority, idx_start, idx_end, pat_key));
+        let plane = area
+            .display_plane
+            .composition_plane(CompositionStage::Chart);
+        if !clipped {
+            self.pattern_ranges.push((
+                plane,
+                priority,
+                idx_start,
+                idx_end,
+                pat_key,
+                255,
+                self.emitting_coverage_source,
+            ));
+        }
     }
 
     /// S-100 Part 9a hatch fill: render parallel lines inside a polygon area.
@@ -2214,7 +3723,11 @@ impl WgpuRenderer {
         _priority: i32,
     ) {
         // Frustum culling: quick AABB check on exterior ring
-        if !Self::is_ring_visible_static(&area.exterior, self.viewport_world_bounds) {
+        if !Self::is_ring_visible_static(
+            &area.exterior,
+            self.viewport_world_bounds,
+            self.lon_wrap_screen_px > 0.0,
+        ) {
             return;
         }
 
@@ -2326,13 +3839,13 @@ impl WgpuRenderer {
 
                 let base_index = self.line_vertices.len() as u32;
                 self.line_vertices
-                    .push(Vertex2D::new(sx - nx, sy - ny, color_arr));
+                    .push(LineVertex::new(sx, sy, -nx, -ny, color_arr));
                 self.line_vertices
-                    .push(Vertex2D::new(sx + nx, sy + ny, color_arr));
+                    .push(LineVertex::new(sx, sy, nx, ny, color_arr));
                 self.line_vertices
-                    .push(Vertex2D::new(ex + nx, ey + ny, color_arr));
+                    .push(LineVertex::new(ex, ey, nx, ny, color_arr));
                 self.line_vertices
-                    .push(Vertex2D::new(ex - nx, ey - ny, color_arr));
+                    .push(LineVertex::new(ex, ey, -nx, -ny, color_arr));
 
                 self.line_indices.push(base_index);
                 self.line_indices.push(base_index + 1);
@@ -2430,60 +3943,6 @@ impl WgpuRenderer {
         segments
     }
 
-    /// Compute line suppression set (S-100 Part 9-11.1.9).
-    /// When multiple features share the same curve geometry, only the
-    /// highest-priority LineInstruction is rendered.
-    fn compute_line_suppression(instructions: &[DrawingInstruction]) -> FxHashSet<usize> {
-        let mut curve_max_priority: FxHashMap<u64, i32> = FxHashMap::default();
-        let mut line_entries: Vec<(usize, u64, i32)> = Vec::new();
-        let mut has_suppressible = false;
-
-        for (idx, inst) in instructions.iter().enumerate() {
-            if let DrawingInstruction::Line(line) = inst {
-                if line.points.len() < 2 {
-                    continue;
-                }
-                let key = Self::curve_geometry_hash(&line.points);
-                let priority = line.priority.0;
-                let entry = curve_max_priority.entry(key).or_insert(priority);
-                if priority > *entry {
-                    *entry = priority;
-                }
-                if line.suppressible {
-                    line_entries.push((idx, key, priority));
-                    has_suppressible = true;
-                }
-            }
-        }
-
-        if has_suppressible {
-            let mut suppressed = FxHashSet::default();
-            for &(idx, key, priority) in &line_entries {
-                if let Some(&max_pri) = curve_max_priority.get(&key) {
-                    if priority < max_pri {
-                        suppressed.insert(idx);
-                    }
-                }
-            }
-            suppressed
-        } else {
-            FxHashSet::default()
-        }
-    }
-
-    /// Compute a hash of curve geometry for S-100 line suppression.
-    /// Two line instructions referencing the same spatial curve will have
-    /// identical world-coordinate point sequences and thus the same hash.
-    fn curve_geometry_hash(points: &[WorldPoint]) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
-        for p in points {
-            p.x.to_bits().hash(&mut hasher);
-            p.y.to_bits().hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
-    /// Add line instruction
     /// Cohen-Sutherland outcode for line clipping
     #[inline]
     fn cs_outcode(x: f32, y: f32, x_min: f32, y_min: f32, x_max: f32, y_max: f32) -> u8 {
@@ -2563,18 +4022,56 @@ impl WgpuRenderer {
         }
     }
 
+    pub fn displayed_line_spans(&self, index: usize) -> Option<&[ferrite_render::LineSpan]> {
+        self.line_suppression
+            .current()
+            .and_then(|plan| plan.spans(index))
+    }
+    pub fn temporal_conditions_changed(&self, context: &RenderContext) -> bool {
+        self.temporal_visibility_mask.len() != context.instruction_count()
+            || context
+                .temporal_statuses()
+                .into_iter()
+                .any(|(index, visible)| self.temporal_visibility_mask.get(index) != Some(&visible))
+    }
+
+    pub fn temporal_visibility_counts(&self) -> (usize, usize) {
+        self.temporal_visibility_counts
+    }
+
+    pub fn line_visibility_counts(&self) -> (usize, usize) {
+        self.line_suppression
+            .current()
+            .map(|p| (p.fully_suppressed.len(), p.partial.len()))
+            .unwrap_or_default()
+    }
     fn add_line(
         &mut self,
         line: &ferrite_render::LineInstruction,
         scaler: &ferrite_render::Scaler,
+        spans: Option<&[ferrite_render::LineSpan]>,
     ) {
-        let points = &line.points;
+        if !line.style.has_visible_stroke() {
+            return;
+        }
+        for points in line.render_paths(scaler) {
+            self.add_line_points(line, scaler, &points, spans);
+        }
+    }
+    fn add_line_points(
+        &mut self,
+        line: &ferrite_render::LineInstruction,
+        scaler: &ferrite_render::Scaler,
+        points: &[ferrite_render::WorldPoint],
+        spans: Option<&[ferrite_render::LineSpan]>,
+    ) {
+        let vertex_start = self.line_vertices.len();
         if points.len() < 2 {
             return;
         }
 
-        // Frustum culling: compute world AABB and skip if entirely off-screen
-        {
+        // Source AABB alone cannot cull a screen-offset line.
+        if line.style.offset_mm == 0. {
             let mut ax = f64::MAX;
             let mut ay = f64::MAX;
             let mut bx = f64::MIN;
@@ -2599,85 +4096,131 @@ impl WgpuRenderer {
         }
 
         let color = line.style.color.to_array();
-        let width = line.style.width;
+        let width = line
+            .style
+            .physical_width(SCREEN_PX_PER_MM * self.state.window.scale_factor() as f32);
+        if width == 0.0 {
+            return;
+        }
+
+        let offset_px = line.style.offset_mm
+            * (SCREEN_PX_PER_MM * self.state.window.scale_factor() as f32) as f64;
+        let offsets = if offset_px == 0. {
+            None
+        } else {
+            let projected: Vec<_> = points
+                .iter()
+                .map(|p| {
+                    let s = scaler.world_to_screen(*p);
+                    [s.x as f64, s.y as f64]
+                })
+                .collect();
+            match ferrite_kernel::line_offset::screen_line_offsets(
+                &projected,
+                offset_px,
+                projected.len() > 2 && projected.first() == projected.last(),
+            ) {
+                Ok(offsets) => Some(offsets),
+                Err(error) => {
+                    tracing::warn!("Physical line offset: {}", error);
+                    return;
+                }
+            }
+        };
+        let shifted = |mut point: ferrite_render::ScreenPoint, segment: usize, fraction: f64| {
+            if let Some(o) = &offsets {
+                point.x += (o[segment][0] + fraction * (o[segment + 1][0] - o[segment][0])) as f32;
+                point.y += (o[segment][1] + fraction * (o[segment + 1][1] - o[segment][1])) as f32;
+            }
+            point
+        };
+        let styled = ferrite_render::dash_line_spans(points, scaler, &line.style, spans);
+        let spans = styled.as_deref().or(spans);
 
         // Screen-space clip bounds with generous margin for line width
         let vw = scaler.viewport.width;
         let vh = scaler.viewport.height;
-        let margin = width * 2.0 + 50.0; // extra margin for thick lines
-        let clip_x_min = -margin;
-        let clip_y_min = -margin;
-        let clip_x_max = vw + margin;
-        let clip_y_max = vh + margin;
+        let margin = width * 2.0 + (offset_px.abs() * 4.) as f32 + 50.0; // extra margin for thick lines
+        let clip_x_min = scaler.viewport.x - margin;
+        let clip_y_min = scaler.viewport.y - margin;
+        let clip_x_max = scaler.viewport.x + vw + margin;
+        let clip_y_max = scaler.viewport.y + vh + margin;
 
-        // Screen-space length limit for short polylines (≤10 points).
-        // Light sector/bearing/route lines are few-vertex features that become enormous
-        // "rays" at high zoom. If any single segment exceeds 25% of viewport height,
-        // skip the entire line. Dense polylines (coastlines, contours with many vertices)
-        // are unaffected since they represent real geometry.
-        if points.len() <= 10 {
-            let max_seg = vh.min(vw) * 0.25;
-            let max_seg_sq = max_seg * max_seg;
-            for i in 0..points.len() - 1 {
-                let s0 = scaler.world_to_screen(points[i]);
-                let s1 = scaler.world_to_screen(points[i + 1]);
-                let dx = s1.x - s0.x;
-                let dy = s1.y - s0.y;
-                if dx * dx + dy * dy > max_seg_sq {
-                    return;
+        let clip = [clip_x_min, clip_y_min, clip_x_max, clip_y_max];
+        if let Some(spans) = spans {
+            for span in spans {
+                if let Some((a, b)) = span.screen_endpoints(points, scaler) {
+                    self.add_line_span(
+                        shifted(a, span.segment, span.start),
+                        shifted(b, span.segment, span.end),
+                        color,
+                        width,
+                        clip,
+                    );
                 }
+            }
+        } else {
+            let mut prev = shifted(scaler.world_to_screen(points[0]), 0, 0.);
+            for (segment, p) in points[1..].iter().enumerate() {
+                let curr = shifted(scaler.world_to_screen(*p), segment, 1.);
+                self.add_line_span(prev, curr, color, width, clip);
+                prev = curr;
             }
         }
-
-        // Direct iteration: no Vec<ScreenPoint> allocation.
-        // Transform consecutive world points to screen, clip, and emit quads inline.
-        let mut prev = scaler.world_to_screen(points[0]);
-        for p in &points[1..] {
-            let curr = scaler.world_to_screen(*p);
-
-            // Skip segments with NaN/Inf coordinates
-            if !prev.x.is_finite()
-                || !prev.y.is_finite()
-                || !curr.x.is_finite()
-                || !curr.y.is_finite()
-            {
-                prev = curr;
-                continue;
+        if line.screen_ray.is_some() || line.portrayal_path.is_some() {
+            let anchor = scaler.world_to_screen(line.points[0]);
+            for v in &mut self.line_vertices[vertex_start..] {
+                v.offset[0] += v.position[0] - anchor.x;
+                v.offset[1] += v.position[1] - anchor.y;
+                v.position = [anchor.x, anchor.y];
             }
+        }
+    }
+    fn add_line_span(
+        &mut self,
+        prev: ferrite_render::ScreenPoint,
+        curr: ferrite_render::ScreenPoint,
+        color: [f32; 4],
+        width: f32,
+        clip: [f32; 4],
+    ) {
+        let [clip_x_min, clip_y_min, clip_x_max, clip_y_max] = clip;
+        // Skip segments with NaN/Inf coordinates
+        if !prev.x.is_finite() || !prev.y.is_finite() || !curr.x.is_finite() || !curr.y.is_finite()
+        {
+            return;
+        }
 
-            // Clip to viewport bounds for clean edges
-            if let Some((cx0, cy0, cx1, cy1)) = Self::clip_line_segment(
-                prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
-            ) {
-                let dx = cx1 - cx0;
-                let dy = cy1 - cy0;
-                let len = (dx * dx + dy * dy).sqrt();
+        // Clip to viewport bounds for clean edges
+        if let Some((cx0, cy0, cx1, cy1)) = Self::clip_line_segment(
+            prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
+        ) {
+            let dx = cx1 - cx0;
+            let dy = cy1 - cy0;
+            let len = (dx * dx + dy * dy).sqrt();
 
-                if len >= 0.001 {
-                    let nx = -dy / len * width * 0.5;
-                    let ny = dx / len * width * 0.5;
+            if len >= 0.001 {
+                let nx = -dy / len * width * 0.5;
+                let ny = dx / len * width * 0.5;
 
-                    let base_index = self.line_vertices.len() as u32;
+                let base_index = self.line_vertices.len() as u32;
 
-                    self.line_vertices
-                        .push(Vertex2D::new(cx0 - nx, cy0 - ny, color));
-                    self.line_vertices
-                        .push(Vertex2D::new(cx0 + nx, cy0 + ny, color));
-                    self.line_vertices
-                        .push(Vertex2D::new(cx1 + nx, cy1 + ny, color));
-                    self.line_vertices
-                        .push(Vertex2D::new(cx1 - nx, cy1 - ny, color));
+                self.line_vertices
+                    .push(LineVertex::new(cx0, cy0, -nx, -ny, color));
+                self.line_vertices
+                    .push(LineVertex::new(cx0, cy0, nx, ny, color));
+                self.line_vertices
+                    .push(LineVertex::new(cx1, cy1, nx, ny, color));
+                self.line_vertices
+                    .push(LineVertex::new(cx1, cy1, -nx, -ny, color));
 
-                    self.line_indices.push(base_index);
-                    self.line_indices.push(base_index + 1);
-                    self.line_indices.push(base_index + 2);
-                    self.line_indices.push(base_index);
-                    self.line_indices.push(base_index + 2);
-                    self.line_indices.push(base_index + 3);
-                }
+                self.line_indices.push(base_index);
+                self.line_indices.push(base_index + 1);
+                self.line_indices.push(base_index + 2);
+                self.line_indices.push(base_index);
+                self.line_indices.push(base_index + 2);
+                self.line_indices.push(base_index + 3);
             }
-
-            prev = curr;
         }
     }
 
@@ -2694,6 +4237,79 @@ impl WgpuRenderer {
         flags
     }
 
+    fn ensure_symbol_texture(&mut self,symbol_id:SymbolId,symbol_str:&str,geom:&crate::SymbolGeometry) {
+        if !self.symbol_textures.contains_key(&symbol_id) {self.symbol_textures.insert(symbol_id,create_symbol_texture(&self.state,&self.pipelines,symbol_str,geom));}
+    }
+    pub fn prepare_globe_with_symbols(&mut self,context:&mut RenderContext,groups:Option<&std::collections::HashSet<u32>>,cache:&mut SymbolCache,profile:Option<&ColorProfile>)->Result<()> {
+        self.globe_pane=None;
+        if self.globe_symbol_resource_revision!=Some(cache.resource_revision()) {
+            self.clear_symbol_textures();self.globe_symbol_resource_revision=Some(cache.resource_revision());
+        }
+        let mut symbols=self.take_globe_symbol_preparation();
+        let result=symbols.prepare(&self.state,&self.pipelines,context,cache,profile,
+            self.diagnostic_pattern_request_keys.unwrap_or_else(||std::env::var("FERRITE_PATTERN_PREPARED_REQUEST_KEYS").as_deref()==Ok("1")),
+            self.diagnostic_prepared_symbol_reuse.unwrap_or_else(||std::env::var("FERRITE_GLOBE_PREPARED_SYMBOL_RESOURCES").as_deref()==Ok("1")));
+        self.install_globe_symbol_preparation(symbols);
+        let diagnostics=result?;
+        self.prepare_globe_preview(context,groups)?;
+        if let Some(pane)=self.globe_pane.as_mut() {merge_symbol_diagnostics(&mut pane.diagnostics.preparation,diagnostics);}
+        Ok(())
+    }
+    fn take_globe_symbol_preparation(&mut self)->GlobeSymbolPreparation {
+        GlobeSymbolPreparation {symbol_textures:std::mem::take(&mut self.symbol_textures),globe_pattern_resources:std::mem::take(&mut self.globe_pattern_resources),globe_pattern_epoch:self.globe_pattern_epoch.take(),globe_prepared_symbol_epoch:self.globe_prepared_symbol_epoch.take(),globe_pattern_textures:std::mem::take(&mut self.globe_pattern_textures),globe_whole_motif_textures:std::mem::take(&mut self.globe_whole_motif_textures)}
+    }
+    fn install_globe_symbol_preparation(&mut self,s:GlobeSymbolPreparation) {
+        self.symbol_textures=s.symbol_textures;self.globe_pattern_resources=s.globe_pattern_resources;self.globe_pattern_epoch=s.globe_pattern_epoch;self.globe_prepared_symbol_epoch=s.globe_prepared_symbol_epoch;self.globe_pattern_textures=s.globe_pattern_textures;self.globe_whole_motif_textures=s.globe_whole_motif_textures;
+    }
+    fn globe_publication_binding(&self)->GlobePublicationBinding {
+        GlobePublicationBinding{extent:[self.state.size.width,self.state.size.height],format:self.state.format(),density:self.state.window.scale_factor().to_bits(),samples:self.globe_sample_count,symbol_scale:self.symbol_scale.to_bits(),tilt:self.ui_state.globe_tilt_deg.to_bits(),range_factor:self.ui_state.globe_range_factor.to_bits(),pose:self.ui_state.globe_pose.map(|p|[p.focus.latitude().to_bits(),p.focus.longitude().to_bits(),p.range_m.to_bits(),p.heading_deg.to_bits(),p.tilt_deg.to_bits()]),flags:[self.ui_state.globe_preview,self.globe_area_cache_enabled,self.globe_curve_cache_enabled,self.globe_curve_bounds_cache_enabled,self.globe_dyadic_sample_cache_enabled,self.globe_curve_scratch_reuse_enabled,self.globe_gpu_projection_enabled,self.spatial_hierarchy_enabled,self.continuous_layer_count!=0]}
+    }
+    /// Prepare only against next context and a fresh provider/cache. Does not
+    /// mutate live renderer fields, uniforms, old target, atlas or selected picks.
+    pub fn prepare_globe_publication(&self,context:&mut RenderContext,groups:Option<&std::collections::HashSet<u32>>,cache:&mut SymbolCache,profile:Option<&ColorProfile>,provider:Arc<dyn ferrite_render::GlobeCoverageProvider>)->Result<PreparedGlobePublication> {
+        if self.globe_coverage_provider.as_ref().is_some_and(|live|Arc::ptr_eq(live,&provider)) {return Err(WgpuError::Render("Publication requires a fresh coverage provider and source epoch cache".into()));}
+        if self.continuous_layer_count!=0 {return Err(WgpuError::Render("Continuous globe domain material is not qualified".into()));}
+        context.scaler.set_pixel_ratio(self.state.window.scale_factor());
+        let mut symbols=GlobeSymbolPreparation::default();
+        let diagnostics=symbols.prepare(&self.state,&self.pipelines,context,cache,profile,
+            self.diagnostic_pattern_request_keys.unwrap_or_else(||std::env::var("FERRITE_PATTERN_PREPARED_REQUEST_KEYS").as_deref()==Ok("1")),
+            self.diagnostic_prepared_symbol_reuse.unwrap_or_else(||std::env::var("FERRITE_GLOBE_PREPARED_SYMBOL_RESOURCES").as_deref()==Ok("1")))?;
+        // Separate Egui Context, renderer and atlas: Context::clone is shared.
+        let mut fonts=EguiIntegration::new(&self.state.device,self.state.format(),1,Arc::clone(&self.state.window));
+        let mut resources=None;
+        let rasters:Vec<_>=if std::env::var("FERRITE_EXPERIMENTAL_GLOBE_RASTERS").as_deref()==Ok("1") {
+            self.raster_layers.iter().map(|l|crate::globe_raster::GlobeRasterLayer{bounds:l.bounds,grid:l.grid,tile_size:l.tile_size,continuous:l.continuous.is_some(),draw_order:l.draw_order,viewing_groups:&l.viewing_groups,bind_group:&l.bind_group}).collect()
+        }else{Vec::new()};
+        let mut pane=crate::globe_view::GlobePane::prepare(&self.state,&mut resources,&self.pipelines,context,groups,self.ui_state.globe_tilt_deg,
+            if self.ui_state.globe_range_factor>0. {self.ui_state.globe_range_factor}else{1.},self.ui_state.globe_pose,
+            &symbols.symbol_textures,&symbols.globe_pattern_resources,&rasters,self.symbol_scale,&mut fonts,self.globe_sample_count,
+            self.globe_area_cache_enabled,self.globe_curve_cache_enabled,self.globe_curve_bounds_cache_enabled,self.globe_dyadic_sample_cache_enabled,
+            self.globe_curve_scratch_reuse_enabled,self.globe_gpu_projection_enabled,self.spatial_hierarchy_enabled,Some(provider.as_ref())).map_err(WgpuError::Render)?;
+        merge_symbol_diagnostics(&mut pane.diagnostics.preparation,diagnostics);
+        let display_scale=pane.diagnostics.scale_denominator.round().clamp(1.,u32::MAX as f64) as u32;
+        let summary=format!("Globe preview: {} areas, {} lines, {} labels; {} unsupported commands, {} rejected geometries",pane.diagnostics.areas,pane.diagnostics.lines,pane.diagnostics.texts,pane.diagnostics.unsupported_commands,pane.diagnostics.rejected_geometries);
+        Ok(PreparedGlobePublication{owner:Arc::clone(&self.continuous_owner),binding:self.globe_publication_binding(),pane,resources,fonts,symbols,resource_revision:cache.resource_revision(),provider,viewport:context.scaler.viewport,display_scale,summary})
+    }
+    /// Validate immediately before durable history commit; no external events
+    /// may mutate this renderer between validation and infallible installation.
+    pub fn validate_globe_publication(&self,prepared:&PreparedGlobePublication)->Result<()> {
+        if !globe_publication_binding_matches(&self.continuous_owner,&prepared.owner,&self.globe_publication_binding(),&prepared.binding) {
+            return Err(WgpuError::Render("Globe publication renderer/extent/sample state changed".into()));
+        }
+        Ok(())
+    }
+    /// No recoverable fallible preparation follows this capsule installation.
+    /// Must have been validated on this renderer immediately before history commit.
+    pub fn commit_globe_publication(&mut self,prepared:PreparedGlobePublication) {
+        assert!(Arc::ptr_eq(&self.continuous_owner,&prepared.owner),"Globe publication belongs to another renderer");
+        if self.globe_symbol_resource_revision!=Some(prepared.resource_revision) {self.pattern_textures.clear();}
+        self.install_globe_symbol_preparation(prepared.symbols);
+        self.globe_symbol_resource_revision=Some(prepared.resource_revision);
+        self.globe_resources=prepared.resources;self.globe_publication_fonts=Some(prepared.fonts);
+        self.globe_coverage_provider=Some(prepared.provider);self.globe_pane=Some(prepared.pane);
+        self.chart_geometry_viewport=Some(prepared.viewport);self.display_scale=prepared.display_scale;self.ui_state.globe_summary=prepared.summary;
+        self.reset_pan_offset();
+    }
     fn try_add_symbol(
         &mut self,
         point: &ferrite_render::PointInstruction,
@@ -2717,44 +4333,30 @@ impl WgpuRenderer {
             None => return false,
         };
 
-        // Create GPU texture if not already cached (using interned SymbolId for O(1) lookup)
-        if !self.symbol_textures.contains_key(&symbol_id) {
-            let (_texture, view) = self.state.create_texture_from_rgba(
-                &geom.pixels,
-                geom.width,
-                geom.height,
-                &format!("symbol_{}", symbol_str),
-            );
+        self.ensure_symbol_texture(symbol_id, symbol_str, geom);
 
-            let bind_group = self
-                .pipelines
-                .create_texture_bind_group(&self.state.device, &view);
-
-            let pivot_in_tex = geom.pivot_in_texture();
-            self.symbol_textures.insert(
-                symbol_id,
-                SymbolTexture {
-                    texture: _texture,
-                    bind_group,
-                    width: geom.width,
-                    height: geom.height,
-                    pivot_in_texture: pivot_in_tex,
-                    render_scale: geom.render_scale,
-                },
-            );
-
-            tracing::debug!(
-                "Created GPU texture for symbol '{}': {}x{}, pivot_in_tex: ({:.2}, {:.2})",
-                symbol_str,
-                geom.width,
-                geom.height,
-                pivot_in_tex.0,
-                pivot_in_tex.1
-            );
-        }
-
+        let rotation = match ferrite_render::flat_rotation(point, scaler) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("Symbol {}: {}", symbol_str, error);
+                return false;
+            }
+        };
         // Convert screen position
-        let screen = scaler.world_to_screen(point.position);
+        let mut screen = match point
+            .portrayal_origin
+            .flat_glyph_anchor(point.position, scaler)
+        {
+            Ok(p) => p,
+            Err(error) => {
+                tracing::warn!("Symbol device anchor rejected: {error}");
+                return false;
+            }
+        };
+        let anchor = [screen.x, screen.y];
+        let mm_to_px = (96.0 / 25.4) * self.state.window.scale_factor() as f32;
+        screen.x += point.local_offset.0 * mm_to_px;
+        screen.y -= point.local_offset.1 * mm_to_px;
 
         // === STAGE 1: World-coordinate deduplication ===
         // Remove exact duplicates from multiple charts at the same geographic position
@@ -2762,14 +4364,19 @@ impl WgpuRenderer {
         let world_x_key = (point.position.x * 1_000_000.0) as i64;
         let world_y_key = (point.position.y * 1_000_000.0) as i64;
         // Use interned symbol ID as hash (already unique per symbol type)
-        let symbol_hash = symbol_id.0 as u64;
+        let symbol_hash = symbol_id.0 as u64
+            ^ (rotation.to_bits() as u64).rotate_left(13)
+            ^ (point.local_offset.0.to_bits() as u64).rotate_left(29)
+            ^ (point.local_offset.1.to_bits() as u64).rotate_left(47);
         let world_key = (world_x_key, world_y_key, symbol_hash);
 
-        if self.world_dedup.contains(&world_key) {
+        if !point.portrayal_origin.is_device_fixed() && self.world_dedup.contains(&world_key) {
             // Exact duplicate from another chart - skip
             return true;
         }
-        self.world_dedup.insert(world_key);
+        if !point.portrayal_origin.is_device_fixed() {
+            self.world_dedup.insert(world_key);
+        }
 
         // === STAGE 2: World-coordinate-based decluttering ===
         // Uses world coordinates divided by pixel-equivalent cell sizes for stable grids.
@@ -2781,7 +4388,6 @@ impl WgpuRenderer {
 
         // Classify symbol types via cached bitflags (O(1) lookup vs repeated starts_with)
         let flags = self.get_symbol_flags(symbol_id, symbol_str);
-        let is_nav_aid = flags & SYM_NAV_AID != 0;
         let is_safety_hazard = flags & SYM_SAFETY != 0;
         let is_sounding = flags & SYM_SOUNDING != 0;
 
@@ -2796,7 +4402,12 @@ impl WgpuRenderer {
 
         // Skip decluttering during animation to prevent symbols from disappearing
         // Only world-coordinate deduplication (Stage 1) applies during drag/inertia
-        if !is_safety_hazard && !self.skip_screen_declutter && scale_x > 1e-10 && scale_y > 1e-10 {
+        if !point.portrayal_origin.is_device_fixed()
+            && !is_safety_hazard
+            && !self.skip_screen_declutter
+            && scale_x > 1e-10
+            && scale_y > 1e-10
+        {
             // Soundings: S-100 collision avoidance (champion = shallowest wins for safety)
             // Two-stage approach:
             // 1. sounding_exact_positions: tracks exact world positions to allow all digits of same sounding
@@ -2812,10 +4423,16 @@ impl WgpuRenderer {
                     // (skip grid check)
                 } else {
                     // First time seeing this exact position - check world-based grid
-                    let world_cell_x = self.sounding_cell_size_px as f64 / scale_x;
-                    let world_cell_y = self.sounding_cell_size_px as f64 / scale_y;
+                    let world_cell_x = self.sounding_cell_size_px as f64
+                        * self.state.window.scale_factor()
+                        / scale_x;
+                    let world_cell_y = self.sounding_cell_size_px as f64
+                        * self.state.window.scale_factor()
+                        / scale_y;
                     let sounding_grid_x = (point.position.x / world_cell_x).floor() as i32;
-                    let sounding_grid_y = (point.position.y / world_cell_y).floor() as i32;
+                    let sounding_grid_y = (scaler.projection().project_y(point.position.y)
+                        / world_cell_y)
+                        .floor() as i32;
                     let sounding_grid_key = (sounding_grid_x, sounding_grid_y);
 
                     // Get current sounding's depth (default to MAX if not set)
@@ -2844,45 +4461,24 @@ impl WgpuRenderer {
                     }
                 }
             }
-            // Non-safety, non-sounding symbols: visual declutter (non-standard optimization)
-            else if !is_sounding {
-                let effective_cell_size = if is_nav_aid {
-                    if self.zoom_level >= 5.0 {
-                        15.0
-                    } else {
-                        self.grid_cell_size
-                    }
-                } else {
-                    self.grid_cell_size
-                };
-
-                let world_cell_x = effective_cell_size as f64 / scale_x;
-                let world_cell_y = effective_cell_size as f64 / scale_y;
-                let grid_x = (point.position.x / world_cell_x).floor() as i32;
-                let grid_y = (point.position.y / world_cell_y).floor() as i32;
-                let grid_key = (grid_x, grid_y);
-
-                if self.symbol_grid.contains(&grid_key) {
-                    return true;
-                }
-                self.symbol_grid.insert(grid_key);
-            }
         }
 
         // Add symbol instance for rendering (uses interned SymbolId - 4 bytes vs 24+ for String)
         self.symbol_instances.push(SymbolInstance {
+            source: self.emitting_coverage_source,
+            plane: point
+                .display_plane
+                .composition_plane(CompositionStage::Chart),
+            feature_id: point.feature_id,
+            cell_index: point.cell_index,
+            world: point.position,
+            priority: point.priority.0,
+            anchor,
             symbol_id,
             screen_x: screen.x,
             screen_y: screen.y,
             scale: point.scale,
-            // S-100 geographic CRS: rotation is clockwise from north (0°=up).
-            // Renderer rotation matrix is clockwise from +X (east) in screen-space (Y-down).
-            // Conversion: screen_angle = geo_angle - 90°
-            rotation: if point.rotation != 0.0 {
-                point.rotation - 90.0
-            } else {
-                0.0
-            },
+            rotation,
         });
 
         true
@@ -2917,43 +4513,37 @@ impl WgpuRenderer {
         self.empty_symbol_ref_count
     }
 
-    /// Render the frame
-    pub fn render(&mut self) -> Result<()> {
-        let profiling = crate::profiler::is_profiling_enabled();
-
-        // get_current_texture includes VSync wait — measure separately
-        let get_tex_timer = if profiling {
-            Some(ScopeTimer::new("get_texture"))
+    /// Exact font, rotation, wrapping and collision policy shared with drawing.
+    fn layout_chart_text(
+        &self,
+        mut shapes: Vec<(
+            CompositionPlane,
+            i32,
+            Option<usize>,
+            u8,
+            egui::epaint::ClippedShape,
+        )>,
+        capture_shapes: bool,
+    ) -> (
+        Vec<(
+            CompositionPlane,
+            i32,
+            Option<usize>,
+            u8,
+            egui::epaint::ClippedShape,
+        )>,
+        Vec<bool>,
+    ) {
+        shapes.clear();
+        let mut accepted = if capture_shapes {
+            Vec::new()
         } else {
-            None
+            vec![false; self.text_labels.len()]
         };
-        let output = self.state.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        if let Some(t) = get_tex_timer {
-            self.cpu_profiler.record("get_texture", t.elapsed());
-        }
-
-        // render_total starts AFTER VSync wait for accurate CPU render cost
-        let render_timer = if profiling {
-            Some(ScopeTimer::new("render_total"))
-        } else {
-            None
-        };
-
-        let egui_timer = if profiling {
-            Some(ScopeTimer::new("render_egui"))
-        } else {
-            None
-        };
-        // Begin egui frame
-        self.egui.begin_frame(&self.state.window);
-
-        // Draw egui UI
-        self.egui.draw_ui(&mut self.ui_state);
-
-        // Paint chart text labels via egui
+        let (width, height) = self.state.viewport_size();
+        let ppp = self.egui.ctx.pixels_per_point();
+        let clip =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width / ppp, height / ppp));
         // Apply the same GPU pan/zoom offset so text tracks with chart geometry during drag
         if !self.text_labels.is_empty() {
             let pan_x = self.screen_pan_offset.0;
@@ -2962,7 +4552,18 @@ impl WgpuRenderer {
             let (pivot_x, pivot_y) = self.screen_zoom_pivot;
 
             let painter = self.egui.ctx.layer_painter(egui::LayerId::background());
-            for label in &self.text_labels {
+            let mut placement = ferrite_render::TextPlacement::default();
+            let mut labels: Vec<_> = (0..self.text_labels.len()).collect();
+            // Higher planes/priorities retain text on collisions; stable source
+            // order provides a neutral tie break. This is a display-engine policy.
+            labels.sort_by_key(|&index| {
+                std::cmp::Reverse((
+                    self.text_labels[index].plane,
+                    self.text_labels[index].priority,
+                ))
+            });
+            for label_index in labels {
+                let label = &self.text_labels[label_index];
                 let color = egui::Color32::from_rgba_unmultiplied(
                     (label.color[0] * 255.0) as u8,
                     (label.color[1] * 255.0) as u8,
@@ -2975,8 +4576,12 @@ impl WgpuRenderer {
                     label.text.clone(),
                     egui::TextFormat {
                         font_id: egui::FontId {
-                            size: label.font_size * zoom,
-                            family: egui::FontFamily::Proportional,
+                            size: label.font_size / self.egui.ctx.pixels_per_point(),
+                            family: if label.bold {
+                                egui::FontFamily::Name("ChartBold".into())
+                            } else {
+                                egui::FontFamily::Proportional
+                            },
                         },
                         color,
                         italics: label.italic,
@@ -2993,50 +4598,210 @@ impl WgpuRenderer {
                 let text_width = galley.rect.width();
                 let text_height = galley.rect.height();
 
-                // Transform label position: pan, then zoom around pivot (same as GPU shader)
-                let sx = label.screen_x + pan_x;
-                let sy = label.screen_y + pan_y;
-                let sx = (sx - pivot_x) * zoom + pivot_x;
-                let sy = (sy - pivot_y) * zoom + pivot_y;
-
-                // Apply horizontal alignment
-                let x = match label.h_align {
-                    ferrite_render::HAlign::Left => sx,
-                    ferrite_render::HAlign::Center => sx - text_width * 0.5,
-                    ferrite_render::HAlign::Right => sx - text_width,
+                let wrap_offsets = [0.0, -self.lon_wrap_screen_px, self.lon_wrap_screen_px];
+                let copies = if self.lon_wrap_screen_px > 0.0
+                    && !label
+                        .source
+                        .is_some_and(|s| self.device_fixed_sources.contains(&s))
+                {
+                    3
+                } else {
+                    1
                 };
+                for (wrap_pass, wrap_offset) in wrap_offsets[..copies].iter().enumerate() {
+                    let coverage_wrap_pass = if label.source.is_some() {
+                        wrap_pass as u8
+                    } else {
+                        0
+                    };
+                    // Wrap and pan before zoom, keeping local text offsets unscaled.
+                    let sx = label.anchor[0] + pan_x + wrap_offset;
+                    let sy = label.anchor[1] + pan_y;
+                    let sx = ((sx - pivot_x) * zoom + pivot_x + label.screen_x - label.anchor[0])
+                        / self.egui.ctx.pixels_per_point();
+                    let sy = ((sy - pivot_y) * self.screen_zoom_scale_y + pivot_y + label.screen_y
+                        - label.anchor[1])
+                        / self.egui.ctx.pixels_per_point();
 
-                // Apply vertical alignment
-                let y = match label.v_align {
-                    ferrite_render::VAlign::Top => sy,
-                    ferrite_render::VAlign::Middle => sy - text_height * 0.5,
-                    ferrite_render::VAlign::Bottom => sy - text_height,
-                };
+                    // Apply horizontal alignment
+                    let x = match label.h_align {
+                        ferrite_render::HAlign::Left => sx,
+                        ferrite_render::HAlign::Center => sx - text_width * 0.5,
+                        ferrite_render::HAlign::Right => sx - text_width,
+                    };
 
-                painter.galley(egui::pos2(x, y), galley, color);
+                    // Apply vertical alignment
+                    let y = match label.v_align {
+                        ferrite_render::VAlign::Top => sy,
+                        ferrite_render::VAlign::Middle => sy - text_height * 0.5,
+                        ferrite_render::VAlign::Bottom => sy - text_height,
+                    };
+
+                    let angle = label.rotation.to_radians();
+                    let dx = x - sx;
+                    let dy = y - sy;
+                    let origin = egui::pos2(
+                        sx + dx * angle.cos() - dy * angle.sin(),
+                        sy + dx * angle.sin() + dy * angle.cos(),
+                    );
+                    let bounds = if label.background.is_some() {
+                        galley.rect.union(galley.mesh_bounds)
+                    } else {
+                        galley.mesh_bounds
+                    };
+                    if !bounds.is_finite() || !bounds.is_positive() {
+                        continue;
+                    }
+                    let min = bounds.min;
+                    let bounds_origin = [
+                        origin.x + min.x * angle.cos() - min.y * angle.sin(),
+                        origin.y + min.x * angle.sin() + min.y * angle.cos(),
+                    ];
+                    let footprint = ferrite_render::TextFootprint::rotated(
+                        bounds_origin,
+                        [bounds.width(), bounds.height()],
+                        angle,
+                    );
+                    let [min, max] = footprint.bounds();
+                    if !clip.intersects(egui::Rect::from_min_max(
+                        egui::pos2(min[0], min[1]),
+                        egui::pos2(max[0], max[1]),
+                    )) {
+                        continue;
+                    }
+                    if !placement.try_place(footprint) {
+                        continue;
+                    }
+                    if let Some(active) = accepted.get_mut(label_index) {
+                        *active = true;
+                    }
+                    if capture_shapes {
+                        if let Some(background) = label.background {
+                            let color = egui::Color32::from_rgba_unmultiplied(
+                                (background[0] * 255.) as u8,
+                                (background[1] * 255.) as u8,
+                                (background[2] * 255.) as u8,
+                                (background[3] * 255.) as u8,
+                            );
+                            let corners = footprint
+                                .corners
+                                .iter()
+                                .map(|p| egui::pos2(p[0], p[1]))
+                                .collect();
+                            shapes.push((
+                                label.plane,
+                                label.priority,
+                                label.source,
+                                coverage_wrap_pass,
+                                egui::epaint::ClippedShape {
+                                    clip_rect: clip,
+                                    shape: egui::Shape::convex_polygon(
+                                        corners,
+                                        color,
+                                        egui::Stroke::NONE,
+                                    ),
+                                },
+                            ));
+                        }
+                        shapes.push((
+                            label.plane,
+                            label.priority,
+                            label.source,
+                            coverage_wrap_pass,
+                            egui::epaint::ClippedShape {
+                                clip_rect: clip,
+                                shape: egui::epaint::TextShape::new(origin, galley.clone(), color)
+                                    .with_angle(angle)
+                                    .into(),
+                            },
+                        ));
+                    }
+                }
             }
         }
 
-        // End egui frame and get output
-        let egui_output = self.egui.end_frame(&self.state.window);
-        if let Some(t) = egui_timer {
-            self.cpu_profiler.record("render_egui", t.elapsed());
+        (shapes, accepted)
+    }
+
+    /// Shared text/selection overlay; optionally includes application panels.
+    fn prepare_overlay(&mut self, include_panels: bool) -> egui::FullOutput {
+        self.chart_text_shapes.clear();
+        // Begin egui frame
+        self.egui.begin_frame(&self.state.window);
+
+        // Draw egui UI
+        if include_panels {
+            self.egui.draw_ui(&mut self.ui_state);
         }
 
-        let mut encoder =
-            self.state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("render_encoder"),
-                });
+        // Selection is an application overlay, separate from IHO portrayal symbols.
+        if let Some([x, y]) = self.selection_anchor {
+            let (pivot_x, pivot_y) = self.screen_zoom_pivot;
+            let ppp = self.egui.ctx.pixels_per_point();
+            let pos = egui::pos2(
+                ((x + self.screen_pan_offset.0 - pivot_x) * self.screen_zoom_scale + pivot_x) / ppp,
+                ((y + self.screen_pan_offset.1 - pivot_y) * self.screen_zoom_scale_y + pivot_y)
+                    / ppp,
+            );
+            let (x, y, w, h) = self.ui_state.chart_area;
+            let clip = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+            let painter = self
+                .egui
+                .ctx
+                .layer_painter(egui::LayerId::background())
+                .with_clip_rect(clip);
+            for path in &self.selection_screen_geometry {
+                let points: Vec<_> = path
+                    .iter()
+                    .map(|p| {
+                        egui::pos2(
+                            ((p[0] + self.screen_pan_offset.0 - pivot_x) * self.screen_zoom_scale
+                                + pivot_x)
+                                / ppp,
+                            ((p[1] + self.screen_pan_offset.1 - pivot_y)
+                                * self.screen_zoom_scale_y
+                                + pivot_y)
+                                / ppp,
+                        )
+                    })
+                    .collect();
+                if points.len() >= 2 {
+                    painter.add(egui::Shape::line(
+                        points.clone(),
+                        egui::Stroke::new(5.0, egui::Color32::BLACK),
+                    ));
+                    painter.add(egui::Shape::line(
+                        points,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 230, 255)),
+                    ));
+                }
+            }
+            painter.circle_stroke(pos, 18.0, egui::Stroke::new(5.0, egui::Color32::BLACK));
+            painter.circle_stroke(
+                pos,
+                18.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 230, 255)),
+            );
+            if let Some(f) = &self.ui_state.selected_feature {
+                painter.text(
+                    pos + egui::vec2(23.0, -22.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &f.feature_type,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::BLACK,
+                );
+            }
+        }
 
-        // Rebuild GPU buffers only when geometry has changed (dirty flag)
-        // During GPU-only pan/zoom, we reuse the cached buffers.
-        let gpu_buf_timer = if profiling {
-            Some(ScopeTimer::new("gpu_buffer_create"))
-        } else {
-            None
-        };
+        let shapes = std::mem::take(&mut self.chart_text_shapes);
+        self.chart_text_shapes = self.layout_chart_text(shapes, true).0;
+
+        // End egui frame and get output
+        self.egui.end_frame(&self.state.window)
+    }
+
+    /// Upload changed geometry once, shared by screen and image targets.
+    fn prepare_geometry_buffers(&mut self) {
         if self.gpu_buffers_dirty {
             self.cached_area_vb = if !self.area_vertices.is_empty() {
                 Some(
@@ -3131,25 +4896,26 @@ impl WgpuRenderer {
 
             self.gpu_buffers_dirty = false;
         }
-        if let Some(t) = gpu_buf_timer {
-            self.cpu_profiler.record("gpu_buffer_create", t.elapsed());
-        }
-
         // Pre-build all symbol GPU buffers before the render pass.
         // This avoids mutable self borrows inside the render pass where view bind groups
         // are held as immutable references (for longitude wrapping multi-pass rendering).
         {
             let sym_ranges = self.symbol_priority_ranges.to_vec();
-            for &(pl, pri, start, end) in &sym_ranges {
+            // Bound the transient lookup; oversized charts use the original scan.
+            let mut symbol_keys = (self.draw_range_index_enabled && !self.ui_state.globe_preview
+                && self.cached_symbol_buffers.len() <= 32_768
+                && sym_ranges.len() <= 32_768)
+                .then(|| self.cached_symbol_buffers.iter()
+                    .map(|(p,q,a,b,_,_,_)| (*p,*q,*a,*b)).collect::<FxHashSet<_>>());
+            for &(pl, pri, start, end, _) in &sym_ranges {
                 if end <= start {
                     continue;
                 }
-                let already_cached =
-                    self.cached_symbol_buffers
-                        .iter()
-                        .any(|(cp, cpr, cs, ce, _, _, _)| {
-                            *cp == pl && *cpr == pri && *cs == start && *ce == end
-                        });
+                let already_cached = match &symbol_keys {
+                    Some(keys) => keys.contains(&(pl,pri,start,end)),
+                    None => self.cached_symbol_buffers.iter().any(|(cp,cpr,cs,ce,_,_,_)|
+                        *cp == pl && *cpr == pri && *cs == start && *ce == end),
+                };
                 if already_cached {
                     continue;
                 }
@@ -3157,32 +4923,454 @@ impl WgpuRenderer {
                 if self.packed_symbol_indices.is_empty() {
                     continue;
                 }
-                let sym_vb = self
-                    .state
-                    .create_vertex_buffer(&self.packed_symbol_vertices, "symbol_packed_vb");
-                let sym_ib = self
-                    .state
-                    .create_index_buffer(&self.packed_symbol_indices, "symbol_packed_ib");
+                let (sym_vb, sym_ib) = if self.pipelines.symbol_instance_pipeline.is_some() {
+                    // Populate the mapped GPU buffer directly; retain no extra CPU instance vector.
+                    let count = self.packed_symbol_vertices.len() / 4;
+                    let buffer = self.state.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("symbol_instance_vb"),
+                        size: (count as u64) * 40,
+                        usage: wgpu::BufferUsages::VERTEX,
+                        mapped_at_creation: true,
+                    });
+                    {
+                        let mut mapped = buffer.slice(..).get_mapped_range_mut();
+                        for (output, quad) in mapped.chunks_exact_mut(40)
+                            .zip(self.packed_symbol_vertices.chunks_exact(4)) {
+                            output.copy_from_slice(bytemuck::bytes_of(
+                                &crate::symbol_instance::SymbolQuadInstance::from_quad(quad)));
+                        }
+                    }
+                    buffer.unmap();
+                    (buffer, self.state.create_index_buffer(&crate::symbol_instance::QUAD_INDICES, "symbol_instance_ib"))
+                } else {
+                    (self.state.create_vertex_buffer(&self.packed_symbol_vertices, "symbol_packed_vb"),
+                     self.state.create_index_buffer(&self.packed_symbol_indices, "symbol_packed_ib"))
+                };
                 let ranges: Vec<_> = self.packed_symbol_ranges.clone();
                 self.cached_symbol_buffers
                     .push((pl, pri, start, end, sym_vb, sym_ib, ranges));
+                if let Some(keys) = &mut symbol_keys { keys.insert((pl,pri,start,end)); }
             }
         }
+    }
 
+    /// Tessellate each ordered glyph group into its own immutable GPU buffers.
+    /// The egui atlas is shared; no per-priority atlas copies or repeated job scans.
+    fn prepare_chart_text(&mut self, output: &mut egui::FullOutput) {
+        self.egui
+            .prepare_chart_atlas(&self.state.device, &self.state.queue, output);
+        self.chart_text_meshes.clear();
+        self.chart_text_buffers.begin();
+        let mut groups = std::collections::BTreeMap::<
+            (CompositionPlane, i32, Option<usize>, u8),
+            Vec<egui::epaint::ClippedShape>,
+        >::new();
+        for (plane, priority, source, wrap_pass, shape) in self.chart_text_shapes.drain(..) {
+            groups
+                .entry((plane, priority, source, wrap_pass))
+                .or_default()
+                .push(shape);
+        }
+        let ppp = output.pixels_per_point;
+        for ((plane, priority, source, wrap_pass), shapes) in groups {
+            for job in self.egui.ctx.tessellate(shapes, ppp) {
+                if let egui::epaint::Primitive::Mesh(mesh) = job.primitive {
+                    if mesh.indices.is_empty() {
+                        continue;
+                    }
+                    let Some(bind_group) = self.egui.chart_atlas_bind_group(mesh.texture_id) else {
+                        tracing::error!("Chart font atlas {:?} missing", mesh.texture_id);
+                        continue;
+                    };
+                    let [width, height] = [self.state.size.width, self.state.size.height];
+                    let x = (job.clip_rect.min.x * ppp).round().clamp(0., width as f32) as u32;
+                    let y = (job.clip_rect.min.y * ppp).round().clamp(0., height as f32) as u32;
+                    let right = (job.clip_rect.max.x * ppp)
+                        .round()
+                        .clamp(x as f32, width as f32) as u32;
+                    let bottom = (job.clip_rect.max.y * ppp)
+                        .round()
+                        .clamp(y as f32, height as f32) as u32;
+                    if x == right || y == bottom {
+                        continue;
+                    }
+                    let scissor = [x, y, right - x, bottom - y];
+                    let vertices: Vec<_> = mesh
+                        .vertices
+                        .iter()
+                        .map(|v| crate::ChartTextVertex {
+                            position: [v.pos.x * ppp, v.pos.y * ppp],
+                            uv: [v.uv.x, v.uv.y],
+                            color: v.color.to_array(),
+                        })
+                        .collect();
+                    let (vertex_buffer, index_buffer) = self.chart_text_buffers.upload(
+                        &self.state.device,
+                        &self.state.queue,
+                        &vertices,
+                        &mesh.indices,
+                    );
+                    self.chart_text_meshes.push(GpuChartText {
+                        source,
+                        wrap_pass,
+                        plane,
+                        priority,
+                        scissor,
+                        bind_group,
+                        vertices: vertex_buffer,
+                        indices: index_buffer,
+                        index_count: mesh.indices.len() as u32,
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn chart_text_buffer_statistics(&self) -> serde_json::Value {
+        serde_json::json!({"allocations":self.chart_text_buffers.allocations,"writes":self.chart_text_buffers.writes,"retained_bytes":self.chart_text_buffers.retained_bytes,"budget_bytes":ChartTextBufferPool::BUDGET,"slots":self.chart_text_buffers.slots.len()})
+    }
+
+    /// Select supported globe sampling without changing the camera pose.
+    /// Default 4x matches chart antialiasing; 1x permits controlled sampling audits.
+    /// Disable retained area meshes for constrained hosts or differential audits.
+    /// The next preparation releases cached areas and executes identical cold draping.
+    /// Disable only immutable source-curve preparation for controlled differential tests.
+    /// Same-binary diagnostic control; only broad-phase selection changes.
+    pub fn set_spatial_hierarchy_enabled(&mut self, enabled: bool) {
+        self.spatial_hierarchy_enabled = enabled;
+    }
+    pub fn set_globe_gpu_projection_enabled(&mut self, enabled: bool) {
+        self.globe_gpu_projection_enabled = enabled;
+    }
+    /// Reuse bounded subdivision work buffers within each curve call.
+    /// Off until controlled geometry, memory, and performance audits pass.
+    pub fn set_globe_curve_scratch_reuse_enabled(&mut self, enabled: bool) {
+        self.globe_curve_scratch_reuse_enabled = enabled;
+    }
+    /// Optional bounded source-coordinate samples; off until performance gates pass.
+    pub fn set_globe_dyadic_sample_cache_enabled(&mut self, enabled: bool) {
+        self.globe_dyadic_sample_cache_enabled = enabled;
+    }
+    /// Differential audit control for source bounds only; route preparation remains cached.
+    pub fn set_globe_curve_bounds_cache_enabled(&mut self, enabled: bool) {
+        self.globe_curve_bounds_cache_enabled = enabled;
+    }
+    pub fn set_globe_curve_cache_enabled(&mut self, enabled: bool) {
+        self.globe_curve_cache_enabled = enabled;
+    }
+    pub fn set_globe_area_cache_enabled(&mut self, enabled: bool) {
+        self.globe_area_cache_enabled = enabled;
+    }
+    pub fn set_globe_sample_count(&mut self, count: u32) -> Result<()> {
+        if !matches!(count, 1 | 4) {
+            return Err(WgpuError::Render("Globe sampling must be 1 or 4".into()));
+        }
+        if self.globe_sample_count != count {
+            self.globe_sample_count = count;
+            self.globe_pane = None;
+            self.globe_resources = None;
+        }
+        Ok(())
+    }
+    /// Prepare a real perspective chart target. Flat caches remain separate.
+    pub fn prepare_globe_preview(
+        &mut self,
+        context: &mut RenderContext,
+        groups: Option<&std::collections::HashSet<u32>>,
+    ) -> Result<()> {
+        self.reset_pan_offset();
+        context
+            .scaler
+            .set_pixel_ratio(self.state.window.scale_factor());
+        if self.globe_pattern_epoch != Some((context.geometry_revision(),context.scaler.pixels_per_mm().to_bits())) {
+            self.globe_pattern_resources.clear();
+            self.globe_pattern_epoch=None;
+        self.globe_prepared_symbol_epoch=None;
+        }
+        self.chart_geometry_viewport = Some(context.scaler.viewport);
+        self.display_scale = context
+            .scaler
+            .display_scale
+            .round()
+            .clamp(1., u32::MAX as f64) as u32;
+        // Invalidate before preparing: an error must not leave an old camera's image/pick.
+        self.globe_pane = None;
+        if self.continuous_layer_count != 0 {
+            return Err(crate::WgpuError::Render("Continuous globe domain material is staged: whole-triangle ray/native interpolation and hardware bounds not qualified".into()));
+        }
+        // Experimental until nearest-node geographic interpolation and tile
+        // seams are independently verified. Flat texture pixels are shared.
+        let globe_rasters:Vec<_>=if std::env::var("FERRITE_EXPERIMENTAL_GLOBE_RASTERS").as_deref()==Ok("1") {
+            self.raster_layers.iter().map(|l|crate::globe_raster::GlobeRasterLayer{bounds:l.bounds,grid:l.grid,tile_size:l.tile_size,continuous:l.continuous.is_some(),draw_order:l.draw_order,viewing_groups:&l.viewing_groups,bind_group:&l.bind_group}).collect()
+        } else {Vec::new()};
+        let pane = crate::globe_view::GlobePane::prepare(
+            &self.state,
+            &mut self.globe_resources,
+            &self.pipelines,
+            context,
+            groups,
+            self.ui_state.globe_tilt_deg,
+            if self.ui_state.globe_range_factor > 0. {
+                self.ui_state.globe_range_factor
+            } else {
+                1.
+            },
+            self.ui_state.globe_pose,
+            &self.symbol_textures,
+            &self.globe_pattern_resources,
+            &globe_rasters,
+            self.symbol_scale,
+            self.globe_publication_fonts.as_mut().unwrap_or(&mut self.egui),
+            self.globe_sample_count,
+            self.globe_area_cache_enabled,
+            self.globe_curve_cache_enabled,
+            self.globe_curve_bounds_cache_enabled,
+            self.globe_dyadic_sample_cache_enabled,
+            self.globe_curve_scratch_reuse_enabled,
+            self.globe_gpu_projection_enabled,
+            self.spatial_hierarchy_enabled,
+            self.globe_coverage_provider.as_deref(),
+        )
+        .map_err(WgpuError::Render)?;
+        self.display_scale = pane
+            .diagnostics
+            .scale_denominator
+            .round()
+            .clamp(1., u32::MAX as f64) as u32;
+        self.ui_state.globe_summary =
+            format!(
+            "Globe preview: {} areas, {} lines, {} labels; {} unsupported commands, {} rejected geometries",
+            pane.diagnostics.areas, pane.diagnostics.lines, pane.diagnostics.texts,
+            pane.diagnostics.unsupported_commands, pane.diagnostics.rejected_geometries,
+        );
+        self.globe_pane = Some(pane);
+        self.update_selection(&context.scaler);
+        Ok(())
+    }
+    /// Replacing product policy invalidates the displayed pane and its picks.
+    pub fn set_globe_coverage_provider(
+        &mut self,
+        provider: Option<Arc<dyn ferrite_render::GlobeCoverageProvider>>,
+    ) {
+        self.globe_pane = None;
+        self.globe_coverage_provider = provider;
+    }
+    pub fn clear_globe_preview(&mut self) {
+        self.ui_state.globe_pose = None;
+        self.globe_pane = None;
+        self.globe_resources = None;
+        self.globe_publication_fonts = None;
+    }
+    pub fn globe_pose(&self) -> Option<ferrite_kernel::globe_navigation::GlobePose> {
+        let d = self.globe_preview_diagnostics()?;
+        Some(ferrite_kernel::globe_navigation::GlobePose {
+            focus: ferrite_kernel::geodesy::GeographicPosition::new(d.focus[1], d.focus[0]).ok()?,
+            range_m: d.range_m,
+            heading_deg: d.heading_deg,
+            tilt_deg: d.tilt_deg,
+        })
+    }
+    pub fn move_globe_anchor(
+        &mut self,
+        anchor: WorldPoint,
+        screen: ScreenPoint,
+        ratio: f64,
+    ) -> bool {
+        let Some(pose) = self.globe_pose() else {
+            return false;
+        };
+        let Some(d) = self.globe_preview_diagnostics() else {
+            return false;
+        };
+        if !ratio.is_finite() || ratio <= 0. {
+            return false;
+        }
+        let v = d.viewport;
+        let Ok(anchor) = ferrite_kernel::geodesy::GeographicPosition::new(anchor.y, anchor.x)
+        else {
+            return false;
+        };
+        let Ok(next) = pose.anchored(
+            [v[2], v[3]],
+            anchor,
+            [screen.x as f64 - v[0], screen.y as f64 - v[1]],
+            (pose.range_m / ratio).clamp(10., 50_000_000.),
+        ) else {
+            return false;
+        };
+        self.ui_state.globe_pose = Some(next);
+        true
+    }
+    /// Current final execution sources, including admitted text/point commands.
+    pub fn globe_displayed_sources(&self) -> &[usize] {
+        self.globe_pane
+            .as_ref()
+            .map_or(&[], |p| p.source_ordinals.as_slice())
+    }
+    pub fn globe_feature_candidates(
+        &mut self,
+        context: &RenderContext,
+        screen: ScreenPoint,
+        radius: f64,
+    ) -> Result<Vec<(usize, crate::globe_scene::GlobeDrawHit)>> {
+        let pane = self
+            .globe_pane
+            .as_ref()
+            .ok_or_else(|| WgpuError::Render("No current globe image for selection".into()))?;
+        if pane.source_geometry_revision != context.geometry_revision()
+            || !pane.matches(
+                &context.scaler,
+                self.ui_state.globe_tilt_deg,
+                self.ui_state.globe_pose,
+                if self.ui_state.globe_range_factor > 0. {
+                    self.ui_state.globe_range_factor
+                } else {
+                    1.
+                },
+            )
+        {
+            return Err(WgpuError::Render(
+                "Globe selection camera or source is stale".into(),
+            ));
+        }
+        let resources = self
+            .globe_resources
+            .as_mut()
+            .ok_or_else(|| WgpuError::Render("Globe selection resources absent".into()))?;
+        pane.pick_sources(
+            resources,
+            &self.state,
+            [screen.x as f64, screen.y as f64],
+            radius,
+        )
+        .map_err(WgpuError::Render)
+    }
+    pub fn set_globe_selection_click(
+        &mut self,
+        screen: [f64; 2],
+        device_fixed: bool,
+        scaler: &ferrite_render::Scaler,
+    ) {
+        self.selection_device_anchor = None;
+        if device_fixed {
+            if let (Some(p), Some(f)) = (&self.globe_pane, &self.ui_state.selected_feature) {
+                let v = p.diagnostics.viewport;
+                let ppm = p.pixels_per_mm();
+                self.selection_device_anchor = Some((
+                    f.cell_index,
+                    f.feature_id,
+                    [(screen[0] - v[0]) / ppm, (v[1] + v[3] - screen[1]) / ppm],
+                ));
+            }
+        }
+        self.update_selection(scaler);
+    }
+    pub fn globe_world_at(&self, screen: ScreenPoint) -> Option<WorldPoint> {
+        self.globe_pane.as_ref()?.world_at(screen)
+    }
+    pub fn globe_preview_diagnostics(&self) -> Option<&crate::GlobePreviewDiagnostics> {
+        self.globe_pane.as_ref().map(|p| &p.diagnostics)
+    }
+
+    /// Encode the same ordered geometry pass for every render target.
+    fn bind_coverage_pipeline<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        primitive: CoveragePrimitive,
+        source: Option<usize>,
+        wrap_pass: usize,
+    ) -> bool {
+        use crate::coverage_gpu_frame::CoverageGpuBinding;
+        if self.coverage_failed
+            || (wrap_pass != 0 && source.is_some_and(|s| self.device_fixed_sources.contains(&s)))
+        {
+            return false;
+        }
+        let binding = match source {
+            None => CoverageGpuBinding::Unclipped,
+            Some(index) => match (&self.coverage_frame, &self.prepared_coverage) {
+                (Some(frame), Some(prepared)) => {
+                    match frame.resolve_instruction(prepared, wrap_pass, index) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            tracing::error!("Coverage draw rejected: {error}");
+                            return false;
+                        }
+                    }
+                }
+                (None, None) if self.device_fixed_sources.contains(&index) => {
+                    CoverageGpuBinding::Unclipped
+                }
+                _ => return false,
+            },
+        };
+        match binding {
+            CoverageGpuBinding::Hidden => false,
+            CoverageGpuBinding::Unclipped => {
+                pass.set_pipeline(match primitive {
+                    CoveragePrimitive::Area => &self.pipelines.area_pipeline,
+                    CoveragePrimitive::Line => &self.pipelines.line_pipeline,
+                    CoveragePrimitive::Symbol => self.pipelines.symbol_instance_pipeline.as_ref().unwrap_or(&self.pipelines.texture_pipeline),
+                    CoveragePrimitive::Pattern => &self.pipelines.pattern_fill_pipeline,
+                    CoveragePrimitive::Text => &self.pipelines.chart_text_pipeline,
+                });
+                true
+            }
+            CoverageGpuBinding::Masked(group) => {
+                let Some(pipelines) = &self.coverage_pipelines else {
+                    return false;
+                };
+                pass.set_pipeline(match primitive {
+                    CoveragePrimitive::Area => &pipelines.area,
+                    CoveragePrimitive::Line => &pipelines.line,
+                    CoveragePrimitive::Symbol => pipelines.symbol_instance.as_ref().unwrap_or(&pipelines.symbol),
+                    CoveragePrimitive::Pattern => &pipelines.pattern,
+                    CoveragePrimitive::Text => &pipelines.text,
+                });
+                if matches!(primitive, CoveragePrimitive::Area | CoveragePrimitive::Line) {
+                    pass.set_bind_group(1, &pipelines.empty_asset, &[]);
+                }
+                pass.set_bind_group(2, group, &[]);
+                true
+            }
+        }
+    }
+
+    fn encode_chart(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        resolve_target: Option<&wgpu::TextureView>,
+        gpu_query: Option<&wgpu_profiler::GpuProfilerQuery>,
+    ) {
+        let draw_index = if self.draw_range_index_enabled && !self.ui_state.globe_preview {
+            let total = self.area_priority_ranges.len()
+                .checked_add(self.pattern_ranges.len())
+                .and_then(|n| n.checked_add(self.line_priority_ranges.len()))
+                .and_then(|n| n.checked_add(self.symbol_priority_ranges.len()))
+                .and_then(|n| n.checked_add(self.chart_text_meshes.len()))
+                .and_then(|n| n.checked_add(self.raster_layers.len()));
+            total.and_then(DrawRangeIndex::new).map(|mut index| {
+                for (i, &(p, q, _, _, _)) in self.area_priority_ranges.iter().enumerate() { index.push(DrawKind::Area, (p,q), i); }
+                for (i, &(p, q, _, _, _, _, _)) in self.pattern_ranges.iter().enumerate() { index.push(DrawKind::Pattern, (p,q), i); }
+                for (i, &(p, q, _, _, _)) in self.line_priority_ranges.iter().enumerate() { index.push(DrawKind::Line, (p,q), i); }
+                for (i, &(p, q, _, _, _)) in self.symbol_priority_ranges.iter().enumerate() { index.push(DrawKind::Symbol, (p,q), i); }
+                for (i, text) in self.chart_text_meshes.iter().enumerate() { index.push(DrawKind::Text, (text.plane,text.priority), i); }
+                for (i, layer) in self.raster_layers.iter().enumerate() { index.push(DrawKind::Raster, layer.draw_order.render_key(), i); }
+                index.finish();
+                index
+            })
+        } else { None };
+        let draw_index = draw_index.as_ref();
+        // Preserve position() first-match semantics, including duplicate keys.
+        let symbol_lookup = draw_index.filter(|_| self.cached_symbol_buffers.len() <= 32_768).map(|_| {
+            let mut lookup = FxHashMap::default();
+            for (i, (p, q, start, end, _, _, _)) in self.cached_symbol_buffers.iter().enumerate() {
+                lookup.entry((*p,*q,*start,*end)).or_insert(i);
+            }
+            lookup
+        });
         let bg = self.background_color.to_array();
-
-        // Use MSAA texture as render target if available, resolve to surface
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = self.state.msaa_view {
-            (msaa_view, Some(&view))
-        } else {
-            (&view, None)
-        };
-
-        let render_pass_timer = if profiling {
-            Some(ScopeTimer::new("render_pass"))
-        } else {
-            None
-        };
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
@@ -3201,8 +5389,34 @@ impl WgpuRenderer {
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
-                timestamp_writes: None,
+                timestamp_writes: gpu_query.and_then(|query| query.render_pass_timestamp_writes()),
             });
+
+            let extent = [self.state.size.width, self.state.size.height];
+            let viewport = self.chart_geometry_viewport.unwrap_or_else(|| {
+                ferrite_render::Viewport::new(extent[0] as f32, extent[1] as f32)
+            });
+            let Some(chart_scissor) = chart_pass_scissor(viewport, extent) else {
+                return;
+            };
+            render_pass.set_scissor_rect(
+                chart_scissor[0],
+                chart_scissor[1],
+                chart_scissor[2],
+                chart_scissor[3],
+            );
+
+            if self.ui_state.globe_preview {
+                if let Some(pane) = &self.globe_pane {
+                    render_pass.set_pipeline(&self.pipelines.texture_pipeline);
+                    render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                    render_pass.set_bind_group(1, &pane.bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, pane.vertices.slice(..));
+                    render_pass.set_index_buffer(pane.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..6, 0, 0..1);
+                }
+                return;
+            }
 
             // === LAYER 1: World map coastlines (lowest layer) ===
             if let (Some(vb), Some(ib)) = (&self.cached_wm_line_vb, &self.cached_wm_line_ib) {
@@ -3231,42 +5445,59 @@ impl WgpuRenderer {
             // === LAYER 3: Chart data (S-101 priority-based rendering) ===
             // Drawn at center, left (-360°), and right (+360°) offsets for wrapping.
             let mut priority_set = FxHashSet::default();
-            for &(plane, pri, _, _) in &self.area_priority_ranges {
+            for &(plane, pri, _, _, _) in &self.area_priority_ranges {
                 priority_set.insert((plane, pri));
             }
-            for &(plane, pri, _, _) in &self.line_priority_ranges {
+            for &(plane, pri, _, _, _) in &self.line_priority_ranges {
                 priority_set.insert((plane, pri));
             }
-            for &(plane, pri, _, _) in &self.symbol_priority_ranges {
+            for &(plane, pri, _, _, _) in &self.symbol_priority_ranges {
                 priority_set.insert((plane, pri));
             }
-            for &(plane, pri, _, _, _) in &self.pattern_ranges {
+            for &(plane, pri, _, _, _, _, _) in &self.pattern_ranges {
                 priority_set.insert((plane, pri));
             }
-            let mut all_priorities: Vec<(u8, i32)> = priority_set.into_iter().collect();
+            for text in &self.chart_text_meshes {
+                priority_set.insert((text.plane, text.priority));
+            }
+            for layer in &self.raster_layers {
+                if ferrite_render::raster_groups_visible(
+                    &layer.viewing_groups,
+                    self.raster_enabled_groups.as_ref(),
+                ) {
+                    priority_set.insert(layer.draw_order.render_key());
+                }
+            }
+            let mut all_priorities: Vec<(CompositionPlane, i32)> =
+                priority_set.into_iter().collect();
             all_priorities.sort_unstable();
-
-            // Clone symbol priority ranges to avoid borrow conflict with pack_symbol_batch_range
-            let sym_priority_ranges = self.symbol_priority_ranges.to_vec();
 
             // Number of wrapping passes: center (always) + left/right if wrapping
             let wrap_pass_count: u8 = if self.lon_wrap_screen_px > 0.0 { 3 } else { 1 };
 
-            for wrap_pass in 0..wrap_pass_count {
-                // Select view bind group for this pass: 0=center, 1=left, 2=right
-                let view_bg = match wrap_pass {
-                    1 => &self.view_bind_group_left,
-                    2 => &self.view_bind_group_right,
-                    _ => &self.view_bind_group,
-                };
-
-                // Render by priority groups (display_plane, priority)
-                for &(plane, priority) in &all_priorities {
+            // Complete each priority across longitude copies before advancing.
+            // Otherwise a low-priority wrapped copy can cover an earlier high-priority copy.
+            for &(plane, priority) in &all_priorities {
+                for wrap_pass in 0..wrap_pass_count {
+                    let view_bg = match wrap_pass {
+                        1 => &self.view_bind_group_left,
+                        2 => &self.view_bind_group_right,
+                        _ => &self.view_bind_group,
+                    };
+                    self.draw_rasters(&mut render_pass, view_bg, (plane, priority), draw_index);
                     // Render areas for this priority
                     if let (Some(vb), Some(ib)) = (&self.cached_area_vb, &self.cached_area_ib) {
-                        for &(pl, pri, start, end) in &self.area_priority_ranges {
+                        for range_index in selected_indices(draw_index, DrawKind::Area, (plane, priority), self.area_priority_ranges.len()) {
+                            let (pl, pri, start, end, source) = self.area_priority_ranges[range_index];
                             if pl == plane && pri == priority && end > start {
-                                render_pass.set_pipeline(&self.pipelines.area_pipeline);
+                                if !self.bind_coverage_pipeline(
+                                    &mut render_pass,
+                                    CoveragePrimitive::Area,
+                                    source,
+                                    wrap_pass as usize,
+                                ) {
+                                    continue;
+                                }
                                 render_pass.set_bind_group(0, view_bg, &[]);
                                 render_pass.set_vertex_buffer(0, vb.slice(..));
                                 render_pass
@@ -3279,11 +5510,31 @@ impl WgpuRenderer {
                     // Render pattern fills for this priority
                     if let (Some(vb), Some(ib)) = (&self.cached_pattern_vb, &self.cached_pattern_ib)
                     {
-                        for (pl, pri, start, end, pat_key) in &self.pattern_ranges {
-                            if *pl == plane && *pri == priority && end > start {
+                        for range_index in selected_indices(draw_index, DrawKind::Pattern, (plane, priority), self.pattern_ranges.len()) {
+                            let (pl, pri, start, end, pat_key, wrap_mode, source) = &self.pattern_ranges[range_index];
+                            if *pl == plane
+                                && *pri == priority
+                                && end > start
+                                && (*wrap_mode == 255 || *wrap_mode == wrap_pass)
+                            {
                                 if let Some(pat_tex) = self.pattern_textures.get(pat_key) {
-                                    render_pass.set_pipeline(&self.pipelines.pattern_fill_pipeline);
-                                    render_pass.set_bind_group(0, view_bg, &[]);
+                                    if !self.bind_coverage_pipeline(
+                                        &mut render_pass,
+                                        CoveragePrimitive::Pattern,
+                                        *source,
+                                        wrap_pass as usize,
+                                    ) {
+                                        continue;
+                                    }
+                                    render_pass.set_bind_group(
+                                        0,
+                                        if *wrap_mode == 255 {
+                                            view_bg
+                                        } else {
+                                            &self.view_bind_group
+                                        },
+                                        &[],
+                                    );
                                     render_pass.set_bind_group(1, &pat_tex.bind_group, &[]);
                                     render_pass.set_vertex_buffer(0, vb.slice(..));
                                     render_pass
@@ -3296,9 +5547,17 @@ impl WgpuRenderer {
 
                     // Render lines for this priority
                     if let (Some(vb), Some(ib)) = (&self.cached_line_vb, &self.cached_line_ib) {
-                        for &(pl, pri, start, end) in &self.line_priority_ranges {
+                        for range_index in selected_indices(draw_index, DrawKind::Line, (plane, priority), self.line_priority_ranges.len()) {
+                            let (pl, pri, start, end, source) = self.line_priority_ranges[range_index];
                             if pl == plane && pri == priority && end > start {
-                                render_pass.set_pipeline(&self.pipelines.line_pipeline);
+                                if !self.bind_coverage_pipeline(
+                                    &mut render_pass,
+                                    CoveragePrimitive::Line,
+                                    source,
+                                    wrap_pass as usize,
+                                ) {
+                                    continue;
+                                }
                                 render_pass.set_bind_group(0, view_bg, &[]);
                                 render_pass.set_vertex_buffer(0, vb.slice(..));
                                 render_pass
@@ -3309,19 +5568,30 @@ impl WgpuRenderer {
                     }
 
                     // Render symbols for this priority (pre-built GPU buffers)
-                    for &(pl, pri, start, end) in &sym_priority_ranges {
+                    for range_index in selected_indices(draw_index, DrawKind::Symbol, (plane, priority), self.symbol_priority_ranges.len()) {
+                            let (pl, pri, start, end, source) = self.symbol_priority_ranges[range_index];
                         if pl == plane && pri == priority && end > start {
                             // Find pre-built buffer (built before render pass)
-                            let cache_idx = self.cached_symbol_buffers.iter().position(
-                                |(cp, cpr, cs, ce, _, _, _)| {
-                                    *cp == pl && *cpr == pri && *cs == start && *ce == end
-                                },
-                            );
+                            let cache_idx = match &symbol_lookup {
+                                Some(lookup) => lookup.get(&(pl, pri, start, end)).copied(),
+                                None => self.cached_symbol_buffers.iter().position(
+                                    |(cp, cpr, cs, ce, _, _, _)| {
+                                        *cp == pl && *cpr == pri && *cs == start && *ce == end
+                                    },
+                                ),
+                            };
                             if let Some(buf_idx) = cache_idx {
                                 let (_, _, _, _, ref sym_vb, ref sym_ib, ref ranges) =
                                     self.cached_symbol_buffers[buf_idx];
 
-                                render_pass.set_pipeline(&self.pipelines.texture_pipeline);
+                                if !self.bind_coverage_pipeline(
+                                    &mut render_pass,
+                                    CoveragePrimitive::Symbol,
+                                    source,
+                                    wrap_pass as usize,
+                                ) {
+                                    continue;
+                                }
                                 render_pass.set_bind_group(0, view_bg, &[]);
                                 render_pass.set_vertex_buffer(0, sym_vb.slice(..));
                                 render_pass
@@ -3330,19 +5600,144 @@ impl WgpuRenderer {
                                 for &(sym_id, idx_start, idx_count) in ranges {
                                     if let Some(tex) = self.symbol_textures.get(&sym_id) {
                                         render_pass.set_bind_group(1, &tex.bind_group, &[]);
-                                        render_pass.draw_indexed(
-                                            idx_start..idx_start + idx_count,
-                                            0,
-                                            0..1,
-                                        );
+                                        if self.pipelines.symbol_instance_pipeline.is_some() {
+                                            // Original six indices per accepted symbol map to consecutive instances.
+                                            render_pass.draw_indexed(0..6, 0, idx_start / 6..(idx_start + idx_count) / 6);
+                                        } else {
+                                            render_pass.draw_indexed(idx_start..idx_start + idx_count, 0, 0..1);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                for text_index in selected_indices(draw_index, DrawKind::Text, (plane, priority), self.chart_text_meshes.len()) {
+                    let text = &self.chart_text_meshes[text_index];
+                    if text.plane == plane && text.priority == priority {
+                        let Some([x, y, width, height]) =
+                            intersect_scissors(text.scissor, chart_scissor)
+                        else {
+                            continue;
+                        };
+                        render_pass.set_scissor_rect(x, y, width, height);
+                        if !self.bind_coverage_pipeline(
+                            &mut render_pass,
+                            CoveragePrimitive::Text,
+                            text.source,
+                            text.wrap_pass as usize,
+                        ) {
+                            continue;
+                        }
+                        render_pass.set_bind_group(0, &self.view_bind_group, &[]);
+                        render_pass.set_bind_group(1, &text.bind_group, &[]);
+                        render_pass.set_vertex_buffer(0, text.vertices.slice(..));
+                        render_pass
+                            .set_index_buffer(text.indices.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass.draw_indexed(0..text.index_count, 0, 0..1);
+                    }
+                }
+                // Text has its own clip; the next priority must return to the
+                // chart pane, not to the full surface behind application chrome.
+                render_pass.set_scissor_rect(
+                    chart_scissor[0],
+                    chart_scissor[1],
+                    chart_scissor[2],
+                    chart_scissor[3],
+                );
             }
         }
+    }
+
+    /// GPU chart execution only; this excludes UI, acquisition and presentation.
+    pub fn gpu_timing_audit(&self) -> serde_json::Value {
+        self.gpu_profiler.audit_value()
+    }
+
+    /// Render the frame
+    pub fn render(&mut self) -> Result<()> {
+        self.validate_continuous_frame()?;
+        let profiling = crate::profiler::is_profiling_enabled();
+
+        // get_current_texture includes VSync wait — measure separately
+        let get_tex_timer = if profiling {
+            Some(ScopeTimer::new("get_texture"))
+        } else {
+            None
+        };
+        let output = self.state.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        if let Some(t) = get_tex_timer {
+            self.cpu_profiler.record("get_texture", t.elapsed());
+        }
+
+        // render_total starts AFTER VSync wait for accurate CPU render cost
+        let render_timer = if profiling {
+            Some(ScopeTimer::new("render_total"))
+        } else {
+            None
+        };
+
+        let egui_timer = if profiling {
+            Some(ScopeTimer::new("render_egui"))
+        } else {
+            None
+        };
+        let mut egui_output = self.prepare_overlay(true);
+        self.prepare_chart_text(&mut egui_output);
+        if let Some(t) = egui_timer {
+            self.cpu_profiler.record("render_egui", t.elapsed());
+        }
+
+        let mut encoder =
+            self.state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("render_encoder"),
+                });
+
+        let gpu_buf_timer = if profiling {
+            Some(ScopeTimer::new("gpu_buffer_create"))
+        } else {
+            None
+        };
+        self.prepare_geometry_buffers();
+        if let Some(t) = gpu_buf_timer {
+            self.cpu_profiler.record("gpu_buffer_create", t.elapsed());
+        }
+
+        // Use MSAA texture as render target if available, resolve to surface
+        let (target_view, resolve_target) = if let Some(ref msaa_view) = self.state.msaa_view {
+            (msaa_view, Some(&view))
+        } else {
+            (&view, None)
+        };
+
+        let render_pass_timer = if profiling {
+            Some(ScopeTimer::new("render_pass"))
+        } else {
+            None
+        };
+        // Pass timestamps need only TIMESTAMP_QUERY; encoder timestamps are optional.
+        let chart_query = self.gpu_profiler.is_enabled().then(|| {
+            self.gpu_profiler.profiler.begin_pass_query(
+                "chart_pass",
+                &mut encoder,
+                &self.state.device,
+            )
+        });
+        self.encode_chart(
+            &mut encoder,
+            target_view,
+            resolve_target,
+            chart_query.as_ref(),
+        );
+        if let Some(query) = chart_query {
+            self.gpu_profiler.profiler.end_query(&mut encoder, query);
+        }
+
 
         if let Some(t) = render_pass_timer {
             self.cpu_profiler.record("render_pass", t.elapsed());
@@ -3389,7 +5784,9 @@ impl WgpuRenderer {
 
         // GPU profiler: end frame and process results
         if self.gpu_profiler.is_enabled() {
-            let _ = self.gpu_profiler.profiler.end_frame();
+            if let Err(error) = self.gpu_profiler.profiler.end_frame() {
+                tracing::warn!("GPU profiling frame rejected: {error}");
+            }
             self.gpu_profiler.process_and_log(&self.state.queue);
         }
 
@@ -3412,12 +5809,73 @@ impl WgpuRenderer {
 
     /// Get window reference
     #[inline]
+    /// Private hidden test control; production defaults OFF unless explicitly enabled.
+    pub fn wait_hidden_key_frame(&self)->Result<()> {
+        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Key frame wait requires hidden unfocused mode".into()));}
+        self.state.device.poll(wgpu::Maintain::Wait);Ok(())
+    }
+
+    pub fn export_hidden_key_flat_coverage(&self,path:&std::path::Path,context:&RenderContext)->Result<()> {
+        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Flat coverage proof requires hidden unfocused window".into()));}
+        std::fs::create_dir_all(path).map_err(|e|WgpuError::Render(e.to_string()))?;
+        let ids:std::collections::BTreeSet<_>=context.raw_instructions().iter().filter_map(|i|i.cell_index()).collect();
+        let mut passes=Vec::new();
+        if let Some(prepared)=&self.prepared_coverage {
+            prepared.validate(context.geometry_revision(),context.coverage_view_revision(),context.instruction_count()).map_err(|e|WgpuError::Render(e.to_string()))?;
+            for index in 0..prepared.pass_count() {
+                let pass=prepared.pass(index).map_err(|e|WgpuError::Render(e.to_string()))?;
+                let decisions=(0..context.instruction_count()).map(|i|pass.decision(i).map(|d|format!("{d:?}"))).collect::<std::result::Result<Vec<_>,_>>().map_err(|e|WgpuError::Render(e.to_string()))?;
+                let mut masks=Vec::new();for id in &ids {
+                    if let Some(mask)=pass.frame().mask(*id as usize) {
+                        let file=format!("pass-{index}-dataset-{id}.r8");std::fs::write(path.join(&file),mask.pixels()).map_err(|e|WgpuError::Render(e.to_string()))?;
+                        masks.push(serde_json::json!({"dataset":id,"origin":mask.origin(),"size":mask.size(),"file":file}));
+                    }else{masks.push(serde_json::json!({"dataset":id,"absent":true}));}
+                }
+                passes.push(serde_json::json!({"pass":index,"decisions":decisions,"masks":masks}));
+            }
+        }
+        std::fs::write(path.join("coverage.json"),serde_json::to_vec_pretty(&serde_json::json!({"bound":self.prepared_coverage.is_some(),"source_datasets":ids,"instruction_count":context.instruction_count(),"passes":passes})).map_err(|e|WgpuError::Render(e.to_string()))?).map_err(|e|WgpuError::Render(e.to_string()))?;Ok(())
+    }
+
+    pub fn configure_hidden_prepared_symbol_resources(&mut self,enabled:bool)->Result<()> {
+        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Prepared symbol diagnostic requires hidden unfocused mode".into()));}
+        self.diagnostic_prepared_symbol_reuse=Some(enabled);self.globe_prepared_symbol_epoch=None;Ok(())
+    }
+    pub fn configure_hidden_retained_passing_diagnostic(&mut self,enabled:bool)->Result<()> {
+        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Retained passing diagnostic requires hidden unfocused mode".into()));}
+        if let Some(resources)=self.globe_resources.as_mut() {resources.configure_retained_passing(enabled);}
+        else if self.ui_state.globe_preview {return Err(WgpuError::Render("Prepared globe required".into()));}
+        Ok(())
+    }
+    pub fn configure_hidden_source_cache_diagnostic(&mut self,mode:u8)->Result<()> {
+        if mode>2 || !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {return Err(WgpuError::Render("Source cache diagnostic requires hidden unfocused mode and mode0..2".into()));}
+        if let Some(resources)=self.globe_resources.as_mut() {resources.configure_source_cache(mode);}
+        else if self.ui_state.globe_preview {return Err(WgpuError::Render("Prepared globe required".into()));}
+        Ok(())
+    }
+
+    pub fn configure_hidden_pattern_key_diagnostic(&mut self,enabled:bool)->Result<()> {
+        if !crate::background_test::enabled() || self.window().is_visible().unwrap_or(true) || self.window().has_focus() {
+            return Err(WgpuError::Render("Pattern key diagnostic requires hidden unfocused mode".into()));
+        }
+        self.diagnostic_pattern_request_keys=Some(enabled);Ok(())
+    }
     pub fn window(&self) -> &Window {
         &self.state.window
     }
 
     /// Save screenshot to file
     pub fn save_screenshot<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        self.save_image(path, false)
+    }
+
+    /// Export the chart and application panels using the same overlay as the screen.
+    /// Does not capture the desktop or another application.
+    pub fn save_screenshot_with_ui<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        self.save_image(path, true)
+    }
+
+    fn save_image<P: AsRef<Path>>(&mut self, path: P, include_panels: bool) -> Result<()> {
         use crate::state::MSAA_SAMPLE_COUNT;
 
         let (width, height) = self.state.viewport_size();
@@ -3495,149 +5953,28 @@ impl WgpuRenderer {
                     label: Some("screenshot_encoder"),
                 });
 
-        // Recreate buffers for rendering
-        let area_vertex_buffer = if !self.area_vertices.is_empty() {
-            Some(
-                self.state
-                    .create_vertex_buffer(&self.area_vertices, "area_vertices"),
-            )
+        let mut overlay = self.prepare_overlay(include_panels);
+        self.prepare_chart_text(&mut overlay);
+        self.prepare_geometry_buffers();
+        let (target_view, resolve_target) = if let Some(ref mv) = msaa_view {
+            (mv, Some(&resolve_view))
         } else {
-            None
+            (&resolve_view, None)
         };
+        self.encode_chart(&mut encoder, target_view, resolve_target, None);
 
-        let area_index_buffer = if !self.area_indices.is_empty() {
-            Some(
-                self.state
-                    .create_index_buffer(&self.area_indices, "area_indices"),
-            )
-        } else {
-            None
-        };
-
-        let line_vertex_buffer = if !self.line_vertices.is_empty() {
-            Some(
-                self.state
-                    .create_vertex_buffer(&self.line_vertices, "line_vertices"),
-            )
-        } else {
-            None
-        };
-
-        let line_index_buffer = if !self.line_indices.is_empty() {
-            Some(
-                self.state
-                    .create_index_buffer(&self.line_indices, "line_indices"),
-            )
-        } else {
-            None
-        };
-
-        // Pattern fill buffers (GPU texture-repeat tiling)
-        let pattern_vertex_buffer = if !self.pattern_vertices.is_empty() {
-            Some(
-                self.state
-                    .create_vertex_buffer(&self.pattern_vertices, "pattern_vertices"),
-            )
-        } else {
-            None
-        };
-        let pattern_index_buffer = if !self.pattern_indices.is_empty() {
-            Some(
-                self.state
-                    .create_index_buffer(&self.pattern_indices, "pattern_indices"),
-            )
-        } else {
-            None
-        };
-
-        // Render to MSAA texture (resolve to output) or directly to output texture
-        {
-            let bg = self.background_color.to_array();
-            let (target_view, resolve_target) = if let Some(ref mv) = msaa_view {
-                (mv, Some(&resolve_view))
-            } else {
-                (&resolve_view, None)
-            };
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("screenshot_render_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg[0] as f64,
-                            g: bg[1] as f64,
-                            b: bg[2] as f64,
-                            a: bg[3] as f64,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-
-            // Render areas
-            if let (Some(vb), Some(ib)) = (&area_vertex_buffer, &area_index_buffer) {
-                render_pass.set_pipeline(&self.pipelines.area_pipeline);
-                render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..self.area_indices.len() as u32, 0, 0..1);
-            }
-
-            // Render pattern fills (GPU texture-repeat tiling)
-            if let (Some(vb), Some(ib)) = (&pattern_vertex_buffer, &pattern_index_buffer) {
-                for (_plane, _p, start, end, pat_key) in &self.pattern_ranges {
-                    if end > start {
-                        if let Some(pat_tex) = self.pattern_textures.get(pat_key) {
-                            render_pass.set_pipeline(&self.pipelines.pattern_fill_pipeline);
-                            render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                            render_pass.set_bind_group(1, &pat_tex.bind_group, &[]);
-                            render_pass.set_vertex_buffer(0, vb.slice(..));
-                            render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            render_pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
-                        }
-                    }
-                }
-            }
-
-            // Render lines
-            if let (Some(vb), Some(ib)) = (&line_vertex_buffer, &line_index_buffer) {
-                render_pass.set_pipeline(&self.pipelines.line_pipeline);
-                render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..self.line_indices.len() as u32, 0, 0..1);
-            }
-
-            // Render symbols (packed single-buffer approach)
-            if !self.symbol_instances.is_empty() {
-                self.pack_symbol_batch_range(0, self.symbol_instances.len());
-
-                if !self.packed_symbol_indices.is_empty() {
-                    let sym_vb = self
-                        .state
-                        .create_vertex_buffer(&self.packed_symbol_vertices, "symbol_packed_vb");
-                    let sym_ib = self
-                        .state
-                        .create_index_buffer(&self.packed_symbol_indices, "symbol_packed_ib");
-
-                    render_pass.set_pipeline(&self.pipelines.texture_pipeline);
-                    render_pass.set_bind_group(0, &self.view_bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, sym_vb.slice(..));
-                    render_pass.set_index_buffer(sym_ib.slice(..), wgpu::IndexFormat::Uint32);
-
-                    for &(sym_id, idx_start, idx_count) in &self.packed_symbol_ranges {
-                        if let Some(tex) = self.symbol_textures.get(&sym_id) {
-                            render_pass.set_bind_group(1, &tex.bind_group, &[]);
-                            render_pass.draw_indexed(idx_start..idx_start + idx_count, 0, 0..1);
-                        }
-                    }
-                }
-            }
-        }
+        // Screen and exported images share chart text and selection overlays.
+        self.egui.render(
+            &self.state.device,
+            &self.state.queue,
+            &mut encoder,
+            &resolve_view,
+            egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [width, height],
+                pixels_per_point: self.state.window.scale_factor() as f32,
+            },
+            overlay,
+        );
 
         // Copy resolved texture to buffer
         encoder.copy_texture_to_buffer(
@@ -3718,12 +6055,13 @@ impl WgpuRenderer {
             line_triangles: self.line_indices.len() / 3,
             symbol_instances: self.symbol_instances.len(),
             symbol_textures: self.symbol_textures.len(),
+            text_labels: self.text_labels.len(),
         }
     }
 }
 
 /// Rendering statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderStats {
     pub area_vertices: usize,
     pub area_triangles: usize,
@@ -3731,6 +6069,7 @@ pub struct RenderStats {
     pub line_triangles: usize,
     pub symbol_instances: usize,
     pub symbol_textures: usize,
+    pub text_labels: usize,
 }
 
 impl std::fmt::Display for RenderStats {
@@ -3745,5 +6084,160 @@ impl std::fmt::Display for RenderStats {
             self.symbol_instances,
             self.symbol_textures
         )
+    }
+}
+
+/// Geographic AABB culling with a 50% animation margin and optional +/-360 copies.
+fn longitude_bounds_relation(
+    aabb: (f64, f64, f64, f64),
+    bounds: Option<(f64, f64, f64, f64)>,
+    wrapping: bool,
+) -> ferrite_kernel::spatial_hierarchy::SpatialRelation {
+    use ferrite_kernel::spatial_hierarchy::SpatialRelation as R;
+    if !longitude_bounds_visible(aabb, bounds, wrapping) {
+        return R::Outside;
+    }
+    let Some((x0, y0, x1, y1)) = bounds else {
+        return R::Inside;
+    };
+    let (ax, ay, bx, by) = aabb;
+    let mx = (x1 - x0) * 0.5;
+    let my = (y1 - y0) * 0.5;
+    let offsets = [0., -360., 360.];
+    if ay >= y0 - my
+        && by <= y1 + my
+        && offsets[..if wrapping { 3 } else { 1 }]
+            .iter()
+            .any(|dx| ax + dx >= x0 - mx && bx + dx <= x1 + mx)
+    {
+        R::Inside
+    } else {
+        R::Intersecting
+    }
+}
+fn longitude_bounds_visible(
+    aabb: (f64, f64, f64, f64),
+    bounds: Option<(f64, f64, f64, f64)>,
+    wrapping: bool,
+) -> bool {
+    let Some((x0, y0, x1, y1)) = bounds else {
+        return true;
+    };
+    let (ax, ay, bx, by) = aabb;
+    let mx = (x1 - x0) * 0.5;
+    let my = (y1 - y0) * 0.5;
+    if by < y0 - my || ay > y1 + my {
+        return false;
+    }
+    let offsets = [0., -360., 360.];
+    offsets[..if wrapping { 3 } else { 1 }]
+        .iter()
+        .any(|offset| bx + offset >= x0 - mx && ax + offset <= x1 + mx)
+}
+#[cfg(test)]
+mod longitude_culling_tests {
+    use super::*;
+    #[test]
+    fn culls_against_the_actual_enabled_copies_with_animation_margin() {
+        let view = Some((350., 0., 370., 10.));
+        assert!(!longitude_bounds_visible((0., 5., 0., 5.), view, false));
+        assert!(longitude_bounds_visible((0., 5., 0., 5.), view, true));
+        assert!(longitude_bounds_visible((720., 5., 720., 5.), view, true));
+        assert!(!longitude_bounds_visible(
+            (-360., 5., -360., 5.),
+            view,
+            true
+        ));
+        assert!(!longitude_bounds_visible((0., 50., 0., 50.), view, true));
+        assert!(longitude_bounds_visible((-5., 0., 5., 10.), view, true));
+        assert!(longitude_bounds_visible((338., 5., 342., 5.), view, false));
+        assert!(!longitude_bounds_visible((325., 5., 329., 5.), view, true));
+    }
+}
+
+/// Intersect a chart's physical-pixel viewport with the current render target.
+fn chart_pass_scissor(viewport: ferrite_render::Viewport, extent: [u32; 2]) -> Option<[u32; 4]> {
+    let [vx, vy, vw, vh] = [viewport.x, viewport.y, viewport.width, viewport.height].map(f64::from);
+    if ![vx, vy, vw, vh].iter().all(|v| v.is_finite())
+        || vw <= 0.
+        || vh <= 0.
+        || extent.contains(&0)
+    {
+        return None;
+    }
+    let x = vx.floor().clamp(0., extent[0] as f64) as u32;
+    let y = vy.floor().clamp(0., extent[1] as f64) as u32;
+    let right = (vx + vw).ceil().clamp(0., extent[0] as f64) as u32;
+    let bottom = (vy + vh).ceil().clamp(0., extent[1] as f64) as u32;
+    (right > x && bottom > y).then(|| [x, y, right - x, bottom - y])
+}
+fn intersect_scissors(a: [u32; 4], b: [u32; 4]) -> Option<[u32; 4]> {
+    let x = a[0].max(b[0]);
+    let y = a[1].max(b[1]);
+    let right = a[0].saturating_add(a[2]).min(b[0].saturating_add(b[2]));
+    let bottom = a[1].saturating_add(a[3]).min(b[1].saturating_add(b[3]));
+    (right > x && bottom > y).then(|| [x, y, right - x, bottom - y])
+}
+#[cfg(test)]
+mod chart_pass_scissor_tests {
+    use super::*;
+    #[test]
+    fn shifted_resized_and_invalid_viewports_are_bounded() {
+        use ferrite_render::Viewport as V;
+        assert_eq!(
+            chart_pass_scissor(V::with_origin(160., 120., 480., 320.), [960, 640]),
+            Some([160, 120, 480, 320])
+        );
+        assert_eq!(
+            chart_pass_scissor(V::with_origin(-10., 20., 100., 80.), [50, 60]),
+            Some([0, 20, 50, 40])
+        );
+        assert_eq!(
+            chart_pass_scissor(V::with_origin(1.2, 2.2, 3.2, 4.2), [50, 60]),
+            Some([1, 2, 4, 5])
+        );
+        for v in [
+            V::new(0., 10.),
+            V::new(f32::NAN, 10.),
+            V::with_origin(f32::INFINITY, 0., 10., 10.),
+            V::with_origin(100., 100., 10., 10.),
+        ] {
+            assert_eq!(chart_pass_scissor(v, [50, 60]), None);
+        }
+        assert_eq!(chart_pass_scissor(V::new(20., 20.), [0, 60]), None);
+    }
+    #[test]
+    fn text_scissor_never_expands_the_chart_pane() {
+        assert_eq!(
+            intersect_scissors([0, 0, 960, 640], [160, 120, 480, 320]),
+            Some([160, 120, 480, 320])
+        );
+        assert_eq!(
+            intersect_scissors([600, 400, 100, 100], [160, 120, 480, 320]),
+            Some([600, 400, 40, 40])
+        );
+        assert_eq!(
+            intersect_scissors([0, 0, 10, 10], [160, 120, 480, 320]),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod globe_publication_stage_tests {
+    use super::*;
+    fn binding()->GlobePublicationBinding {GlobePublicationBinding{extent:[800,600],format:wgpu::TextureFormat::Bgra8UnormSrgb,density:2f64.to_bits(),samples:4,symbol_scale:1f32.to_bits(),tilt:0f64.to_bits(),range_factor:1f64.to_bits(),pose:Some([0,0,100f64.to_bits(),0,0]),flags:[false;9]}}
+    #[test]
+    fn publication_binding_rejects_other_renderer_and_changed_frame_state() {
+        let owner=Arc::new(());let other=Arc::new(());let expected=binding();
+        assert!(globe_publication_binding_matches(&owner,&owner,&expected,&expected));
+        assert!(!globe_publication_binding_matches(&owner,&other,&expected,&expected));
+        for field in 0..9 {let mut changed=expected.clone();match field {0=>changed.extent[0]+=1,1=>changed.format=wgpu::TextureFormat::Rgba8Unorm,2=>changed.density=1f64.to_bits(),3=>changed.samples=1,4=>changed.symbol_scale=2f32.to_bits(),5=>changed.tilt=1f64.to_bits(),6=>changed.range_factor=2f64.to_bits(),7=>changed.pose.as_mut().unwrap()[2]=101f64.to_bits(),_=>changed.flags[1]=true};assert!(!globe_publication_binding_matches(&owner,&owner,&changed,&expected),"field{field}");}
+    }
+    #[test]
+    fn fresh_publication_symbol_state_has_no_live_gpu_aliases_or_epochs() {
+        let fresh=GlobeSymbolPreparation::default();
+        assert!(fresh.symbol_textures.is_empty()&&fresh.globe_pattern_resources.is_empty()&&fresh.globe_pattern_textures.is_empty()&&fresh.globe_whole_motif_textures.is_empty());
+        assert!(fresh.globe_pattern_epoch.is_none()&&fresh.globe_prepared_symbol_epoch.is_none());
     }
 }

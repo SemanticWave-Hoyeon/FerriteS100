@@ -1,0 +1,24 @@
+[package]
+name = "ferrite-kernel"
+version.workspace = true
+edition.workspace = true
+description = "Product-neutral S-100 chart kernel contracts and spatial coverage operations"
+
+[dependencies]
+anyhow.workspace = true
+
+serde.workspace = true
+chrono.workspace = true
+geographiclib-rs = { version = "=0.2.7", default-features = false }
+
+earcutr.workspace = true
+
+geo = { version = "=0.31.0", default-features = false }
+
+num-bigint = "=0.4.8"
+
+num-complex = "=0.4.6"
+num-integer = "=0.1.47"
+
+[dev-dependencies]
+serde_json.workspace = true

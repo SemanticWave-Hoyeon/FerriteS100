@@ -2,20 +2,21 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::{
-    AttributeBinding, AttributeValueType, ComplexAttribute, FeatureType, InformationType,
-    ListedValue, Multiplicity, Result, SimpleAttribute, SpatialPrimitive,
+    AttributeBinding, AttributeValueType, AttributeVisibility, ComplexAttribute, FeatureType,
+    InformationType, ListedValue, Multiplicity, Result, SimpleAttribute, SpatialPrimitive,
 };
 
 /// Feature Catalogue
 #[derive(Debug, Clone)]
 pub struct FeatureCatalogue {
+    pub source_path: std::path::PathBuf,
     pub name: String,
     pub scope: String,
     pub version: String,
@@ -28,6 +29,41 @@ pub struct FeatureCatalogue {
 }
 
 impl FeatureCatalogue {
+    /// Resolve a binding on a feature, information type or complex attribute.
+    /// Inherited bindings are searched without following catalogue cycles indefinitely.
+    pub fn attribute_visibility(
+        &self,
+        owner: &str,
+        attribute: &str,
+    ) -> Option<AttributeVisibility> {
+        if let Some(complex) = self.complex_attributes.get(owner) {
+            return complex
+                .sub_attributes
+                .iter()
+                .find(|b| b.attribute_code == attribute)
+                .map(|b| b.visibility);
+        }
+        let mut current = Some(owner);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(code) = current {
+            if !seen.insert(code) {
+                return None;
+            }
+            let (bindings, parent) = if let Some(feature) = self.feature_types.get(code) {
+                (&feature.attribute_bindings, feature.super_type.as_deref())
+            } else if let Some(info) = self.information_types.get(code) {
+                (&info.attribute_bindings, info.super_type.as_deref())
+            } else {
+                return None;
+            };
+            if let Some(binding) = bindings.iter().find(|b| b.attribute_code == attribute) {
+                return Some(binding.visibility);
+            }
+            current = parent;
+        }
+        None
+    }
+
     /// Maximum allowed XML file size (50 MB)
     /// Security: Prevents resource exhaustion from oversized files
     const MAX_XML_SIZE: u64 = 50 * 1024 * 1024;
@@ -39,22 +75,34 @@ impl FeatureCatalogue {
         let path = path.as_ref();
         tracing::info!("Loading Feature Catalogue: {}", path.display());
 
-        // Security: Check file size before loading
-        let metadata = std::fs::metadata(path)?;
-        if metadata.len() > Self::MAX_XML_SIZE {
-            return Err(crate::FCError::InvalidValue(format!(
-                "File too large: {} bytes (max {} bytes)",
-                metadata.len(),
-                Self::MAX_XML_SIZE
-            )));
+        let mut bytes = Vec::new();
+        File::open(path)?.take(Self::MAX_XML_SIZE + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > Self::MAX_XML_SIZE {
+            return Err(crate::FCError::InvalidValue("FC XML byte limit exceeded (50 MiB)".into()));
         }
+        Self::parse_bytes(path, &bytes)
+    }
 
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+    /// Retain a digest of the same bounded input buffer consumed by the parser.
+    pub fn load_bound<P: AsRef<Path>>(path: P) -> Result<BoundFeatureCatalogue> {
+        use sha2::Digest;
+        let path = path.as_ref();
+        let mut bytes = Vec::new();
+        File::open(path)?.take(Self::MAX_XML_SIZE + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > Self::MAX_XML_SIZE {
+            return Err(crate::FCError::InvalidValue("FC XML byte limit exceeded (50 MiB)".into()));
+        }
+        let digest = sha2::Sha256::digest(&bytes).into();
+        Ok(BoundFeatureCatalogue { catalogue: Self::parse_bytes(path, &bytes)?, digest })
+    }
+
+    fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let reader = BufReader::new(bytes);
         let mut xml_reader = Reader::from_reader(reader);
         xml_reader.config_mut().trim_text(true);
 
         let mut catalogue = FeatureCatalogue {
+            source_path: path.to_path_buf(),
             name: String::new(),
             scope: String::new(),
             version: String::new(),
@@ -67,11 +115,20 @@ impl FeatureCatalogue {
         };
 
         let mut buf = Vec::new();
+        let mut catalogue_root_seen = false;
 
         loop {
             match xml_reader.read_event_into(&mut buf)? {
                 Event::Start(ref e) => {
                     let local_name = get_local_name(e);
+                    if !catalogue_root_seen {
+                        if local_name != "S100_FC_FeatureCatalogue" {
+                            return Err(crate::FCError::InvalidValue(
+                                "Not an S-100 Feature Catalogue XML document".into(),
+                            ));
+                        }
+                        catalogue_root_seen = true;
+                    }
                     match local_name.as_str() {
                         "S100_FC_SimpleAttribute" => {
                             let attr = parse_simple_attribute(&mut xml_reader)?;
@@ -111,6 +168,12 @@ impl FeatureCatalogue {
                 _ => {}
             }
             buf.clear();
+        }
+
+        if !catalogue_root_seen {
+            return Err(crate::FCError::InvalidValue(
+                "Missing S-100 Feature Catalogue XML root".into(),
+            ));
         }
 
         tracing::info!(
@@ -301,6 +364,7 @@ fn parse_feature_type<R: std::io::BufRead>(
     reader: &mut Reader<R>,
 ) -> Result<FeatureType> {
     let mut ft = FeatureType {
+        feature_use_type: None,
         code: String::new(),
         name: String::new(),
         definition: None,
@@ -327,6 +391,15 @@ fn parse_feature_type<R: std::io::BufRead>(
                     "name" => ft.name = read_text_content(reader)?,
                     "definition" => ft.definition = Some(read_text_content(reader)?),
                     "superType" => ft.super_type = Some(read_text_content(reader)?),
+                    "featureUseType" if depth == 1 => {
+                        if ft.feature_use_type.is_some() {
+                            return Err(crate::FCError::InvalidValue(
+                                "Duplicate featureUseType".into(),
+                            ));
+                        }
+                        ft.feature_use_type =
+                            Some(crate::FeatureUseType::parse(&read_text_content(reader)?)?);
+                    }
                     // Sub-parser consumes entire element including End
                     "attributeBinding" => {
                         let binding = parse_attribute_binding(e, reader)?;
@@ -346,6 +419,9 @@ fn parse_feature_type<R: std::io::BufRead>(
                 if depth == 0 {
                     break;
                 }
+            }
+            Event::Empty(ref e) if depth == 1 && get_local_name(e) == "featureUseType" => {
+                return Err(crate::FCError::InvalidValue("Empty featureUseType".into()));
             }
             Event::Empty(_) => {}
             Event::Eof => break,
@@ -418,6 +494,7 @@ fn parse_attribute_binding<R: std::io::BufRead>(
 ) -> Result<AttributeBinding> {
     let mut binding = AttributeBinding {
         attribute_code: String::new(),
+        visibility: AttributeVisibility::Public,
         multiplicity: Multiplicity::default(),
         sequential: false,
         permitted_values: Vec::new(),
@@ -443,6 +520,18 @@ fn parse_attribute_binding<R: std::io::BufRead>(
                         } else {
                             binding.attribute_code = read_text_content(reader)?;
                         }
+                    }
+                    "attributeVisibility" => {
+                        binding.visibility = match read_text_content(reader)?.as_str() {
+                            "publicVisibility" => AttributeVisibility::Public,
+                            "protectedVisibility" => AttributeVisibility::Protected,
+                            "privateVisibility" => AttributeVisibility::Private,
+                            value => {
+                                return Err(crate::FCError::InvalidValue(format!(
+                                    "Unknown attributeVisibility: {value}"
+                                )))
+                            }
+                        };
                     }
                     "lower" => {
                         let val = read_text_content(reader)?;
@@ -590,5 +679,109 @@ fn parse_spatial_primitive(s: &str) -> Option<SpatialPrimitive> {
         "coverage" => Some(SpatialPrimitive::Coverage),
         "nogeometry" | "none" => Some(SpatialPrimitive::NoGeometry),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    #[test]
+    fn binding_visibility_consumes_xml_and_rejects_unknown_values() {
+        for (value, expected) in [
+            ("publicVisibility", AttributeVisibility::Public),
+            ("protectedVisibility", AttributeVisibility::Protected),
+            ("privateVisibility", AttributeVisibility::Private),
+        ] {
+            let xml = format!("<attributeBinding><multiplicity><lower>0</lower><upper>1</upper></multiplicity><attributeVisibility>{value}</attributeVisibility><attribute ref=\"depth\"/></attributeBinding>");
+            let mut reader = Reader::from_str(&xml);
+            let Event::Start(start) = reader.read_event().unwrap() else {
+                panic!()
+            };
+            let binding = parse_attribute_binding(&start, &mut reader).unwrap();
+            assert_eq!(binding.visibility, expected);
+            assert_eq!(binding.attribute_code, "depth");
+            assert_eq!(binding.multiplicity.upper, Some(1));
+        }
+        let xml = "<attributeBinding><attributeVisibility>unknown</attributeVisibility></attributeBinding>";
+        let mut reader = Reader::from_str(xml);
+        let Event::Start(start) = reader.read_event().unwrap() else {
+            panic!()
+        };
+        assert!(parse_attribute_binding(&start, &mut reader).is_err());
+    }
+}
+
+#[cfg(test)]
+mod feature_use_tests {
+    use super::*;
+    fn parse(content: &str) -> Result<FeatureType> {
+        let xml = format!("<S100_FC_FeatureType><code>Test</code>{content}</S100_FC_FeatureType>");
+        let mut reader = Reader::from_str(&xml);
+        let Event::Start(start) = reader.read_event().unwrap() else {
+            panic!()
+        };
+        parse_feature_type(&start, &mut reader)
+    }
+    #[test]
+    fn feature_use_categories_are_preserved_not_guessed() {
+        for value in ["geographic", "meta", "cartographic", "theme"] {
+            let ft = parse(&format!("<featureUseType>{value}</featureUseType>")).unwrap();
+            assert_eq!(ft.code, "Test");
+            assert_eq!(ft.feature_use_type.unwrap().as_str(), value);
+        }
+        assert_eq!(parse("").unwrap().feature_use_type, None);
+        assert_eq!(
+            parse(
+                "<definitionReference><featureUseType>meta</featureUseType></definitionReference>"
+            )
+            .unwrap()
+            .feature_use_type,
+            None
+        );
+    }
+    #[test]
+    fn invalid_empty_and_duplicate_classifications_are_rejected() {
+        for content in [
+            "<featureUseType>unknown</featureUseType>",
+            "<featureUseType>Geographic</featureUseType>",
+            "<featureUseType/>",
+            "<featureUseType></featureUseType>",
+            "<featureUseType>meta</featureUseType><featureUseType>geographic</featureUseType>",
+        ] {
+            assert!(parse(content).is_err(), "{content}");
+        }
+    }
+}
+
+/// Parsed catalogue and exact source identity, replaced as one value.
+#[derive(Debug, Clone)]
+pub struct BoundFeatureCatalogue { catalogue: FeatureCatalogue, digest: [u8; 32] }
+impl std::ops::Deref for BoundFeatureCatalogue {
+    type Target = FeatureCatalogue;
+    fn deref(&self) -> &Self::Target { &self.catalogue }
+}
+impl BoundFeatureCatalogue { pub fn source_digest(&self) -> &[u8; 32] { &self.digest } }
+
+#[cfg(test)]
+mod source_identity_tests {
+    use super::*;
+    #[test]
+    fn bound_metadata_and_digest_survive_original_edit_and_deletion() {
+        use sha2::Digest;
+        let path = std::env::temp_dir().join(format!("ferrite-fc-source-{}-{}.xml", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let xml = |name: &str| format!("<S100_FC_FeatureCatalogue><name>{name}</name><versionNumber>2.0</versionNumber><productId>S-101</productId></S100_FC_FeatureCatalogue>");
+        let a = xml("A"); let b = xml("B");
+        std::fs::write(&path, &a).unwrap();
+        let first = FeatureCatalogue::load_bound(&path).unwrap();
+        assert_eq!(FeatureCatalogue::load(&path).unwrap().name, first.name);
+        assert_eq!(first.name, "A");
+        assert_eq!(first.source_digest().as_slice(), sha2::Sha256::digest(a.as_bytes()).as_slice());
+        std::fs::write(&path, &b).unwrap();
+        let second = FeatureCatalogue::load_bound(&path).unwrap();
+        assert_eq!(second.name, "B");
+        assert_ne!(first.source_digest(), second.source_digest());
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(first.name, "A");
+        assert_eq!(second.name, "B");
     }
 }

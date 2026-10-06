@@ -3,6 +3,7 @@
 //! This crate provides data structures for representing S-100/S-101
 //! Electronic Navigational Chart data.
 
+mod attribute_updates;
 mod cell;
 mod code_mapping;
 mod error;
@@ -16,3 +17,5 @@ pub use error::*;
 pub use feature::*;
 pub use information::*;
 pub use spatial::*;
+
+pub mod updates;

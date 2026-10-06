@@ -1,5 +1,6 @@
 //! Error types for Lua integration
 
+use crate::mlua;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

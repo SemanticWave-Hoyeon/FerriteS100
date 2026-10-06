@@ -1,0 +1,16 @@
+[package]
+name = "ferrite-secom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+ferrite-security.workspace = true
+base64 = "=0.22.1"
+serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-manual-roots"] }
+uuid = "1"
+openssl = { version = "0.10", features = ["vendored"] }
+[dev-dependencies]
+serde_json.workspace = true

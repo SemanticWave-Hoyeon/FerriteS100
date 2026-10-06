@@ -18,7 +18,7 @@ pub struct FRID {
 }
 
 /// Feature Object Identifier (FOID)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FOID {
     /// Producing agency code
     pub agen: u16,
@@ -26,6 +26,13 @@ pub struct FOID {
     pub fidn: u32,
     /// Feature identification subdivision
     pub fids: u16,
+}
+
+/// Human-readable component tuple, not an MRN or dataset-local record identifier.
+impl std::fmt::Display for FOID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.agen, self.fidn, self.fids)
+    }
 }
 
 /// Attribute value types
@@ -68,7 +75,8 @@ pub struct Attribute {
     pub natc: u16,
     /// Attribute index (position in list)
     pub atix: u16,
-    /// Parent attribute index (0 = root)
+    /// Parent tuple position in the combined internal vector (1-based; 0 = root).
+    /// Field-local PAIX is normalized when multiple ATTR fields are appended.
     pub paix: u16,
     /// Attribute value (raw text)
     pub atvl: String,
@@ -113,6 +121,9 @@ pub struct SpatialAssociation {
     pub usag: u8,
     /// Mask pointer
     pub mask: u8,
+    pub scale_minimum: Option<u32>,
+    pub scale_maximum: Option<u32>,
+    pub update_instruction: u8,
 }
 
 /// Information association
@@ -124,6 +135,8 @@ pub struct InformationAssociation {
     pub narc: u16,
     /// Referenced information record
     pub info_id: RecordId,
+    pub update_instruction: u8,
+    pub attributes: Vec<Attribute>,
 }
 
 /// Feature association
@@ -135,11 +148,15 @@ pub struct FeatureAssociation {
     pub narc: u16,
     /// Referenced feature record
     pub feature_id: RecordId,
+    pub update_instruction: u8,
+    pub attributes: Vec<Attribute>,
 }
 
 /// Mask record
 #[derive(Debug, Clone)]
 pub struct MaskRecord {
+    /// MASK MUIN (1 insert, 2 delete); application of updates is separate.
+    pub update_instruction: u8,
     /// Mask type
     pub mask_type: u8,
     /// Referenced spatial

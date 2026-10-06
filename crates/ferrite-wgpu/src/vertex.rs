@@ -88,59 +88,32 @@ impl TexturedVertex {
     }
 }
 
-/// Line vertex with width attribute
+/// Stroke vertex: geographic center and an unscaled screen-pixel offset.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct LineVertex {
     pub position: [f32; 2],
-    pub normal: [f32; 2],
+    pub offset: [f32; 2],
     pub color: [f32; 4],
-    pub width: f32,
-    pub _padding: f32,
 }
 
 impl LineVertex {
     #[inline]
-    pub fn new(x: f32, y: f32, nx: f32, ny: f32, color: [f32; 4], width: f32) -> Self {
-        LineVertex {
+    pub fn new(x: f32, y: f32, ox: f32, oy: f32, color: [f32; 4]) -> Self {
+        Self {
             position: [x, y],
-            normal: [nx, ny],
+            offset: [ox, oy],
             color,
-            width,
-            _padding: 0.0,
         }
     }
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                // position
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                // normal
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                // color
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                // width
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
-                    shader_location: 3,
-                    format: wgpu::VertexFormat::Float32,
-                },
-            ],
+            attributes: &ATTRIBUTES,
         }
     }
 }
@@ -161,8 +134,8 @@ pub struct ViewUniforms {
     pub pan_offset: [f32; 2],
     /// GPU zoom scale (1.0 = no zoom, >1 = zoomed in)
     pub zoom_scale: f32,
-    /// Padding for alignment
-    pub _padding2: f32,
+    /// Independent vertical zoom; occupies the former padding slot.
+    pub zoom_scale_y: f32,
     /// Zoom pivot point in screen coordinates
     pub zoom_pivot: [f32; 2],
     /// Padding for 16-byte alignment
@@ -203,7 +176,7 @@ impl ViewUniforms {
             _padding: 0.0,
             pan_offset: [pan_x, pan_y],
             zoom_scale,
-            _padding2: 0.0,
+            zoom_scale_y: zoom_scale,
             zoom_pivot: [zoom_pivot_x, zoom_pivot_y],
             _padding3: [0.0, 0.0],
         }

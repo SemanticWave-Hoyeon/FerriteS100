@@ -32,6 +32,36 @@ pub struct ContextParameter {
     pub default_value: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub enable: Option<String>,
+    #[serde(default)]
+    pub constraints: Vec<ContextEnumeration>,
+    #[serde(default)]
+    pub validations: Vec<ContextValidation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextText {
+    pub text: String,
+    pub language: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextEnumeration {
+    pub value: String,
+    pub labels: Vec<ContextText>,
+    pub icon: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContextExpression {
+    XPath(String),
+    Regex(String),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextValidation {
+    pub enable: Option<String>,
+    pub expression: ContextExpression,
+    pub errors: Vec<ContextText>,
+    pub icon: Option<String>,
 }
 
 /// Context parameter type
