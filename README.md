@@ -596,6 +596,22 @@ path and rendering modules and retains the 2D S-101/S-102 chart view. General
 WGS84 geodesy and Mercator navigation remain. Historical globe reports in
 `TestResults/` describe the older implementation.
 
+The line suppression cache now prepares stable geometric relations before
+interactive traversal, within its existing 64 MiB transformed-input and 32 MiB
+compiler admission limits. Current visibility, date, viewing-group, scale and
+coverage decisions remain live. Refused preparation uses the existing lazy
+planner; `FERRITE_LINE_SUPPRESSION_PREWARM=0` explicitly disables preparation.
+The DEF escape decoder also uses one pass while preserving the original
+nonrecursive escape order and Unicode output.
+
+In one hidden SHOM workload, paired diagnostics removed four growth-triggered
+relation recompilations: affected frame preparation fell from about 16–36 ms
+to 6–12 ms. Preparation cost 136–219 ms initially and retained about 2.38 MB
+of compiled relations in that workload. Warm results were mixed; this is not
+foreground 60 FPS or cross-platform certification. The combined candidate
+passed 272 CPU tests, eight original signed-chain comparisons and 14 paired
+palette/pattern/zoom recovery checks including the official Wreck at 200x.
+
 Lua 5.4 remains the shipping qualification backend; Lua 5.4/5.5 are selected at
 build time. Feature/Portrayal Catalogue versions remain independently selectable.
 The corrected shallow-pattern contract suppresses only the recognized official PC's

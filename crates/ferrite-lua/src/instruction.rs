@@ -389,10 +389,37 @@ impl DrawingCommand {
 
 /// Decode DEF-encoded special characters: &s → ;  &c → :  &m → ,  &a → &
 fn def_decode(s: &str) -> String {
-    s.replace("&s", ";")
-        .replace("&c", ":")
-        .replace("&m", ",")
-        .replace("&a", "&")
+    // Output never grows: each recognized two-byte escape becomes one byte.
+    // Decode original tokens only. In particular, &as becomes literal &s;
+    // decoding the ampersand does not recursively interpret the following s.
+    let Some(first) = s.find('&') else { return s.to_owned(); };
+    let mut output = String::with_capacity(s.len());
+    output.push_str(&s[..first]);
+    let mut rest = &s[first..];
+    loop {
+        let replacement = match rest.as_bytes().get(1) {
+            Some(b's') => Some(';'),
+            Some(b'c') => Some(':'),
+            Some(b'm') => Some(','),
+            Some(b'a') => Some('&'),
+            _ => None,
+        };
+        if let Some(value) = replacement {
+            output.push(value);
+            rest = &rest[2..];
+        } else {
+            output.push('&');
+            rest = &rest[1..];
+        }
+        if let Some(next) = rest.find('&') {
+            output.push_str(&rest[..next]);
+            rest = &rest[next..];
+        } else {
+            output.push_str(rest);
+            break;
+        }
+    }
+    output
 }
 
 // ──────────────────────────────────────────────────────
@@ -2506,5 +2533,37 @@ mod observed_def_tests {
             assert!(PortrayalResult::parse("1","PointInstruction:WRECKS01",invalid).is_err(),"{invalid}");
         }
         assert_eq!(result("a:1;A:2").observed_parameters,["A:2","a:1"]);
+    }
+}
+
+#[cfg(test)]
+mod def_decode_reference_controls {
+    use super::*;
+    fn reference(input: &str) -> String {
+        input.replace("&s", ";").replace("&c", ":").replace("&m", ",").replace("&a", "&")
+    }
+    #[test]
+    fn original_escape_tokens_match_legacy_order_including_unicode_and_overlaps() {
+        fn enumerate(prefix: &mut String, depth: usize) {
+            assert_eq!(def_decode(prefix), reference(prefix), "input={prefix:?}");
+            if depth == 0 { return; }
+            for piece in ["&", "s", "c", "m", "a", "X", "한"] {
+                let length=prefix.len();prefix.push_str(piece);
+                enumerate(prefix,depth-1);prefix.truncate(length);
+            }
+        }
+        enumerate(&mut String::new(),5);
+        for input in ["&as", "&ac", "&am", "&aa", "&&as", "&a&s&c&m", "끝🌊&a&s마지막&", "&unknown;&"] {
+            assert_eq!(def_decode(input),reference(input),"input={input:?}");
+        }
+        assert_eq!(def_decode("&as &ac &am &aa"),"&s &c &m &a");
+    }
+    #[test]
+    fn long_plaintext_and_mixed_escaped_text_preserve_full_content() {
+        for input in ["Plain 한글🌊 without escapes".repeat(8192),"&a&s&m&c🌊&unknown&as&&".repeat(8192)] {
+            let result=def_decode(&input);
+            assert_eq!(result,reference(&input));
+            assert!(result.len()<=input.len());
+        }
     }
 }

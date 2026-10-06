@@ -231,9 +231,21 @@ pub struct LineSuppressionCache {
     )>,
     immutable_last: Option<(Vec<bool>, Arc<LineSuppressionPlan>)>,
     immutable_current: Option<Arc<LineSuppressionPlan>>,
+    // Opt-in only. A declined prewarm is tried once per immutable source epoch.
+    prewarm_policy: Option<bool>,
+    prewarm_attempt: Option<(u64, FlatProjection, usize)>,
 }
 impl LineSuppressionCache {
+    fn static_prewarm_policy(value: Option<&str>) -> bool {
+        value.is_none_or(|value| value == "1")
+    }
+    /// Override bounded static preparation and invalidate all cached relations.
+    pub fn set_static_prewarm_enabled(&mut self, enabled: bool) {
+        self.clear();
+        self.prewarm_policy = Some(enabled);
+    }
     pub fn clear(&mut self) {
+        self.prewarm_attempt = None;
         self.last = None;
         self.immutable_prepared = None;
         self.immutable_last = None;
@@ -267,6 +279,21 @@ impl LineSuppressionCache {
         projection: FlatProjection,
     ) -> Arc<LineSuppressionPlan> {
         debug_assert!(visibility.is_none_or(|v| v.len() == instructions.len()));
+        let prewarm = *self.prewarm_policy.get_or_insert_with(|| {
+            Self::static_prewarm_policy(std::env::var("FERRITE_LINE_SUPPRESSION_PREWARM").ok().as_deref())
+        });
+        let source = (revision, projection, instructions.len());
+        if prewarm && self.prewarm_attempt != Some(source) {
+            self.prewarm_attempt = Some(source);
+            if let Some((prepared, compiled)) = Self::try_static_prewarm(
+                instructions, projection, 64 * 1024 * 1024, 32 * 1024 * 1024,
+            ) {
+                self.immutable_last = None;
+                self.immutable_prepared = Some((revision, projection, prepared, Some(compiled)));
+            }
+            // Decline changes no original prepared state: lazy admission and its
+            // original mutable fallback below remain authoritative.
+        }
         let eligible: Vec<_> = instructions.iter().enumerate().map(|(i,item)| {
             visibility.is_none_or(|v|v.get(i).copied().unwrap_or(false))
                 && instruction_visible(item,scale,groups,override_group)
@@ -389,6 +416,58 @@ impl LineSuppressionCache {
         };
         self.immutable_current = Some(Arc::clone(&plan));
         plan
+    }
+    /// Compile a superset of possible geographic source curves, never visibility.
+    /// Invalid prospective geometry declines the whole speculative operation.
+    /// The existing lazy planner alone decides how that geometry is handled.
+    fn try_static_prewarm(
+        instructions: &[DrawingInstruction], projection: FlatProjection,
+        transform_budget: usize, compiler_budget: usize,
+    ) -> Option<(Vec<bool>, PreparedLineSuppression)> {
+        let mut points = 0usize;
+        let mut segments = 0usize;
+        let mut lines = 0usize;
+        for item in instructions {
+            if let DrawingInstruction::Line(line) = item {
+                if line.screen_ray.is_none() && line.portrayal_path.is_none() {
+                    // Do not speculatively process malformed/incomplete sources.
+                    Curve::new(&line.points)?;
+                    points = points.checked_add(line.points.len())?;
+                    segments = segments.checked_add(line.points.len() - 1)?;
+                    lines = lines.checked_add(1)?;
+                }
+            }
+        }
+        let base = instructions.len().checked_mul(std::mem::size_of::<DrawingInstruction>())?;
+        if base.checked_add(points.checked_mul(std::mem::size_of::<WorldPoint>())?)? > transform_budget
+            || segments.checked_mul(128)? > compiler_budget
+            || lines.checked_mul(128)? > compiler_budget { return None; }
+        let mut prepared = Vec::with_capacity(instructions.len());
+        let mut transformed = Vec::with_capacity(instructions.len());
+        for item in instructions {
+            let mut out = crate::LineInstruction::new(Vec::new());
+            let mut selected = false;
+            if let DrawingInstruction::Line(line) = item {
+                if line.screen_ray.is_none() && line.portrayal_path.is_none() {
+                    selected = true;
+                    // Identical original project_y expression and source order.
+                    out.points = line.points.iter()
+                        .map(|p| WorldPoint::new(p.x, projection.project_y(p.y))).collect();
+                    Curve::new(&out.points)?;
+                    // Extreme arithmetic is left to the original lazy planner.
+                    if out.points.windows(2).any(|p| {
+                        !(p[1].x-p[0].x).is_finite() || !(p[1].y-p[0].y).is_finite()
+                    }) { return None; }
+                    out.priority = line.priority;
+                    out.display_plane = line.display_plane;
+                    out.suppressible = line.suppressible;
+                }
+            }
+            prepared.push(selected);
+            transformed.push(DrawingInstruction::Line(out));
+        }
+        let compiled = PreparedLineSuppression::compile(&transformed, compiler_budget)?;
+        Some((prepared, compiled))
     }
     pub fn plan(
         &mut self,
@@ -1440,4 +1519,117 @@ mod immutable_projected_tests {
         warm.clear();
         assert!(warm.current().is_none());
     }
+}
+
+#[cfg(test)]
+mod static_prewarm_contract_tests {
+    use super::*;
+    fn line(a: (f64,f64), b: (f64,f64), priority:i32)->DrawingInstruction {
+        DrawingInstruction::Line(crate::LineInstruction::new(vec![WorldPoint::new(a.0,a.1),WorldPoint::new(b.0,b.1)]).with_priority(priority))
+    }
+    fn fixture()->Vec<DrawingInstruction> {
+        vec![line((0.,60.),(0.,80.),2),line((0.,70.),(0.,80.),9),line((0.,80.),(0.,60.),5)]
+    }
+    fn compare(cache:&mut LineSuppressionCache, items:&[DrawingInstruction], epoch:u64,
+        projection:FlatProjection, scale:u32, groups:Option<&HashSet<u32>>, visible:&[bool]) {
+        let mut original=LineSuppressionCache::default();
+        original.set_static_prewarm_enabled(false);
+        let golden=original.plan_immutable_projected_with_visibility(items,epoch,scale,groups,None,Some(visible),projection);
+        let actual=cache.plan_immutable_projected_with_visibility(items,epoch,scale,groups,None,Some(visible),projection);
+        assert_eq!(*actual,*golden);
+        // Independent ordinary planner, not a copy of speculative logic.
+        let direct=LineSuppressionCache::default().plan_projected_with_visibility(items,scale,groups,None,Some(visible),projection);
+        assert_eq!(*actual,*direct);
+    }
+    #[test]
+    fn growth_and_visibility_never_admit_an_ineligible_high_priority_source() {
+        let items=fixture();let mut cache=LineSuppressionCache::default();cache.set_static_prewarm_enabled(true);
+        for projection in [FlatProjection::LocalGeographic,FlatProjection::EllipsoidalMercator] {
+            for mask in [1,3,7,0,5,2,7,1] {
+                let visible:Vec<_>=(0..3).map(|i|mask&(1<<i)!=0).collect();
+                compare(&mut cache,&items,1,projection,0,None,&visible);
+                assert!(cache.immutable_prepared.as_ref().unwrap().2.iter().all(|p|*p));
+                assert!(cache.immutable_preparation_bytes().unwrap()<=32*1024*1024);
+            }
+        }
+    }
+    #[test]
+    fn source_epoch_reorder_remove_and_projection_clear_original_relations() {
+        let mut items=fixture();let mut cache=LineSuppressionCache::default();cache.set_static_prewarm_enabled(true);
+        for epoch in 1..5 {
+            let visible=vec![true;items.len()];
+            compare(&mut cache,&items,epoch,FlatProjection::EllipsoidalMercator,0,None,&visible);
+            if epoch==1 {items.reverse();} else if epoch==2 {items.pop();} else {
+                if let DrawingInstruction::Line(l)=&mut items[0] {l.points[0].x+=1.;}
+            }
+        }
+        cache.clear();assert!(cache.prewarm_attempt.is_none());assert!(cache.current().is_none());
+    }
+    #[test]
+    fn group_scale_alpha_and_temporal_coverage_permissions_stay_live() {
+        let mut items=fixture();if let DrawingInstruction::Line(l)=&mut items[1] {
+            l.scale_range=crate::ScaleRange{scale_minimum:Some(1000),scale_maximum:Some(100)};l.viewing_group=crate::ViewingGroup(999);
+        }
+        let mut cache=LineSuppressionCache::default();cache.set_static_prewarm_enabled(true);
+        for groups in [HashSet::new(),items.iter().flat_map(|i|i.viewing_groups().map(|g|g.0)).chain([999]).collect::<HashSet<u32>>() ] {for scale in [0,99,100,1000,1001] {
+            for mask in [vec![true,true,true],vec![true,false,true]] {compare(&mut cache,&items,1,FlatProjection::LocalGeographic,scale,Some(&groups),&mask);}
+        }}
+        if let DrawingInstruction::Line(l)=&mut items[1] {l.style.color.a=0.;}
+        compare(&mut cache,&items,2,FlatProjection::LocalGeographic,100,None,&[true,true,true]);
+    }
+    #[test]
+    fn invalid_prospective_curve_declines_and_preserves_lazy_result() {
+        for bad in [f64::NAN,f64::INFINITY,100.] {
+            let mut items=fixture();if let DrawingInstruction::Line(l)=&mut items[1] {l.points[0].y=bad;}
+            assert!(LineSuppressionCache::try_static_prewarm(&items,FlatProjection::EllipsoidalMercator,64*1024*1024,32*1024*1024).is_none());
+            let mut cache=LineSuppressionCache::default();cache.set_static_prewarm_enabled(true);
+            compare(&mut cache,&items,1,FlatProjection::EllipsoidalMercator,0,None,&[true,false,true]);
+            compare(&mut cache,&items,1,FlatProjection::EllipsoidalMercator,0,None,&[true,true,true]);
+            assert_eq!(cache.prewarm_attempt,Some((1,FlatProjection::EllipsoidalMercator,3)));
+        }
+    }
+    #[test]
+    fn admission_bounds_decline_without_partial_state_and_zero_extra_retained_topology() {
+        let items=fixture();
+        assert!(LineSuppressionCache::try_static_prewarm(&items,FlatProjection::LocalGeographic,0,32*1024*1024).is_none());
+        assert!(LineSuppressionCache::try_static_prewarm(&items,FlatProjection::LocalGeographic,64*1024*1024,0).is_none());
+        let (_,compiled)=LineSuppressionCache::try_static_prewarm(&items,FlatProjection::LocalGeographic,64*1024*1024,32*1024*1024).unwrap();
+        assert!(compiled.retained_bytes()<=32*1024*1024);
+    }
+}
+
+#[cfg(test)]
+mod static_prewarm_numeric_tests {
+    use super::*;
+    #[test]
+    fn projected_overlap_endpoints_preserve_fraction_bits_across_live_masks() {
+        let items=vec![
+            DrawingInstruction::Line(crate::LineInstruction::new(vec![WorldPoint::new(0.,55.),WorldPoint::new(0.,82.)]).with_priority(2)),
+            DrawingInstruction::Line(crate::LineInstruction::new(vec![WorldPoint::new(-0.,61.),WorldPoint::new(0.,77.)]).with_priority(4)),
+        ];
+        let mut warm=LineSuppressionCache::default();warm.set_static_prewarm_enabled(true);
+        for projection in [FlatProjection::LocalGeographic,FlatProjection::EllipsoidalMercator] {for mask in [[true,false],[true,true],[false,true],[true,true]] {
+            let actual=warm.plan_immutable_projected_with_visibility(&items,1,0,None,None,Some(&mask),projection);
+            let golden=LineSuppressionCache::default().plan_projected_with_visibility(&items,0,None,None,Some(&mask),projection);
+            assert_eq!(actual.fully_suppressed,golden.fully_suppressed);
+            for (index,spans) in &actual.partial {
+                let expected=golden.partial.get(index).unwrap();assert_eq!(spans.len(),expected.len());
+                for (a,b) in spans.iter().zip(expected) {assert_eq!((a.segment,a.start.to_bits(),a.end.to_bits()),(b.segment,b.start.to_bits(),b.end.to_bits()));}
+            }
+            assert_eq!(actual.partial.len(),golden.partial.len());
+        }}
+    }
+}
+
+#[cfg(test)] mod default_static_preparation_policy_tests {
+ use super::*;
+ #[test] fn default_and_explicit_controls_preserve_disable_and_unknown_values() {
+  assert!(LineSuppressionCache::static_prewarm_policy(None));
+  assert!(LineSuppressionCache::static_prewarm_policy(Some("1")));
+  for value in ["0", "", "yes", "01", "true"] {
+   assert!(!LineSuppressionCache::static_prewarm_policy(Some(value)));
+  }
+  let mut owner=LineSuppressionCache::default();owner.set_static_prewarm_enabled(false);
+  assert_eq!(owner.prewarm_policy,Some(false));owner.clear();assert_eq!(owner.prewarm_policy,Some(false));
+ }
 }
