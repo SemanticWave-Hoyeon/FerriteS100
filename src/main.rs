@@ -80,11 +80,13 @@ impl CoverageLifecycleResize {
 mod cell_source_identity;
 mod chart_publication;
 mod dataset_discovery;
+mod dataset_open_plan;
 mod dataset_signature_policy;
 mod interoperability;
 mod navigation;
 mod plugins;
 mod process_stats;
+mod s101_catalogue_selection;
 mod s101_lifecycle_metadata;
 mod s101_update_plan;
 mod s102_depth_policy;
@@ -356,6 +358,8 @@ struct AppConfig {
     fc_path: PathBuf,
     /// Path to Portrayal Catalogue directory
     pc_path: PathBuf,
+    /// Explicit local multi-version inventory; raw bytes remain source-bound.
+    catalogue_inventory: PathBuf,
     /// Path to log directory (used only in debug builds)
     log_path: PathBuf,
     /// Debug mode enabled (--debug flag)
@@ -484,6 +488,11 @@ impl AppConfig {
                 .find(|w| w[0] == "--pc")
                 .map(|w| PathBuf::from(&w[1]))
                 .unwrap_or_else(|| base.join("Catalogues/PC/S-101")),
+            catalogue_inventory: args
+                .windows(2)
+                .find(|w| w[0] == "--catalogue-inventory")
+                .map(|w| PathBuf::from(&w[1]))
+                .unwrap_or_else(|| base.parent().unwrap_or(&base).join("S101-Catalogues")),
             log_path: base.join("logs"),
             debug_mode,
             auto_chart,
@@ -677,6 +686,39 @@ struct PreparedBathymetryInput {
     bounds: Option<GeoBounds>,
 }
 
+/// Required SVGs are resolved in a new CPU cache; live material caches are not
+/// touched. Device texture admission precedes infallible upload at publication.
+fn preflight_candidate_symbols(
+    context: &RenderContext,
+    symbols: &mut SymbolCache,
+    profile: &ferrite_portrayal_catalog::ColorProfile,
+    texture_limit: u32,
+) -> Result<()> {
+    for instruction in context.raw_instructions() {
+        let reference = match instruction {
+            DrawingInstruction::Point(point) => Some(point.symbol_ref.as_str()),
+            DrawingInstruction::Area(area) => match &area.fill {
+                ferrite_render::AreaFillType::Pattern { symbol_ref, .. }
+                | ferrite_render::AreaFillType::CentroidSymbol(symbol_ref) => {
+                    Some(symbol_ref.as_str())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(reference) = reference.filter(|r| !r.is_empty()) {
+            let geometry = symbols.get_symbol(reference, profile).with_context(|| {
+                format!("Candidate PC resource could not be rendered: {reference}")
+            })?;
+            anyhow::ensure!(
+                geometry.width <= texture_limit && geometry.height <= texture_limit,
+                "Candidate SVG exceeds GPU texture limit: {reference}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// State belonging to the displayed datasets before an attempted load.
 struct LoadCheckpoint {
     verified_count: usize,
@@ -688,6 +730,53 @@ struct LoadCheckpoint {
 }
 
 /// Background loading state
+/// Private catalogue pair selected from captured, authenticated-or-explicit-OFF DSIDs.
+/// Not installed until complete portrayal/resources and durable history succeed.
+struct CandidateCatalogues {
+    fc: Arc<BoundFeatureCatalogue>,
+    pc: Arc<BoundPortrayalCatalogue>,
+    fc_status: CatalogueStatus,
+    pc_status: CatalogueStatus,
+    notice: String,
+}
+/// Only the fields modified by normalize_feature_codes; graph, source and order
+/// remain owned by the loaded cell. Used for synchronous preparation rollback.
+struct CatalogueNormalization {
+    feature_codes: Vec<(i64, Option<String>)>,
+    mapping: ferrite_s100_core::CodeMapping,
+}
+impl CatalogueNormalization {
+    fn capture(cell: &S101Cell) -> Self {
+        Self {
+            feature_codes: cell
+                .features
+                .iter()
+                .map(|(id, f)| (*id, f.feature_code.clone()))
+                .collect(),
+            mapping: cell.code_mappings.feature_types.clone(),
+        }
+    }
+    fn restore(self, cell: &mut S101Cell) {
+        for (id, code) in self.feature_codes {
+            cell.features
+                .get_mut(&id)
+                .expect("Preparation preserves feature ownership")
+                .feature_code = code;
+        }
+        cell.code_mappings.feature_types = self.mapping;
+    }
+}
+enum CataloguePreparation {
+    RetainedView,
+    Loaded { preserve_view: bool },
+}
+enum PreparedLoadPortrayal {
+    Current(Box<PreparedPortrayal>),
+    Catalogue {
+        owner: Box<CandidateCatalogues>,
+        change: Box<PreparedPortrayalChange>,
+    },
+}
 struct BackgroundLoadingState {
     /// Number of files being loaded
     total_files: usize,
@@ -695,7 +784,9 @@ struct BackgroundLoadingState {
     loaded_count: usize,
     pending: Vec<ChartPublicationResult>,
     failed: bool,
+    allow_partial: bool,
     checkpoint: LoadCheckpoint,
+    candidate_catalogues: Option<CandidateCatalogues>,
     /// Receiver for loaded cells
     receiver: Receiver<Result<ChartPublicationResult>>,
 }
@@ -730,6 +821,47 @@ impl RenderedSymbol {
             .then(a.1.total_cmp(&b.1))
             .then(a.0.cell_index.cmp(&b.0.cell_index))
             .then(a.0.feature_id.cmp(&b.0.feature_id))
+    }
+}
+
+fn chart_batch_publishable(allow_partial: bool, failed: bool, complete_datasets: usize) -> bool {
+    complete_datasets > 0 && (allow_partial || !failed)
+}
+
+#[derive(Default)]
+struct DatasetOpenSession {
+    rasters: std::collections::VecDeque<PathBuf>,
+    charts: Option<Vec<PathBuf>>,
+    selected_charts: Vec<PathBuf>,
+    notices: Vec<String>,
+    raster_loaded: usize,
+    raster_existing: usize,
+    raster_failed: usize,
+    chart_started: bool,
+    chart_failed: bool,
+    chart_partial: bool,
+}
+
+impl DatasetOpenSession {
+    fn summary(&self, chart_count: usize) -> String {
+        let charts = if !self.chart_started {
+            "not requested"
+        } else if self.chart_failed && self.chart_partial {
+            "completed with failed datasets"
+        } else if self.chart_failed {
+            "failed; previous charts retained"
+        } else {
+            "completed"
+        };
+        let mut message = format!("Dataset loading complete. S-101: {charts} ({chart_count} charts available). S-102: {} loaded, {} already open, {} failed. {} skipped or failed entries.", self.raster_loaded, self.raster_existing, self.raster_failed, self.notices.len());
+        for notice in self.notices.iter().take(32) {
+            message.push('\n');
+            message.push_str(notice);
+        }
+        if self.notices.len() > 32 {
+            message.push_str("\nAdditional details are recorded in the application log.");
+        }
+        message
     }
 }
 
@@ -773,6 +905,7 @@ struct ChartApp {
     fc: Arc<BoundFeatureCatalogue>,
     /// Portrayal Catalogue reference
     pc: Arc<BoundPortrayalCatalogue>,
+    catalogue_inventory: PathBuf,
     /// Feature Catalogue status (for UI display)
     fc_status: CatalogueStatus,
     /// Portrayal Catalogue status (for UI display)
@@ -807,6 +940,7 @@ struct ChartApp {
     unsigned_count: usize,
     startup_error: Option<String>,
     publication_test_fail_before_commit: bool,
+    catalogue_test_fail_history: bool,
     pending_auto_s102: Vec<PathBuf>,
     s102_pc_path: PathBuf,
     s102_adjustments_path: Option<PathBuf>,
@@ -815,6 +949,8 @@ struct ChartApp {
     /// Paths of already loaded chart files (to prevent duplicates)
     /// Background loading state (Some if loading in progress)
     loading_state: Option<BackgroundLoadingState>,
+    dataset_open_discovery: Option<Receiver<Result<dataset_open_plan::Plan>>>,
+    dataset_open_session: Option<DatasetOpenSession>,
     /// Plugin system
     plugin_system: plugins::PluginSystem,
     /// Base instruction count (chart instructions only, before plugin instructions)
@@ -924,6 +1060,10 @@ impl ChartApp {
             recent_positions: Vec::new(),
             fc,
             pc,
+            catalogue_inventory: {
+                let base = get_app_base_dir();
+                base.parent().unwrap_or(&base).join("S101-Catalogues")
+            },
             fc_status,
             pc_status,
             cells: Vec::new(),
@@ -948,11 +1088,14 @@ impl ChartApp {
             unsigned_count: 0,
             startup_error: None,
             publication_test_fail_before_commit: false,
+            catalogue_test_fail_history: false,
             pending_auto_s102: Vec::new(),
             s102_adjustments_path: None,
             s102_pc_path: get_app_base_dir().join("Catalogues/PC/S-102"),
             chart_loaded: false,
             loading_state: None,
+            dataset_open_discovery: None,
+            dataset_open_session: None,
             plugin_system: {
                 let base = get_app_base_dir();
                 // Check both plugin directory names:
@@ -1284,7 +1427,10 @@ impl ChartApp {
     fn load_bathymetry(&mut self, paths: &[PathBuf]) -> Result<()> {
         let checkpoint = self.load_checkpoint();
         match self.load_bathymetry_transaction(paths) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_dataset_tree();
+                Ok(())
+            }
             Err(error) => {
                 self.restore_load_checkpoint(checkpoint);
                 Err(error)
@@ -1650,28 +1796,142 @@ impl ChartApp {
         &mut self,
         request: PortrayalChangeRequest,
     ) -> Result<PreparedPortrayalChange> {
+        let fc = Arc::clone(&self.fc);
+        let pc = Arc::clone(&self.pc);
+        let symbols = self.symbol_cache.fork_empty();
+        self.prepare_portrayal_change_for_catalogues(
+            request,
+            &fc,
+            &pc,
+            symbols,
+            CataloguePreparation::RetainedView,
+        )
+    }
+    /// All manual entrypoints share the same private-pair/material transaction.
+    /// No renderer/UI/cache/catalogue ownership changes before successful staging.
+    fn change_catalogue_pair_manually(
+        &mut self,
+        fc: Arc<BoundFeatureCatalogue>,
+        pc: Arc<BoundPortrayalCatalogue>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.loading_state.is_none(),
+            "Wait for dataset loading to finish before changing catalogues"
+        );
+        ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
+        for cell in &self.cells {
+            ferrite_s101::validate_dataset_catalogues(
+                &cell.dsid,
+                &fc,
+                &pc.product_id,
+                &pc.version,
+            )?;
+        }
+        ferrite_s101::viewing_groups_for_layers(
+            &pc,
+            self.applied_settings
+                .viewing_layers
+                .iter()
+                .map(String::as_str),
+        )?;
+        let fc_status = validate_fc(&fc, &fc.source_path);
+        let pc_status = validate_pc(&pc, &pc.root_path);
+        let symbols = SymbolCache::new_with_pattern_contract(
+            pc.root_path.join("Symbols"),
+            pc.sources(),
+            ferrite_s101::shallow_pattern_contract(&pc),
+        );
+        let original: Vec<_> = self
+            .cells
+            .iter()
+            .map(CatalogueNormalization::capture)
+            .collect();
+        let codes = fc.feature_type_codes();
+        for cell in &mut self.cells {
+            cell.normalize_feature_codes(&codes);
+        }
+        let prepared = self.prepare_portrayal_change_for_catalogues(
+            PortrayalChangeRequest {
+                profile: self.current_profile_name.clone(),
+                settings: self.applied_settings.clone(),
+            },
+            &fc,
+            &pc,
+            symbols,
+            CataloguePreparation::Loaded {
+                preserve_view: true,
+            },
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                for (cell, original) in self.cells.iter_mut().zip(original) {
+                    original.restore(cell);
+                }
+                return Err(error);
+            }
+        };
+        // Staging validated the capsule. Only infallible owner moves follow.
+        self.fc = fc;
+        self.pc = pc;
+        self.fc_status = fc_status;
+        self.pc_status = pc_status;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.fc_status = self.fc_status.clone();
+            renderer.ui_state.pc_status = self.pc_status.clone();
+            renderer.ui_state.optional_viewing_layers =
+                ferrite_s101::optional_viewing_layers(&self.pc);
+            renderer.ui_state.notice = None;
+        }
+        self.install_portrayal_change(prepared);
+        self.refresh_dataset_tree();
+        Ok(())
+    }
+
+    fn prepare_portrayal_change_for_catalogues(
+        &mut self,
+        request: PortrayalChangeRequest,
+        fc: &BoundFeatureCatalogue,
+        pc: &BoundPortrayalCatalogue,
+        mut symbols: SymbolCache,
+        preparation: CataloguePreparation,
+    ) -> Result<PreparedPortrayalChange> {
+        let (preserve_view, preflight_resources) = match preparation {
+            CataloguePreparation::RetainedView => (true, false),
+            CataloguePreparation::Loaded { preserve_view } => (preserve_view, true),
+        };
         let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
-        anyhow::ensure!(request.settings.show_shallow_pattern || self.symbol_cache.shallow_pattern_contract().is_some(),
+        anyhow::ensure!(request.settings.show_shallow_pattern || symbols.shallow_pattern_contract().is_some(),
             "Current PC has no supported independent shallow-pattern selector; previous portrayal retained");
         let (pan, zoom, _) = renderer.fast_view_transform();
         anyhow::ensure!(
             pan == (0., 0.) && zoom == 1. && renderer.fast_view_scales().1 == 1.,
             "Finish current affine navigation before changing portrayal"
         );
-        let _profile = self
-            .pc
+        let profile = pc
             .color_profiles
             .profiles
             .get(&request.profile)
             .context("Requested colour profile not found")?;
-        validated_lua_context(&self.pc, Some(&request.settings))?;
-        ferrite_s101::validate_catalogue_pair(&self.fc, &self.pc)?;
+        validated_lua_context(pc, Some(&request.settings))?;
+        ferrite_s101::validate_catalogue_pair(fc, pc)?;
+        if preflight_resources {
+            for cell in &self.cells {
+                ferrite_s101::validate_dataset_catalogues(
+                    &cell.dsid,
+                    fc,
+                    &pc.product_id,
+                    &pc.version,
+                )?;
+                ferrite_s101::coverage_scale::dataset_reference_scale(cell)?;
+            }
+        }
         let mut next = self.render_context.empty_for_rebuild();
         if !self.cells.is_empty() {
             try_lua_portrayal(
                 &self.cells,
-                &self.fc,
-                &self.pc,
+                fc,
+                pc,
                 &mut next,
                 &request.profile,
                 Some(&request.settings),
@@ -1683,7 +1943,7 @@ impl ChartApp {
             None
         };
         let ic_changed = if let Some(ic) = active_ic.as_ref() {
-            interoperability::compose_vectors(ic, &self.cells, &self.fc, &mut next)?
+            interoperability::compose_vectors(ic, &self.cells, fc, &mut next)?
         } else {
             0
         };
@@ -1692,7 +1952,14 @@ impl ChartApp {
             instruction.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
             next.add_instruction(instruction);
         }
-        next.scaler = self.render_context.scaler.clone();
+        if preserve_view {
+            next.scaler = self.render_context.scaler.clone();
+        } else {
+            next.set_bounds(self.bounds);
+            let (x, y, w, h) = renderer.chart_viewport_pixels();
+            next.set_viewport_rect(x, y, w, h);
+            next.zoom_to_fit(self.bounds);
+        }
         let coverage = Arc::new(
             ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(
                 &self.cells,
@@ -1793,13 +2060,20 @@ impl ChartApp {
             DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
             DisplayMode::All => ferrite_s101::DisplayPreset::Other,
         };
-        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.pc, preset)?;
+        let mut groups = ferrite_s101::viewing_groups_for_preset(pc, preset)?;
         groups.extend(ferrite_s101::viewing_groups_for_layers(
-            &self.pc,
+            pc,
             request.settings.viewing_layers.iter().map(String::as_str),
         )?);
         groups.insert(21010);
-        let symbols = self.symbol_cache.fork_empty();
+        if preflight_resources {
+            preflight_candidate_symbols(
+                &next,
+                &mut symbols,
+                profile,
+                renderer.raster_texture_limit(),
+            )?;
+        }
         // Fresh private cache and actual candidate profile, never clear live GPU caches.
         let scene = renderer.prepare_raster_scene_publication(raster)?;
         renderer.validate_raster_scene_publication(&scene)?;
@@ -1807,7 +2081,7 @@ impl ChartApp {
             !self.publication_test_fail_before_commit,
             "Injected portrayal change failure after complete scene staging"
         );
-        let background = lookup_pc_color(&self.pc, "DEPDW", &request.profile);
+        let background = lookup_pc_color(pc, "DEPDW", &request.profile);
         Ok(PreparedPortrayalChange {
             base_instruction_count,
             portrayal: PreparedPortrayal {
@@ -1835,6 +2109,11 @@ impl ChartApp {
                     .as_ref()
                     .context("Missing prepared scene")?,
             )?;
+        self.install_portrayal_change(prepared);
+        Ok(())
+    }
+    /// No Result-returning operation follows durable publication checks.
+    fn install_portrayal_change(&mut self, prepared: PreparedPortrayalChange) {
         let PreparedPortrayalChange {
             base_instruction_count,
             portrayal,
@@ -1863,7 +2142,6 @@ impl ChartApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
-        Ok(())
     }
 
     /// Opt-in hidden diagnostic at the settled screenshot gate; first failure
@@ -2371,8 +2649,303 @@ impl ChartApp {
         Ok(())
     }
 
+    fn refresh_dataset_tree(&mut self) {
+        use ferrite_wgpu::{DatasetLayerEntry, DatasetLayerId, DatasetProductLayer};
+        let mut files = Vec::with_capacity(self.cells.len());
+        for (index, cell) in self.cells.iter().enumerate() {
+            let Ok((product, name)) = s101_update_plan::dataset_key(&cell.dsid) else {
+                continue;
+            };
+            let source = self
+                .loaded_chain_paths
+                .get(index)
+                .and_then(|paths| paths.first())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            files.push(DatasetLayerEntry {
+                id: DatasetLayerId::S101 { product, name },
+                name: cell.dsid.dataset_name.clone(),
+                source,
+                detail: format!(
+                    "Edition {} · update {} · {} features",
+                    cell.dsid.edition_number,
+                    cell.dsid.update_number,
+                    cell.features.len()
+                ),
+            });
+        }
+        let mut raster_files = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (path, _, _) in &self.bathymetry {
+            if seen.insert(path.clone()) {
+                raster_files.push(DatasetLayerEntry {
+                    id: DatasetLayerId::S102(path.clone()),
+                    name: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    source: path.display().to_string(),
+                    detail: "S-102 bathymetry".into(),
+                });
+            }
+        }
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.dataset_layers = vec![
+                DatasetProductLayer {
+                    product: "S-101".into(),
+                    fc: format!("FC {} · {}", self.fc.version, self.fc.source_path.display()),
+                    pc: format!("PC {} · {}", self.pc.version, self.pc.root_path.display()),
+                    files,
+                },
+                DatasetProductLayer {
+                    product: "S-102".into(),
+                    fc: "FC: product schema (no external FC loaded)".into(),
+                    pc: format!("PC · {}", self.s102_pc_path.display()),
+                    files: raster_files,
+                },
+            ];
+            if !renderer
+                .ui_state
+                .dataset_layers
+                .iter()
+                .flat_map(|p| &p.files)
+                .any(|f| renderer.ui_state.selected_dataset.as_ref() == Some(&f.id))
+            {
+                renderer.ui_state.selected_dataset = None;
+            }
+        }
+    }
+
+    fn unload_dataset(&mut self, id: ferrite_wgpu::DatasetLayerId) -> Result<()> {
+        anyhow::ensure!(
+            self.loading_state.is_none()
+                && self.dataset_open_discovery.is_none()
+                && self.dataset_open_session.is_none(),
+            "Wait for dataset loading to finish before unloading"
+        );
+        anyhow::ensure!(
+            !self.zoom_animating
+                && !self.is_dragging
+                && self.zoom_rebuild_phase == 0
+                && self.pan_rebuild_phase == 0
+                && self.pending_portrayal_change.is_none(),
+            "Finish navigation or portrayal changes before unloading"
+        );
+        let request = PortrayalChangeRequest {
+            profile: self.current_profile_name.clone(),
+            settings: self.applied_settings.clone(),
+        };
+        match id {
+            ferrite_wgpu::DatasetLayerId::S101 { product, name } => {
+                let key = (product, name);
+                let index = self
+                    .cells
+                    .iter()
+                    .position(|cell| {
+                        s101_update_plan::dataset_key(&cell.dsid).is_ok_and(|k| k == key)
+                    })
+                    .context("Dataset is no longer loaded")?;
+                anyhow::ensure!(
+                    self.cells.len() == self.loaded_source_identities.len()
+                        && self.cells.len() == self.loaded_chain_paths.len(),
+                    "Loaded S-101 ownership is not aligned"
+                );
+                let cell = self.cells.remove(index);
+                let identity = self.loaded_source_identities.remove(index);
+                let paths = self.loaded_chain_paths.remove(index);
+                let staged = self
+                    .prepare_portrayal_change(request)
+                    .and_then(|prepared| self.commit_portrayal_change(prepared));
+                if let Err(error) = staged {
+                    self.cells.insert(index, cell);
+                    self.loaded_source_identities.insert(index, identity);
+                    self.loaded_chain_paths.insert(index, paths);
+                    return Err(error);
+                }
+                self.loaded_discovery.remove(&key);
+            }
+            ferrite_wgpu::DatasetLayerId::S102(path) => {
+                anyhow::ensure!(
+                    self.bathymetry.iter().any(|(loaded, _, _)| *loaded == path),
+                    "Dataset is no longer loaded"
+                );
+                let mut removed = Vec::new();
+                let retained = std::mem::take(&mut self.bathymetry)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, value)| {
+                        if value.0 == path {
+                            removed.push((index, value));
+                            None
+                        } else {
+                            Some(value)
+                        }
+                    })
+                    .collect();
+                self.bathymetry = retained;
+                let staged = self
+                    .prepare_portrayal_change(request)
+                    .and_then(|prepared| self.commit_portrayal_change(prepared));
+                if let Err(error) = staged {
+                    for (index, value) in removed {
+                        self.bathymetry.insert(index, value);
+                    }
+                    return Err(error);
+                }
+                // Close removed HDF handles before releasing their private files,
+                // including on Windows where open-file deletion is restricted.
+                drop(removed);
+                self.bathymetry_bounds.remove(&path);
+                self.depth_policies.remove(&path);
+                self.depth_inputs.remove(&path);
+            }
+        }
+        // Manual unloading is in-memory only: never create cancellation history.
+        self.select_feature(None);
+        self.pending_hit_test = None;
+        self.chart_loaded = !self.cells.is_empty() || !self.bathymetry.is_empty();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.selection_candidates.clear();
+            renderer.ui_state.selection_requested = None;
+            renderer.ui_state.chart_count = self.cells.len() + self.bathymetry.len();
+            renderer.ui_state.bathymetry_count = self.bathymetry.len();
+            renderer.ui_state.security_status = "Retained datasets keep their original verification results; dataset manually unloaded".into();
+            renderer.ui_state.feature_count =
+                self.cells.iter().map(|cell| cell.features.len()).sum();
+            renderer.ui_state.loaded_chart = self
+                .cells
+                .first()
+                .map(|cell| cell.dsid.dataset_name.clone());
+            renderer.ui_state.selected_dataset = None;
+            renderer.ui_state.notice = Some("Dataset unloaded".into());
+        }
+        self.refresh_dataset_tree();
+        self.refresh_visible_selection();
+        Ok(())
+    }
+
+    fn begin_dataset_open(&mut self, path: PathBuf, folder: bool) -> Result<()> {
+        anyhow::ensure!(
+            self.loading_state.is_none()
+                && self.dataset_open_discovery.is_none()
+                && self.dataset_open_session.is_none(),
+            "Dataset loading is already in progress; wait until it finishes"
+        );
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("dataset-discovery".into())
+            .spawn(move || {
+                let plan = if folder {
+                    dataset_open_plan::discover(&path)
+                } else {
+                    dataset_open_plan::single_file(&path)
+                };
+                let _ = sender.send(plan);
+            })?;
+        self.dataset_open_discovery = Some(receiver);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.notice = Some("Discovering datasets…".into());
+        }
+        Ok(())
+    }
+
+    fn dataset_open_failure(&mut self, message: String) {
+        if let Some(session) = &mut self.dataset_open_session {
+            session.chart_failed = true;
+            session.notices.push(message);
+        }
+    }
+
+    fn poll_dataset_open(&mut self) {
+        if let Some(receiver) = &self.dataset_open_discovery {
+            let plan = match receiver.try_recv() {
+                Ok(plan) => Some(plan),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
+                    "Dataset discovery worker stopped before returning a result"
+                ))),
+            };
+            if let Some(plan) = plan {
+                self.dataset_open_discovery = None;
+                match plan {
+                    Ok(plan) => {
+                        self.dataset_open_session = Some(DatasetOpenSession {
+                            rasters: plan.rasters.into(),
+                            charts: Some(plan.charts),
+                            selected_charts: plan.selected_charts,
+                            notices: plan.notices,
+                            ..Default::default()
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!("Could not open datasets: {error:#}");
+                        error!("{message}");
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.ui_state.notice = Some(message);
+                        }
+                    }
+                }
+            }
+        }
+        if self.loading_state.is_some() {
+            return;
+        }
+        let Some(mut session) = self.dataset_open_session.take() else {
+            return;
+        };
+        // Each raster is transactional. A damaged/unsupported delivery cannot
+        // prevent the remaining independent files from being attempted.
+        if let Some(path) = session.rasters.pop_front() {
+            let previous = self.bathymetry.len();
+            match self.load_bathymetry(std::slice::from_ref(&path)) {
+                Ok(()) if self.bathymetry.len() > previous => session.raster_loaded += 1,
+                Ok(()) => session.raster_existing += 1,
+                Err(error) => {
+                    session.raster_failed += 1;
+                    let message = format!("{}: {error:#}", path.display());
+                    error!("{message}");
+                    session.notices.push(message);
+                }
+            }
+            self.refresh_dataset_tree();
+            self.dataset_open_session = Some(session);
+            return;
+        }
+        if let Some(charts) = session.charts.take() {
+            if !charts.is_empty() {
+                session.chart_started = true;
+                self.dataset_open_session = Some(session);
+                let selected = self
+                    .dataset_open_session
+                    .as_ref()
+                    .map(|s| s.selected_charts.clone())
+                    .unwrap_or_default();
+                if let Err(error) = self.load_charts_with_selection(&charts, &selected) {
+                    self.dataset_open_failure(format!("S-101 batch: {error:#}"));
+                }
+                return;
+            }
+        }
+        for notice in &session.notices {
+            tracing::warn!("Dataset open: {notice}");
+        }
+        let summary = session.summary(self.cells.len());
+        info!("{summary}");
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.notice = Some(summary);
+        }
+    }
+
     /// Start loading chart files in background (non-blocking)
     fn load_charts(&mut self, paths: &[PathBuf]) -> Result<()> {
+        self.load_charts_with_selection(paths, paths)
+    }
+    fn load_charts_with_selection(
+        &mut self,
+        paths: &[PathBuf],
+        selected: &[PathBuf],
+    ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -2408,23 +2981,79 @@ impl ChartApp {
             }
             let history =
                 chart_publication::CancellationHistory::read(&self.cancellation_history_path)?;
-            let (plans, cancellations) = s101_update_plan::authorized_batch(
-                candidates,
-                paths,
-                &authorization,
-                require_signature,
-                &loaded,
-                &history,
-            )?;
-            Ok((authorization, plans, cancellations))
+            let (plans, cancellations, discovery_notices) = if selected.is_empty() {
+                let (plans, notices) = s101_update_plan::authorized_folder_plans(
+                    candidates,
+                    &authorization,
+                    require_signature,
+                )?;
+                (plans, Vec::new(), notices)
+            } else {
+                let (plans, cancellations) = s101_update_plan::authorized_batch(
+                    candidates,
+                    selected,
+                    &authorization,
+                    require_signature,
+                    &loaded,
+                    &history,
+                )?;
+                (plans, cancellations, Vec::new())
+            };
+            let candidate_catalogues = if plans.is_empty() {
+                None
+            } else {
+                let incoming: Vec<_> = plans
+                    .iter()
+                    .flat_map(|p| std::iter::once(&p.base).chain(&p.updates))
+                    .map(|p| p.id.clone())
+                    .collect();
+                let retained: Vec<_> = self.cells.iter().map(|c| c.dsid.clone()).collect();
+                match s101_catalogue_selection::resolve_pair_for_loading(
+                    &incoming,
+                    &retained,
+                    &self.fc,
+                    &self.pc,
+                    &self.catalogue_inventory,
+                )? {
+                    s101_catalogue_selection::Selection::KeepCurrent => None,
+                    s101_catalogue_selection::Selection::UseInstalled { fc, pc, notice } => {
+                        anyhow::ensure!(pc.color_profiles.profiles.contains_key(&self.current_profile_name),
+                            "Compatible PC has no active colour profile {}; select an available profile before loading",self.current_profile_name);
+                        validated_lua_context(&pc, Some(&self.applied_settings))?;
+                        let fc_status = validate_fc(&fc, &fc.source_path);
+                        let pc_status = validate_pc(&pc, &pc.root_path);
+                        Some(CandidateCatalogues {
+                            fc: Arc::new(*fc),
+                            pc: Arc::new(*pc),
+                            fc_status,
+                            pc_status,
+                            notice,
+                        })
+                    }
+                }
+            };
+            Ok((
+                authorization,
+                plans,
+                cancellations,
+                candidate_catalogues,
+                discovery_notices,
+            ))
         })();
-        let (authorization, plans, cancellations) = match prepared {
-            Ok(value) => value,
-            Err(error) => {
-                self.restore_load_checkpoint(checkpoint);
-                return Err(error);
-            }
-        };
+        let (authorization, plans, cancellations, candidate_catalogues, discovery_notices) =
+            match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    self.restore_load_checkpoint(checkpoint);
+                    return Err(error);
+                }
+            };
+        for notice in &discovery_notices {
+            tracing::warn!("Dataset discovery: {notice}");
+        }
+        if let Some(session) = &mut self.dataset_open_session {
+            session.notices.extend(discovery_notices);
+        }
         self.frames_since_loaded = None;
         let total_files = plans.len() + cancellations.len();
         if total_files == 0 {
@@ -2440,9 +3069,18 @@ impl ChartApp {
         let (tx, rx) = mpsc::channel();
 
         // Catalogue pair was validated before load state changed.
-        let fc = Arc::clone(&self.fc);
-        let pc_product = self.pc.product_id.clone();
-        let pc_version = self.pc.version.clone();
+        let fc = Arc::clone(
+            candidate_catalogues
+                .as_ref()
+                .map(|p| &p.fc)
+                .unwrap_or(&self.fc),
+        );
+        let pc = candidate_catalogues
+            .as_ref()
+            .map(|p| &p.pc)
+            .unwrap_or(&self.pc);
+        let pc_product = pc.product_id.clone();
+        let pc_version = pc.version.clone();
 
         // Spawn background thread for loading
         std::thread::spawn(move || {
@@ -2460,6 +3098,13 @@ impl ChartApp {
                         &pc_version,
                     )
                     .with_context(|| format!("Incompatible S-101 dataset {}", path.display()))?;
+                    ferrite_s101::validate_spatial_scale_properties(
+                        &cell.dsid,
+                        cell.features.values(),
+                    )
+                    .with_context(|| {
+                        format!("Nonconformant S-101 spatial scales {}", path.display())
+                    })?;
                     // Normalize feature codes
                     cell.normalize_feature_codes(&fc_feature_codes);
 
@@ -2503,7 +3148,9 @@ impl ChartApp {
             loaded_count: 0,
             pending: Vec::new(),
             failed: false,
+            allow_partial: selected.is_empty(),
             checkpoint,
+            candidate_catalogues,
             receiver: rx,
         });
 
@@ -2542,7 +3189,11 @@ impl ChartApp {
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.ui_state.notice = Some(message.clone());
                             }
-                            if self.auto_screenshot.is_some() {
+                            if let Some(session) = &mut self.dataset_open_session {
+                                session.chart_failed = true;
+                                session.notices.push(message.clone());
+                            }
+                            if self.auto_screenshot.is_some() && !loading_state.allow_partial {
                                 self.startup_error = Some(message);
                             }
                         }
@@ -2569,7 +3220,11 @@ impl ChartApp {
                         if let Some(renderer) = &mut self.renderer {
                             renderer.ui_state.notice = Some(message.clone());
                         }
-                        if self.auto_screenshot.is_some() {
+                        if let Some(session) = &mut self.dataset_open_session {
+                            session.chart_failed = true;
+                            session.notices.push(message.clone());
+                        }
+                        if self.auto_screenshot.is_some() && !loading_state.allow_partial {
                             self.startup_error = Some(message);
                         }
                     }
@@ -2591,9 +3246,10 @@ impl ChartApp {
                 .loading_state
                 .take()
                 .expect("Completed load state exists");
-            if state.failed || state.pending.is_empty() {
-                // A batch is all-or-nothing. Successful parses remain private if
-                // another chain failed; current cells, extent and selection survive.
+            if !chart_batch_publishable(state.allow_partial, state.failed, state.pending.len()) {
+                self.dataset_open_failure("S-101 batch failed; previous charts retained (see application log for individual chain errors)".into());
+                // Explicit-file batches are all-or-nothing. Folder publication
+                // still installs only completely materialized logical datasets.
                 self.restore_load_checkpoint(state.checkpoint);
                 if let Some(renderer) = &mut self.renderer {
                     renderer.ui_state.loading_progress = None;
@@ -2604,8 +3260,14 @@ impl ChartApp {
                 self.restore_load_checkpoint(state.checkpoint);
                 self.load_error(anyhow::anyhow!("Verification policy or bound catalogues changed while loading; reopen the datasets"));
             } else {
-                self.finalize_loading(state.pending, state.checkpoint);
+                if let Some(session) = &mut self.dataset_open_session {
+                    session.chart_partial = state.failed && state.allow_partial;
+                }
+                self.finalize_loading(state.pending, state.checkpoint, state.candidate_catalogues);
             }
+        }
+        if completed {
+            self.refresh_dataset_tree();
         }
         completed
     }
@@ -2647,6 +3309,10 @@ impl ChartApp {
     fn load_error(&mut self, error: anyhow::Error) {
         let message = format!("S-101 load rejected; previous chart retained: {error:#}");
         error!("{message}");
+        self.dataset_open_failure(message.clone());
+        if let Some(session) = &mut self.dataset_open_session {
+            session.chart_partial = false;
+        }
         if let Some(renderer) = &mut self.renderer {
             renderer.ui_state.loading_progress = None;
             renderer.ui_state.notice = Some(message.clone());
@@ -2661,6 +3327,7 @@ impl ChartApp {
         &mut self,
         operations: Vec<ChartPublicationResult>,
         checkpoint: LoadCheckpoint,
+        candidate_catalogues: Option<CandidateCatalogues>,
     ) {
         let mut incoming = Vec::new();
         let mut removals = Vec::new();
@@ -2753,7 +3420,36 @@ impl ChartApp {
             self.bounds = chart_data_bounds(&self.cells, self.bathymetry_bounds.values().copied());
             self.bounds.expand_by_percent(0.1);
         }
-        let prepared = match self.prepare_instructions(cancelled_count > 0) {
+        // All candidate FC/PC/VM/cache/material state stays private. The old live
+        // pair and renderer resources still own the retained display on failure.
+        let staged = if let Some(owner) = candidate_catalogues {
+            let symbols = SymbolCache::new_with_pattern_contract(
+                owner.pc.root_path.join("Symbols"),
+                owner.pc.sources(),
+                ferrite_s101::shallow_pattern_contract(&owner.pc),
+            );
+            let request = PortrayalChangeRequest {
+                profile: self.current_profile_name.clone(),
+                settings: self.applied_settings.clone(),
+            };
+            self.prepare_portrayal_change_for_catalogues(
+                request,
+                &owner.fc,
+                &owner.pc,
+                symbols,
+                CataloguePreparation::Loaded {
+                    preserve_view: cancelled_count > 0,
+                },
+            )
+            .map(|change| PreparedLoadPortrayal::Catalogue {
+                owner: Box::new(owner),
+                change: Box::new(change),
+            })
+        } else {
+            self.prepare_instructions(cancelled_count > 0)
+                .map(|p| PreparedLoadPortrayal::Current(Box::new(p)))
+        };
+        let prepared = match staged {
             Ok(prepared) => prepared,
             Err(error) => {
                 transaction.rollback(
@@ -2769,7 +3465,18 @@ impl ChartApp {
         };
         // Every recoverable portrayal error precedes durable and visible commits.
         // The OS lock keeps history/name reuse checks current across instances.
-        if let Err(error) = history.persist(transaction.cancellations()) {
+        let persist_result = if self.catalogue_test_fail_history {
+            Err(anyhow::anyhow!(
+                if ferrite_wgpu::background_test::enabled() {
+                    "Injected catalogue history failure after complete material staging"
+                } else {
+                    "History fault requires hidden test"
+                }
+            ))
+        } else {
+            history.persist(transaction.cancellations())
+        };
+        if let Err(error) = persist_result {
             transaction.rollback(
                 &mut self.cells,
                 &mut self.loaded_source_identities,
@@ -2780,7 +3487,24 @@ impl ChartApp {
             self.load_error(error);
             return;
         }
-        self.publish_instructions(prepared);
+        match prepared {
+            PreparedLoadPortrayal::Current(portrayal) => self.publish_instructions(*portrayal),
+            PreparedLoadPortrayal::Catalogue { owner, change } => {
+                let owner = *owner;
+                self.fc = owner.fc;
+                self.pc = owner.pc;
+                self.fc_status = owner.fc_status;
+                self.pc_status = owner.pc_status;
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.ui_state.fc_status = self.fc_status.clone();
+                    renderer.ui_state.pc_status = self.pc_status.clone();
+                    renderer.ui_state.optional_viewing_layers =
+                        ferrite_s101::optional_viewing_layers(&self.pc);
+                    renderer.ui_state.notice = Some(owner.notice);
+                }
+                self.install_portrayal_change(*change);
+            }
+        }
         drop(transaction.commit());
         self.loaded_discovery = next_metadata;
         self.chart_loaded = !self.cells.is_empty() || !self.bathymetry.is_empty();
@@ -3054,6 +3778,8 @@ impl ChartApp {
     fn clear_charts(&mut self) {
         // Drop the receiver so a previously started load cannot repopulate cleared charts.
         self.loading_state = None;
+        self.dataset_open_discovery = None;
+        self.dataset_open_session = None;
         if let Some(_r) = &mut self.renderer {}
         #[cfg(debug_assertions)]
         info!("Clearing all charts");
@@ -3257,11 +3983,6 @@ impl ChartApp {
         bincode::deserialize(payload).map_err(|e| format!("deserialization failed: {}", e))
     }
 
-    fn regenerate_instructions(&mut self) -> Result<()> {
-        let prepared = self.prepare_instructions(false)?;
-        self.publish_instructions(prepared);
-        Ok(())
-    }
     fn prepare_instructions(&mut self, preserve_view: bool) -> Result<PreparedPortrayal> {
         self.prepare_instructions_internal(preserve_view)
     }
@@ -3695,7 +4416,424 @@ impl ChartApp {
         }
     }
 
+    /// Explicit hidden qualification hook, using the ordinary discovery/queue and
+    /// removal paths. No official input or cancellation history is rewritten.
+    fn audit_dataset_ui(&mut self, output: &Path) -> Result<()> {
+        anyhow::ensure!(
+            ferrite_wgpu::background_test::enabled(),
+            "Hidden audit required"
+        );
+        let window = self.window.as_ref().context("Window required")?;
+        anyhow::ensure!(
+            window.is_visible() == Some(false) && !window.has_focus(),
+            "Visible/focused audit forbidden"
+        );
+        anyhow::ensure!(!output.exists(), "Audit output must be new");
+        fs::create_dir_all(output)?;
+        self.cancellation_history_path = output.join("history.json");
+        let input = PathBuf::from(std::env::var("FERRITE_DATASET_UI_INPUT")?);
+        let folder = std::env::var("FERRITE_DATASET_UI_KIND").is_ok_and(|s| s == "folder");
+        // Match the ordinary UI's first painted frame before accepting an open
+        // request; raster publication requires a measured chart viewport.
+        for _ in 0..5 {
+            self.renderer.as_mut().unwrap().render()?;
+            self.sync_chart_layout();
+        }
+        self.begin_dataset_open(input, folder)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        while self.dataset_open_discovery.is_some()
+            || self.dataset_open_session.is_some()
+            || self.loading_state.is_some()
+        {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "Dataset opening audit timed out"
+            );
+            if self.loading_state.is_some() {
+                self.poll_loading();
+            }
+            self.poll_dataset_open();
+            if let Some(error) = self.startup_error.take() {
+                anyhow::bail!(error);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.refresh_dataset_tree();
+        for _ in 0..5 {
+            self.renderer.as_mut().unwrap().render()?;
+            if self.sync_chart_layout() {
+                self.update_view();
+            }
+        }
+        let expected: usize = std::env::var("FERRITE_DATASET_UI_EXPECTED")?.parse()?;
+        let tree_count: usize = self
+            .renderer
+            .as_ref()
+            .unwrap()
+            .ui_state
+            .dataset_layers
+            .iter()
+            .map(|p| p.files.len())
+            .sum();
+        anyhow::ensure!(
+            tree_count == expected && expected > 0,
+            "Expected {expected} tree files, got {tree_count}"
+        );
+        let opening_notice = self.renderer.as_ref().unwrap().ui_state.notice.clone();
+        let before = self.capture_catalogue_audit(&output.join("loaded"))?;
+        let id = self
+            .renderer
+            .as_ref()
+            .unwrap()
+            .ui_state
+            .dataset_layers
+            .iter()
+            .flat_map(|p| &p.files)
+            .next()
+            .context("No tree file")?
+            .id
+            .clone();
+        let old_tree = format!(
+            "{:?}",
+            self.renderer.as_ref().unwrap().ui_state.dataset_layers
+        );
+        self.publication_test_fail_before_commit = true;
+        let failure = self
+            .unload_dataset(id.clone())
+            .err()
+            .context("Injected late unload failure accepted")?;
+        self.publication_test_fail_before_commit = false;
+        anyhow::ensure!(
+            self.capture_catalogue_audit(&output.join("failed-unload"))? == before,
+            "Failed unload changed live publication"
+        );
+        anyhow::ensure!(
+            format!(
+                "{:?}",
+                self.renderer.as_ref().unwrap().ui_state.dataset_layers
+            ) == old_tree,
+            "Failed unload changed tree"
+        );
+        self.unload_dataset(id)?;
+        anyhow::ensure!(
+            self.renderer
+                .as_ref()
+                .unwrap()
+                .ui_state
+                .selected_feature
+                .is_none()
+                && self
+                    .renderer
+                    .as_ref()
+                    .unwrap()
+                    .ui_state
+                    .selection_candidates
+                    .is_empty(),
+            "Unloaded stale selection retained"
+        );
+        self.capture_catalogue_audit(&output.join("unloaded-one"))?;
+        if std::env::var("FERRITE_DATASET_UI_UNLOAD_ALL").is_ok_and(|s| s == "1") {
+            loop {
+                let id = self
+                    .renderer
+                    .as_ref()
+                    .unwrap()
+                    .ui_state
+                    .dataset_layers
+                    .iter()
+                    .flat_map(|p| &p.files)
+                    .next()
+                    .map(|f| f.id.clone());
+                let Some(id) = id else {
+                    break;
+                };
+                self.unload_dataset(id)?;
+            }
+            anyhow::ensure!(
+                !self.chart_loaded && self.cells.is_empty() && self.bathymetry.is_empty(),
+                "Last dataset retained"
+            );
+            self.capture_catalogue_audit(&output.join("unloaded-all"))?;
+        }
+        anyhow::ensure!(
+            !self.cancellation_history_path.exists(),
+            "Manual unload created cancellation history"
+        );
+        fs::write(
+            output.join("result.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"tree_count":tree_count,"opening_notice":opening_notice,"failed_unload":format!("{failure:#}"),"failure_binding_exact":true,"tree_before":old_tree,"remaining_cells":self.cells.len(),"remaining_raster_instances":self.bathymetry.len(),"history_written":false,"visible":self.window.as_ref().unwrap().is_visible(),"focused":self.window.as_ref().unwrap().has_focus()}),
+            )?,
+        )?;
+        Ok(())
+    }
+
     /// Diagnostic snapshot of the live model, excluding intentional error notices.
+    /// Nondefault hidden verification hook. Owns only a new private audit/history
+    /// directory; it never alters official input bytes or the ordinary startup path.
+    fn catalogue_audit_binding(&self) -> Result<serde_json::Value> {
+        let r = self.renderer.as_ref().context("Renderer required")?;
+        let history = if self.cancellation_history_path.exists() {
+            let length = fs::metadata(&self.cancellation_history_path)?.len();
+            anyhow::ensure!(
+                length <= 8 * 1024 * 1024,
+                "Audit history exceeds bounded read"
+            );
+            Some(format!(
+                "{:x}",
+                Sha256::digest(fs::read(&self.cancellation_history_path)?)
+            ))
+        } else {
+            None
+        };
+        Ok(serde_json::json!({"model":self.publication_model()?,
+            "fc_digest":self.fc.source_digest(),"pc_digest":self.pc.source_digest(),
+            "fc_version":self.fc.version,"pc_version":self.pc.version,
+            "fc_product":self.fc.product_id,"pc_product":self.pc.product_id,
+            "symbol_cache_revision":self.symbol_cache.resource_revision(),"symbol_cache_len":self.symbol_cache.len(),
+            "fc_ui":format!("{:?}",r.ui_state.fc_status),"pc_ui":format!("{:?}",r.ui_state.pc_status),
+            "optional_layers":format!("{:?}",r.ui_state.optional_viewing_layers),
+            "profile":self.current_profile_name,"history_sha256":history}))
+    }
+    fn capture_catalogue_audit(&mut self, output: &Path) -> Result<serde_json::Value> {
+        self.renderer
+            .as_mut()
+            .context("Renderer required")?
+            .render()?;
+        self.audit_portrayal(output)?;
+        self.renderer
+            .as_mut()
+            .unwrap()
+            .save_screenshot(output.join("chart.png"))?;
+        let binding = self.catalogue_audit_binding()?;
+        fs::write(
+            output.join("binding.json"),
+            serde_json::to_vec_pretty(&binding)?,
+        )?;
+        Ok(binding)
+    }
+    fn catalogue_audit_load(&mut self, paths: &[PathBuf]) -> Result<Option<String>> {
+        if let Err(error) = self.load_charts(paths) {
+            return Ok(Some(format!("{error:#}")));
+        }
+        self.wait_publication_test_load()?;
+        Ok(self.startup_error.take())
+    }
+    fn audit_catalogue_publication(&mut self, output: &Path) -> Result<()> {
+        anyhow::ensure!(
+            ferrite_wgpu::background_test::enabled(),
+            "Hidden audit required"
+        );
+        let w = self.window.as_ref().context("Window required")?;
+        anyhow::ensure!(
+            w.is_visible() == Some(false) && !w.has_focus(),
+            "Visible/focused audit forbidden"
+        );
+        anyhow::ensure!(
+            self.auto_screenshot.is_some(),
+            "Audit needs --screenshot error propagation"
+        );
+        anyhow::ensure!(!output.exists(), "Audit output must be new");
+        anyhow::ensure!(
+            self.pending_auto_chart.is_empty(),
+            "Pass target paths via audit JSON, not --chart"
+        );
+        let targets: Vec<PathBuf> =
+            serde_json::from_str(&std::env::var("FERRITE_ROOT_CATALOGUE_INPUTS")?)?;
+        anyhow::ensure!(
+            !targets.is_empty() && targets.len() <= 256,
+            "Audit input count invalid"
+        );
+        let expected: usize = std::env::var("FERRITE_ROOT_CATALOGUE_EXPECTED_CELLS")?.parse()?;
+        let retained: Vec<PathBuf> = std::env::var("FERRITE_ROOT_CATALOGUE_RETAINED_INPUTS")
+            .ok()
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default();
+        anyhow::ensure!(retained.len() <= 256, "Audit retained input count invalid");
+        let mut input_guards = Vec::new();
+        for p in targets.iter().chain(&retained) {
+            let bytes =
+                ferrite_security::UnauthenticatedSnapshot::copy_bounded(p, 512 * 1024 * 1024)?;
+            let captured = fs::read(bytes.path())?;
+            input_guards.push((
+                p.clone(),
+                format!("{:x}", Sha256::digest(&captured)),
+                captured.len(),
+            ));
+        }
+        fs::create_dir_all(output)?;
+        self.cancellation_history_path = output.join("history.json");
+        if !retained.is_empty() {
+            anyhow::ensure!(
+                self.catalogue_audit_load(&retained)?.is_none(),
+                "Retained original load failed"
+            );
+        }
+        let original = self.capture_catalogue_audit(&output.join("before"))?;
+        let mode =
+            std::env::var("FERRITE_ROOT_CATALOGUE_AUDIT_MODE").unwrap_or_else(|_| "success".into());
+        let mut failures = Vec::new();
+        if mode == "manual-reject" || mode == "manual-recovery" {
+            anyhow::ensure!(
+                self.catalogue_audit_load(&targets)?.is_none(),
+                "Manual audit initial load failed"
+            );
+            anyhow::ensure!(
+                self.cells.len() == expected && expected > 0,
+                "Manual audit cell count mismatch"
+            );
+            let before = self.capture_catalogue_audit(&output.join("manual-before"))?;
+            let fc = Arc::new(load_feature_catalogue(Path::new(&std::env::var(
+                "FERRITE_ROOT_MANUAL_FC",
+            )?))?);
+            let pc = Arc::new(load_portrayal_catalogue(Path::new(&std::env::var(
+                "FERRITE_ROOT_MANUAL_PC",
+            )?))?);
+            if mode == "manual-reject" {
+                let error = self
+                    .change_catalogue_pair_manually(fc, pc)
+                    .err()
+                    .context("Manual incompatible/resource pair accepted")?;
+                anyhow::ensure!(
+                    self.capture_catalogue_audit(&output.join("manual-rejected"))? == before,
+                    "Manual rejection changed retained publication"
+                );
+                failures.push(format!("{error:#}"));
+            } else {
+                self.publication_test_fail_before_commit = true;
+                let result = self.change_catalogue_pair_manually(fc.clone(), pc.clone());
+                self.publication_test_fail_before_commit = false;
+                let error = result.err().context("Manual staged failure not observed")?;
+                anyhow::ensure!(
+                    format!("{error:#}").contains("Injected portrayal change failure"),
+                    "Unexpected manual failure: {error:#}"
+                );
+                anyhow::ensure!(
+                    self.capture_catalogue_audit(&output.join("manual-material-failure"))?
+                        == before,
+                    "Failed manual staging changed publication"
+                );
+                failures.push(format!("{error:#}"));
+                self.change_catalogue_pair_manually(fc, pc)?;
+                self.capture_catalogue_audit(&output.join("manual-retry"))?;
+            }
+        } else if mode == "mixed-reject" || mode == "signature-reject" || mode == "numeric-reject" {
+            let error = self
+                .catalogue_audit_load(&targets)?
+                .context("Expected load rejection")?;
+            if mode == "mixed-reject" {
+                anyhow::ensure!(
+                    error.contains("Mixed S-101"),
+                    "Unexpected mixed-version rejection: {error}"
+                );
+            }
+            if mode == "numeric-reject" {
+                anyhow::ensure!(
+                    error.contains("Nonconformant S-101 spatial scales"),
+                    "Unexpected numeric spatial-scale rejection: {error}"
+                );
+            }
+            let after = self.capture_catalogue_audit(&output.join("rejected"))?;
+            anyhow::ensure!(
+                after == original,
+                "Rejected catalogue load changed retained ownership/view/history"
+            );
+            failures.push(error);
+        } else {
+            anyhow::ensure!(
+                mode == "success" && self.cells.is_empty(),
+                "Pair transition audit requires no retained S101 cells"
+            );
+            for (phase, history_fault) in [("material-failure", false), ("history-failure", true)] {
+                self.publication_test_fail_before_commit = !history_fault;
+                self.catalogue_test_fail_history = history_fault;
+                let result = self.catalogue_audit_load(&targets);
+                self.publication_test_fail_before_commit = false;
+                self.catalogue_test_fail_history = false;
+                let error = result?.context("Injected catalogue failure not observed")?;
+                anyhow::ensure!(
+                    if history_fault {
+                        error.contains("Injected catalogue history failure")
+                    } else {
+                        error.contains("Injected portrayal change failure")
+                    },
+                    "Unexpected failure: {error}"
+                );
+                anyhow::ensure!(
+                    self.capture_catalogue_audit(&output.join(phase))? == original,
+                    "Failed preparation changed retained pair/cache/UI/view/history"
+                );
+                failures.push(error);
+            }
+            anyhow::ensure!(
+                self.catalogue_audit_load(&targets)?.is_none(),
+                "Catalogue retry failed"
+            );
+            anyhow::ensure!(
+                self.cells.len() == expected && expected > 0,
+                "Unexpected successful dataset count"
+            );
+            anyhow::ensure!(
+                self.pc.version == "1.0.2" && self.fc.version == "1.0.2",
+                "Expected actual legacy catalogue1.0.2"
+            );
+            anyhow::ensure!(
+                self.cells.iter().all(|c| c
+                    .dsid
+                    .product_edition
+                    .parse::<ferrite_kernel::SpecificationVersion>()
+                    .is_ok_and(|v| v.edition == 1)),
+                "Unexpected dataset Edition"
+            );
+            anyhow::ensure!(
+                self.render_context.instruction_count() > 0,
+                "Successful legacy portrayal is empty"
+            );
+            let first = self.capture_catalogue_audit(&output.join("retry"))?;
+            let instruction_bytes = bincode::serialize(self.render_context.raw_instructions())?;
+            let fc_digest = *self.fc.source_digest();
+            let pc_digest = *self.pc.source_digest();
+            let revision = self.symbol_cache.resource_revision();
+            anyhow::ensure!(
+                self.catalogue_audit_load(&targets)?.is_none(),
+                "Repeat load failed"
+            );
+            anyhow::ensure!(
+                *self.fc.source_digest() == fc_digest
+                    && *self.pc.source_digest() == pc_digest
+                    && self.symbol_cache.resource_revision() == revision,
+                "Repeat load unnecessarily replaced catalogue/cache owner"
+            );
+            anyhow::ensure!(
+                bincode::serialize(self.render_context.raw_instructions())? == instruction_bytes,
+                "Repeat typed instructions differ"
+            );
+            let repeat = self.capture_catalogue_audit(&output.join("repeat"))?;
+            fs::write(
+                output.join("successful.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({"first":first,"repeat":repeat}))?,
+            )?;
+        }
+        for (p, hash, length) in &input_guards {
+            let snapshot =
+                ferrite_security::UnauthenticatedSnapshot::copy_bounded(p, 512 * 1024 * 1024)?;
+            let bytes = fs::read(snapshot.path())?;
+            anyhow::ensure!(
+                bytes.len() == *length && format!("{:x}", Sha256::digest(&bytes)) == *hash,
+                "Audit source changed: {}",
+                p.display()
+            );
+        }
+        fs::write(
+            output.join("receipt.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"mode":mode,"hidden":true,"focused":false,"inputs":input_guards,"expected_cells":expected,"failures":failures,"final":self.catalogue_audit_binding()?,"no_update_view_repair":true,"scope":"raw8 are CPU geometry exports; retained picking only if baseline has actual selection; no positive legacy pick claim"}),
+            )?,
+        )?;
+        Ok(())
+    }
+
     fn publication_model(&self) -> Result<serde_json::Value> {
         let renderer = self.renderer.as_ref().context("Renderer required")?;
         let cells: Vec<_> = self.cells.iter().enumerate().map(|(index, cell)| {
@@ -5740,22 +6878,30 @@ impl ApplicationHandler for ChartApp {
                             let _args: Vec<_> = std::env::args().collect();
 
                             self.renderer = Some(renderer);
+                            self.refresh_dataset_tree();
 
-                            if !self.pending_auto_s102.is_empty() {
-                                let paths = std::mem::take(&mut self.pending_auto_s102);
-                                if let Err(e) = self.load_bathymetry(&paths) {
-                                    error!("Failed to load S-102: {e:#}");
-                                    if self.auto_screenshot.is_some() {
-                                        self.startup_error =
-                                            Some(format!("Failed to load S-102: {e:#}"));
-                                        event_loop.exit();
-                                        return;
-                                    }
-                                    if let Some(r) = &mut self.renderer {
-                                        r.ui_state.coverage_info =
-                                            Some(format!("S-102 load failed: {e:#}"));
-                                    }
+                            if let Some(path) = std::env::var_os("FERRITE_DATASET_UI_AUDIT") {
+                                std::env::remove_var("FERRITE_DATASET_UI_AUDIT");
+                                if let Err(error) = self.audit_dataset_ui(&PathBuf::from(path)) {
+                                    self.startup_error =
+                                        Some(format!("Dataset UI audit failed: {error:#}"));
                                 }
+                                event_loop.exit();
+                                return;
+                            }
+                            if let Some(output) =
+                                std::env::var_os("FERRITE_ROOT_CATALOGUE_PUBLICATION_AUDIT")
+                            {
+                                std::env::remove_var("FERRITE_ROOT_CATALOGUE_PUBLICATION_AUDIT");
+                                if let Err(error) =
+                                    self.audit_catalogue_publication(&PathBuf::from(output))
+                                {
+                                    self.startup_error = Some(format!(
+                                        "Catalogue publication audit failed: {error:#}"
+                                    ));
+                                }
+                                event_loop.exit();
+                                return;
                             }
                             // Auto-load chart if --chart was specified
                             if !self.pending_auto_chart.is_empty() {
@@ -6161,6 +7307,35 @@ impl ApplicationHandler for ChartApp {
                     }
                 }
 
+                self.poll_dataset_open();
+                let dataset_busy = self.loading_state.is_some()
+                    || self.dataset_open_discovery.is_some()
+                    || self.dataset_open_session.is_some();
+                let (select_dataset, unload_dataset) = self
+                    .renderer
+                    .as_mut()
+                    .map(|renderer| {
+                        renderer.ui_state.dataset_loading = dataset_busy;
+                        (
+                            renderer.ui_state.dataset_selection_requested.take(),
+                            renderer.ui_state.dataset_unload_requested.take(),
+                        )
+                    })
+                    .unwrap_or((None, None));
+                if let Some(id) = select_dataset {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.ui_state.selected_dataset = Some(id);
+                    }
+                }
+                if let Some(id) = unload_dataset {
+                    if let Err(error) = self.unload_dataset(id) {
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.ui_state.notice = Some(format!(
+                                "Could not unload dataset; previous display retained: {error:#}"
+                            ));
+                        }
+                    }
+                }
                 self.process_pending_portrayal_change();
 
                 let candidate = self.renderer.as_mut().and_then(|renderer| {
@@ -6229,48 +7404,15 @@ impl ApplicationHandler for ChartApp {
                     event_loop.exit();
                     return;
                 }
-                let selected_exchange = self
-                    .renderer
-                    .as_mut()
-                    .and_then(|r| r.ui_state.selected_exchange_set.take());
-                if open_exchange || selected_exchange.is_some() {
-                    if let Some(folder) = selected_exchange.or_else(|| {
-                        rfd::FileDialog::new()
-                            .set_title("Open S-101 / S-102 exchange set folder")
-                            .pick_folder()
-                    }) {
-                        match dataset_discovery::exchange_set_choices(&folder).and_then(|choices| {
-                            if !choices.is_empty() {
-                                if let Some(r) = &mut self.renderer {
-                                    r.ui_state.notice = None;
-                                    r.ui_state.exchange_set_choices = choices;
-                                }
-                                Ok(None)
-                            } else {
-                                dataset_discovery::discover_exchange_folder(&folder).map(Some)
-                            }
-                        }) {
-                            Ok(None) => {}
-                            Ok(Some((charts, rasters))) => {
-                                if let Some(r) = &mut self.renderer {
-                                    r.ui_state.notice = None;
-                                }
-                                let result = self
-                                    .load_bathymetry(&rasters)
-                                    .and_then(|_| self.load_charts(&charts));
-                                if let Err(error) = result {
-                                    error!("Exchange set load failed: {error:#}");
-                                    if let Some(r) = &mut self.renderer {
-                                        r.ui_state.notice =
-                                            Some(format!("Could not open exchange set: {error:#}"));
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                if let Some(r) = &mut self.renderer {
-                                    r.ui_state.notice =
-                                        Some(format!("Could not open exchange set: {error:#}"));
-                                }
+                if open_exchange {
+                    if let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Open Dataset Folder")
+                        .pick_folder()
+                    {
+                        if let Err(error) = self.begin_dataset_open(folder, true) {
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.ui_state.notice =
+                                    Some(format!("Could not open dataset folder: {error:#}"));
                             }
                         }
                     }
@@ -6325,37 +7467,15 @@ impl ApplicationHandler for ChartApp {
                         })();
                         match candidate {
                             Ok((fc, pc)) => {
-                                self.fc_status = validate_fc(&fc, &fc.source_path);
-                                self.pc_status = validate_pc(&pc, &pc.root_path);
-                                self.symbol_cache = SymbolCache::new_with_pattern_contract(
-                                    pc.root_path.join("Symbols"),
-                                    pc.sources(),
-                                    ferrite_s101::shallow_pattern_contract(&pc),
-                                );
-                                self.fc = Arc::new(fc);
-                                self.pc = Arc::new(pc);
-                                if let Some(r) = &mut self.renderer {
-                                    r.clear_symbol_textures();
-                                    r.ui_state.fc_status = self.fc_status.clone();
-                                    r.ui_state.pc_status = self.pc_status.clone();
-                                    r.ui_state.optional_viewing_layers =
-                                        ferrite_s101::optional_viewing_layers(&self.pc);
-                                    r.ui_state.notice = None;
-                                }
-                                if self.chart_loaded {
-                                    let codes = self.fc.feature_type_codes();
-                                    for cell in &mut self.cells {
-                                        cell.normalize_feature_codes(&codes);
-                                    }
-                                    if let Err(error) = self.regenerate_instructions() {
-                                        if let Some(r) = &mut self.renderer {
-                                            r.ui_state.notice = Some(format!(
-                                                "Catalogue set portrayal failed: {error:#}"
-                                            ));
-                                        }
+                                if let Err(error) =
+                                    self.change_catalogue_pair_manually(Arc::new(fc), Arc::new(pc))
+                                {
+                                    if let Some(r) = &mut self.renderer {
+                                        r.ui_state.notice = Some(format!(
+                                            "Catalogue set portrayal failed: {error:#}"
+                                        ));
                                     }
                                 }
-                                self.update_view();
                             }
                             Err(error) => {
                                 if let Some(r) = &mut self.renderer {
@@ -6418,44 +7538,19 @@ impl ApplicationHandler for ChartApp {
 
                 // Process UI requests
                 if open_file {
-                    let paths = rfd::FileDialog::new()
-                        .add_filter("S-101 / S-102", &["000", "h5", "H5"])
+                    if let Some(path) = rfd::FileDialog::new()
                         .add_filter(
-                            "S-101 updates / reissues (select numeric extension)",
-                            &["*"],
+                            "S-100 datasets / exchange catalogue",
+                            &["000", "h5", "H5", "xml"],
                         )
-                        .set_title("Open S-101 charts or S-102 bathymetry")
-                        .pick_files()
-                        .unwrap_or_default();
-
-                    #[cfg(debug_assertions)]
+                        .add_filter("All files (including numeric updates)", &["*"])
+                        .set_title("Open Dataset")
+                        .pick_file()
                     {
-                        info!("File dialog returned {} files", paths.len());
-                        for (i, p) in paths.iter().enumerate() {
-                            info!("  [{}] {}", i, p.display());
-                        }
-                    }
-
-                    if !paths.is_empty() {
-                        if let Some(r) = &mut self.renderer {
-                            r.ui_state.notice = None;
-                        }
-                        let (raster_paths, chart_paths): (Vec<_>, Vec<_>) =
-                            paths.into_iter().partition(|p| {
-                                p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h5"))
-                            });
-                        if !raster_paths.is_empty() {
-                            if let Err(e) = self.load_bathymetry(&raster_paths) {
-                                error!("S-102 load failed: {e:#}");
-                                if let Some(r) = &mut self.renderer {
-                                    r.ui_state.notice = Some(format!("S-102 load failed: {e:#}"));
-                                }
-                            }
-                        }
-                        if let Err(e) = self.load_charts(&chart_paths) {
-                            error!("Failed to load chart(s): {}", e);
-                            if let Some(r) = &mut self.renderer {
-                                r.ui_state.notice = Some(format!("S-101 load failed: {e:#}"));
+                        if let Err(error) = self.begin_dataset_open(path, false) {
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.ui_state.notice =
+                                    Some(format!("Could not open dataset: {error:#}"));
                             }
                         }
                     }
@@ -6486,26 +7581,15 @@ impl ApplicationHandler for ChartApp {
                         });
                         match candidate {
                             Ok(new_fc) => {
-                                info!("Loaded FC: {} v{}", new_fc.product_id, new_fc.version);
-                                self.fc_status = validate_fc(&new_fc, &path);
-                                self.fc = Arc::new(new_fc);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer.ui_state.fc_status = self.fc_status.clone();
-                                }
-                                if self.chart_loaded {
-                                    let codes = self.fc.feature_type_codes();
-                                    for cell in &mut self.cells {
-                                        cell.normalize_feature_codes(&codes);
+                                if let Err(error) = self.change_catalogue_pair_manually(
+                                    Arc::new(new_fc),
+                                    self.pc.clone(),
+                                ) {
+                                    if let Some(r) = &mut self.renderer {
+                                        r.ui_state.notice = Some(format!(
+                                            "Feature catalogue portrayal failed: {error:#}"
+                                        ));
                                     }
-                                    if let Err(error) = self.regenerate_instructions() {
-                                        error!("FC portrayal rebuild failed: {error:#}");
-                                        if let Some(r) = &mut self.renderer {
-                                            r.ui_state.notice = Some(format!(
-                                                "Feature catalogue portrayal failed: {error:#}"
-                                            ));
-                                        }
-                                    }
-                                    self.update_view();
                                 }
                             }
                             Err(e) => {
@@ -6550,34 +7634,15 @@ impl ApplicationHandler for ChartApp {
                         });
                         match candidate {
                             Ok(new_pc) => {
-                                info!("Loaded PC: {} v{}", new_pc.product_id, new_pc.version);
-                                self.pc_status = validate_pc(&new_pc, &path);
-
-                                // Reload symbol cache with new PC
-                                let symbols_path = path.join("Symbols");
-                                self.symbol_cache = SymbolCache::new_with_pattern_contract(
-                                    &symbols_path,
-                                    new_pc.sources(),
-                                    ferrite_s101::shallow_pattern_contract(&new_pc),
-                                );
-                                self.pc = Arc::new(new_pc);
-
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer.clear_symbol_textures();
-                                    renderer.ui_state.pc_status = self.pc_status.clone();
-                                    renderer.ui_state.optional_viewing_layers =
-                                        ferrite_s101::optional_viewing_layers(&self.pc);
-                                }
-                                if self.chart_loaded {
-                                    if let Err(error) = self.regenerate_instructions() {
-                                        error!("PC portrayal rebuild failed: {error:#}");
-                                        if let Some(r) = &mut self.renderer {
-                                            r.ui_state.notice = Some(format!(
-                                                "Portrayal catalogue rebuild failed: {error:#}"
-                                            ));
-                                        }
+                                if let Err(error) = self.change_catalogue_pair_manually(
+                                    self.fc.clone(),
+                                    Arc::new(new_pc),
+                                ) {
+                                    if let Some(r) = &mut self.renderer {
+                                        r.ui_state.notice = Some(format!(
+                                            "Portrayal catalogue rebuild failed: {error:#}"
+                                        ));
                                     }
-                                    self.update_view();
                                 }
                             }
                             Err(e) => {
@@ -6637,6 +7702,7 @@ impl ApplicationHandler for ChartApp {
 
                 if clear_charts {
                     self.clear_charts();
+                    self.refresh_dataset_tree();
                     // Deactivate all plugins (close panels) and clear plugin data
                     self.plugin_system.deactivate_all_plugins();
                     self.plugin_system.clear_all_data();
@@ -6814,6 +7880,26 @@ impl ApplicationHandler for ChartApp {
                     }
                     if self.frames_since_loaded.is_some() {
                         self.frames_since_loaded = Some(0);
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
+                if self.loading_state.is_none() && !self.pending_auto_s102.is_empty() {
+                    let paths = std::mem::take(&mut self.pending_auto_s102);
+                    if let Err(error) = self.load_bathymetry(&paths) {
+                        let message = format!("S-102 startup load failed: {error:#}");
+                        error!("{message}");
+                        if self.auto_screenshot.is_some() {
+                            self.startup_error = Some(message);
+                            event_loop.exit();
+                            return;
+                        }
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.ui_state.notice = Some(message);
+                        }
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -6999,7 +8085,10 @@ impl ApplicationHandler for ChartApp {
                 let needs_redraw = {
                     let has_inertia =
                         self.pan_velocity.0.abs() > 0.00001 || self.pan_velocity.1.abs() > 0.00001;
-                    let has_loading = self.loading_state.is_some();
+                    let has_loading = self.loading_state.is_some()
+                        || !self.pending_auto_s102.is_empty()
+                        || self.dataset_open_discovery.is_some()
+                        || self.dataset_open_session.is_some();
                     let has_screenshot_pending = self.frames_since_loaded.is_some();
                     let has_zoom_pending = self.zoom_rebuild_phase > 0;
                     let egui_needs = self
@@ -7608,6 +8697,7 @@ fn run_app() -> Result<()> {
     app.require_signatures = config.require_signatures;
     app.pending_auto_s102 = config.auto_s102;
     app.s102_pc_path = config.s102_pc_path;
+    app.catalogue_inventory = config.catalogue_inventory;
     app.s102_adjustments_path = config.s102_adjustments_path;
     app.initial_interoperability_enabled = config.initial_interoperability_enabled;
     app.ic_transition_audit = config.ic_transition_audit;
@@ -8620,5 +9710,229 @@ mod static_line_relation_policy_tests {
                 value
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod candidate_catalogue_material_tests {
+    use super::*;
+    struct Fixture {
+        root: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "s101-candidate-material-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(root.join("Symbols")).unwrap();
+            std::fs::write(root.join("Symbols/A.svg"),"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10' fill='red'/></svg>").unwrap();
+            Self { root }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    fn context(symbol: &str) -> RenderContext {
+        let mut context = RenderContext::new(Viewport::new(100., 100.));
+        context.add_instruction(DrawingInstruction::Point(
+            ferrite_render::PointInstruction::new(symbol.into(), WorldPoint::new(0., 0.)),
+        ));
+        context
+    }
+    #[test]
+    fn candidate_missing_svg_and_gpu_limit_leave_live_cache_revision_and_payload_unchanged() {
+        let f = Fixture::new();
+        let profile = ferrite_portrayal_catalog::ColorProfile::new("Day".into(), "Day".into());
+        let mut live = SymbolCache::new(f.root.join("Symbols"));
+        assert!(live.get_symbol("A", &profile).is_some());
+        let old_revision = live.resource_revision();
+        let old_len = live.len();
+        let mut private = live.fork_empty();
+        assert!(
+            preflight_candidate_symbols(&context("MISSING"), &mut private, &profile, 4096).is_err()
+        );
+        assert!(preflight_candidate_symbols(&context("A"), &mut private, &profile, 1).is_err());
+        drop(private);
+        assert_eq!(live.resource_revision(), old_revision);
+        assert_eq!(live.len(), old_len);
+        assert!(live.get_symbol("A", &profile).is_some());
+    }
+    #[test]
+    fn successful_private_materials_keep_live_cache_until_commit_owner_move() {
+        let f = Fixture::new();
+        let profile = ferrite_portrayal_catalog::ColorProfile::new("Day".into(), "Day".into());
+        let live = SymbolCache::new(f.root.join("Symbols"));
+        let old_revision = live.resource_revision();
+        let mut private = live.fork_empty();
+        preflight_candidate_symbols(&context("A"), &mut private, &profile, 4096).unwrap();
+        assert_eq!(live.len(), 0);
+        assert_eq!(live.resource_revision(), old_revision);
+        assert_eq!(private.len(), 1);
+        let installed = private;
+        assert_eq!(installed.len(), 1);
+        assert_ne!(installed.resource_revision(), old_revision);
+    }
+}
+
+#[cfg(test)]
+mod manual_catalogue_normalization_tests {
+    use super::*;
+    fn cell() -> S101Cell {
+        S101Cell {
+            file_path: PathBuf::from("original.000"),
+            dsid: Default::default(),
+            code_mappings: Default::default(),
+            coord_factor: 1.,
+            coord_factor_y: 1.,
+            coord_factor_z: 1.,
+            coord_origin_x: 0.,
+            coord_origin_y: 0.,
+            coord_origin_z: 0.,
+            minimum_display_scale: None,
+            maximum_display_scale: None,
+            points: Default::default(),
+            multi_points: Default::default(),
+            curves: Default::default(),
+            composite_curves: Default::default(),
+            surfaces: Default::default(),
+            features: Default::default(),
+            information: Default::default(),
+            spatial_information_associations: Default::default(),
+        }
+    }
+    #[test]
+    fn normalization_rollback_restores_both_mapping_directions_and_source() {
+        let mut cell = cell();
+        cell.code_mappings
+            .feature_types
+            .insert(7, "BuoyCardinal".into());
+        // Keep an unrelated reverse entry: normalization is not a canonical-map rebuild.
+        cell.code_mappings
+            .feature_types
+            .str_to_num
+            .insert("OldAlias".into(), 9);
+        let original = CatalogueNormalization::capture(&cell);
+        cell.normalize_feature_codes(&["CardinalBuoy".into()]);
+        assert_eq!(
+            cell.code_mappings.feature_types.get_string(7).unwrap(),
+            "CardinalBuoy"
+        );
+        original.restore(&mut cell);
+        assert_eq!(
+            cell.code_mappings.feature_types.get_string(7).unwrap(),
+            "BuoyCardinal"
+        );
+        assert_eq!(
+            cell.code_mappings.feature_types.get_numeric("OldAlias"),
+            Some(9)
+        );
+        assert_eq!(cell.file_path, PathBuf::from("original.000"));
+    }
+    #[test]
+    fn repeated_failed_preparations_restore_original_mapping_exactly() {
+        let mut cell = cell();
+        cell.code_mappings
+            .feature_types
+            .insert(7, "buoycardinal".into());
+        let before = cell.code_mappings.feature_types.clone();
+        for _ in 0..2 {
+            let original = CatalogueNormalization::capture(&cell);
+            cell.normalize_feature_codes(&["BuoyCardinal".into()]);
+            original.restore(&mut cell);
+            assert_eq!(
+                cell.code_mappings.feature_types.num_to_str,
+                before.num_to_str
+            );
+            assert_eq!(
+                cell.code_mappings.feature_types.str_to_num,
+                before.str_to_num
+            );
+        }
+    }
+    #[test]
+    fn rollback_restores_none_and_alias_feature_codes_without_replacing_graph() {
+        let mut cell = cell();
+        for (id, code) in [(1, Some("BuoyCardinal")), (2, None)] {
+            cell.features.insert(
+                id,
+                ferrite_s100_core::FeatureRecord {
+                    frid: ferrite_s100_core::FRID {
+                        rcid: id as u32,
+                        nftc: 7,
+                        rver: 3,
+                        ruin: 1,
+                    },
+                    foid: None,
+                    attributes: Vec::new(),
+                    spatial_associations: Vec::new(),
+                    information_associations: Vec::new(),
+                    feature_associations: Vec::new(),
+                    masks: Vec::new(),
+                    feature_code: code.map(str::to_owned),
+                    primitive_type: ferrite_s100_core::SpatialPrimitiveType::NoGeometry,
+                },
+            );
+        }
+        let original = CatalogueNormalization::capture(&cell);
+        cell.normalize_feature_codes(&["CardinalBuoy".into()]);
+        assert_eq!(
+            cell.features[&1].feature_code.as_deref(),
+            Some("CardinalBuoy")
+        );
+        original.restore(&mut cell);
+        assert_eq!(
+            cell.features[&1].feature_code.as_deref(),
+            Some("BuoyCardinal")
+        );
+        assert_eq!(cell.features[&2].feature_code, None);
+        assert_eq!(cell.features[&1].frid.rver, 3);
+        assert_eq!(cell.features.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod dataset_open_session_tests {
+    use super::*;
+    #[test]
+    fn failed_folder_chain_does_not_block_other_complete_datasets_but_file_batch_is_atomic() {
+        assert!(chart_batch_publishable(true, true, 2));
+        assert!(!chart_batch_publishable(false, true, 2));
+        assert!(!chart_batch_publishable(true, true, 0));
+        assert!(chart_batch_publishable(false, false, 1));
+        let session = DatasetOpenSession {
+            chart_started: true,
+            chart_failed: true,
+            chart_partial: true,
+            ..Default::default()
+        };
+        assert!(session
+            .summary(2)
+            .contains("completed with failed datasets"));
+    }
+    #[test]
+    fn partial_success_summary_exposes_failure_and_caps_display_without_losing_log_details() {
+        let session = DatasetOpenSession {
+            raster_loaded: 2,
+            raster_existing: 1,
+            raster_failed: 1,
+            chart_started: true,
+            chart_failed: true,
+            notices: (0..40).map(|n| format!("failure-{n}")).collect(),
+            ..Default::default()
+        };
+        let text = session.summary(17);
+        assert!(text.contains("failed; previous charts retained"));
+        assert!(text.contains("2 loaded, 1 already open, 1 failed"));
+        assert!(text.contains("40 skipped or failed entries"));
+        assert!(text.contains("failure-31"));
+        assert!(!text.contains("failure-32"));
+        assert!(text.contains("application log"));
     }
 }

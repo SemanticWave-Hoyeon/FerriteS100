@@ -63,9 +63,9 @@ pub fn validate_dataset_catalogues(
         identifier_version == data,
         "Dataset PRSP and PRED specification versions disagree"
     );
-    fcv.require_same_edition_backward_compatibility(data)
+    fcv.require_same_edition_backward_revision_compatibility(data)
         .context("Feature Catalogue cannot process dataset specification")?;
-    pcv.require_same_edition_backward_compatibility(data)
+    pcv.require_same_edition_backward_revision_compatibility(data)
         .context("Portrayal Catalogue cannot process dataset specification")?;
     Ok(())
 }
@@ -112,5 +112,59 @@ mod tests {
         assert!(validate_dataset_catalogues(&dataset, &fc, "S-101", "2.0.0").is_err());
         dataset.product_identifier = "INT.IHO.S-102.1.1".into();
         assert!(validate_dataset_catalogues(&dataset, &fc, "S-101", "2.0.0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod clarification_policy_tests {
+    use super::*;
+    fn fc(version: &str) -> FeatureCatalogue {
+        FeatureCatalogue {
+            source_path: Default::default(),
+            name: String::new(),
+            scope: String::new(),
+            version: version.into(),
+            version_date: String::new(),
+            product_id: "S-101".into(),
+            simple_attributes: Default::default(),
+            complex_attributes: Default::default(),
+            feature_types: Default::default(),
+            information_types: Default::default(),
+        }
+    }
+    fn data(version: &str) -> DatasetIdentification {
+        DatasetIdentification {
+            product_identifier: format!("INT.IHO.S-101.{version}"),
+            product_edition: version.into(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn both_catalogues_accept_earlier_and_later_clarifications_independently() {
+        for (fv, pv, dv) in [
+            ("2.0.0", "2.0.1", "2.0.9"),
+            ("2.0.9", "2.0.0", "2.0.1"),
+            ("2.1.0", "2.0.0", "2.0.99"),
+        ] {
+            assert!(validate_dataset_catalogues(&data(dv), &fc(fv), "S-101", pv).is_ok());
+        }
+    }
+    #[test]
+    fn compatibility_does_not_bypass_identity_revision_or_edition_checks() {
+        assert!(
+            validate_dataset_catalogues(&data("2.1.0"), &fc("2.0.99"), "S-101", "2.1.0").is_err()
+        );
+        assert!(
+            validate_dataset_catalogues(&data("2.1.0"), &fc("2.1.0"), "S-101", "2.0.99").is_err()
+        );
+        assert!(
+            validate_dataset_catalogues(&data("1.0.9"), &fc("2.0.0"), "S-101", "2.0.0").is_err()
+        );
+        assert!(
+            validate_dataset_catalogues(&data("2.0.9"), &fc("2.0.0"), "S-102", "2.0.0").is_err()
+        );
+        let mut mismatch = data("2.0.9");
+        mismatch.product_edition = "2.0.0".into();
+        assert!(validate_dataset_catalogues(&mismatch, &fc("2.0.0"), "S-101", "2.0.0").is_err());
     }
 }

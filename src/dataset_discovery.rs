@@ -23,6 +23,7 @@ pub fn feature_catalogue_file(root: &Path) -> anyhow::Result<std::path::PathBuf>
 
 /// Discover S-101 chain members and S-102 products without following symlinks.
 /// The application planner groups numeric members; updates are never standalone cells.
+#[cfg(test)]
 pub fn discover_exchange_folder(
     root: &Path,
 ) -> anyhow::Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)> {
@@ -69,6 +70,7 @@ pub fn discover_exchange_folder(
 
 /// A collection folder contains separate producer deliveries, which must not
 /// silently share a conflicting base. Return catalogue containers for selection.
+#[cfg(test)]
 pub fn exchange_set_choices(root: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let choices = catalogue_containers(root)?;
     if choices.iter().any(|p| p == root) {
@@ -81,6 +83,7 @@ pub fn exchange_set_choices(root: &Path) -> anyhow::Result<Vec<std::path::PathBu
     })
 }
 
+#[cfg(test)]
 fn catalogue_containers(root: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     anyhow::ensure!(root.is_dir(), "Exchange set path is not a folder");
     let mut choices = std::collections::BTreeSet::new();
@@ -226,4 +229,44 @@ mod catalogue_discovery_tests {
         assert!(feature_catalogue_file(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// Recursive collection discovery used by the open-all planner. Unlike the
+/// legacy single-delivery API, nested catalogue containers are not pruned.
+/// Paths remain original: signature verification belongs to the loader.
+pub(crate) fn discover_recursive_files(
+    root: &Path,
+) -> anyhow::Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)> {
+    anyhow::ensure!(
+        std::fs::symlink_metadata(root)?.is_dir(),
+        "Dataset folder must be a real directory"
+    );
+    let mut charts = Vec::new();
+    let mut rasters = Vec::new();
+    for (count, entry) in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        anyhow::ensure!(
+            count < 100_000,
+            "Recursive dataset discovery exceeds entry limit"
+        );
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if crate::s101_update_plan::is_chart_file(entry.path()) {
+            charts.push(entry.into_path());
+        } else if is_dataset_file(entry.path(), "h5") || is_dataset_file(entry.path(), "hdf5") {
+            rasters.push(entry.into_path());
+        }
+        anyhow::ensure!(
+            charts.len() + rasters.len() <= 4096,
+            "Recursive dataset inputs exceed4096"
+        );
+    }
+    charts.sort();
+    rasters.sort();
+    Ok((charts, rasters))
 }

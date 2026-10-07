@@ -1629,6 +1629,9 @@ pub use interoperability::{plan_interoperability, InteroperabilityPlan};
 mod catalogue_compatibility;
 pub use catalogue_compatibility::{validate_catalogue_pair, validate_dataset_catalogues};
 
+mod spatial_scale_admission;
+pub use spatial_scale_admission::validate_spatial_scale_properties;
+
 mod context_validation;
 pub use context_validation::{
     context_validation_parameters, synchronize_legacy_context, validate_portrayal_context,

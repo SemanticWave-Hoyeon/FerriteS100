@@ -296,6 +296,86 @@ pub(crate) fn authorized_batch(
     }
     Ok((plans, cancellations))
 }
+/// Folder discovery is not an explicit cancellation operation. Capture each
+/// authorized original once, then isolate failures by logical dataset; successful
+/// groups still use the existing edition/reissue/duplicate/chain planner.
+pub(crate) fn authorized_folder_plans(
+    mut candidates: Vec<PathBuf>,
+    authorization: &ferrite_security::AuthorizedDatasets,
+    require_signature: bool,
+) -> Result<(Vec<Plan>, Vec<String>)> {
+    ensure!(
+        candidates.len() <= MAX_INPUTS,
+        "Too many S-101 folder inputs"
+    );
+    candidates.sort();
+    candidates.dedup();
+    let mut remaining = 512u64 * 1024 * 1024;
+    let mut captured = Vec::new();
+    let mut notices = Vec::new();
+    for candidate in candidates {
+        match authorized_inputs_with_budget(
+            vec![candidate.clone()],
+            authorization,
+            require_signature,
+            remaining,
+        ) {
+            Ok((ordinary, cancellations)) => {
+                for input in ordinary {
+                    remaining = remaining
+                        .checked_sub(input.data_length)
+                        .context("Folder snapshot budget accounting mismatch")?;
+                    captured.push(input);
+                }
+                for input in cancellations {
+                    // Skip ONLY the physical cancellation collection returned
+                    // by authenticated capture, never infer it from a filename.
+                    remaining = remaining
+                        .checked_sub(input.data_length)
+                        .context("Folder snapshot budget accounting mismatch")?;
+                    notices.push(format!(
+                        "Skipped discovered cancellation (explicit selection required): {}",
+                        input.original.display()
+                    ));
+                }
+            }
+            Err(error) => notices.push(format!(
+                "Skipped S-101 input {}: {error:#}",
+                candidate.display()
+            )),
+        }
+    }
+    let (ready, group_notices) = folder_group_plans(captured)?;
+    notices.extend(group_notices);
+    Ok((ready, notices))
+}
+fn folder_group_plans(inputs: Vec<Input>) -> Result<(Vec<Plan>, Vec<String>)> {
+    ensure!(
+        inputs.len() <= MAX_INPUTS,
+        "Too many captured folder inputs"
+    );
+    let mut groups: BTreeMap<(String, String), Vec<Input>> = BTreeMap::new();
+    let mut notices = Vec::new();
+    for input in inputs {
+        match dataset_key(&input.id) {
+            Ok(key) => groups.entry(key).or_default().push(input),
+            Err(error) => notices.push(format!(
+                "Skipped invalid S-101 dataset identity {}: {error:#}",
+                input.original.display()
+            )),
+        }
+    }
+    let mut ready = Vec::new();
+    for ((product, name), group) in groups {
+        match plans(group) {
+            Ok(planned) => ready.extend(planned),
+            Err(error) => {
+                notices.push(format!("Skipped S-101 dataset {product}/{name}: {error:#}"))
+            }
+        }
+    }
+    Ok((ready, notices))
+}
 fn input_fingerprint(path: &Path, limit: u64) -> Result<(u64, [u8; 32])> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -334,13 +414,27 @@ fn authorized_inputs(
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
 ) -> Result<(Vec<Input>, Vec<Input>)> {
+    authorized_inputs_with_budget(
+        candidates,
+        authorization,
+        require_signature,
+        512 * 1024 * 1024,
+    )
+}
+// Same original capture/parse path with the caller's remaining aggregate budget.
+// The legacy wrapper passes its original512MiB; folder calls never reset it.
+fn authorized_inputs_with_budget(
+    candidates: Vec<PathBuf>,
+    authorization: &ferrite_security::AuthorizedDatasets,
+    require_signature: bool,
+    mut remaining: u64,
+) -> Result<(Vec<Input>, Vec<Input>)> {
     ensure!(
         candidates.len() <= MAX_INPUTS,
         "Too many S-101 snapshot inputs"
     );
     let mut inputs = Vec::new();
     let mut cancellations = Vec::new();
-    let mut remaining = 512u64 * 1024 * 1024;
     for path in candidates {
         let authenticated = crate::dataset_signature_policy::dataset_snapshot(
             authorization,
@@ -1258,5 +1352,129 @@ mod tests {
         std::fs::write(folder.join("CATALOG.XML"), xml("2024-10-18")).unwrap();
         assert!(authorized_batch(candidates, &[update], &auth, false, &loaded, &history).is_ok());
         std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn folder_conflicting_dataset_does_not_discard_independent_complete_chain() {
+        let a = input(1, 0, "1");
+        let mut conflict = input(1, 0, "1");
+        conflict.data_sha256[0] = 1;
+        let mut b = input(2, 0, "1");
+        b.id.dataset_name = "101GOOD.000".into();
+        let mut u = input(2, 1, "2");
+        u.id.dataset_name = "101GOOD.001".into();
+        let (ready, notices) = folder_group_plans(vec![a, conflict, b, u]).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].base.id.dataset_name, "101GOOD.000");
+        assert_eq!(ready[0].updates.len(), 1);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("Conflicting duplicate"));
+    }
+    #[test]
+    fn folder_uses_original_planner_latest_reissue_duplicates_gap_and_identity() {
+        let mut dup = input(2, 2, "1");
+        dup.original = "copy/101TEST.002".into();
+        let mut gap = input(1, 0, "1");
+        gap.id.dataset_name = "101GAP.000".into();
+        let mut missing = input(1, 2, "2");
+        missing.id.dataset_name = "101GAP.002".into();
+        let mut invalid = input(1, 0, "1");
+        invalid.id.dataset_name = "../INVALID.000".into();
+        let (ready, notices) = folder_group_plans(vec![
+            input(1, 0, "1"),
+            input(2, 0, "1"),
+            input(2, 2, "1"),
+            dup,
+            input(2, 3, "2"),
+            gap,
+            missing,
+            invalid,
+        ])
+        .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].base.id.edition_number, 2);
+        assert_eq!(ready[0].base.id.update_number, 2);
+        assert_eq!(ready[0].updates[0].id.update_number, 3);
+        assert_eq!(notices.len(), 2);
+    }
+    #[test]
+    fn folder_required_signature_and_capture_budget_never_bypass_error() {
+        let dir = std::env::temp_dir().join(format!("ferrite-folder-auth-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("101TEST.000");
+        std::fs::write(&path, b"not ISO8211").unwrap();
+        let auth = crate::dataset_signature_policy::unchecked_datasets(std::slice::from_ref(&path))
+            .unwrap();
+        let (ready, notices) = authorized_folder_plans(vec![path.clone()], &auth, true).unwrap();
+        assert!(ready.is_empty());
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("Required authenticated dataset snapshot"));
+        let error = authorized_inputs_with_budget(vec![path], &auth, false, 1)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("limit") || format!("{error:#}").contains("budget"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn folder_discovered_physical_cancellation_is_notice_never_removal() {
+        let dir =
+            std::env::temp_dir().join(format!("ferrite-folder-cancel-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("101AA00TEST.003");
+        std::fs::write(
+            &path,
+            crate::chart_publication::tests::physical_cancellation_fixture(
+                "2",
+                "0",
+                "101AA00TEST.003",
+            ),
+        )
+        .unwrap();
+        let auth = crate::dataset_signature_policy::unchecked_datasets(std::slice::from_ref(&path))
+            .unwrap();
+        // Cancellation catalogue evidence is required even OFF. Missing it is
+        // a skipped authentication/metadata error, never a guessed ordinary cell.
+        let (ready, notices) = authorized_folder_plans(vec![path], &auth, false).unwrap();
+        assert!(ready.is_empty());
+        assert_eq!(notices.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires local read-only official SHOM/UKHO TestData"]
+    fn actual_recursive_folder_plans_skip_conflicts_keep_other_original_datasets() {
+        let root = Path::new("/Users/hoyeoncho/Desktop/Development/FerriteS100/TestData");
+        for name in ["SHOM-S101", "UKHO-S101"] {
+            let (paths, _) =
+                crate::dataset_discovery::discover_recursive_files(&root.join(name)).unwrap();
+            let auth = crate::dataset_signature_policy::unchecked_datasets(&paths).unwrap();
+            let (ready, notices) = authorized_folder_plans(paths, &auth, false).unwrap();
+            let details: Vec<_> = ready.iter().map(|plan| serde_json::json!({
+                "dataset": plan.base.id.dataset_name,
+                "product": plan.base.id.product_identifier,
+                "product_edition": plan.base.id.product_edition,
+                "dataset_edition": plan.base.id.edition_number,
+                "base_counter": plan.base.id.update_number,
+                "ending_counter": plan.updates.last().map_or(plan.base.id.update_number, |v|v.id.update_number),
+                "original_paths": plan.input_paths(),
+            })).collect();
+            println!(
+                "FOLDER_OPEN_PLAN_PROOF {}",
+                serde_json::json!({
+                    "tree":name,"ready_count":ready.len(),"notices":notices,"plans":details,
+                    "signature_verification_required":false,"read_only":true,
+                    "materialized_or_native_rendered":false,
+                })
+            );
+            assert!(!ready.is_empty());
+            assert!(ready
+                .iter()
+                .flat_map(Plan::input_paths)
+                .all(|p| p.starts_with(root.join(name))));
+            if name == "UKHO-S101" {
+                assert_eq!(ready.len(), 17);
+            }
+            if name == "SHOM-S101" {
+                assert!(notices.iter().any(|v| v.contains("Conflicting duplicate")));
+            }
+        }
     }
 }

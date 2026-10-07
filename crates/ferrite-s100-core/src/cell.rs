@@ -2478,6 +2478,29 @@ mod identifier_tests {
         assert!(parse_typed_identifier(&[100, 1, 0], 100).is_err());
     }
     #[test]
+    fn robust_spatial_scale_nulls_preserve_both_sentinels_in_both_fields() {
+        // S101 Annex B5.1.31 / S100 SPAS note explicitly permits both encodings
+        // for older data. Actual UKHO17 has SMIN0 / SMAXu32MAX for all39678 SPAS.
+        for (minimum, maximum) in [
+            (0u32, 0u32),
+            (0, u32::MAX),
+            (u32::MAX, 0),
+            (u32::MAX, u32::MAX),
+        ] {
+            let mut raw = vec![120, 7, 0, 0, 0, 2];
+            raw.extend(minimum.to_le_bytes());
+            raw.extend(maximum.to_le_bytes());
+            raw.push(1);
+            let associations = parse_spas(&raw).unwrap();
+            assert_eq!(associations.len(), 1);
+            assert_eq!(associations[0].scale_minimum, None);
+            assert_eq!(associations[0].scale_maximum, None);
+            assert_eq!(associations[0].spatial_id, RecordId::new(120, 7));
+            assert_eq!(associations[0].ornt, 2);
+            assert_eq!(associations[0].update_instruction, 1);
+        }
+    }
+    #[test]
     fn spatial_associations_have_fifteen_byte_stride_and_scale_nulls() {
         let mut d = vec![110, 1, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0, 1];
         d.extend_from_slice(&[130, 2, 0, 0, 0, 1, 16, 39, 0, 0, 232, 3, 0, 0, 1]);

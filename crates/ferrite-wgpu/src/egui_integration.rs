@@ -111,16 +111,41 @@ pub struct PluginButton {
     pub active: bool,
 }
 
+/// Stable dataset identity: UI requests never rely on compacting cell indices.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DatasetLayerId {
+    S101 { product: String, name: String },
+    S102(std::path::PathBuf),
+}
+#[derive(Debug, Clone)]
+pub struct DatasetLayerEntry {
+    pub id: DatasetLayerId,
+    pub name: String,
+    pub source: String,
+    pub detail: String,
+}
+#[derive(Debug, Clone)]
+pub struct DatasetProductLayer {
+    pub product: String,
+    pub fc: String,
+    pub pc: String,
+    pub files: Vec<DatasetLayerEntry>,
+}
+
 /// Application state shared between egui UI and main app
 #[derive(Debug, Clone, Default)]
 pub struct AppUiState {
     pub reduced_motion: bool,
+    pub dataset_tree_hidden: bool,
+    pub dataset_layers: Vec<DatasetProductLayer>,
+    pub selected_dataset: Option<DatasetLayerId>,
+    pub dataset_selection_requested: Option<DatasetLayerId>,
+    pub dataset_unload_requested: Option<DatasetLayerId>,
+    pub dataset_loading: bool,
 
     pub object_detail_sections: ObjectDetailSections,
     pub object_attribute_query: String,
     pub open_exchange_requested: bool,
-    pub exchange_set_choices: Vec<std::path::PathBuf>,
-    pub selected_exchange_set: Option<std::path::PathBuf>,
     pub close_requested: bool,
     pub notice: Option<String>,
     selection_ui_identity: Option<(Option<u32>, i64)>,
@@ -586,6 +611,85 @@ impl EguiIntegration {
         state.show_temporal = open;
     }
 
+    fn draw_dataset_tree(ctx: &egui::Context, ui_state: &mut AppUiState) {
+        if !ui_state.dataset_tree_hidden {
+            egui::SidePanel::left("dataset_tree_panel")
+                .resizable(true)
+                .default_width(250.0)
+                .min_width(160.0)
+                .max_width(450.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Data Layers");
+                        if ui.small_button("Hide").clicked() {
+                            ui_state.dataset_tree_hidden = true;
+                        }
+                    });
+                    if ui_state.dataset_loading {
+                        ui.label("Loading datasets…");
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("dataset_tree_scroll")
+                        .show(ui, |ui| {
+                            if ui_state
+                                .dataset_layers
+                                .iter()
+                                .all(|layer| layer.files.is_empty())
+                            {
+                                ui.label("No dataset loaded");
+                            }
+                            for layer in &ui_state.dataset_layers {
+                                egui::CollapsingHeader::new(format!(
+                                    "{} ({})",
+                                    layer.product,
+                                    layer.files.len()
+                                ))
+                                .id_salt((&layer.product, "product-layer"))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    ui.small(&layer.fc);
+                                    ui.small(&layer.pc);
+                                    for file in &layer.files {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    ui_state.selected_dataset.as_ref()
+                                                        == Some(&file.id),
+                                                    &file.name,
+                                                )
+                                                .on_hover_text(format!(
+                                                    "{}\n{}",
+                                                    file.detail, file.source
+                                                ))
+                                                .clicked()
+                                            {
+                                                ui_state.selected_dataset = Some(file.id.clone());
+                                                ui_state.dataset_selection_requested =
+                                                    Some(file.id.clone());
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !ui_state.dataset_loading,
+                                                    egui::Button::new("Unload").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                ui_state.dataset_unload_requested =
+                                                    Some(file.id.clone());
+                                            }
+                                        });
+                                        if ui_state.selected_dataset.as_ref() == Some(&file.id) {
+                                            ui.small(&file.detail);
+                                            ui.small(&file.source);
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                });
+        }
+    }
+
     pub fn draw_ui(&self, ui_state: &mut AppUiState) {
         let theme = Theme::for_profile(&ui_state.color_profile);
         theme.apply(&self.ctx, ui_state.reduced_motion);
@@ -613,11 +717,11 @@ impl EguiIntegration {
                 ui.horizontal_wrapped(|ui| {
                     // File menu
                     ui.menu_button("File", |ui| {
-                        if ui.button("Open datasets…").clicked() {
+                        if ui.button("Open Dataset…").clicked() {
                             ui_state.open_file_requested = true;
                             ui.close_menu();
                         }
-                        if ui.button("Open exchange set folder…").clicked() {
+                        if ui.button("Open Dataset Folder…").clicked() {
                             ui_state.open_exchange_requested = true;
                             ui.close_menu();
                         }
@@ -650,8 +754,16 @@ impl EguiIntegration {
                         }
                     });
 
-                    if icon_button(ui, Icon::Open, "Open S-101 / S-102 datasets").clicked() {
+                    if ui.button("Open Dataset").clicked() {
                         ui_state.open_file_requested = true;
+                    }
+
+                    if ui
+                        .button("Open Dataset Folder")
+                        .on_hover_text("Recursively open datasets and exchange sets in a folder")
+                        .clicked()
+                    {
+                        ui_state.open_exchange_requested = true;
                     }
 
                     if ui
@@ -660,6 +772,13 @@ impl EguiIntegration {
                         .clicked()
                     {
                         ui_state.debug_mode = !ui_state.debug_mode;
+                    }
+
+                    if ui
+                        .selectable_label(!ui_state.dataset_tree_hidden, "Data Layers")
+                        .clicked()
+                    {
+                        ui_state.dataset_tree_hidden = !ui_state.dataset_tree_hidden;
                     }
 
                     // View menu
@@ -880,6 +999,8 @@ impl EguiIntegration {
                 });
             });
 
+        Self::draw_dataset_tree(&self.ctx, ui_state);
+
         // Feature info panel (right side)
         egui::SidePanel::right("feature_panel")
             .default_width(320.0)
@@ -901,20 +1022,6 @@ impl EguiIntegration {
                 if let Some(notice)=ui_state.notice.clone() {
                     ui.colored_label(theme.error,&notice);
                     if ui.small_button("Dismiss message").clicked(){ui_state.notice=None;}
-                    ui.separator();
-                }
-                if !ui_state.exchange_set_choices.is_empty() {
-                    ui.label("Choose one exchange set from this collection:");
-                    let mut selected = None;
-                    for path in &ui_state.exchange_set_choices {
-                        let label = path.display().to_string();
-                        if ui.button(&label).clicked() { selected = Some(path.clone()); }
-                    }
-                    if let Some(path) = selected {
-                        ui_state.selected_exchange_set = Some(path);
-                        ui_state.exchange_set_choices.clear();
-                    }
-                    if ui.small_button("Cancel selection").clicked() { ui_state.exchange_set_choices.clear(); }
                     ui.separator();
                 }
                 if !ui_state.interoperability_status.is_empty() {
@@ -1990,5 +2097,135 @@ mod signature_setting_tests {
             assert!(!state.settings_changed);
             assert!(state.pending_settings.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod dataset_tree_ui_tests {
+    use super::*;
+    fn texts(shape: &egui::epaint::Shape, output: &mut Vec<(String, egui::Pos2)>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                output.push((text.galley.text().to_owned(), text.pos))
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    texts(shape, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn draw(
+        ctx: &egui::Context,
+        state: &mut AppUiState,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000., 700.),
+            )),
+            events,
+            ..Default::default()
+        };
+        let frame = ctx.run(raw, |ctx| EguiIntegration::draw_dataset_tree(ctx, state));
+        let mut output = Vec::new();
+        for clipped in frame.shapes {
+            texts(&clipped.shape, &mut output);
+        }
+        output
+    }
+    fn state() -> AppUiState {
+        AppUiState {
+            dataset_layers: vec![DatasetProductLayer {
+                product: "S-101".into(),
+                fc: "FC 2.0.0".into(),
+                pc: "PC 2.0.0".into(),
+                files: vec![DatasetLayerEntry {
+                    id: DatasetLayerId::S101 {
+                        product: "S-101".into(),
+                        name: "cell".into(),
+                    },
+                    name: "CELL.000".into(),
+                    source: "/data/CELL.000".into(),
+                    detail: "Edition 2".into(),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+    fn click(ctx: &egui::Context, state: &mut AppUiState, position: egui::Pos2) {
+        draw(
+            ctx,
+            state,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        draw(
+            ctx,
+            state,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+    }
+    #[test]
+    fn actual_tree_draws_product_catalogues_and_selection_uses_stable_identity() {
+        let ctx = egui::Context::default();
+        let mut state = state();
+        draw(&ctx, &mut state, vec![]);
+        let output = draw(&ctx, &mut state, vec![]);
+        for label in ["FC 2.0.0", "PC 2.0.0", "CELL.000"] {
+            assert!(
+                output.iter().any(|(text, _)| text == label),
+                "missing {label}: {output:?}"
+            );
+        }
+        let pos = output
+            .iter()
+            .find(|(text, _)| text == "CELL.000")
+            .unwrap()
+            .1
+            + egui::vec2(3., 5.);
+        click(&ctx, &mut state, pos);
+        assert_eq!(
+            state.dataset_selection_requested,
+            Some(state.dataset_layers[0].files[0].id.clone())
+        );
+        assert_eq!(state.selected_dataset, state.dataset_selection_requested);
+    }
+    #[test]
+    fn busy_tree_disables_unload_then_emits_only_stable_file_request() {
+        let ctx = egui::Context::default();
+        let mut state = state();
+        state.dataset_loading = true;
+        draw(&ctx, &mut state, vec![]);
+        let output = draw(&ctx, &mut state, vec![]);
+        let pos = output.iter().find(|(text, _)| text == "Unload").unwrap().1 + egui::vec2(3., 5.);
+        click(&ctx, &mut state, pos);
+        assert!(state.dataset_unload_requested.is_none());
+        state.dataset_loading = false;
+        draw(&ctx, &mut state, vec![]);
+        let output = draw(&ctx, &mut state, vec![]);
+        // The loading label disappears, so use the button's current position.
+        let pos = output.iter().find(|(text, _)| text == "Unload").unwrap().1 + egui::vec2(3., 5.);
+        click(&ctx, &mut state, pos);
+        assert_eq!(
+            state.dataset_unload_requested,
+            Some(state.dataset_layers[0].files[0].id.clone())
+        );
+        state.dataset_tree_hidden = true;
+        assert!(draw(&ctx, &mut state, vec![]).is_empty());
     }
 }

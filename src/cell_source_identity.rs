@@ -16,6 +16,12 @@ impl LoadedSourceIdentities {
             .get_mut(index)
             .expect("Cell/source identity indices stay aligned") = identity;
     }
+    pub(crate) fn remove(&mut self, index: usize) -> CellSourceIdentity {
+        self.by_cell.remove(index)
+    }
+    pub(crate) fn insert(&mut self, index: usize, identity: CellSourceIdentity) {
+        self.by_cell.insert(index, identity);
+    }
     pub(crate) fn len(&self) -> usize {
         self.by_cell.len()
     }

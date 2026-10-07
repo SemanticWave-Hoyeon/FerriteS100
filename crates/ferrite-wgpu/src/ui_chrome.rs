@@ -112,7 +112,6 @@ impl Theme {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Icon {
-    Open,
     Plus,
     Minus,
     Fit,
@@ -143,20 +142,6 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
                 p.line_segment([pos(x, y), pos(x + 4. * dx, y)], stroke);
                 p.line_segment([pos(x, y), pos(x, y + 4. * dy)], stroke);
             }
-        }
-        Icon::Open => {
-            p.add(egui::Shape::closed_line(
-                vec![
-                    pos(-7., -5.),
-                    pos(-2., -5.),
-                    pos(0., -3.),
-                    pos(7., -3.),
-                    pos(7., 6.),
-                    pos(-7., 6.),
-                ],
-                stroke,
-            ));
-            p.line_segment([pos(-7., -1.), pos(7., -1.)], stroke);
         }
     }
     response.on_hover_text(label)
