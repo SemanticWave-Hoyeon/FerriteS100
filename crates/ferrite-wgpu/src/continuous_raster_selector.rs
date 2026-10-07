@@ -86,20 +86,25 @@ fn continuous_grid_select(image:texture_2d<f32>,p:vec2<f32>,span:vec2<f32>,coord
 /// Staging/compiling a material must not silently turn it into a frame certificate.
 #[derive(Clone)]
 pub struct ValidatedContinuousFrame {
-    pub(crate) transform_key:[u32;9],
-    pub(crate) binding:crate::continuous_frame_binding::ContinuousFrameBinding,
-    pub(crate) material_keys:Vec<[u8;32]>,
-    pub(crate) coordinate_error_source:f32,
-    _qualified_by_backend:(),
+    pub(crate) transform_key: [u32; 9],
+    pub(crate) binding: crate::continuous_frame_binding::ContinuousFrameBinding,
+    pub(crate) material_keys: Vec<[u8; 32]>,
+    pub(crate) coordinate_error_source: f32,
+    _qualified_by_backend: (),
 }
 impl ValidatedContinuousFrame {
-    pub(crate) fn error(&self)->f32 {self.coordinate_error_source}
+    pub(crate) fn error(&self) -> f32 {
+        self.coordinate_error_source
+    }
 }
 
 /// A separate flat material leaves the existing raster shader/pipeline unchanged.
 /// The selector function below is composed into flat colour.
-pub(crate) fn flat_shader()->String {
-    format!("{}\n{}",SELECTOR_WGSL,r#"
+pub(crate) fn flat_shader() -> String {
+    format!(
+        "{}\n{}",
+        SELECTOR_WGSL,
+        r#"
 struct Input { @location(0) position:vec2<f32>, @location(1) anchor:vec2<f32>, @location(2) origin:vec2<f32>, @location(3) step:vec2<f32>, @location(4) offset:vec2<u32>, @location(5) size:vec2<u32>, @location(6) row_bounds:vec2<f32>, @location(7) row_index:u32 }
 struct Output { @builtin(position) position:vec4<f32>, @location(0) @interpolate(flat) origin:vec2<f32>, @location(1) @interpolate(flat) step:vec2<f32> }
 struct ViewUniforms {view_proj:mat4x4<f32>,viewport_size:vec2<f32>,scale:f32,_padding:f32,pan_offset:vec2<f32>,zoom_scale:f32,zoom_scale_y:f32,zoom_pivot:vec2<f32>,_padding3:vec2<f32>}
@@ -127,14 +132,24 @@ struct ViewUniforms {view_proj:mat4x4<f32>,viewport_size:vec2<f32>,scale:f32,_pa
  if selected.rank==0xffffffffu || selected.rgba.a<=0. {discard;}
  return selected.rgba;
 }
-"#)
+"#
+    )
 }
 
-#[cfg(test)] mod tests {
+#[cfg(test)]
+mod tests {
     use super::*;
-    #[test] fn shared_flat_selector_parses_and_validates_without_gpu_or_window() {
-        let source=flat_shader();let module=wgpu::naga::front::wgsl::parse_str(&source).unwrap();
-        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(),wgpu::naga::valid::Capabilities::all()).validate(&module).unwrap();
-        assert!(source.contains("selected.rgba.a<=0."));assert!(source.contains("selected.rank==0xffffffffu"));
+    #[test]
+    fn shared_flat_selector_parses_and_validates_without_gpu_or_window() {
+        let source = flat_shader();
+        let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        assert!(source.contains("selected.rgba.a<=0."));
+        assert!(source.contains("selected.rank==0xffffffffu"));
     }
 }

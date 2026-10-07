@@ -17,16 +17,16 @@
 mod egui_integration;
 mod object_details;
 pub use object_details::{draw_selected_object_details, ObjectDetailSections};
+mod draw_range_index;
 mod error;
 mod pipeline;
 pub mod profiler;
 mod renderer;
-mod draw_range_index;
 mod state;
-mod symbol_cache;
 pub mod svg_painted_support;
-pub mod whole_motif;
+mod symbol_cache;
 mod vertex;
+pub mod whole_motif;
 
 pub use egui_integration::*;
 pub use error::*;
@@ -48,11 +48,6 @@ mod ui_chrome;
 
 pub mod screen_stroke;
 
-
-
-
-
-
 /// Fragment clipping shared by chart portrayal products.
 pub mod coverage_clip;
 
@@ -65,12 +60,10 @@ pub mod background_test;
 
 mod symbol_instance;
 
-
 // Staged continuous-source selector; no existing raster path is replaced yet.
-mod continuous_raster_selector;
 mod continuous_frame_binding;
+mod continuous_raster_selector;
 pub use continuous_raster_selector::ValidatedContinuousFrame;
-
 
 mod raster_publication_budget;
 

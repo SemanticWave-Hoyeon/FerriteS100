@@ -16,35 +16,47 @@ impl DisplayPlanes {
 }
 
 fn children<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Vec<Node<'a, 'i>> {
-    node.children().filter(|n| n.is_element()
-        && n.tag_name().name() == name
-        && (n.tag_name().namespace().is_none()
-            || n.tag_name().namespace() == node.tag_name().namespace())).collect()
+    node.children()
+        .filter(|n| {
+            n.is_element()
+                && n.tag_name().name() == name
+                && (n.tag_name().namespace().is_none()
+                    || n.tag_name().namespace() == node.tag_name().namespace())
+        })
+        .collect()
 }
 
 pub(crate) fn read(doc: &Document<'_>) -> Result<DisplayPlanes> {
     let containers = children(doc.root_element(), "displayPlanes");
     if containers.len() != 1 {
-        return Err(PCError::InvalidValue("PC requires one displayPlanes container".into()));
+        return Err(PCError::InvalidValue(
+            "PC requires one displayPlanes container".into(),
+        ));
     }
     let definitions = children(containers[0], "displayPlane");
     if definitions.is_empty() {
-        return Err(PCError::InvalidValue("PC displayPlanes requires a plane definition".into()));
+        return Err(PCError::InvalidValue(
+            "PC displayPlanes requires a plane definition".into(),
+        ));
     }
     let mut result = DisplayPlanes::default();
     for n in definitions {
         let id = n.attribute("id").unwrap_or("");
         if id.is_empty() || id.trim() != id {
-            return Err(PCError::InvalidValue("Display plane requires a nonempty id".into()));
+            return Err(PCError::InvalidValue(
+                "Display plane requires a nonempty id".into(),
+            ));
         }
-        let raw = n.attribute("order").ok_or_else(|| {
-            PCError::InvalidValue(format!("Display plane {id} has no order"))
-        })?;
+        let raw = n
+            .attribute("order")
+            .ok_or_else(|| PCError::InvalidValue(format!("Display plane {id} has no order")))?;
         let order = raw.parse::<i32>().ok().and_then(NonZeroI32::new).ok_or_else(|| {
             PCError::InvalidValue(format!("Display plane {id} needs a supported nonzero integer order; zero is reserved for RADAR"))
         })?;
         if result.planes.insert(id.to_owned(), order).is_some() {
-            return Err(PCError::InvalidValue(format!("Duplicate display plane: {id}")));
+            return Err(PCError::InvalidValue(format!(
+                "Duplicate display plane: {id}"
+            )));
         }
     }
     Ok(result)

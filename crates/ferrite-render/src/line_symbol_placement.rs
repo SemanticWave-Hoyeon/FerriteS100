@@ -156,7 +156,7 @@ pub fn placed_curve_points(
         clipped = clip_curve_components(components, rect)?;
         &clipped[..]
     } else {
-        &components[..]
+        components
     };
     if !placement.visible_parts && paths.len() > 1 {
         return Err("Full curve crosses a singular/depth-clipped projection domain".into());

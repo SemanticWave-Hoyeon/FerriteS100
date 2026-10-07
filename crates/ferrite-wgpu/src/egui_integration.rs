@@ -116,8 +116,6 @@ pub struct PluginButton {
 pub struct AppUiState {
     pub reduced_motion: bool,
 
-
-
     pub object_detail_sections: ObjectDetailSections,
     pub object_attribute_query: String,
     pub open_exchange_requested: bool,
@@ -521,25 +519,6 @@ impl EguiIntegration {
             self.renderer.update_texture(device, queue, id, &delta);
         }
     }
-    /// Flush font changes without an extra UI pass or consuming native input.
-    pub(crate) fn flush_chart_fonts(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        for (id, delta) in std::mem::take(&mut self.pending_font_textures).set {
-            self.renderer.update_texture(device, queue, id, &delta);
-        }
-        if let Some(delta) = self.ctx.fonts(|fonts| fonts.font_image_delta()) {
-            self.ctx
-                .tex_manager()
-                .write()
-                .set(egui::TextureId::default(), delta);
-        }
-        let delta = self.ctx.tex_manager().write().take_delta();
-        for (id, image) in delta.set {
-            self.renderer.update_texture(device, queue, id, &image);
-        }
-        for id in delta.free {
-            self.renderer.free_texture(&id);
-        }
-    }
     pub fn chart_atlas_bind_group(&self, id: egui::TextureId) -> Option<wgpu::BindGroup> {
         self.renderer
             .texture(&id)
@@ -685,7 +664,6 @@ impl EguiIntegration {
 
                     // View menu
                     ui.menu_button("View", |ui| {
-
                         ui.separator();
 
                         ui.menu_button("Color palette", |ui| {
@@ -768,9 +746,7 @@ impl EguiIntegration {
                     ui.separator();
 
                     // Keep the view choice visible without opening a menu.
-                    ui.horizontal(|ui| {
-
-                    });
+                    ui.horizontal(|_ui| {});
                     ui.separator();
                     // Zoom controls
                     if icon_button(ui, Icon::Plus, "Zoom in").clicked() {
@@ -1952,7 +1928,9 @@ mod temporal_dialog_tests {
 
 fn signature_verification_toggle(ui: &mut egui::Ui, enabled: &mut bool) -> egui::Response {
     ui.checkbox(enabled, "Verify digital signatures")
-        .on_hover_text("Applies to newly opened S-100 datasets. Reload existing charts to verify them.")
+        .on_hover_text(
+            "Applies to newly opened S-100 datasets. Reload existing charts to verify them.",
+        )
 }
 
 #[cfg(test)]
@@ -1969,24 +1947,44 @@ mod signature_setting_tests {
         let portrayal = state.settings.clone();
         let frame = |events, state: &mut AppUiState| {
             let mut rect = egui::Rect::NOTHING;
-            let _ = context.run(egui::RawInput { events, ..Default::default() }, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    rect = signature_verification_toggle(ui, &mut state.verify_dataset_signatures).rect;
-                });
-            });
+            let _ = context.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        rect =
+                            signature_verification_toggle(ui, &mut state.verify_dataset_signatures)
+                                .rect;
+                    });
+                },
+            );
             rect
         };
         let center = frame(Vec::new(), &mut state).center();
         for expected in [true, false] {
-            frame(vec![
-                egui::Event::PointerMoved(center),
-                egui::Event::PointerButton { pos: center, button: egui::PointerButton::Primary,
-                    pressed: true, modifiers: egui::Modifiers::default() },
-            ], &mut state);
-            frame(vec![
-                egui::Event::PointerButton { pos: center, button: egui::PointerButton::Primary,
-                    pressed: false, modifiers: egui::Modifiers::default() },
-            ], &mut state);
+            frame(
+                vec![
+                    egui::Event::PointerMoved(center),
+                    egui::Event::PointerButton {
+                        pos: center,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                &mut state,
+            );
+            frame(
+                vec![egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                &mut state,
+            );
             assert_eq!(state.verify_dataset_signatures, expected);
             assert_eq!(state.settings, portrayal);
             assert!(!state.settings_changed);

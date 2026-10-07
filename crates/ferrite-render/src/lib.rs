@@ -83,18 +83,17 @@ pub use scene_spatial::SceneSpatialIndex;
 mod portrayal_origin;
 pub use portrayal_origin::{PointOriginCrs, PointOriginGeometry, PortrayalOrigin};
 
-
 pub mod prepared_coverage;
 pub use prepared_coverage::{InstructionCoverageClass, PreparedCoverage, PreparedCoveragePass};
 
 mod pattern_crs;
-pub use pattern_crs::{PatternCrs, HatchStroke, HatchLineSymbol};
+pub use pattern_crs::{HatchLineSymbol, HatchStroke, PatternCrs};
 
 mod pattern_lattice;
-pub use pattern_lattice::{PatternLattice, PatternCellLimits, PatternCellPlan};
+pub use pattern_lattice::{PatternCellLimits, PatternCellPlan, PatternLattice};
 
 mod pattern_display_policy;
-pub use pattern_display_policy::{ShallowPatternContract, pattern_display_allows};
+pub use pattern_display_policy::{pattern_display_allows, ShallowPatternContract};
 
 /// Bounded opt-in 2D frame diagnostics; no visibility or render-policy changes.
 pub mod flat_reuse_diagnostics;

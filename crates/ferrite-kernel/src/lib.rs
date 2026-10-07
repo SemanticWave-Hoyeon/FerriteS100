@@ -1,4 +1,6 @@
 //! Product-neutral chart kernel. Product encodings and application UI stay outside.
+pub mod coverage_domain;
+pub mod depth_selection;
 pub mod geocentric;
 pub mod geodesy;
 pub mod map_camera;
@@ -6,8 +8,6 @@ pub mod rhumb;
 pub mod scale_policy;
 pub mod triangulation;
 pub mod whole_symbol;
-pub mod depth_selection;
-pub mod coverage_domain;
 
 use anyhow::{ensure, Result};
 #[derive(Debug, Clone, Copy)]
@@ -40,7 +40,7 @@ impl GridGeometry {
         Ok(())
     }
     pub fn position(&self, column: usize, row: usize) -> Option<(f64, f64)> {
-        (column < self.width && row < self.height).then(|| {
+        (column < self.width && row < self.height).then_some({
             (
                 self.origin_x + column as f64 * self.spacing_x,
                 self.origin_y + row as f64 * self.spacing_y,
@@ -54,7 +54,7 @@ impl GridGeometry {
         let c = ((x - self.origin_x) / self.spacing_x + 0.5).floor();
         let r = ((y - self.origin_y) / self.spacing_y + 0.5).floor();
         (c >= 0.0 && r >= 0.0 && c < self.width as f64 && r < self.height as f64)
-            .then(|| (c as usize, r as usize))
+            .then_some((c as usize, r as usize))
     }
 }
 /// Lazy row-major tiles; partial edge windows retain their original grid indices.
@@ -161,11 +161,17 @@ pub trait CoverageSource: Send + Sync {
     fn geometry(&self) -> &GridGeometry;
     fn read_window(&self, window: GridWindow) -> Result<CoverageTile>;
     /// Native-CRS continuous validity, evaluated at query position, not node centre.
-    fn is_valid_position(&self,x:f64,y:f64)->bool {x.is_finite() && y.is_finite()}
+    fn is_valid_position(&self, x: f64, y: f64) -> bool {
+        x.is_finite() && y.is_finite()
+    }
     /// A cell texture alone cannot represent a domain cutting cell interiors.
-    fn requires_geometric_mask(&self)->bool {false}
+    fn requires_geometric_mask(&self) -> bool {
+        false
+    }
     fn query_nearest(&self, x: f64, y: f64) -> Result<Option<CoverageQuery>> {
-        if !self.is_valid_position(x,y) {return Ok(None);}
+        if !self.is_valid_position(x, y) {
+            return Ok(None);
+        }
         let Some((column, row)) = self.geometry().nearest(x, y) else {
             return Ok(None);
         };
@@ -224,7 +230,9 @@ pub trait CoverageSource: Send + Sync {
 /// Implementations must bound their temporary reads; callers bound the output window.
 pub trait NumericCoverageSource: Send + Sync {
     fn numeric_geometry(&self) -> &GridGeometry;
-    fn requires_spatial_mask(&self)->bool {false}
+    fn requires_spatial_mask(&self) -> bool {
+        false
+    }
     fn visit_window_values(
         &self,
         window: GridWindow,
@@ -234,8 +242,12 @@ pub trait NumericCoverageSource: Send + Sync {
 
 /// Raw sources need no second f64 sample buffer. Existing 128-row reads are retained.
 impl<T: CoverageSource + ?Sized> NumericCoverageSource for T {
-    fn numeric_geometry(&self) -> &GridGeometry { self.geometry() }
-    fn requires_spatial_mask(&self)->bool {self.requires_geometric_mask()}
+    fn numeric_geometry(&self) -> &GridGeometry {
+        self.geometry()
+    }
+    fn requires_spatial_mask(&self) -> bool {
+        self.requires_geometric_mask()
+    }
     fn visit_window_values(
         &self,
         window: GridWindow,
@@ -244,16 +256,33 @@ impl<T: CoverageSource + ?Sized> NumericCoverageSource for T {
         window.validate(self.geometry())?;
         for row in (0..window.height).step_by(128) {
             let part = GridWindow {
-                column: window.column, row: window.row + row,
-                width: window.width, height: 128.min(window.height - row),
+                column: window.column,
+                row: window.row + row,
+                width: window.width,
+                height: 128.min(window.height - row),
             };
             let tile = self.read_window(part)?;
             ensure!(tile.window == part, "Coverage returned a different window");
-            ensure!(tile.samples.len() == part.width * part.height,
-                "Coverage tile sample count differs");
+            ensure!(
+                tile.samples.len() == part.width * part.height,
+                "Coverage tile sample count differs"
+            );
             for (index, sample) in tile.samples.iter().enumerate() {
-                let p=self.geometry().position(part.column+index%part.width,part.row+index/part.width).ok_or_else(||anyhow::anyhow!("Invalid coverage node"))?;
-                visitor(row * window.width + index, if self.is_valid_position(p.0,p.1) {sample.value.map(f64::from)}else{None})?;
+                let p = self
+                    .geometry()
+                    .position(
+                        part.column + index % part.width,
+                        part.row + index / part.width,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("Invalid coverage node"))?;
+                visitor(
+                    row * window.width + index,
+                    if self.is_valid_position(p.0, p.1) {
+                        sample.value.map(f64::from)
+                    } else {
+                        None
+                    },
+                )?;
             }
         }
         Ok(())
@@ -520,7 +549,6 @@ impl CompositionPlane {
 mod version;
 pub use version::SpecificationVersion;
 
-
 pub mod surface_bounds;
 
 pub mod spatial_hierarchy;
@@ -536,7 +564,6 @@ pub mod coverage_frame;
 pub mod portrayal_position;
 
 pub mod line_offset;
-
 
 pub mod longitude_extent;
 

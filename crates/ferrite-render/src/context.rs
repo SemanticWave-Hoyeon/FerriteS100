@@ -103,7 +103,7 @@ impl ViewingGroupState {
 
     /// Disable all groups
     pub fn disable_all(&mut self) {
-        for (_, visible) in self.visible_groups.iter_mut() {
+        for visible in self.visible_groups.values_mut() {
             *visible = false;
         }
     }
@@ -136,8 +136,8 @@ pub struct RenderContext {
     sorted: bool,
     /// Process-unique identity for the lifetime of this instruction geometry.
     geometry_revision: u64,
-    static_line_relation_epoch:crate::StaticLineRelationEpoch,
-    static_area_geometry_epoch:crate::StaticAreaGeometryEpoch,
+    static_line_relation_epoch: crate::StaticLineRelationEpoch,
+    static_area_geometry_epoch: crate::StaticAreaGeometryEpoch,
     /// Immutable command topology; camera, palette and date changes do not rebuild it.
     dependency_graph: std::sync::OnceLock<std::sync::Arc<crate::DrawingDependencyGraph>>,
     dependency_plan_cache_enabled: bool,
@@ -165,8 +165,8 @@ impl RenderContext {
             feature_ids: HashSet::new(),
             sorted: false,
             geometry_revision: next_geometry_revision(),
-            static_line_relation_epoch:crate::StaticLineRelationEpoch::fresh(),
-            static_area_geometry_epoch:crate::StaticAreaGeometryEpoch::fresh(),
+            static_line_relation_epoch: crate::StaticLineRelationEpoch::fresh(),
+            static_area_geometry_epoch: crate::StaticAreaGeometryEpoch::fresh(),
             dependency_graph: std::sync::OnceLock::new(),
             dependency_plan_cache_enabled: true,
             prepared_coverage: None,
@@ -244,8 +244,8 @@ impl RenderContext {
 
         self.instructions.push(instruction);
         self.geometry_revision = next_geometry_revision();
-        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
-        self.static_area_geometry_epoch=crate::StaticAreaGeometryEpoch::fresh();
+        self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+        self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.temporal_index_dirty = true;
@@ -260,12 +260,14 @@ impl RenderContext {
     /// par_sort_by_key is NOT stable, which caused symbols to appear/disappear inconsistently.
     /// Reuses sorted content during animation; newly changed instructions still sort.
     /// Read-only guard for caches bound to the stable raw instruction order.
-    pub fn instructions_are_sorted(&self)->bool {self.sorted}
+    pub fn instructions_are_sorted(&self) -> bool {
+        self.sorted
+    }
     pub fn get_sorted_instructions(&mut self) -> &[DrawingInstruction] {
         // Animation must retain the same portrayal order as a stationary view.
         if !self.sorted {
-            self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
-        self.static_area_geometry_epoch=crate::StaticAreaGeometryEpoch::fresh();
+            self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+            self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
             // Use stable sort to ensure consistent symbol decluttering
             // Unstable sorts can reorder same-priority instructions differently each frame
             self.dependency_graph.take();
@@ -289,8 +291,8 @@ impl RenderContext {
     pub fn clear_instructions(&mut self) {
         self.instructions.clear();
         self.geometry_revision = next_geometry_revision();
-        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
-        self.static_area_geometry_epoch=crate::StaticAreaGeometryEpoch::fresh();
+        self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+        self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.temporal_indices.clear();
@@ -305,8 +307,8 @@ impl RenderContext {
             return;
         }
         self.geometry_revision = next_geometry_revision();
-        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
-        self.static_area_geometry_epoch=crate::StaticAreaGeometryEpoch::fresh();
+        self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+        self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         for instruction in self.instructions.iter_mut().skip(start) {
             instruction.set_portrayal_origin(origin.clone());
         }
@@ -422,22 +424,26 @@ impl RenderContext {
     /// Calendar diagnostics retain their meaning; coverage visibility is an
     /// independent execution pre-filter before suppression and decluttering.
     pub fn set_coverage_visibility_fusion_enabled(&mut self, enabled: bool) {
-        self.coverage_visibility_fusion_enabled=enabled;
+        self.coverage_visibility_fusion_enabled = enabled;
     }
     pub fn portrayal_visibility(&self) -> crate::error::Result<(Vec<bool>, usize, usize)> {
         let (mut visible, hidden, diagnostics) = self.date_visibility();
         if let Some(coverage) = self.prepared_coverage()? {
             if self.coverage_visibility_fusion_enabled {
-                coverage.intersect_visibility(self.geometry_revision,self.coverage_view_revision,&mut visible)?;
+                coverage.intersect_visibility(
+                    self.geometry_revision,
+                    self.coverage_view_revision,
+                    &mut visible,
+                )?;
             } else {
-            let mask = coverage.visibility(
-                self.geometry_revision,
-                self.coverage_view_revision,
-                self.instructions.len(),
-            )?;
-            for (v, c) in visible.iter_mut().zip(mask) {
-                *v &= c;
-            }
+                let mask = coverage.visibility(
+                    self.geometry_revision,
+                    self.coverage_view_revision,
+                    self.instructions.len(),
+                )?;
+                for (v, c) in visible.iter_mut().zip(mask) {
+                    *v &= c;
+                }
             }
         }
         Ok((visible, hidden, diagnostics))
@@ -500,10 +506,14 @@ impl RenderContext {
         let mut visibility = vec![true; self.instructions.len()];
         for (index, instruction) in self.temporal_entries() {
             match ferrite_kernel::temporal_intervals_visible_with_offset(
-                instruction.time_intervals(), &instant, local_offset,
+                instruction.time_intervals(),
+                &instant,
+                local_offset,
             ) {
                 Ok(value) => {
-                    if !value { hidden += 1; }
+                    if !value {
+                        hidden += 1;
+                    }
                     visibility[index] = value;
                 }
                 Err(_) => {
@@ -619,8 +629,8 @@ impl RenderContext {
             .retain(|i| !matches!(i.portrayal_origin(), crate::PortrayalOrigin::CoverageExempt));
         if before != self.instructions.len() {
             self.geometry_revision = next_geometry_revision();
-        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
-        self.static_area_geometry_epoch=crate::StaticAreaGeometryEpoch::fresh();
+            self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+            self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.temporal_index_dirty = true;
@@ -647,8 +657,8 @@ impl RenderContext {
         if count < self.instructions.len() {
             self.instructions.truncate(count);
             self.geometry_revision = next_geometry_revision();
-        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
-        self.static_area_geometry_epoch=crate::StaticAreaGeometryEpoch::fresh();
+            self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+            self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.temporal_index_dirty = true;
@@ -665,19 +675,41 @@ impl RenderContext {
     }
 
     /// Independent immutable area topology identity; never geometry ownership.
-    pub fn static_area_geometry_epoch(&self)->crate::StaticAreaGeometryEpoch {self.static_area_geometry_epoch}
-    pub fn inherit_static_area_geometry_from(&mut self,previous:&Self)->bool {
-        if !self.sorted || !previous.sorted || !crate::area_relation_identity::same_area_inputs(&self.instructions,&previous.instructions) {return false}
-        self.static_area_geometry_epoch=previous.static_area_geometry_epoch;true
+    pub fn static_area_geometry_epoch(&self) -> crate::StaticAreaGeometryEpoch {
+        self.static_area_geometry_epoch
+    }
+    pub fn inherit_static_area_geometry_from(&mut self, previous: &Self) -> bool {
+        if !self.sorted
+            || !previous.sorted
+            || !crate::area_relation_identity::same_area_inputs(
+                &self.instructions,
+                &previous.instructions,
+            )
+        {
+            return false;
+        }
+        self.static_area_geometry_epoch = previous.static_area_geometry_epoch;
+        true
     }
 
     /// Read-only relation identity, independent from owned geometry lifetime.
-    pub fn static_line_relation_epoch(&self)->crate::StaticLineRelationEpoch{self.static_line_relation_epoch}
+    pub fn static_line_relation_epoch(&self) -> crate::StaticLineRelationEpoch {
+        self.static_line_relation_epoch
+    }
     /// Once per staged publication. Never digest/pointer equality and never per-frame.
     /// Both contexts must already have the same stable ordinal sorting applied.
-    pub fn inherit_static_line_relations_from(&mut self,previous:&Self)->bool{
-        if !self.sorted||!previous.sorted||!crate::line_relation_identity::same_static_line_relation_inputs(&self.instructions,&previous.instructions){return false}
-        self.static_line_relation_epoch=previous.static_line_relation_epoch;true
+    pub fn inherit_static_line_relations_from(&mut self, previous: &Self) -> bool {
+        if !self.sorted
+            || !previous.sorted
+            || !crate::line_relation_identity::same_static_line_relation_inputs(
+                &self.instructions,
+                &previous.instructions,
+            )
+        {
+            return false;
+        }
+        self.static_line_relation_epoch = previous.static_line_relation_epoch;
+        true
     }
 
     /// Geometry lifetime token. Viewport, colors, sorting and temporal settings
@@ -735,8 +767,8 @@ impl RenderContext {
     pub fn set_instructions_from_cache(&mut self, instructions: Vec<DrawingInstruction>) {
         self.instructions = instructions;
         self.geometry_revision = next_geometry_revision();
-        self.static_line_relation_epoch=crate::StaticLineRelationEpoch::fresh();
-        self.static_area_geometry_epoch=crate::StaticAreaGeometryEpoch::fresh();
+        self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+        self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.temporal_index_dirty = true;
@@ -1617,7 +1649,8 @@ mod indexed_date_visibility_controls {
             return (
                 vec![true; context.instructions.len()],
                 0,
-                context.instructions
+                context
+                    .instructions
                     .iter()
                     .filter(|i| !i.time_intervals().is_empty())
                     .count(),
@@ -1642,7 +1675,8 @@ mod indexed_date_visibility_controls {
                 return (
                     vec![true; context.instructions.len()],
                     0,
-                    context.instructions
+                    context
+                        .instructions
                         .iter()
                         .filter(|i| !i.time_intervals().is_empty())
                         .count(),
@@ -1676,83 +1710,158 @@ mod indexed_date_visibility_controls {
         (visibility, hidden, diagnostics)
     }
 
-
     fn annual() -> ferrite_kernel::TemporalInterval {
-        ferrite_kernel::TemporalInterval::new(Some(ferrite_kernel::TemporalBounds::new(
-            Some("----1101".into()),Some("----0331".into())).unwrap()),None,None,
-            ferrite_kernel::IntervalClosure::Closed).unwrap()
+        ferrite_kernel::TemporalInterval::new(
+            Some(
+                ferrite_kernel::TemporalBounds::new(
+                    Some("----1101".into()),
+                    Some("----0331".into()),
+                )
+                .unwrap(),
+            ),
+            None,
+            None,
+            ferrite_kernel::IntervalClosure::Closed,
+        )
+        .unwrap()
     }
     fn context() -> RenderContext {
-        let mut c=RenderContext::new(Viewport::new(960.,640.));
-        c.settings.current_date=Some("2026-07-15".into());
+        let mut c = RenderContext::new(Viewport::new(960., 640.));
+        c.settings.current_date = Some("2026-07-15".into());
         for index in 0..128 {
-            let mut i=DrawingInstruction::Line(LineInstruction::new(vec![
-                WorldPoint::new(index as f64,0.),WorldPoint::new(index as f64,1.)])
-                .with_priority(127-index));
-            if index==1 || index==91 {i.set_time_intervals(&[annual()]);}
-            if index==91 {i.set_portrayal_origin(crate::PortrayalOrigin::CoverageExempt);}
+            let mut i = DrawingInstruction::Line(
+                LineInstruction::new(vec![
+                    WorldPoint::new(index as f64, 0.),
+                    WorldPoint::new(index as f64, 1.),
+                ])
+                .with_priority(127 - index),
+            );
+            if index == 1 || index == 91 {
+                i.set_time_intervals(&[annual()]);
+            }
+            if index == 91 {
+                i.set_portrayal_origin(crate::PortrayalOrigin::CoverageExempt);
+            }
             c.add_instruction(i);
         }
         c
     }
     fn check(c: &RenderContext) {
-        assert_eq!(c.date_visibility(),original_full_scan(c));
+        assert_eq!(c.date_visibility(), original_full_scan(c));
     }
     #[test]
     fn sparse_dirty_and_sorted_entries_preserve_mask_counts_and_source_order() {
-        let mut c=context();assert!(c.temporal_index_dirty);check(&c);
-        assert_eq!(c.date_visibility().1,2);
-        c.get_sorted_instructions();assert!(!c.temporal_index_dirty);
-        assert_eq!(c.temporal_indices.len(),2);check(&c);
-        c.settings.current_date=Some("2026-01-15".into());check(&c);
-        assert_eq!(c.date_visibility().1,0);
-        c.settings.date_dependent=false;check(&c);
-        assert!(c.date_visibility().0.iter().all(|v|*v));
+        let mut c = context();
+        assert!(c.temporal_index_dirty);
+        check(&c);
+        assert_eq!(c.date_visibility().1, 2);
+        c.get_sorted_instructions();
+        assert!(!c.temporal_index_dirty);
+        assert_eq!(c.temporal_indices.len(), 2);
+        check(&c);
+        c.settings.current_date = Some("2026-01-15".into());
+        check(&c);
+        assert_eq!(c.date_visibility().1, 0);
+        c.settings.date_dependent = false;
+        check(&c);
+        assert!(c.date_visibility().0.iter().all(|v| *v));
     }
     #[test]
     fn invalid_view_offset_and_selector_diagnostics_match_original_exactly() {
-        let mut c=context();c.get_sorted_instructions();
-        for offset in [0,9*3600,-7*3600,61,86400] {
-            c.settings.local_time_offset_seconds=offset;
-            for date in ["2026-07-15","bad-date","2026-02-30"] {
-                c.settings.current_date=Some(date.into());check(&c);
+        let mut c = context();
+        c.get_sorted_instructions();
+        for offset in [0, 9 * 3600, -7 * 3600, 61, 86400] {
+            c.settings.local_time_offset_seconds = offset;
+            for date in ["2026-07-15", "bad-date", "2026-02-30"] {
+                c.settings.current_date = Some(date.into());
+                check(&c);
             }
         }
-        c.settings.local_time_offset_seconds=0;c.settings.current_date=Some("2026-07-15".into());
-        c.settings.current_datetime=Some("2026-01-15T23:59:59-07:00".into());check(&c);
-        c.settings.current_datetime=Some("bad-instant".into());check(&c);
-        c.settings.current_datetime=None;
-        let invalid=ferrite_kernel::TemporalInterval::new(None,Some(ferrite_kernel::TemporalBounds::new(
-            Some("250000".into()),Some("130000".into())).unwrap()),None,
-            ferrite_kernel::IntervalClosure::Closed).unwrap();
-        c.set_time_intervals_from(127,&[invalid.clone()]);check(&c);c.get_sorted_instructions();check(&c);
-        assert_eq!(c.date_visibility().2,1);
-        let mixed=ferrite_kernel::TemporalInterval::new(annual().date,invalid.time,None,
-            ferrite_kernel::IntervalClosure::Closed).unwrap();
-        c.set_time_intervals_from(127,&[mixed]);check(&c);c.get_sorted_instructions();check(&c);
-        assert_eq!(c.date_visibility().2,1);
+        c.settings.local_time_offset_seconds = 0;
+        c.settings.current_date = Some("2026-07-15".into());
+        c.settings.current_datetime = Some("2026-01-15T23:59:59-07:00".into());
+        check(&c);
+        c.settings.current_datetime = Some("bad-instant".into());
+        check(&c);
+        c.settings.current_datetime = None;
+        let invalid = ferrite_kernel::TemporalInterval::new(
+            None,
+            Some(
+                ferrite_kernel::TemporalBounds::new(Some("250000".into()), Some("130000".into()))
+                    .unwrap(),
+            ),
+            None,
+            ferrite_kernel::IntervalClosure::Closed,
+        )
+        .unwrap();
+        c.set_time_intervals_from(127, &[invalid.clone()]);
+        check(&c);
+        c.get_sorted_instructions();
+        check(&c);
+        assert_eq!(c.date_visibility().2, 1);
+        let mixed = ferrite_kernel::TemporalInterval::new(
+            annual().date,
+            invalid.time,
+            None,
+            ferrite_kernel::IntervalClosure::Closed,
+        )
+        .unwrap();
+        c.set_time_intervals_from(127, &[mixed]);
+        check(&c);
+        c.get_sorted_instructions();
+        check(&c);
+        assert_eq!(c.date_visibility().2, 1);
     }
     #[test]
     fn mutations_rebuild_ordinals_without_reusing_visibility_or_errors() {
-        let mut c=context();c.get_sorted_instructions();check(&c);
-        c.remove_coverage_exempt_instructions();assert!(c.temporal_index_dirty);check(&c);
-        c.get_sorted_instructions();assert_eq!(c.temporal_indices.len(),1);check(&c);
-        c.set_time_intervals_from(126,&[annual()]);check(&c);c.get_sorted_instructions();check(&c);
-        c.truncate_instructions(16);check(&c);c.get_sorted_instructions();check(&c);
-        let mut replacement=c.raw_instructions().to_vec();replacement.reverse();
-        c.set_instructions_from_cache(replacement);check(&c);c.get_sorted_instructions();check(&c);
-        c.clear_instructions();assert!(c.temporal_indices.is_empty());assert!(!c.temporal_index_dirty);
-        assert_eq!(c.date_visibility(),(vec![],0,0));check(&c);
+        let mut c = context();
+        c.get_sorted_instructions();
+        check(&c);
+        c.remove_coverage_exempt_instructions();
+        assert!(c.temporal_index_dirty);
+        check(&c);
+        c.get_sorted_instructions();
+        assert_eq!(c.temporal_indices.len(), 1);
+        check(&c);
+        c.set_time_intervals_from(126, &[annual()]);
+        check(&c);
+        c.get_sorted_instructions();
+        check(&c);
+        c.truncate_instructions(16);
+        check(&c);
+        c.get_sorted_instructions();
+        check(&c);
+        let mut replacement = c.raw_instructions().to_vec();
+        replacement.reverse();
+        c.set_instructions_from_cache(replacement);
+        check(&c);
+        c.get_sorted_instructions();
+        check(&c);
+        c.clear_instructions();
+        assert!(c.temporal_indices.is_empty());
+        assert!(!c.temporal_index_dirty);
+        assert_eq!(c.date_visibility(), (vec![], 0, 0));
+        check(&c);
     }
     #[test]
     fn empty_selector_index_keeps_all_visible_including_invalid_view() {
-        let mut c=RenderContext::new(Viewport::new(960.,640.));
-        c.settings.current_date=Some("bad-date".into());
-        for _ in 0..512 {c.add_instruction(DrawingInstruction::Line(LineInstruction::new(vec![
-            WorldPoint::new(0.,0.),WorldPoint::new(1.,1.)])));}
-        check(&c);c.get_sorted_instructions();assert!(c.temporal_indices.is_empty());check(&c);
-        assert_eq!(c.date_visibility(),(vec![true;512],0,0));
-        c.settings.current_date=None;c.settings.local_time_offset_seconds=61;check(&c);
-        c.settings.date_dependent=false;check(&c);
+        let mut c = RenderContext::new(Viewport::new(960., 640.));
+        c.settings.current_date = Some("bad-date".into());
+        for _ in 0..512 {
+            c.add_instruction(DrawingInstruction::Line(LineInstruction::new(vec![
+                WorldPoint::new(0., 0.),
+                WorldPoint::new(1., 1.),
+            ])));
+        }
+        check(&c);
+        c.get_sorted_instructions();
+        assert!(c.temporal_indices.is_empty());
+        check(&c);
+        assert_eq!(c.date_visibility(), (vec![true; 512], 0, 0));
+        c.settings.current_date = None;
+        c.settings.local_time_offset_seconds = 61;
+        check(&c);
+        c.settings.date_dependent = false;
+        check(&c);
     }
 }

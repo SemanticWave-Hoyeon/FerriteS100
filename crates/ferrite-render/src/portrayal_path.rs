@@ -70,7 +70,8 @@ impl PortrayalPath {
                 }
             }
             runs.push(points);
-            previous_closed = matches!(path, Self::GeographicArc { sweep, .. } if sweep.rem_euclid(360.) == 0.);
+            previous_closed =
+                matches!(path, Self::GeographicArc { sweep, .. } if sweep.rem_euclid(360.) == 0.);
         }
         runs
     }
@@ -126,7 +127,12 @@ impl PortrayalPath {
             points
         };
         let pts = match self {
-            Self::GeographicArc { center, radius_m, start, sweep } => {
+            Self::GeographicArc {
+                center,
+                radius_m,
+                start,
+                sweep,
+            } => {
                 return geographic_arc_world_points(*center, *radius_m, *start, *sweep, scaler);
             }
             Self::Group(_) => {
@@ -198,7 +204,8 @@ impl PortrayalPath {
                     let radius = (a.0 - center.0).hypot(a.1 - center.1);
                     let first_sweep = if sweep >= 0. { m } else { m - 360. };
                     let mut first = arc(center, radius, s, first_sweep, false);
-                    let mut second = arc(center, radius, s + first_sweep, sweep - first_sweep, false);
+                    let mut second =
+                        arc(center, radius, s + first_sweep, sweep - first_sweep, false);
                     if first.is_empty() || second.is_empty() {
                         return Vec::new();
                     }
@@ -225,54 +232,89 @@ impl PortrayalPath {
 /// it is an explicit numerical tessellation policy, not a universal analytic
 /// error theorem. Refuse budget/precision failures instead of silently capping
 /// tessellation and claiming the requested quality was reached.
-fn geographic_arc_world_points(center: (f64,f64), radius_m: f64, start: f64, sweep: f64, scaler: &Scaler) -> Vec<WorldPoint> {
-    use ferrite_kernel::geodesy::{GeodesicRadiusArc,GeographicPosition};
-    let resolve = || -> Result<Vec<WorldPoint>,String> {
-        let center = GeographicPosition::new(center.1,center.0).map_err(|e| e.to_string())?;
-        let arc = GeodesicRadiusArc::new(center,radius_m,start,sweep).map_err(|e|e.to_string())?;
-        const MAX_VERTICES:usize=4097;
-        let seed=arc.sample_drawing_copies(5.,MAX_VERTICES,center.longitude()).map_err(|e|e.to_string())?;
-        let at=|t:f64,reference:f64| -> Result<WorldPoint,String> {
-            let p=arc.position_at(t).map_err(|e|e.to_string())?;
-            Ok(WorldPoint::new(p.longitude_near(reference).map_err(|e|e.to_string())?,p.latitude()))
+fn geographic_arc_world_points(
+    center: (f64, f64),
+    radius_m: f64,
+    start: f64,
+    sweep: f64,
+    scaler: &Scaler,
+) -> Vec<WorldPoint> {
+    use ferrite_kernel::geodesy::{GeodesicRadiusArc, GeographicPosition};
+    let resolve = || -> Result<Vec<WorldPoint>, String> {
+        let center = GeographicPosition::new(center.1, center.0).map_err(|e| e.to_string())?;
+        let arc =
+            GeodesicRadiusArc::new(center, radius_m, start, sweep).map_err(|e| e.to_string())?;
+        const MAX_VERTICES: usize = 4097;
+        let seed = arc
+            .sample_drawing_copies(5., MAX_VERTICES, center.longitude())
+            .map_err(|e| e.to_string())?;
+        let at = |t: f64, reference: f64| -> Result<WorldPoint, String> {
+            let p = arc.position_at(t).map_err(|e| e.to_string())?;
+            Ok(WorldPoint::new(
+                p.longitude_near(reference).map_err(|e| e.to_string())?,
+                p.latitude(),
+            ))
         };
-        let project=|p:WorldPoint| -> Result<[f64;2],String> {
-            let q=scaler.world_to_screen_f64(p);
-            if q[0].is_finite() && q[1].is_finite() { Ok(q) } else { Err("Non-finite geographic arc projection".into()) }
+        let project = |p: WorldPoint| -> Result<[f64; 2], String> {
+            let q = scaler.world_to_screen_f64(p);
+            if q[0].is_finite() && q[1].is_finite() {
+                Ok(q)
+            } else {
+                Err("Non-finite geographic arc projection".into())
+            }
         };
-        let mut output=Vec::new();
-        output.push(WorldPoint::new(seed[0].longitude(),seed[0].latitude()));
-        let segments=seed.len()-1;
+        let mut output = Vec::new();
+        output.push(WorldPoint::new(seed[0].longitude(), seed[0].latitude()));
+        let segments = seed.len() - 1;
         for i in 0..segments {
-            let a=WorldPoint::new(seed[i].longitude(),seed[i].latitude());
-            let b=WorldPoint::new(seed[i+1].longitude(),seed[i+1].latitude());
-            let mut stack=vec![(i as f64/segments as f64,(i+1) as f64/segments as f64,a,b,0usize)];
-            while let Some((ta,tb,a,b,depth))=stack.pop() {
-                let pa=project(a)?;let pb=project(b)?;
-                let mut error=0f64;
-                let mut middle=a;
-                for f in [0.25,0.5,0.75] {
-                    let p=at(ta+(tb-ta)*f,a.x+(b.x-a.x)*f)?;
-                    let q=project(p)?;
-                    let x=pa[0]+(pb[0]-pa[0])*f;
-                    let y=pa[1]+(pb[1]-pa[1])*f;
-                    error=error.max((q[0]-x).hypot(q[1]-y));
-                    if f==0.5 { middle=p; }
+            let a = WorldPoint::new(seed[i].longitude(), seed[i].latitude());
+            let b = WorldPoint::new(seed[i + 1].longitude(), seed[i + 1].latitude());
+            let mut stack = vec![(
+                i as f64 / segments as f64,
+                (i + 1) as f64 / segments as f64,
+                a,
+                b,
+                0usize,
+            )];
+            while let Some((ta, tb, a, b, depth)) = stack.pop() {
+                let pa = project(a)?;
+                let pb = project(b)?;
+                let mut error = 0f64;
+                let mut middle = a;
+                for f in [0.25, 0.5, 0.75] {
+                    let p = at(ta + (tb - ta) * f, a.x + (b.x - a.x) * f)?;
+                    let q = project(p)?;
+                    let x = pa[0] + (pb[0] - pa[0]) * f;
+                    let y = pa[1] + (pb[1] - pa[1]) * f;
+                    error = error.max((q[0] - x).hypot(q[1] - y));
+                    if f == 0.5 {
+                        middle = p;
+                    }
                 }
-                if error<=0.125 {
-                    if output.len()>=MAX_VERTICES { return Err("Geographic arc vertex budget exceeded".into()); }
+                if error <= 0.125 {
+                    if output.len() >= MAX_VERTICES {
+                        return Err("Geographic arc vertex budget exceeded".into());
+                    }
                     output.push(b);
                 } else {
-                    if depth>=20 || output.len()+stack.len()+2>MAX_VERTICES { return Err("Geographic arc refinement budget exceeded".into()); }
-                    let tm=(ta+tb)*0.5;
-                    stack.push((tm,tb,middle,b,depth+1));
-                    stack.push((ta,tm,a,middle,depth+1));
+                    if depth >= 20 || output.len() + stack.len() + 2 > MAX_VERTICES {
+                        return Err("Geographic arc refinement budget exceeded".into());
+                    }
+                    let tm = (ta + tb) * 0.5;
+                    stack.push((tm, tb, middle, b, depth + 1));
+                    stack.push((ta, tm, a, middle, depth + 1));
                 }
             }
         }
         Ok(output)
     };
-    match resolve() { Ok(points)=>points,Err(error)=>{tracing::error!("Geographic portrayal arc: {error}");Vec::new()} }
+    match resolve() {
+        Ok(points) => points,
+        Err(error) => {
+            tracing::error!("Geographic portrayal arc: {error}");
+            Vec::new()
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -280,59 +322,120 @@ mod tests {
     use crate::{GeoBounds, Viewport};
     #[test]
     fn geographic_metric_arc_refines_for_the_active_view_and_dense_reference() {
-        use ferrite_kernel::geodesy::{GeographicPosition,GeodesicRadiusArc,inverse};
-        let center=GeographicPosition::new(50.,179.9).unwrap();
-        for projection in [crate::FlatProjection::LocalGeographic,crate::FlatProjection::EllipsoidalMercator] {
-            let mut counts=Vec::new();
-            for zoom in [1.,200.] {
-                let mut scaler=Scaler::new(GeoBounds::new(179.9-1./zoom,50.-1./zoom,179.9+1./zoom,50.+1./zoom),Viewport::new(800.,600.));
+        use ferrite_kernel::geodesy::{inverse, GeodesicRadiusArc, GeographicPosition};
+        let center = GeographicPosition::new(50., 179.9).unwrap();
+        for projection in [
+            crate::FlatProjection::LocalGeographic,
+            crate::FlatProjection::EllipsoidalMercator,
+        ] {
+            let mut counts = Vec::new();
+            for zoom in [1., 200.] {
+                let mut scaler = Scaler::new(
+                    GeoBounds::new(
+                        179.9 - 1. / zoom,
+                        50. - 1. / zoom,
+                        179.9 + 1. / zoom,
+                        50. + 1. / zoom,
+                    ),
+                    Viewport::new(800., 600.),
+                );
                 scaler.set_projection(projection);
-                for sweep in [270.,-270.] {
-                    let path=PortrayalPath::GeographicArc{center:(179.9,50.),radius_m:50_000.,start:0.,sweep};
-                    let points=path.world_points(WorldPoint::new(0.,0.),&scaler);
+                for sweep in [270., -270.] {
+                    let path = PortrayalPath::GeographicArc {
+                        center: (179.9, 50.),
+                        radius_m: 50_000.,
+                        start: 0.,
+                        sweep,
+                    };
+                    let points = path.world_points(WorldPoint::new(0., 0.), &scaler);
                     assert!((2..=4097).contains(&points.len()));
-                    let mut fractions=Vec::new();
-                    for (i,p) in points.iter().enumerate() {
-                        let source=GeographicPosition::new(p.y,(p.x+180.).rem_euclid(360.)-180.).unwrap();
-                        let m=inverse(center,source).unwrap();
-                        assert!((m.distance_m-50_000.).abs()<1e-6);
-                        let f=if i==0 {0.} else if i+1==points.len() {1.} else if sweep>0. {m.initial_azimuth_deg.rem_euclid(360.)/sweep} else {(-m.initial_azimuth_deg).rem_euclid(360.)/(-sweep)};
+                    let mut fractions = Vec::new();
+                    for (i, p) in points.iter().enumerate() {
+                        let source =
+                            GeographicPosition::new(p.y, (p.x + 180.).rem_euclid(360.) - 180.)
+                                .unwrap();
+                        let m = inverse(center, source).unwrap();
+                        assert!((m.distance_m - 50_000.).abs() < 1e-6);
+                        let f = if i == 0 {
+                            0.
+                        } else if i + 1 == points.len() {
+                            1.
+                        } else if sweep > 0. {
+                            m.initial_azimuth_deg.rem_euclid(360.) / sweep
+                        } else {
+                            (-m.initial_azimuth_deg).rem_euclid(360.) / (-sweep)
+                        };
                         fractions.push(f);
                     }
-                    assert!(fractions.windows(2).all(|f| f[0]<f[1]));
-                    let arc=GeodesicRadiusArc::new(center,50_000.,0.,sweep).unwrap();
+                    assert!(fractions.windows(2).all(|f| f[0] < f[1]));
+                    let arc = GeodesicRadiusArc::new(center, 50_000., 0., sweep).unwrap();
                     for i in 1..5000 {
-                        let t=i as f64/5000.;
-                        let segment=fractions.partition_point(|f| *f<t).saturating_sub(1).min(points.len()-2);
-                        let a=scaler.world_to_screen_f64(points[segment]);let b=scaler.world_to_screen_f64(points[segment+1]);
-                        let p=arc.position_at(t).unwrap();
-                        let lon=p.longitude_near((points[segment].x+points[segment+1].x)*0.5).unwrap();
-                        let q=scaler.world_to_screen_f64(WorldPoint::new(lon,p.latitude()));
-                        let d=[b[0]-a[0],b[1]-a[1]];let length=d[0]*d[0]+d[1]*d[1];
-                        let f=if length>0. {(((q[0]-a[0])*d[0]+(q[1]-a[1])*d[1])/length).clamp(0.,1.)} else {0.};
-                        let error=(q[0]-a[0]-f*d[0]).hypot(q[1]-a[1]-f*d[1]);
-                        assert!(error<0.25,"{projection:?} zoom {zoom} sweep {sweep} error {error}");
+                        let t = i as f64 / 5000.;
+                        let segment = fractions
+                            .partition_point(|f| *f < t)
+                            .saturating_sub(1)
+                            .min(points.len() - 2);
+                        let a = scaler.world_to_screen_f64(points[segment]);
+                        let b = scaler.world_to_screen_f64(points[segment + 1]);
+                        let p = arc.position_at(t).unwrap();
+                        let lon = p
+                            .longitude_near((points[segment].x + points[segment + 1].x) * 0.5)
+                            .unwrap();
+                        let q = scaler.world_to_screen_f64(WorldPoint::new(lon, p.latitude()));
+                        let d = [b[0] - a[0], b[1] - a[1]];
+                        let length = d[0] * d[0] + d[1] * d[1];
+                        let f = if length > 0. {
+                            (((q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1]) / length).clamp(0., 1.)
+                        } else {
+                            0.
+                        };
+                        let error = (q[0] - a[0] - f * d[0]).hypot(q[1] - a[1] - f * d[1]);
+                        assert!(
+                            error < 0.25,
+                            "{projection:?} zoom {zoom} sweep {sweep} error {error}"
+                        );
                     }
-                    if sweep>0. {counts.push(points.len());}
+                    if sweep > 0. {
+                        counts.push(points.len());
+                    }
                 }
             }
-            assert!(counts[1]>counts[0],"zoom must retessellate the retained geographic arc");
+            assert!(
+                counts[1] > counts[0],
+                "zoom must retessellate the retained geographic arc"
+            );
         }
     }
     #[test]
     fn three_point_arc_preserves_defining_positions_in_both_directions() {
         for density in [1., 2.] {
             for zoom in [0.5, 1., 200.] {
-                let mut scaler = Scaler::new(GeoBounds::new(-1./zoom,-1./zoom,1./zoom,1./zoom),Viewport::new(800.,600.));
+                let mut scaler = Scaler::new(
+                    GeoBounds::new(-1. / zoom, -1. / zoom, 1. / zoom, 1. / zoom),
+                    Viewport::new(800., 600.),
+                );
                 scaler.set_pixel_ratio(density);
-                let origin=WorldPoint::new(0.,0.);
-                let anchor=scaler.world_to_screen(origin);
-                let local=|p:(f64,f64)| scaler.screen_to_world(ScreenPoint::new(anchor.x+(p.0*scaler.pixels_per_mm()) as f32,anchor.y-(p.1*scaler.pixels_per_mm()) as f32));
-                for (a,b,c) in [((2.13,17.29),(-11.81,3.07),(14.23,-9.61)),((14.23,-9.61),(-11.81,3.07),(2.13,17.29))] {
-                    let points=PortrayalPath::Arc3{start:a,median:b,end:c}.world_points(origin,&scaler);
-                    assert_eq!(points.first().copied(),Some(local(a)));
-                    assert_eq!(points.last().copied(),Some(local(c)));
-                    assert_eq!(points.iter().filter(|&&p| p==local(b)).count(),1);
+                let origin = WorldPoint::new(0., 0.);
+                let anchor = scaler.world_to_screen(origin);
+                let local = |p: (f64, f64)| {
+                    scaler.screen_to_world(ScreenPoint::new(
+                        anchor.x + (p.0 * scaler.pixels_per_mm()) as f32,
+                        anchor.y - (p.1 * scaler.pixels_per_mm()) as f32,
+                    ))
+                };
+                for (a, b, c) in [
+                    ((2.13, 17.29), (-11.81, 3.07), (14.23, -9.61)),
+                    ((14.23, -9.61), (-11.81, 3.07), (2.13, 17.29)),
+                ] {
+                    let points = PortrayalPath::Arc3 {
+                        start: a,
+                        median: b,
+                        end: c,
+                    }
+                    .world_points(origin, &scaler);
+                    assert_eq!(points.first().copied(), Some(local(a)));
+                    assert_eq!(points.last().copied(), Some(local(c)));
+                    assert_eq!(points.iter().filter(|&&p| p == local(b)).count(), 1);
                     assert!(points.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
                 }
             }
@@ -513,14 +616,30 @@ mod arc3_degenerate_contract {
     use super::*;
     #[test]
     fn invalid_three_point_arcs_never_fabricate_straight_segments() {
-        let scaler=Scaler::new(crate::GeoBounds::new(-1.,-1.,1.,1.),crate::Viewport::new(800.,600.));
-        for (start,median,end) in [((0.,0.),(1.,1.),(2.,2.)), ((0.,0.),(0.,0.),(1.,2.)), ((0.,0.),(1.,2.),(0.,0.)), ((0.,0.),(f64::NAN,1.),(2.,1.))] {
-            let path=PortrayalPath::Arc3 {start,median,end};
-            assert!(path.world_points(WorldPoint::new(0.,0.),&scaler).is_empty());
-            assert!(path.world_paths(WorldPoint::new(0.,0.),&scaler).is_empty());
+        let scaler = Scaler::new(
+            crate::GeoBounds::new(-1., -1., 1., 1.),
+            crate::Viewport::new(800., 600.),
+        );
+        for (start, median, end) in [
+            ((0., 0.), (1., 1.), (2., 2.)),
+            ((0., 0.), (0., 0.), (1., 2.)),
+            ((0., 0.), (1., 2.), (0., 0.)),
+            ((0., 0.), (f64::NAN, 1.), (2., 1.)),
+        ] {
+            let path = PortrayalPath::Arc3 { start, median, end };
+            assert!(path
+                .world_points(WorldPoint::new(0., 0.), &scaler)
+                .is_empty());
+            assert!(path
+                .world_paths(WorldPoint::new(0., 0.), &scaler)
+                .is_empty());
         }
-        let valid=PortrayalPath::Arc3 {start:(0.,10.),median:(10.,0.),end:(0.,-10.)};
-        assert!(valid.world_points(WorldPoint::new(0.,0.),&scaler).len()>2);
+        let valid = PortrayalPath::Arc3 {
+            start: (0., 10.),
+            median: (10., 0.),
+            end: (0., -10.),
+        };
+        assert!(valid.world_points(WorldPoint::new(0., 0.), &scaler).len() > 2);
     }
 }
 
@@ -529,25 +648,40 @@ mod closed_path_contract {
     use super::*;
     #[test]
     fn a_closed_run_cannot_absorb_the_next_segment() {
-        let scaler=Scaler::new(crate::GeoBounds::new(-1.,-1.,1.,1.),crate::Viewport::new(800.,600.));
-        let origin=WorldPoint::new(0.,0.);
-        let closed=PortrayalPath::Group(vec![
-            PortrayalPath::Arc {center:(0.,0.),radius:10.,start:0.,sweep:360.,geographic_angle:false},
-            PortrayalPath::Polyline(vec![(0.,10.),(0.,20.)]),
+        let scaler = Scaler::new(
+            crate::GeoBounds::new(-1., -1., 1., 1.),
+            crate::Viewport::new(800., 600.),
+        );
+        let origin = WorldPoint::new(0., 0.);
+        let closed = PortrayalPath::Group(vec![
+            PortrayalPath::Arc {
+                center: (0., 0.),
+                radius: 10.,
+                start: 0.,
+                sweep: 360.,
+                geographic_angle: false,
+            },
+            PortrayalPath::Polyline(vec![(0., 10.), (0., 20.)]),
         ]);
-        let runs=closed.world_paths(origin,&scaler);
-        assert_eq!(runs.len(),2);
-        assert_eq!(runs[0].first(),runs[0].last());
-        assert_eq!(runs[0].last(),runs[1].first());
-        let open=PortrayalPath::Group(vec![
-            PortrayalPath::Arc {center:(0.,0.),radius:10.,start:0.,sweep:180.,geographic_angle:false},
-            PortrayalPath::Polyline(vec![(0.,-10.),(0.,-20.)]),
+        let runs = closed.world_paths(origin, &scaler);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].first(), runs[0].last());
+        assert_eq!(runs[0].last(), runs[1].first());
+        let open = PortrayalPath::Group(vec![
+            PortrayalPath::Arc {
+                center: (0., 0.),
+                radius: 10.,
+                start: 0.,
+                sweep: 180.,
+                geographic_angle: false,
+            },
+            PortrayalPath::Polyline(vec![(0., -10.), (0., -20.)]),
         ]);
-        assert_eq!(open.world_paths(origin,&scaler).len(),1);
-        let degenerate_closed=PortrayalPath::Group(vec![
-            PortrayalPath::Polyline(vec![(0.,0.),(0.,0.)]),
-            PortrayalPath::Polyline(vec![(0.,0.),(0.,20.)]),
+        assert_eq!(open.world_paths(origin, &scaler).len(), 1);
+        let degenerate_closed = PortrayalPath::Group(vec![
+            PortrayalPath::Polyline(vec![(0., 0.), (0., 0.)]),
+            PortrayalPath::Polyline(vec![(0., 0.), (0., 20.)]),
         ]);
-        assert_eq!(degenerate_closed.world_paths(origin,&scaler).len(),2);
+        assert_eq!(degenerate_closed.world_paths(origin, &scaler).len(), 2);
     }
 }

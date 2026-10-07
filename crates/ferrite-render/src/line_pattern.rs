@@ -98,7 +98,7 @@ fn dash_projected_line_spans_impl(
         if style.dash_pattern.is_empty() {
             return Ok(None);
         }
-        if style.dash_pattern.len() % 2 != 0
+        if !style.dash_pattern.len().is_multiple_of(2)
             || style
                 .dash_pattern
                 .iter()
@@ -109,7 +109,7 @@ fn dash_projected_line_spans_impl(
         }
         let mut start = 0.;
         let mut dashes = Vec::new();
-        for pair in style.dash_pattern.chunks_exact(2) {
+        for pair in style.dash_pattern.as_chunks::<2>().0 {
             dashes.push((start, pair[0] as f64));
             start += pair[0] as f64 + pair[1] as f64;
         }

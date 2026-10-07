@@ -46,7 +46,7 @@ fn area(ring: &[f64]) -> f64 {
 /// a numerical coverage check, not proof that arbitrary input rings are simple.
 pub fn triangulate(coords: &[f64], holes: &[usize]) -> Result<Vec<usize>> {
     ensure!(
-        coords.len() % 2 == 0 && coords.len() >= 6 && coords.len() / 2 <= 1_048_576,
+        coords.len().is_multiple_of(2) && coords.len() >= 6 && coords.len() / 2 <= 1_048_576,
         "Invalid polygon coordinate count"
     );
     ensure!(
@@ -69,7 +69,9 @@ pub fn triangulate(coords: &[f64], holes: &[usize]) -> Result<Vec<usize>> {
     // Translate before earcut to retain small local features at large eastings.
     let origin = [coords[0], coords[1]];
     let local: Vec<_> = coords
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|p| [p[0] - origin[0], p[1] - origin[1]])
         .collect();
     ensure!(
@@ -95,7 +97,7 @@ pub fn triangulate(coords: &[f64], holes: &[usize]) -> Result<Vec<usize>> {
         indices.len() >= 3 && indices.len() % 3 == 0 && indices.iter().all(|i| *i < n),
         "Invalid or empty polygon triangle result"
     );
-    let covered = sum(indices.chunks_exact(3).map(|t| {
+    let covered = sum(indices.as_chunks::<3>().0.iter().map(|t| {
         let a = [local[t[0] * 2], local[t[0] * 2 + 1]];
         let b = [local[t[1] * 2], local[t[1] * 2 + 1]];
         let c = [local[t[2] * 2], local[t[2] * 2 + 1]];

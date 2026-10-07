@@ -119,7 +119,7 @@ mod tests {
         std::fs::create_dir_all(root.join("a/S100_ROOT")).unwrap();
         std::fs::create_dir_all(root.join("b")).unwrap();
         std::fs::write(root.join("a/S100_ROOT/CATALOG.XML"), []).unwrap();
-        std::fs::write(root.join("b/S100_ROOT\\CATALOG.XML"), []).unwrap();
+        std::fs::write(root.join("b/CATALOG.XML"), []).unwrap();
         assert_eq!(
             exchange_set_choices(&root).unwrap(),
             vec![root.join("a/S100_ROOT"), root.join("b")]
@@ -129,6 +129,26 @@ mod tests {
             .is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
+    // Backslashes can be literal archive filename characters only on Unix.
+    // Windows exercises native directory separators in the portable test above.
+    #[cfg(unix)]
+    #[test]
+    fn collection_choices_recognize_literal_backslash_catalogues() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrite-backslash-collection-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("a/S100_ROOT")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/S100_ROOT/CATALOG.XML"), []).unwrap();
+        std::fs::write(root.join("b/S100_ROOT\\CATALOG.XML"), []).unwrap();
+        assert_eq!(
+            exchange_set_choices(&root).unwrap(),
+            vec![root.join("a/S100_ROOT"), root.join("b")]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn selected_exchange_does_not_merge_nested_delivery() {
         let root =

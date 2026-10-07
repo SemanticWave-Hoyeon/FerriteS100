@@ -96,7 +96,10 @@ pub fn convert_lua_results_for_cell(
     let make_display_plane = |vis: &ferrite_lua::VisibilityState| -> ferrite_render::DisplayPlane {
         match vis.display_plane.reference() {
             Some(name) => ferrite_render::DisplayPlane::from_catalogue_order(
-                pc.display_planes.resolve(name).expect("display plane preflight validated")),
+                pc.display_planes
+                    .resolve(name)
+                    .expect("display plane preflight validated"),
+            ),
             // Preserve the application's existing compatibility plane when the
             // Lua initial state has no declared catalogue reference.
             None => ferrite_render::DisplayPlane::default(),
@@ -893,25 +896,47 @@ pub fn convert_lua_results_for_cell(
                                             line = line.with_unsuppressed();
                                         }
                                         geometry_instructions.push(line);
-                                    } else if let ferrite_lua::PathSegment::ArcByRadius { center, radius, start_angle, angular_distance } = seg {
-                                        if crs.crs_angle != "GeographicCRS" || crs.crs_distance != "GeographicCRS" {
+                                    } else if let ferrite_lua::PathSegment::ArcByRadius {
+                                        center,
+                                        radius,
+                                        start_angle,
+                                        angular_distance,
+                                    } = seg
+                                    {
+                                        if crs.crs_angle != "GeographicCRS"
+                                            || crs.crs_distance != "GeographicCRS"
+                                        {
                                             tracing::error!("Unsupported mixed CRS geographic arc: feature {:?}",feature_id);
                                             continue;
                                         }
                                         // Geographic X/Y follows the same chart contract as
                                         // the adjacent existing Polyline adapter. Retain the
                                         // metric arc for active-viewport tessellation/picking.
-                                        let center_point=WorldPoint::new(center.0,center.1);
-                                        let mut line=LineInstruction::new(vec![center_point,center_point])
-                                            .with_style(strokes[0].clone())
-                                            .with_priority(visibility.drawing_priority)
-                                            .with_viewing_groups(&pc.viewing_groups.resolve_drawing_groups(&visibility.viewing_groups,&visibility.named_viewing_groups)?)
-                                            .with_scale_range(make_scale_range(visibility))
-                                            .with_display_plane(make_display_plane(visibility))
-                                            .with_feature_id(feature_id.unwrap_or(0))
-                                            .with_cell_index(cell_index);
-                                        line.portrayal_path=Some(ferrite_render::PortrayalPath::GeographicArc{center:*center,radius_m:*radius,start:*start_angle,sweep:*angular_distance});
-                                        if unsuppressed { line=line.with_unsuppressed(); }
+                                        let center_point = WorldPoint::new(center.0, center.1);
+                                        let mut line =
+                                            LineInstruction::new(vec![center_point, center_point])
+                                                .with_style(strokes[0].clone())
+                                                .with_priority(visibility.drawing_priority)
+                                                .with_viewing_groups(
+                                                    &pc.viewing_groups.resolve_drawing_groups(
+                                                        &visibility.viewing_groups,
+                                                        &visibility.named_viewing_groups,
+                                                    )?,
+                                                )
+                                                .with_scale_range(make_scale_range(visibility))
+                                                .with_display_plane(make_display_plane(visibility))
+                                                .with_feature_id(feature_id.unwrap_or(0))
+                                                .with_cell_index(cell_index);
+                                        line.portrayal_path =
+                                            Some(ferrite_render::PortrayalPath::GeographicArc {
+                                                center: *center,
+                                                radius_m: *radius,
+                                                start: *start_angle,
+                                                sweep: *angular_distance,
+                                            });
+                                        if unsuppressed {
+                                            line = line.with_unsuppressed();
+                                        }
                                         geometry_instructions.push(line);
                                     } else {
                                         tracing::error!("Geographic augmented arc not implemented: feature {:?}",feature_id);
@@ -2023,11 +2048,25 @@ mod hatch_resource_tests {
     fn empty_plane_cell() -> S101Cell {
         use ferrite_s100_core::*;
         S101Cell {
-            file_path: Default::default(), dsid: Default::default(), code_mappings: DatasetCodeMappings::new(),
-            coord_factor:1.,coord_factor_y:1.,coord_factor_z:1.,coord_origin_x:0.,coord_origin_y:0.,coord_origin_z:0.,
-            minimum_display_scale:None,maximum_display_scale:None,
-            points:Default::default(),multi_points:Default::default(),curves:Default::default(),composite_curves:Default::default(),
-            surfaces:Default::default(),features:Default::default(),information:Default::default(),spatial_information_associations:Default::default(),
+            file_path: Default::default(),
+            dsid: Default::default(),
+            code_mappings: DatasetCodeMappings::new(),
+            coord_factor: 1.,
+            coord_factor_y: 1.,
+            coord_factor_z: 1.,
+            coord_origin_x: 0.,
+            coord_origin_y: 0.,
+            coord_origin_z: 0.,
+            minimum_display_scale: None,
+            maximum_display_scale: None,
+            points: Default::default(),
+            multi_points: Default::default(),
+            curves: Default::default(),
+            composite_curves: Default::default(),
+            surfaces: Default::default(),
+            features: Default::default(),
+            information: Default::default(),
+            spatial_information_associations: Default::default(),
         }
     }
     #[test]
@@ -2036,35 +2075,92 @@ mod hatch_resource_tests {
         let mut cell = empty_plane_cell();
         let curve_id = RecordId::new(120, 1);
         let surface_id = RecordId::new(130, 1);
-        cell.curves.insert(curve_id.key(), CurveRecord {
-            id: curve_id, segments: vec![CurveSegment { segment_type: SegmentType::Line,
-                positions: [(0.,0.),(1.,0.),(1.,1.),(0.,1.),(0.,0.)].into_iter().map(|(x,y)| Coordinate::new(x,y)).collect() }],
-            start_point: None, end_point: None, update_instruction: 0,
-        });
-        cell.surfaces.insert(surface_id.key(), SurfaceRecord {
-            id: surface_id, exterior_ring: vec![OrientedCurve {curve_id, orientation:true}],
-            interior_rings: vec![], update_instruction:0,
-        });
-        cell.features.insert(42, FeatureRecord {
-            frid: FRID {rcid:42,nftc:0,rver:1,ruin:0}, foid:None, attributes:vec![],
-            spatial_associations:vec![SpatialAssociation {spatial_id:surface_id,ornt:1,usag:1,mask:0,scale_minimum:None,scale_maximum:None,update_instruction:0}],
-            information_associations:vec![],feature_associations:vec![],masks:vec![],feature_code:None,primitive_type:SpatialPrimitiveType::Surface,
-        });
+        cell.curves.insert(
+            curve_id.key(),
+            CurveRecord {
+                id: curve_id,
+                segments: vec![CurveSegment {
+                    segment_type: SegmentType::Line,
+                    positions: [(0., 0.), (1., 0.), (1., 1.), (0., 1.), (0., 0.)]
+                        .into_iter()
+                        .map(|(x, y)| Coordinate::new(x, y))
+                        .collect(),
+                }],
+                start_point: None,
+                end_point: None,
+                update_instruction: 0,
+            },
+        );
+        cell.surfaces.insert(
+            surface_id.key(),
+            SurfaceRecord {
+                id: surface_id,
+                exterior_ring: vec![OrientedCurve {
+                    curve_id,
+                    orientation: true,
+                }],
+                interior_rings: vec![],
+                update_instruction: 0,
+            },
+        );
+        cell.features.insert(
+            42,
+            FeatureRecord {
+                frid: FRID {
+                    rcid: 42,
+                    nftc: 0,
+                    rver: 1,
+                    ruin: 0,
+                },
+                foid: None,
+                attributes: vec![],
+                spatial_associations: vec![SpatialAssociation {
+                    spatial_id: surface_id,
+                    ornt: 1,
+                    usag: 1,
+                    mask: 0,
+                    scale_minimum: None,
+                    scale_maximum: None,
+                    update_instruction: 0,
+                }],
+                information_associations: vec![],
+                feature_associations: vec![],
+                masks: vec![],
+                feature_code: None,
+                primitive_type: SpatialPrimitiveType::Surface,
+            },
+        );
         let pc = catalogue();
-        for (suffix, expected) in [(",false",false),(",true",true),("",true)] {
-            let mut context = RenderContext::new(ferrite_render::Viewport::new(800.,600.));
-            let result = ferrite_lua::PortrayalResult::parse("42", &format!("AreaCRS:LocalGeometry;SymbolFill:ASYM,-4,0,2,4{suffix}"), "").unwrap();
+        for (suffix, expected) in [(",false", false), (",true", true), ("", true)] {
+            let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+            let result = ferrite_lua::PortrayalResult::parse(
+                "42",
+                &format!("AreaCRS:LocalGeometry;SymbolFill:ASYM,-4,0,2,4{suffix}"),
+                "",
+            )
+            .unwrap();
             convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 3, "Day").unwrap();
-            assert_eq!(context.raw_instructions().len(),1);
-            let ferrite_render::DrawingInstruction::Area(area) = &context.raw_instructions()[0] else {panic!("expected surface symbol fill")};
+            assert_eq!(context.raw_instructions().len(), 1);
+            let ferrite_render::DrawingInstruction::Area(area) = &context.raw_instructions()[0]
+            else {
+                panic!("expected surface symbol fill")
+            };
             assert_eq!(area.pattern_clip_symbols, expected);
-            assert_eq!(area.cell_index,Some(3)); assert_eq!(area.feature_id,Some(42));
-            assert_eq!(area.pattern_crs,ferrite_render::PatternCrs::LocalGeometry);
+            assert_eq!(area.cell_index, Some(3));
+            assert_eq!(area.feature_id, Some(42));
+            assert_eq!(area.pattern_crs, ferrite_render::PatternCrs::LocalGeometry);
             // collect_surface_points removes the repeated closing endpoint;
             // preserve all four authored corners in the same order.
-            assert_eq!(area.exterior.iter().map(|p|(p.x,p.y)).collect::<Vec<_>>(),[(0.,0.),(1.,0.),(1.,1.),(0.,1.)]);
-            let ferrite_render::AreaFillType::Pattern {symbol_ref,v1,v2} = &area.fill else {panic!("expected retained lattice")};
-            assert_eq!(symbol_ref,"ASYM");assert_eq!(*v1,(-4.,0.));assert_eq!(*v2,(2.,4.));
+            assert_eq!(
+                area.exterior.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
+                [(0., 0.), (1., 0.), (1., 1.), (0., 1.)]
+            );
+            let ferrite_render::AreaFillType::Pattern { symbol_ref, v1, v2 } = &area.fill else {
+                panic!("expected retained lattice")
+            };
+            assert_eq!(symbol_ref, "ASYM");
+            assert_eq!(*v1, (-4., 0.));
+            assert_eq!(*v2, (2., 4.));
             // An older JSON instruction lacking the new option must retain the standard default.
             let mut json = serde_json::to_value(area).unwrap();
             json.as_object_mut().unwrap().remove("pattern_clip_symbols");
@@ -2074,38 +2170,63 @@ mod hatch_resource_tests {
     }
     #[test]
     fn geographic_radius_arc_reaches_retained_geometry_with_order_and_source() {
-        let pc=catalogue();let cell=empty_plane_cell();
-        let mut context=RenderContext::new(ferrite_render::Viewport::new(800.,600.));
+        let pc = catalogue();
+        let cell = empty_plane_cell();
+        let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
         let result=ferrite_lua::PortrayalResult::parse("42","DrawingPriority:7;ArcByRadius:179.9,50,50000,35,-270;AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.32,CHBLK;LineInstruction:L","").unwrap();
-        convert_lua_results_for_cell(&[result],&cell,&pc,&mut context,3,"Day").unwrap();
-        assert_eq!(context.raw_instructions().len(),1);
-        let ferrite_render::DrawingInstruction::Line(line)=&context.raw_instructions()[0] else {panic!("arc must remain a line")};
-        assert_eq!(line.cell_index,Some(3));
-        assert_eq!(line.feature_id,Some(42));
-        assert!(matches!(line.portrayal_path,Some(ferrite_render::PortrayalPath::GeographicArc{center:(179.9,50.),radius_m:50_000.,start:35.,sweep:-270.})));
-        let scaler=ferrite_render::Scaler::new(ferrite_render::GeoBounds::new(178.,49.,181.,51.),ferrite_render::Viewport::new(800.,600.));
-        assert!(line.render_points(&scaler).len()>2);
+        convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 3, "Day").unwrap();
+        assert_eq!(context.raw_instructions().len(), 1);
+        let ferrite_render::DrawingInstruction::Line(line) = &context.raw_instructions()[0] else {
+            panic!("arc must remain a line")
+        };
+        assert_eq!(line.cell_index, Some(3));
+        assert_eq!(line.feature_id, Some(42));
+        assert!(matches!(
+            line.portrayal_path,
+            Some(ferrite_render::PortrayalPath::GeographicArc {
+                center: (179.9, 50.),
+                radius_m: 50_000.,
+                start: 35.,
+                sweep: -270.
+            })
+        ));
+        let scaler = ferrite_render::Scaler::new(
+            ferrite_render::GeoBounds::new(178., 49., 181., 51.),
+            ferrite_render::Viewport::new(800., 600.),
+        );
+        assert!(line.render_points(&scaler).len() > 2);
     }
     #[test]
     fn named_pc_orders_reach_common_instructions_and_unknown_name_is_atomic() {
-        let mut pc=catalogue();
-        for (id,order) in [("OverRadar",-701),("underRadar",90000)] {
-            pc.display_planes.planes.insert(id.into(),std::num::NonZeroI32::new(order).unwrap());
+        let mut pc = catalogue();
+        for (id, order) in [("OverRadar", -701), ("underRadar", 90000)] {
+            pc.display_planes
+                .planes
+                .insert(id.into(), std::num::NonZeroI32::new(order).unwrap());
         }
-        let cell=empty_plane_cell();
-        let mut ctx=RenderContext::new(ferrite_render::Viewport::new(200.,100.));
+        let cell = empty_plane_cell();
+        let mut ctx = RenderContext::new(ferrite_render::Viewport::new(200., 100.));
         let good=ferrite_lua::PortrayalResult::parse("f", "AugmentedPoint:GeographicCRS,1,2;DisplayPlane:OverRadar;PointInstruction:A;DisplayPlane:underRadar;PointInstruction:B", "").unwrap();
-        convert_lua_results_for_cell(&[good],&cell,&pc,&mut ctx,0,"Day").unwrap();
-        assert_eq!(ctx.raw_instructions().len(),2);
-        let orders:Vec<_>=ctx.raw_instructions().iter().map(|i|i.display_plane().order().get()).collect();
-        assert_eq!(orders,[-701,90000]);
-        let before=serde_json::to_vec(ctx.raw_instructions()).unwrap();
+        convert_lua_results_for_cell(&[good], &cell, &pc, &mut ctx, 0, "Day").unwrap();
+        assert_eq!(ctx.raw_instructions().len(), 2);
+        let orders: Vec<_> = ctx
+            .raw_instructions()
+            .iter()
+            .map(|i| i.display_plane().order().get())
+            .collect();
+        assert_eq!(orders, [-701, 90000]);
+        let before = serde_json::to_vec(ctx.raw_instructions()).unwrap();
         let bad=ferrite_lua::PortrayalResult::parse("f", "AugmentedPoint:GeographicCRS,1,2;DisplayPlane:OverRadar;PointInstruction:A;DisplayPlane:UnderRadar;PointInstruction:B", "").unwrap();
-        assert!(convert_lua_results_for_cell(&[bad],&cell,&pc,&mut ctx,0,"Day").is_err());
-        assert_eq!(before,serde_json::to_vec(ctx.raw_instructions()).unwrap());
-        let null=ferrite_lua::PortrayalResult::parse("f","DisplayPlane:Unregistered;NullInstruction","").unwrap();
-        convert_lua_results_for_cell(&[null],&cell,&pc,&mut ctx,0,"Day").unwrap();
-        assert_eq!(before,serde_json::to_vec(ctx.raw_instructions()).unwrap());
+        assert!(convert_lua_results_for_cell(&[bad], &cell, &pc, &mut ctx, 0, "Day").is_err());
+        assert_eq!(before, serde_json::to_vec(ctx.raw_instructions()).unwrap());
+        let null = ferrite_lua::PortrayalResult::parse(
+            "f",
+            "DisplayPlane:Unregistered;NullInstruction",
+            "",
+        )
+        .unwrap();
+        convert_lua_results_for_cell(&[null], &cell, &pc, &mut ctx, 0, "Day").unwrap();
+        assert_eq!(before, serde_json::to_vec(ctx.raw_instructions()).unwrap());
     }
     #[test]
     fn split_curve_components_are_painted_as_complete_layers() {
@@ -2368,40 +2489,93 @@ mod hatch_resource_tests {
 // group foundational or adding it to a display-mode layer. Unknown semantics
 // must leave the original commands visible.
 fn shallow_selector_is_independent(pc: &ferrite_portrayal_catalog::PortrayalCatalogue) -> bool {
-    if pc.product_id != "S-101" { return false; }
-    let Some(group) = pc.viewing_groups.runtime_id("90000") else { return false; };
-    if pc.foundation_mode.contains(&group) { return false; }
-    let Some(layer) = pc.viewing_group_layers.layers.get("900") else { return false; };
-    if layer.viewing_group_ids.as_slice() != [group] || pc.display_modes.modes.is_empty() { return false; }
+    if pc.product_id != "S-101" {
+        return false;
+    }
+    let Some(group) = pc.viewing_groups.runtime_id("90000") else {
+        return false;
+    };
+    if pc.foundation_mode.contains(&group) {
+        return false;
+    }
+    let Some(layer) = pc.viewing_group_layers.layers.get("900") else {
+        return false;
+    };
+    if layer.viewing_group_ids.as_slice() != [group] || pc.display_modes.modes.is_empty() {
+        return false;
+    }
     // Reject alternate membership as unknown even if it is currently omitted
     // by every mode: this is no longer the audited independent selector shape.
-    if pc.viewing_group_layers.layers.iter().any(|(id, layer)|
-        id != "900" && layer.viewing_group_ids.contains(&group)) { return false; }
-    !pc.display_modes.modes.values().any(|mode|
-        mode.viewing_group_layers.iter().any(|id| id == "900"))
+    if pc
+        .viewing_group_layers
+        .layers
+        .iter()
+        .any(|(id, layer)| id != "900" && layer.viewing_group_ids.contains(&group))
+    {
+        return false;
+    }
+    !pc.display_modes
+        .modes
+        .values()
+        .any(|mode| mode.viewing_group_layers.iter().any(|id| id == "900"))
 }
 
 /// Current audited S-101 independent shallow-water selector profile. Unknown PC
 /// rules retain every pattern; the host must report that this toggle is unavailable.
-pub fn shallow_pattern_contract(pc:&ferrite_portrayal_catalog::BoundPortrayalCatalogue)->Option<ferrite_render::ShallowPatternContract> {
-    if !shallow_selector_is_independent(pc) { return None; }
-    let known=[0x0f,0xe2,0x04,0xc6,0x15,0x7b,0xeb,0xd6,0x1a,0xf1,0xd5,0x1f,0x98,0x16,0xb1,0x36,0x68,0x3a,0x1f,0xad,0x7c,0xe7,0x20,0x03,0x2f,0xd9,0x94,0x29,0x3a,0x53,0xae,0x9b];
-    let fill=pc.get_area_fill("DIAMOND1")?;
-    let ferrite_portrayal_catalog::AreaFillType::Symbol(s)=&fill.fill_type else{return None};
-    if s.symbol_ref!="DIAMOND1P" || s.area_crs!="GlobalGeometry" || (s.v1.x,s.v1.y)!=(22.5,0.) || (s.v2.x,s.v2.y)!=(0.,43.13) {return None;}
-    ferrite_render::ShallowPatternContract::from_bound_selector(pc,std::path::Path::new("Rules/SEABED01.lua"),known,"900","90000","DIAMOND1",9,ferrite_render::DisplayPlane::UnderRadar)
+pub fn shallow_pattern_contract(
+    pc: &ferrite_portrayal_catalog::BoundPortrayalCatalogue,
+) -> Option<ferrite_render::ShallowPatternContract> {
+    if !shallow_selector_is_independent(pc) {
+        return None;
+    }
+    let known = [
+        0x0f, 0xe2, 0x04, 0xc6, 0x15, 0x7b, 0xeb, 0xd6, 0x1a, 0xf1, 0xd5, 0x1f, 0x98, 0x16, 0xb1,
+        0x36, 0x68, 0x3a, 0x1f, 0xad, 0x7c, 0xe7, 0x20, 0x03, 0x2f, 0xd9, 0x94, 0x29, 0x3a, 0x53,
+        0xae, 0x9b,
+    ];
+    let fill = pc.get_area_fill("DIAMOND1")?;
+    let ferrite_portrayal_catalog::AreaFillType::Symbol(s) = &fill.fill_type else {
+        return None;
+    };
+    if s.symbol_ref != "DIAMOND1P"
+        || s.area_crs != "GlobalGeometry"
+        || (s.v1.x, s.v1.y) != (22.5, 0.)
+        || (s.v2.x, s.v2.y) != (0., 43.13)
+    {
+        return None;
+    }
+    ferrite_render::ShallowPatternContract::from_bound_selector(
+        pc,
+        std::path::Path::new("Rules/SEABED01.lua"),
+        known,
+        "900",
+        "90000",
+        "DIAMOND1",
+        9,
+        ferrite_render::DisplayPlane::UnderRadar,
+    )
 }
 
-#[cfg(test)] mod shallow_pattern_catalogue_tests {
+#[cfg(test)]
+mod shallow_pattern_catalogue_tests {
     #[test]
     fn parsed_snapshot_requires_independent_nonfoundation_selector() {
-        let root=std::env::temp_dir().join(format!("ferrite-shallow-independence-{}-{}",std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "ferrite-shallow-independence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let xml=|foundation:&str,mode:&str,extra:&str| format!(
-            "<portrayalCatalog productId='S-101' version='2.0.0'><foundationMode>{foundation}</foundationMode><displayPlanes><displayPlane id='UnderRadar' order='-1'/></displayPlanes><viewingGroups><viewingGroup id='90000'><description><name>Shallow pattern</name></description></viewingGroup></viewingGroups><viewingGroupLayers><viewingGroupLayer id='900'><viewingGroup>90000</viewingGroup></viewingGroupLayer>{extra}</viewingGroupLayers><displayModes><displayMode id='StandardDisplay'><name>Standard</name>{mode}</displayMode></displayModes></portrayalCatalog>");
-        let original=xml("","","");std::fs::write(root.join("portrayal_catalogue.xml"),&original).unwrap();
-        let retained=ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&root).unwrap();
+        let xml = |foundation: &str, mode: &str, extra: &str| {
+            format!(
+            "<portrayalCatalog productId='S-101' version='2.0.0'><foundationMode>{foundation}</foundationMode><displayPlanes><displayPlane id='UnderRadar' order='-1'/></displayPlanes><viewingGroups><viewingGroup id='90000'><description><name>Shallow pattern</name></description></viewingGroup></viewingGroups><viewingGroupLayers><viewingGroupLayer id='900'><viewingGroup>90000</viewingGroup></viewingGroupLayer>{extra}</viewingGroupLayers><displayModes><displayMode id='StandardDisplay'><name>Standard</name>{mode}</displayMode></displayModes></portrayalCatalog>")
+        };
+        let original = xml("", "", "");
+        std::fs::write(root.join("portrayal_catalogue.xml"), &original).unwrap();
+        let retained = ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&root).unwrap();
         assert!(super::shallow_selector_is_independent(&retained));
         for mutated in [xml("<viewingGroup>90000</viewingGroup>","",""),
             xml("","<viewingGroupLayer>900</viewingGroupLayer>",""),
@@ -2417,58 +2591,113 @@ pub fn shallow_pattern_contract(pc:&ferrite_portrayal_catalog::BoundPortrayalCat
     }
 
     #[test]
-    #[ignore="requires immutable official PC input via FERRITE_SHALLOW_PC; mutates owned copy only"]
+    #[ignore = "requires immutable official PC input via FERRITE_SHALLOW_PC; mutates owned copy only"]
     fn official_same_rule_fill_and_layer_cannot_override_foundation_or_display_modes() {
-        let source=std::path::PathBuf::from(std::env::var("FERRITE_SHALLOW_PC").unwrap());
-        let original=ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&source).unwrap();
+        let source = std::path::PathBuf::from(std::env::var("FERRITE_SHALLOW_PC").unwrap());
+        let original = ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&source).unwrap();
         assert!(super::shallow_pattern_contract(&original).is_some());
-        let root=std::env::temp_dir().join(format!("ferrite-shallow-official-{}-{}",std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "ferrite-shallow-official-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         // All bytes come from the bounded retained map, not a second live read.
-        let mut pending=vec![source.clone()];
-        while let Some(directory)=pending.pop() {
+        let mut pending = vec![source.clone()];
+        while let Some(directory) = pending.pop() {
             for entry in std::fs::read_dir(directory).unwrap() {
-                let entry=entry.unwrap();let kind=entry.file_type().unwrap();assert!(!kind.is_symlink());
-                let path=entry.path();let relative=path.strip_prefix(&source).unwrap();let target=root.join(relative);
-                if kind.is_dir() {std::fs::create_dir_all(target).unwrap();pending.push(path);}
-                else {assert!(kind.is_file());let bytes=original.sources().read_relative(relative).unwrap();
-                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();std::fs::write(target,bytes.as_ref()).unwrap();}
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                let path = entry.path();
+                let relative = path.strip_prefix(&source).unwrap();
+                let target = root.join(relative);
+                if kind.is_dir() {
+                    std::fs::create_dir_all(target).unwrap();
+                    pending.push(path);
+                } else {
+                    assert!(kind.is_file());
+                    let bytes = original.sources().read_relative(relative).unwrap();
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(target, bytes.as_ref()).unwrap();
+                }
             }
         }
-        let file=root.join("portrayal_catalogue.xml");let xml=std::fs::read_to_string(&file).unwrap();
-        let copied=ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&root).unwrap();
+        let file = root.join("portrayal_catalogue.xml");
+        let xml = std::fs::read_to_string(&file).unwrap();
+        let copied = ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&root).unwrap();
         assert!(super::shallow_pattern_contract(&copied).is_some());
-        for (closing,insertion) in [("</foundationMode>","<viewingGroup>90000</viewingGroup>"),
-            ("</displayMode>","<viewingGroupLayer>900</viewingGroupLayer>")] {
-            assert!(xml.contains(closing));let mutant=xml.replacen(closing,&format!("{insertion}{closing}"),1);
-            std::fs::write(&file,mutant).unwrap();
-            let parsed=ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&root).unwrap();
-            assert_eq!(copied.sources().read_relative(std::path::Path::new("Rules/SEABED01.lua")).unwrap(),
-                parsed.sources().read_relative(std::path::Path::new("Rules/SEABED01.lua")).unwrap());
-            assert_eq!(parsed.viewing_group_layers.layers["900"].viewing_group_ids,copied.viewing_group_layers.layers["900"].viewing_group_ids);
+        for (closing, insertion) in [
+            ("</foundationMode>", "<viewingGroup>90000</viewingGroup>"),
+            (
+                "</displayMode>",
+                "<viewingGroupLayer>900</viewingGroupLayer>",
+            ),
+        ] {
+            assert!(xml.contains(closing));
+            let mutant = xml.replacen(closing, &format!("{insertion}{closing}"), 1);
+            std::fs::write(&file, mutant).unwrap();
+            let parsed = ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&root).unwrap();
+            assert_eq!(
+                copied
+                    .sources()
+                    .read_relative(std::path::Path::new("Rules/SEABED01.lua"))
+                    .unwrap(),
+                parsed
+                    .sources()
+                    .read_relative(std::path::Path::new("Rules/SEABED01.lua"))
+                    .unwrap()
+            );
+            assert_eq!(
+                parsed.viewing_group_layers.layers["900"].viewing_group_ids,
+                copied.viewing_group_layers.layers["900"].viewing_group_ids
+            );
             assert!(super::shallow_pattern_contract(&parsed).is_none());
             assert!(super::shallow_pattern_contract(&copied).is_some());
         }
-        let after=ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&source).unwrap();
-        assert_eq!(original.source_digest(),after.source_digest());
+        let after = ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(&source).unwrap();
+        assert_eq!(original.source_digest(), after.source_digest());
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    #[ignore="requires separately source-SHA-guarded official PC directory via FERRITE_SHALLOW_PC"]
+    #[ignore = "requires separately source-SHA-guarded official PC directory via FERRITE_SHALLOW_PC"]
     fn official_pc_selector_is_bound_and_nonshallow_patterns_are_retained() {
-        let pc=ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(std::env::var("FERRITE_SHALLOW_PC").unwrap()).unwrap();
-        let contract=super::shallow_pattern_contract(&pc).expect("audited selector contract");
-        assert_eq!(contract.source_digest(),*pc.source_digest());
-        let raw=super::shallow_pattern_contract(&pc).unwrap();
-        for (fill,symbol,group,optional) in [("DIAMOND1","DIAMOND1P",90000,true),("DRGARE01","DRGARE01P",13030,false),("NODATA03","NODATA03P",11050,false),("TSSJCT02","TSSJCT02P",25010,false)] {
-            let mut a=ferrite_render::AreaInstruction::new(vec![ferrite_render::WorldPoint::new(0.,0.),ferrite_render::WorldPoint::new(1.,0.),ferrite_render::WorldPoint::new(0.,1.)])
-                .with_pattern_fill(symbol.into(),(22.5,0.),(0.,43.13)).with_priority(9).with_feature_id(1).with_cell_index(0).with_pattern_crs(ferrite_render::PatternCrs::GlobalGeometry);
-            a.fill_ref=Some(fill.into());a.viewing_group.0=group;a.portrayal_origin=ferrite_render::PortrayalOrigin::NonPoint;
-            let item=ferrite_render::DrawingInstruction::Area(a);
-            assert_eq!(raw.is_optional(&item),optional);
-            assert_eq!(ferrite_render::pattern_display_allows(&item,false,Some(&raw)),!optional);
+        let pc = ferrite_portrayal_catalog::PortrayalCatalogue::load_bound(
+            std::env::var("FERRITE_SHALLOW_PC").unwrap(),
+        )
+        .unwrap();
+        let contract = super::shallow_pattern_contract(&pc).expect("audited selector contract");
+        assert_eq!(contract.source_digest(), *pc.source_digest());
+        let raw = super::shallow_pattern_contract(&pc).unwrap();
+        for (fill, symbol, group, optional) in [
+            ("DIAMOND1", "DIAMOND1P", 90000, true),
+            ("DRGARE01", "DRGARE01P", 13030, false),
+            ("NODATA03", "NODATA03P", 11050, false),
+            ("TSSJCT02", "TSSJCT02P", 25010, false),
+        ] {
+            let mut a = ferrite_render::AreaInstruction::new(vec![
+                ferrite_render::WorldPoint::new(0., 0.),
+                ferrite_render::WorldPoint::new(1., 0.),
+                ferrite_render::WorldPoint::new(0., 1.),
+            ])
+            .with_pattern_fill(symbol.into(), (22.5, 0.), (0., 43.13))
+            .with_priority(9)
+            .with_feature_id(1)
+            .with_cell_index(0)
+            .with_pattern_crs(ferrite_render::PatternCrs::GlobalGeometry);
+            a.fill_ref = Some(fill.into());
+            a.viewing_group.0 = group;
+            a.portrayal_origin = ferrite_render::PortrayalOrigin::NonPoint;
+            let item = ferrite_render::DrawingInstruction::Area(a);
+            assert_eq!(raw.is_optional(&item), optional);
+            assert_eq!(
+                ferrite_render::pattern_display_allows(&item, false, Some(&raw)),
+                !optional
+            );
         }
     }
 }

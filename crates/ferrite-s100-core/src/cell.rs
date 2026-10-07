@@ -743,10 +743,12 @@ impl S101Cell {
         }
         if let Some(ptas_field) = ptas.first() {
             let ptas_data = ptas_field.data_trimmed();
-            if ptas_data.len() % 6 != 0
+            if !ptas_data.len().is_multiple_of(6)
                 || ptas_data
-                    .chunks_exact(6)
-                    .any(|t| t[0] != 110 || !matches!(t[5], 1 | 2 | 3))
+                    .as_chunks::<6>()
+                    .0
+                    .iter()
+                    .any(|t| t[0] != 110 || !matches!(t[5], 1..=3))
             {
                 return Err(S100Error::InvalidFieldData("Invalid PTAS tuple".into()));
             }
@@ -837,21 +839,6 @@ impl S101Cell {
         Ok(())
     }
 
-    /// Parse coordinate array from field data
-    fn parse_coordinates(&self, data: &[u8]) -> Result<Vec<Coordinate>> {
-        let data = data.strip_suffix(&[FIELD_TERMINATOR]).unwrap_or(data);
-        decode_coordinate_list(
-            data,
-            2,
-            [self.coord_factor, self.coord_factor_y, self.coord_factor_z],
-            [
-                self.coord_origin_x,
-                self.coord_origin_y,
-                self.coord_origin_z,
-            ],
-        )
-    }
-
     /// Process composite curve record
     fn process_composite_curve(&mut self, dr: &DR) -> Result<()> {
         let ccid_field = dr
@@ -872,7 +859,7 @@ impl S101Cell {
 
         for cuco_field in dr.find_fields(tags::CUCO) {
             let cuco_data = cuco_field.data_trimmed();
-            if cuco_data.len() % 6 != 0 {
+            if !cuco_data.len().is_multiple_of(6) {
                 return Err(S100Error::InvalidFieldData(
                     "Truncated curve component".into(),
                 ));
@@ -933,7 +920,7 @@ impl S101Cell {
 
         for rias_field in dr.find_fields(tags::RIAS) {
             let rias_data = rias_field.data_trimmed();
-            if rias_data.len() % 8 != 0 {
+            if !rias_data.len().is_multiple_of(8) {
                 return Err(S100Error::InvalidFieldData(
                     "Truncated ring association".into(),
                 ));
@@ -1856,7 +1843,7 @@ fn strict_chain_dsid(data: &[u8]) -> Result<Vec<String>> {
             .ok_or_else(|| S100Error::InvalidRecord("Unterminated chain DSID string".into()))?;
         let s = std::str::from_utf8(&tail[..n])
             .map_err(|_| S100Error::InvalidRecord("Invalid UTF-8 chain DSID string".into()))?;
-        if matches!(i, 0 | 1 | 2 | 3 | 4 | 5 | 9)
+        if matches!(i, 0 | 1..=3 | 4 | 5 | 9)
             && (!s.is_ascii() || s.bytes().any(|b| b.is_ascii_control()))
         {
             return Err(S100Error::InvalidRecord(
@@ -2452,7 +2439,7 @@ fn parse_typed_identifier(data: &[u8], expected_type: u8) -> Result<(u32, u16, u
 }
 fn parse_spas(data: &[u8]) -> Result<Vec<SpatialAssociation>> {
     let data = data.strip_suffix(&[FIELD_TERMINATOR]).unwrap_or(data);
-    if data.len() % 15 != 0 {
+    if !data.len().is_multiple_of(15) {
         return Err(S100Error::InvalidFieldData(
             "SPAS length is not a multiple of 15".into(),
         ));
@@ -2465,7 +2452,9 @@ fn parse_spas(data: &[u8]) -> Result<Vec<SpatialAssociation>> {
         }
     };
     Ok(data
-        .chunks_exact(15)
+        .as_chunks::<15>()
+        .0
+        .iter()
         .map(|d| SpatialAssociation {
             spatial_id: RecordId::new(d[0], u32::from_le_bytes(d[1..5].try_into().unwrap())),
             ornt: d[5] as i8,
@@ -2510,7 +2499,7 @@ fn decode_coordinate_list(
     origins: [f64; 3],
 ) -> Result<Vec<Coordinate>> {
     let stride = dimensions * 4;
-    if !(2..=3).contains(&dimensions) || data.len() % stride != 0 {
+    if !(2..=3).contains(&dimensions) || !data.len().is_multiple_of(stride) {
         return Err(S100Error::InvalidFieldData(
             "Invalid coordinate list length".into(),
         ));
@@ -2924,12 +2913,14 @@ mod identity_attribute_tests {
 
 fn parse_masks(data: &[u8]) -> Result<Vec<MaskRecord>> {
     let data = data.strip_suffix(&[FIELD_TERMINATOR]).unwrap_or(data);
-    if data.len() % 7 != 0 {
+    if !data.len().is_multiple_of(7) {
         return Err(S100Error::InvalidFieldData(
             "MASK length is not a multiple of 7".into(),
         ));
     }
-    data.chunks_exact(7)
+    data.as_chunks::<7>()
+        .0
+        .iter()
         .map(|d| {
             if !matches!(d[5], 1 | 2) || !matches!(d[6], 1 | 2) {
                 return Err(S100Error::InvalidFieldData(

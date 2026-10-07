@@ -38,15 +38,32 @@ impl<'a> CoverageGpuPlan<'a> {
         texture_limit: u32,
         pixel_budget: usize,
     ) -> Result<Self> {
-        Self::new_with_frame_local_reuse(prepared, revision, view_revision, instruction_count,
-            pass_count, texture_limit, pixel_budget, false)
+        Self::new_with_frame_local_reuse(
+            prepared,
+            revision,
+            view_revision,
+            instruction_count,
+            pass_count,
+            texture_limit,
+            pixel_budget,
+            false,
+        )
     }
     /// Reuse is limited to borrowed mask/frame identities in THIS new plan.
     /// Complete original validation and logical admission precede alias analysis.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the validated public plan API: explicit source/view revisions, logical bounds and frame-local reuse option remain separate inputs."
+    )]
     pub fn new_with_frame_local_reuse(
-        prepared: &'a PreparedCoverage, revision: u64, view_revision: u64,
-        instruction_count: usize, pass_count: usize, texture_limit: u32,
-        pixel_budget: usize, reuse: bool,
+        prepared: &'a PreparedCoverage,
+        revision: u64,
+        view_revision: u64,
+        instruction_count: usize,
+        pass_count: usize,
+        texture_limit: u32,
+        pixel_budget: usize,
+        reuse: bool,
     ) -> Result<Self> {
         let invalid = |text: &str| WgpuError::Render(text.into());
         prepared
@@ -112,8 +129,10 @@ impl<'a> CoverageGpuPlan<'a> {
         })
     }
     fn frame_local_aliases(
-        prepared: &PreparedCoverage, masks: &[(usize, usize, &PixelMask)],
-        logical_bytes: usize, reuse: bool,
+        prepared: &PreparedCoverage,
+        masks: &[(usize, usize, &PixelMask)],
+        logical_bytes: usize,
+        reuse: bool,
     ) -> (Option<Vec<usize>>, usize, bool) {
         // No sharing when admission declines: original cold upload, no drawing loss.
         if !reuse || masks.len() > 1024 {
@@ -128,7 +147,10 @@ impl<'a> CoverageGpuPlan<'a> {
             let Ok(source) = prepared.pass(*pass) else {
                 return (None, logical_bytes, false);
             };
-            let key = (source.frame() as *const _ as usize, *mask as *const PixelMask as usize);
+            let key = (
+                source.frame() as *const _ as usize,
+                *mask as *const PixelMask as usize,
+            );
             let index = match seen.get(&key) {
                 Some(index) => *index,
                 None => {
@@ -153,16 +175,26 @@ impl<'a> CoverageGpuPlan<'a> {
             let size = mask.size();
             let image = if size.contains(&0) { [1, 1] } else { size };
             if image.iter().any(|dimension| *dimension > limit) {
-                return Err(WgpuError::Render("Coverage upload exceeds requested device limits".into()));
+                return Err(WgpuError::Render(
+                    "Coverage upload exceeds requested device limits".into(),
+                ));
             }
         }
         Ok(())
     }
-    pub fn unique_pixel_bytes(&self) -> usize { self.unique_pixel_bytes }
-    pub fn unique_clip_count(&self) -> usize {
-        self.clip_indices.as_ref().map_or(self.masks.len(), |indices| indices.iter().copied().max().map_or(0, |last| last + 1))
+    pub fn unique_pixel_bytes(&self) -> usize {
+        self.unique_pixel_bytes
     }
-    pub fn reuse_admitted(&self) -> bool { self.reuse_admitted }
+    pub fn unique_clip_count(&self) -> usize {
+        self.clip_indices
+            .as_ref()
+            .map_or(self.masks.len(), |indices| {
+                indices.iter().copied().max().map_or(0, |last| last + 1)
+            })
+    }
+    pub fn reuse_admitted(&self) -> bool {
+        self.reuse_admitted
+    }
     pub fn pixel_bytes(&self) -> usize {
         self.pixel_bytes
     }
@@ -201,10 +233,17 @@ impl CoverageGpuFrame {
         let mut logical_allocated = 0usize;
         let mut unique_allocated = 0usize;
         for (alias, (pass, dataset, mask)) in plan.masks.into_iter().enumerate() {
-            let index = plan.clip_indices.as_ref().map_or(alias, |indices| indices[alias]);
+            let index = plan
+                .clip_indices
+                .as_ref()
+                .map_or(alias, |indices| indices[alias]);
             if index == clips.len() {
                 let clip = CoverageClip::new(
-                    device, queue, layout, Some(mask), ClipTransform::IDENTITY,
+                    device,
+                    queue,
+                    layout,
+                    Some(mask),
+                    ClipTransform::IDENTITY,
                     plan.pixel_bytes - logical_allocated,
                 )?;
                 unique_allocated += clip.pixel_bytes();
@@ -242,7 +281,7 @@ impl CoverageGpuFrame {
                     WgpuError::Render("No coverage binding for dataset draw".into())
                 })?;
                 CoverageGpuBinding::Masked(&self.clips[*index].bind_group)
-            },
+            }
         })
     }
     /// Resolve only from a binding for this instruction geometry and view.
@@ -273,9 +312,15 @@ impl CoverageGpuFrame {
         self.pixel_bytes
     }
     /// Physical logical R8 texels of unique clips; not total RSS/driver memory.
-    pub fn unique_pixel_bytes(&self) -> usize { self.unique_pixel_bytes }
-    pub fn unique_clip_count(&self) -> usize { self.clips.len() }
-    pub fn mask_count(&self) -> usize { self.masks.len() }
+    pub fn unique_pixel_bytes(&self) -> usize {
+        self.unique_pixel_bytes
+    }
+    pub fn unique_clip_count(&self) -> usize {
+        self.clips.len()
+    }
+    pub fn mask_count(&self) -> usize {
+        self.masks.len()
+    }
 }
 
 #[cfg(test)]
@@ -294,7 +339,12 @@ mod tests {
     fn prepared(extent: [u32; 2], point_only: bool) -> PreparedCoverage {
         prepared_frames(extent, point_only, false, 2)
     }
-    fn prepared_frames(extent: [u32; 2], point_only: bool, distinct: bool, passes: usize) -> PreparedCoverage {
+    fn prepared_frames(
+        extent: [u32; 2],
+        point_only: bool,
+        distinct: bool,
+        passes: usize,
+    ) -> PreparedCoverage {
         let rect = |w| {
             Region::from_rings(&[[0., 0.], [w, 0.], [w, 10.], [0., 10.], [0., 0.]], &[]).unwrap()
         };
@@ -340,7 +390,14 @@ mod tests {
             .map(|_| {
                 PreparedCoveragePass::prepare(
                     &instructions,
-                    if distinct { Arc::new(CoverageFrame::new(&inventory, &selection, &viewport, extent, 4096).unwrap()) } else { frame.clone() },
+                    if distinct {
+                        Arc::new(
+                            CoverageFrame::new(&inventory, &selection, &viewport, extent, 4096)
+                                .unwrap(),
+                        )
+                    } else {
+                        frame.clone()
+                    },
                     |_| Ok(InstructionCoverageClass::Dataset(0)),
                     |_, _| Ok(Some([11., 1.])),
                 )
@@ -356,10 +413,10 @@ mod tests {
         assert!(frame_local_clip_reuse_policy(Some(OsStr::new("1"))));
         assert!(!frame_local_clip_reuse_policy(Some(OsStr::new("0"))));
         // Public compatibility constructor remains original/non-reuse regardless of policy.
-        let p = prepared_frames([12,12], false, false, 3);
-        let baseline = CoverageGpuPlan::new(&p,1,2,2,3,8192,300).unwrap();
-        assert_eq!(baseline.unique_clip_count(),3);
-        assert_eq!(baseline.pixel_bytes(),300);
+        let p = prepared_frames([12, 12], false, false, 3);
+        let baseline = CoverageGpuPlan::new(&p, 1, 2, 2, 3, 8192, 300).unwrap();
+        assert_eq!(baseline.unique_clip_count(), 3);
+        assert_eq!(baseline.pixel_bytes(), 300);
     }
     #[test]
     fn shipping_policy_invalid_and_nonunicode_values_keep_original_path() {
@@ -367,57 +424,93 @@ mod tests {
         for value in ["", "true", "false", " 1", "1 ", "01", "2", " 0", "0 "] {
             assert!(!frame_local_clip_reuse_policy(Some(OsStr::new(value))));
         }
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::ffi::OsStrExt;
-            assert!(!frame_local_clip_reuse_policy(Some(OsStr::from_bytes(&[255]))));
+            assert!(!frame_local_clip_reuse_policy(Some(OsStr::from_bytes(&[
+                255
+            ]))));
         }
     }
     #[test]
     fn live_frame_identity_shares_three_passes_but_distinct_frames_do_not() {
         for distinct in [false, true] {
-            let p = prepared_frames([12,12], false, distinct, 3);
-            let on = CoverageGpuPlan::new_with_frame_local_reuse(&p,1,2,2,3,8192,300,true).unwrap();
-            let off = CoverageGpuPlan::new(&p,1,2,2,3,8192,300).unwrap();
+            let p = prepared_frames([12, 12], false, distinct, 3);
+            let on = CoverageGpuPlan::new_with_frame_local_reuse(&p, 1, 2, 2, 3, 8192, 300, true)
+                .unwrap();
+            let off = CoverageGpuPlan::new(&p, 1, 2, 2, 3, 8192, 300).unwrap();
             assert_eq!(on.mask_count(), off.mask_count());
             assert_eq!(on.pixel_bytes(), 300);
-            assert_eq!(on.unique_clip_count(), if distinct {3} else {1});
-            assert_eq!(on.unique_pixel_bytes(), if distinct {300} else {100});
+            assert_eq!(on.unique_clip_count(), if distinct { 3 } else { 1 });
+            assert_eq!(on.unique_pixel_bytes(), if distinct { 300 } else { 100 });
             assert_eq!(off.unique_clip_count(), 3);
-            assert_eq!(on.clip_indices, Some(if distinct {vec![0,1,2]} else {vec![0,0,0]}));
+            assert_eq!(
+                on.clip_indices,
+                Some(if distinct {
+                    vec![0, 1, 2]
+                } else {
+                    vec![0, 0, 0]
+                })
+            );
             assert!(off.clip_indices.is_none());
         }
     }
     #[test]
     fn reuse_preserves_budget_revision_count_and_device_limit_errors() {
-        let p=prepared_frames([12,12],false,false,3);
-        for (revision,view,count,passes,limit,budget) in [(1,2,2,3,8192,299),(0,2,2,3,8192,300),(1,0,2,3,8192,300),(1,2,1,3,8192,300),(1,2,2,2,8192,300),(1,2,2,3,9,300)] {
-            let err=|reuse|CoverageGpuPlan::new_with_frame_local_reuse(&p,revision,view,count,passes,limit,budget,reuse).err().unwrap().to_string();
-            assert_eq!(err(false),err(true));
+        let p = prepared_frames([12, 12], false, false, 3);
+        for (revision, view, count, passes, limit, budget) in [
+            (1, 2, 2, 3, 8192, 299),
+            (0, 2, 2, 3, 8192, 300),
+            (1, 0, 2, 3, 8192, 300),
+            (1, 2, 1, 3, 8192, 300),
+            (1, 2, 2, 2, 8192, 300),
+            (1, 2, 2, 3, 9, 300),
+        ] {
+            let err = |reuse| {
+                CoverageGpuPlan::new_with_frame_local_reuse(
+                    &p, revision, view, count, passes, limit, budget, reuse,
+                )
+                .err()
+                .unwrap()
+                .to_string()
+            };
+            assert_eq!(err(false), err(true));
         }
-        for reuse in [false,true] {
-            let plan=CoverageGpuPlan::new_with_frame_local_reuse(&p,1,2,2,3,8192,300,reuse).unwrap();
+        for reuse in [false, true] {
+            let plan =
+                CoverageGpuPlan::new_with_frame_local_reuse(&p, 1, 2, 2, 3, 8192, 300, reuse)
+                    .unwrap();
             assert!(plan.validate_upload_limit(9).is_err());
             assert!(plan.validate_upload_limit(10).is_ok());
         }
     }
     #[test]
     fn empty_and_unclipped_aliases_keep_original_logical_admission() {
-        for (point,logical,unique) in [(false,3,1),(true,0,0)] {
-            let p=prepared_frames([0,0],point,false,3);
-            let plan=CoverageGpuPlan::new_with_frame_local_reuse(&p,1,2,2,3,8192,logical,true).unwrap();
-            assert_eq!(plan.pixel_bytes(),logical);assert_eq!(plan.unique_pixel_bytes(),unique);
+        for (point, logical, unique) in [(false, 3, 1), (true, 0, 0)] {
+            let p = prepared_frames([0, 0], point, false, 3);
+            let plan =
+                CoverageGpuPlan::new_with_frame_local_reuse(&p, 1, 2, 2, 3, 8192, logical, true)
+                    .unwrap();
+            assert_eq!(plan.pixel_bytes(), logical);
+            assert_eq!(plan.unique_pixel_bytes(), unique);
         }
     }
     #[test]
     fn bounded_alias_admission_declines_to_complete_cold_plan() {
-        let p=prepared_frames([12,12],false,false,1025);
-        let plan=CoverageGpuPlan::new_with_frame_local_reuse(&p,1,2,2,1025,8192,102500,true).unwrap();
-        assert!(!plan.reuse_admitted());assert_eq!(plan.unique_clip_count(),1025);
-        assert_eq!(plan.pixel_bytes(),plan.unique_pixel_bytes());
+        let p = prepared_frames([12, 12], false, false, 1025);
+        let plan =
+            CoverageGpuPlan::new_with_frame_local_reuse(&p, 1, 2, 2, 1025, 8192, 102500, true)
+                .unwrap();
+        assert!(!plan.reuse_admitted());
+        assert_eq!(plan.unique_clip_count(), 1025);
+        assert_eq!(plan.pixel_bytes(), plan.unique_pixel_bytes());
         assert!(plan.clip_indices.is_none());
-        let p=prepared_frames([12,12],false,false,1024);
-        let plan=CoverageGpuPlan::new_with_frame_local_reuse(&p,1,2,2,1024,8192,102400,true).unwrap();
-        assert!(plan.reuse_admitted());assert_eq!(plan.unique_clip_count(),1);
+        let p = prepared_frames([12, 12], false, false, 1024);
+        let plan =
+            CoverageGpuPlan::new_with_frame_local_reuse(&p, 1, 2, 2, 1024, 8192, 102400, true)
+                .unwrap();
+        assert!(plan.reuse_admitted());
+        assert_eq!(plan.unique_clip_count(), 1);
     }
 
     #[test]

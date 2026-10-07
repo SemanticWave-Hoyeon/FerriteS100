@@ -53,7 +53,8 @@ pub(crate) fn parse(path: &Path, id: &str) -> Result<Definition> {
 }
 
 pub(crate) fn parse_bytes(bytes: &[u8], id: &str) -> Result<Definition> {
-    let xml = std::str::from_utf8(bytes).map_err(|e| invalid(format!("LineStyle XML UTF-8: {e}")))?;
+    let xml =
+        std::str::from_utf8(bytes).map_err(|e| invalid(format!("LineStyle XML UTF-8: {e}")))?;
     parse_text(xml, id)
 }
 

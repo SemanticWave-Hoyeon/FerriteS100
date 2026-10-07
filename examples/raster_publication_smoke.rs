@@ -104,9 +104,7 @@ impl ApplicationHandler for Smoke {
             .unwrap();
         r.reproject_raster_publication(&mut raster, &c.scaler)
             .unwrap();
-        let scene = r
-            .prepare_raster_scene_publication(raster)
-            .unwrap();
+        let scene = r.prepare_raster_scene_publication(raster).unwrap();
         r.validate_raster_scene_publication(&scene).unwrap();
         r.commit_raster_scene_publication(scene);
         assert_eq!(r.get_pan_offset(), (0., 0.));

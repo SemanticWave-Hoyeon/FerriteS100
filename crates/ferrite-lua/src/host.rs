@@ -129,11 +129,10 @@ fn navigate_and_get_simple_values<'a>(
         if i == 0 {
             // First level - look in root_attrs
             current = root_attrs.get(code).and_then(|v| v.get(*index));
-        } else if let Some(parent) = current {
+        } else {
+            let parent = current?;
             // Subsequent levels - look in parent's complex_attrs
             current = parent.complex_attrs.get(code).and_then(|v| v.get(*index));
-        } else {
-            return None;
         }
     }
 
@@ -511,12 +510,32 @@ impl HostFunctions {
         *features = data.features;
         *information = data.information_types;
         *spatials = data.spatials;
-        *associations = data.feature_associations.into_iter().map(|(key, values)|
-            (key, values.into_iter().map(|a|
-                (a.target_id, a.association_code, a.role_code)).collect())).collect();
-        *info_associations = data.information_associations.into_iter().map(|(key, values)|
-            (key, values.into_iter().map(|a|
-                (a.info_id, a.association_code, a.role_code)).collect())).collect();
+        *associations = data
+            .feature_associations
+            .into_iter()
+            .map(|(key, values)| {
+                (
+                    key,
+                    values
+                        .into_iter()
+                        .map(|a| (a.target_id, a.association_code, a.role_code))
+                        .collect(),
+                )
+            })
+            .collect();
+        *info_associations = data
+            .information_associations
+            .into_iter()
+            .map(|(key, values)| {
+                (
+                    key,
+                    values
+                        .into_iter()
+                        .map(|a| (a.info_id, a.association_code, a.role_code))
+                        .collect(),
+                )
+            })
+            .collect();
         *reverse = data.spatial_to_features;
         Ok(())
     }
@@ -2290,46 +2309,146 @@ mod catalogue_setup_benchmark {
 #[cfg(test)]
 mod owned_cell_data_tests {
     use super::*;
-    use crate::context::{AttributeValue,ComplexAttribute,FeatureAssociation,InformationAssociation,InformationInfo,PrimitiveType};
+    use crate::context::{
+        AttributeValue, ComplexAttribute, FeatureAssociation, InformationAssociation,
+        InformationInfo, PrimitiveType,
+    };
     fn data() -> CellData {
-        let mut nested=ComplexAttribute::new("nested".into());
-        nested.simple_attrs.insert("values".into(),vec![AttributeValue::Text("retained value".into()),AttributeValue::Integer(9)]);
+        let mut nested = ComplexAttribute::new("nested".into());
+        nested.simple_attrs.insert(
+            "values".into(),
+            vec![
+                AttributeValue::Text("retained value".into()),
+                AttributeValue::Integer(9),
+            ],
+        );
         CellData {
-            features:HashMap::from([(7,FeatureInfo {id:7,code:"Wreck".into(),primitive_type:PrimitiveType::Point,
-                attributes:HashMap::from([("name".into(),AttributeValue::Text("unchanged text".into()))]),
-                complex_attributes:HashMap::from([("nested".into(),vec![nested])]),spatial_refs:Vec::new()})]),
-            information_types:HashMap::from([(8,InformationInfo {id:8,code:"Info".into(),attributes:HashMap::new(),complex_attributes:HashMap::new()})]),
-            spatials:HashMap::from([(9,SpatialInfo {id:9,spatial_type:PrimitiveType::Point,coordinates:vec![(1.5,2.5)],z_coordinates:vec![Some(-3.5)],curve_associations:Vec::new(),interior_curve_associations:Vec::new()})]),
-            feature_associations:HashMap::from([(7,vec![FeatureAssociation {target_id:4,association_code:"first".into(),role_code:"role1".into()},FeatureAssociation {target_id:2,association_code:"second".into(),role_code:"role2".into()}])]),
-            information_associations:HashMap::from([(7,vec![InformationAssociation {info_id:8,association_code:"info".into(),role_code:"info role".into()}])]),
-            spatial_to_features:HashMap::from([(9,vec![7,3,7])]),
+            features: HashMap::from([(
+                7,
+                FeatureInfo {
+                    id: 7,
+                    code: "Wreck".into(),
+                    primitive_type: PrimitiveType::Point,
+                    attributes: HashMap::from([(
+                        "name".into(),
+                        AttributeValue::Text("unchanged text".into()),
+                    )]),
+                    complex_attributes: HashMap::from([("nested".into(), vec![nested])]),
+                    spatial_refs: Vec::new(),
+                },
+            )]),
+            information_types: HashMap::from([(
+                8,
+                InformationInfo {
+                    id: 8,
+                    code: "Info".into(),
+                    attributes: HashMap::new(),
+                    complex_attributes: HashMap::new(),
+                },
+            )]),
+            spatials: HashMap::from([(
+                9,
+                SpatialInfo {
+                    id: 9,
+                    spatial_type: PrimitiveType::Point,
+                    coordinates: vec![(1.5, 2.5)],
+                    z_coordinates: vec![Some(-3.5)],
+                    curve_associations: Vec::new(),
+                    interior_curve_associations: Vec::new(),
+                },
+            )]),
+            feature_associations: HashMap::from([(
+                7,
+                vec![
+                    FeatureAssociation {
+                        target_id: 4,
+                        association_code: "first".into(),
+                        role_code: "role1".into(),
+                    },
+                    FeatureAssociation {
+                        target_id: 2,
+                        association_code: "second".into(),
+                        role_code: "role2".into(),
+                    },
+                ],
+            )]),
+            information_associations: HashMap::from([(
+                7,
+                vec![InformationAssociation {
+                    info_id: 8,
+                    association_code: "info".into(),
+                    role_code: "info role".into(),
+                }],
+            )]),
+            spatial_to_features: HashMap::from([(9, vec![7, 3, 7])]),
         }
     }
     #[test]
     fn moved_data_equals_borrowed_data_preserves_buffers_and_association_order() {
-        let data=data();
-        let coordinates=data.spatials[&9].coordinates.as_ptr();
-        let association=data.feature_associations[&7][0].association_code.as_ptr();
-        let text=match &data.features[&7].attributes["name"] {AttributeValue::Text(s)=>s.as_ptr(),_=>unreachable!()};
-        let borrowed=HostFunctions::new();borrowed.from_cell_data(&data);
-        let owned=HostFunctions::new();owned.from_owned_cell_data(data).unwrap();
-        assert_eq!(owned.spatials.read().unwrap()[&9].coordinates.as_ptr(),coordinates);
-        assert_eq!(owned.feature_associations.read().unwrap()[&7][0].1.as_ptr(),association);
-        let actual=owned.features.read().unwrap();
-        assert_eq!(match &actual[&7].attributes["name"] {AttributeValue::Text(s)=>s.as_ptr(),_=>unreachable!()},text);
-        assert_eq!(format!("{:?}",actual[&7]),format!("{:?}",borrowed.features.read().unwrap()[&7]));
-        assert_eq!(format!("{:?}",owned.information_types.read().unwrap()[&8]),format!("{:?}",borrowed.information_types.read().unwrap()[&8]));
-        assert_eq!(format!("{:?}",owned.spatials.read().unwrap()[&9]),format!("{:?}",borrowed.spatials.read().unwrap()[&9]));
-        assert_eq!(*owned.feature_associations.read().unwrap(),*borrowed.feature_associations.read().unwrap());
-        assert_eq!(*owned.information_associations.read().unwrap(),*borrowed.information_associations.read().unwrap());
-        assert_eq!(*owned.spatial_to_features.read().unwrap(),*borrowed.spatial_to_features.read().unwrap());
+        let data = data();
+        let coordinates = data.spatials[&9].coordinates.as_ptr();
+        let association = data.feature_associations[&7][0].association_code.as_ptr();
+        let text = match &data.features[&7].attributes["name"] {
+            AttributeValue::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        let borrowed = HostFunctions::new();
+        borrowed.from_cell_data(&data);
+        let owned = HostFunctions::new();
+        owned.from_owned_cell_data(data).unwrap();
+        assert_eq!(
+            owned.spatials.read().unwrap()[&9].coordinates.as_ptr(),
+            coordinates
+        );
+        assert_eq!(
+            owned.feature_associations.read().unwrap()[&7][0].1.as_ptr(),
+            association
+        );
+        let actual = owned.features.read().unwrap();
+        assert_eq!(
+            match &actual[&7].attributes["name"] {
+                AttributeValue::Text(s) => s.as_ptr(),
+                _ => unreachable!(),
+            },
+            text
+        );
+        assert_eq!(
+            format!("{:?}", actual[&7]),
+            format!("{:?}", borrowed.features.read().unwrap()[&7])
+        );
+        assert_eq!(
+            format!("{:?}", owned.information_types.read().unwrap()[&8]),
+            format!("{:?}", borrowed.information_types.read().unwrap()[&8])
+        );
+        assert_eq!(
+            format!("{:?}", owned.spatials.read().unwrap()[&9]),
+            format!("{:?}", borrowed.spatials.read().unwrap()[&9])
+        );
+        assert_eq!(
+            *owned.feature_associations.read().unwrap(),
+            *borrowed.feature_associations.read().unwrap()
+        );
+        assert_eq!(
+            *owned.information_associations.read().unwrap(),
+            *borrowed.information_associations.read().unwrap()
+        );
+        assert_eq!(
+            *owned.spatial_to_features.read().unwrap(),
+            *borrowed.spatial_to_features.read().unwrap()
+        );
     }
     #[test]
     fn owned_lock_failure_leaves_previous_maps_intact() {
-        let host=HostFunctions::new();host.from_owned_cell_data(data()).unwrap();
-        let poisoned=Arc::clone(&host.spatials);
-        let _=std::thread::spawn(move || {let _guard=poisoned.write().unwrap();panic!("poison fixture");}).join();
-        let mut replacement=data();replacement.features.clear();
+        let host = HostFunctions::new();
+        host.from_owned_cell_data(data()).unwrap();
+        let poisoned = Arc::clone(&host.spatials);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.write().unwrap();
+            panic!("poison fixture");
+        })
+        .join();
+        let mut replacement = data();
+        replacement.features.clear();
         assert!(host.from_owned_cell_data(replacement).is_err());
         assert!(host.features.read().unwrap().contains_key(&7));
     }

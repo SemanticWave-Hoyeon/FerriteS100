@@ -557,66 +557,73 @@ impl RenderPipelines {
                     cache: None,
                 });
 
-        let symbol_instance_pipeline = if std::env::var("FERRITE_SYMBOL_INSTANCING").as_deref() == Ok("1") {
-            let symbol_instance_shader = state.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("symbol_instance_shader"),
-                source: wgpu::ShaderSource::Wgsl(crate::symbol_instance::shader().into()),
-            });
-        let symbol_instance_pipeline =
-            state
-                .device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("symbol_instance_pipeline"),
-                    layout: Some(&texture_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &symbol_instance_shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[crate::symbol_instance::SymbolQuadInstance::desc()],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &symbol_instance_shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: state.format(),
-                            // Premultiplied alpha blending: src + dst * (1 - src_alpha)
-                            blend: Some(wgpu::BlendState {
-                                color: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                                alpha: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                            }),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count: MSAA_SAMPLE_COUNT,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    multiview: None,
-                    cache: None,
-                });
+        let symbol_instance_pipeline = if std::env::var("FERRITE_SYMBOL_INSTANCING").as_deref()
+            == Ok("1")
+        {
+            let symbol_instance_shader =
+                state
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("symbol_instance_shader"),
+                        source: wgpu::ShaderSource::Wgsl(crate::symbol_instance::shader().into()),
+                    });
+            let symbol_instance_pipeline =
+                state
+                    .device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("symbol_instance_pipeline"),
+                        layout: Some(&texture_pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &symbol_instance_shader,
+                            entry_point: Some("vs_main"),
+                            buffers: &[crate::symbol_instance::SymbolQuadInstance::desc()],
+                            compilation_options: Default::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &symbol_instance_shader,
+                            entry_point: Some("fs_main"),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: state.format(),
+                                // Premultiplied alpha blending: src + dst * (1 - src_alpha)
+                                blend: Some(wgpu::BlendState {
+                                    color: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::One,
+                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                    alpha: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::One,
+                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                }),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: Default::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            strip_index_format: None,
+                            front_face: wgpu::FrontFace::Ccw,
+                            cull_mode: None,
+                            polygon_mode: wgpu::PolygonMode::Fill,
+                            unclipped_depth: false,
+                            conservative: false,
+                        },
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState {
+                            count: MSAA_SAMPLE_COUNT,
+                            mask: !0,
+                            alpha_to_coverage_enabled: false,
+                        },
+                        multiview: None,
+                        cache: None,
+                    });
 
             Some(symbol_instance_pipeline)
-        } else { None };
+        } else {
+            None
+        };
 
         let raster_pipeline =
             state
@@ -905,69 +912,81 @@ impl RenderPipelines {
     }
 
     /// Coverage lookup colours and NoData remain discrete at grid-cell boundaries.
+    pub(crate) fn ensure_continuous_raster_pipeline(&mut self, state: &GpuState) {
+        if self.continuous_raster_pipeline.is_some() {
+            return;
+        }
+        let shader = state
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("continuous-source-selector"),
+                source: wgpu::ShaderSource::Wgsl(
+                    crate::continuous_raster_selector::flat_shader().into(),
+                ),
+            });
+        let layout = state
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("continuous-source-selector-layout"),
+                bind_group_layouts: &[
+                    &self.view_bind_group_layout,
+                    &self.texture_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+        let pipeline = state
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("continuous_source_selector_pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[RasterVertex::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: state.format(),
+                        // Premultiplied alpha blending: src + dst * (1 - src_alpha)
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: MSAA_SAMPLE_COUNT,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
 
-    pub(crate) fn ensure_continuous_raster_pipeline(&mut self,state:&GpuState) {
-        if self.continuous_raster_pipeline.is_some() {return;}
-        let shader=state.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label:Some("continuous-source-selector"),source:wgpu::ShaderSource::Wgsl(crate::continuous_raster_selector::flat_shader().into()),
-        });
-        let layout=state.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label:Some("continuous-source-selector-layout"),bind_group_layouts:&[&self.view_bind_group_layout,&self.texture_bind_group_layout],push_constant_ranges:&[],
-        });
-        let pipeline =
-            state
-                .device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("continuous_source_selector_pipeline"),
-                    layout: Some(&layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[RasterVertex::desc()],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: state.format(),
-                            // Premultiplied alpha blending: src + dst * (1 - src_alpha)
-                            blend: Some(wgpu::BlendState {
-                                color: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                                alpha: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                            }),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count: MSAA_SAMPLE_COUNT,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    multiview: None,
-                    cache: None,
-                });
-
-        self.continuous_raster_pipeline=Some(pipeline);
+        self.continuous_raster_pipeline = Some(pipeline);
     }
     pub fn create_raster_bind_group(
         &self,

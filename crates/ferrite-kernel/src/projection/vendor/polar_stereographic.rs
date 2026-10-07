@@ -1,6 +1,10 @@
 // Adapted from geoconvert 1.0.2, Copyright (c) 2024 Nicholas Crothers.
 // MIT license; see LICENSE and UPSTREAM.md in this directory.
-use super::{ThisOrThat, constants::{WGS84_A, WGS84_F, UPS_K0}, utility::{GeoMath, dms}, LatLon};
+use super::{
+    constants::{UPS_K0, WGS84_A, WGS84_F},
+    utility::{dms, GeoMath},
+    LatLon, ThisOrThat,
+};
 
 const F: f64 = WGS84_F;
 const E2: f64 = F * (2.0 - F);
@@ -14,7 +18,6 @@ pub(crate) struct PolarStereographic {
 
 impl PolarStereographic {
     pub fn ups() -> PolarStereographic {
-
         let es = (F < 0.0).ternary(-1.0, 1.0) * E2.abs().sqrt();
         let c = (1.0 - F) * 1_f64.eatanhe(es).exp();
 
@@ -33,7 +36,10 @@ impl PolarStereographic {
         let tau = lat.to_radians().tan();
         let taup = tau.taupf(self.es);
         let mut rho = 1_f64.hypot(taup) + taup.abs();
-        rho = (taup >= 0.0).ternary_lazy(|| (!lat.eps_eq(f64::from(dms::QD))).ternary_lazy(|| 1.0 / rho, || 0.0), || rho);
+        rho = (taup >= 0.0).ternary_lazy(
+            || (!lat.eps_eq(f64::from(dms::QD))).ternary_lazy(|| 1.0 / rho, || 0.0),
+            || rho,
+        );
         rho *= 2.0 * self.k0 * self.a / self.c;
 
         let (mut x, mut y) = {
@@ -49,11 +55,10 @@ impl PolarStereographic {
 
     pub fn to_latlon(&self, northp: bool, x: f64, y: f64) -> LatLon {
         let rho = x.hypot(y);
-        let t = (rho != 0.0)
-            .ternary_lazy(
-                || rho / (2.0 * self.k0 * self.a / self.c),
-                || f64::EPSILON.powi(2)
-            );
+        let t = (rho != 0.0).ternary_lazy(
+            || rho / (2.0 * self.k0 * self.a / self.c),
+            || f64::EPSILON.powi(2),
+        );
         let taup = (1.0 / t - t) / 2.;
         let tau = taup.tauf(self.es);
 

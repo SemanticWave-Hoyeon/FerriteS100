@@ -27,7 +27,15 @@ impl CoveragePipelines {
         texture_layout: &wgpu::BindGroupLayout,
         pattern_layout: &wgpu::BindGroupLayout,
     ) -> Result<Self> {
-        Self::new_with_symbol_instancing(device, format, samples, view_layout, texture_layout, pattern_layout, false)
+        Self::new_with_symbol_instancing(
+            device,
+            format,
+            samples,
+            view_layout,
+            texture_layout,
+            pattern_layout,
+            false,
+        )
     }
 
     /// Keep the ordinary pipelines unchanged. Construct these variants only
@@ -150,21 +158,23 @@ impl CoveragePipelines {
             wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
         )?;
         let symbol_instance = if symbol_instancing {
-        let symbol_instance = make(
-            "coverage-symbol-instance",
-            &crate::symbol_instance::shader(),
-            &symbol_layout,
-            crate::symbol_instance::SymbolQuadInstance::desc(),
-            "fs_main",
-            &[FragmentEntry {
-                name: "fs_main",
-                input_type: "TextureVertexOutput",
-                position_field: "clip_position",
-            }],
-            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-        )?;
+            let symbol_instance = make(
+                "coverage-symbol-instance",
+                &crate::symbol_instance::shader(),
+                &symbol_layout,
+                crate::symbol_instance::SymbolQuadInstance::desc(),
+                "fs_main",
+                &[FragmentEntry {
+                    name: "fs_main",
+                    input_type: "TextureVertexOutput",
+                    position_field: "clip_position",
+                }],
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            )?;
             Some(symbol_instance)
-        } else { None };
+        } else {
+            None
+        };
         let pattern = make(
             "coverage-pattern",
             PATTERN_FILL_SHADER,
@@ -220,8 +230,23 @@ mod api_compatibility_tests {
     use super::*;
     #[test]
     fn legacy_six_argument_and_opt_in_seven_argument_factory_signatures_compile() {
-        type Legacy = fn(&wgpu::Device, wgpu::TextureFormat, u32, &wgpu::BindGroupLayout, &wgpu::BindGroupLayout, &wgpu::BindGroupLayout) -> Result<CoveragePipelines>;
-        type OptIn = fn(&wgpu::Device, wgpu::TextureFormat, u32, &wgpu::BindGroupLayout, &wgpu::BindGroupLayout, &wgpu::BindGroupLayout, bool) -> Result<CoveragePipelines>;
+        type Legacy = fn(
+            &wgpu::Device,
+            wgpu::TextureFormat,
+            u32,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+        ) -> Result<CoveragePipelines>;
+        type OptIn = fn(
+            &wgpu::Device,
+            wgpu::TextureFormat,
+            u32,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+            bool,
+        ) -> Result<CoveragePipelines>;
         let _: Legacy = CoveragePipelines::new;
         let _: OptIn = CoveragePipelines::new_with_symbol_instancing;
     }

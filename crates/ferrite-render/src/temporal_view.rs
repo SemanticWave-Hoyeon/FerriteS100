@@ -39,8 +39,8 @@ impl Default for TemporalView {
 }
 impl TemporalView {
     pub fn from_settings(settings: &DisplaySettings) -> Self {
-        let mut state = Self::default();
-        state.mode = if !settings.date_dependent {
+        let defaults = Self::default();
+        let mode = if !settings.date_dependent {
             TemporalViewMode::All
         } else if settings.current_datetime.is_some() {
             TemporalViewMode::Instant
@@ -49,13 +49,12 @@ impl TemporalView {
         } else {
             TemporalViewMode::Live
         };
-        if let Some(date) = &settings.current_date {
-            state.date = date.clone();
-        }
-        if let Some(instant) = &settings.current_datetime {
-            state.instant = instant.clone();
-        }
-        state.source_offset = chrono::FixedOffset::east_opt(settings.local_time_offset_seconds)
+        let date = settings.current_date.clone().unwrap_or(defaults.date);
+        let instant = settings
+            .current_datetime
+            .clone()
+            .unwrap_or(defaults.instant);
+        let source_offset = chrono::FixedOffset::east_opt(settings.local_time_offset_seconds)
             .map(|o| {
                 if o.local_minus_utc() == 0 {
                     "Z".into()
@@ -64,7 +63,12 @@ impl TemporalView {
                 }
             })
             .unwrap_or_else(|| settings.local_time_offset_seconds.to_string());
-        state
+        Self {
+            mode,
+            date,
+            instant,
+            source_offset,
+        }
     }
     /// Validate the entire proposed selection before changing any active settings.
     pub fn apply(&self, settings: &mut DisplaySettings) -> Result<(), String> {

@@ -5,8 +5,8 @@ use ferrite_kernel::{CoverageSample, CoverageSource, GridGeometry, GridWindow};
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{Color, RenderContext, ScreenPoint, Viewport};
 use ferrite_s102::{hdf5, BathymetryCoverage, BathymetryPortrayal, DepthSettings};
-use hdf5::types::VarLenAscii;
 use ferrite_wgpu::WgpuRenderer;
+use hdf5::types::VarLenAscii;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -21,17 +21,72 @@ struct DepthValue {
     depth: f32,
     uncertainty: f32,
 }
-#[derive(hdf5::H5Type,Clone)] #[repr(C)] #[allow(non_snake_case)] struct Definition {
- code:VarLenAscii,name:VarLenAscii,#[hdf5(rename="uom.name")]unit:VarLenAscii,fillValue:VarLenAscii,datatype:VarLenAscii,lower:VarLenAscii,upper:VarLenAscii,closure:VarLenAscii,
+#[derive(hdf5::H5Type, Clone)]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct Definition {
+    code: VarLenAscii,
+    name: VarLenAscii,
+    #[hdf5(rename = "uom.name")]
+    unit: VarLenAscii,
+    fillValue: VarLenAscii,
+    datatype: VarLenAscii,
+    lower: VarLenAscii,
+    upper: VarLenAscii,
+    closure: VarLenAscii,
 }
-impl Definition {fn for_code(code:&str)->Self {
- let text=|s:&str|VarLenAscii::from_ascii(s).unwrap();
- let (name,unit,fill,datatype,lower,upper,closure)=match code {"uncertainty"=>(code,"metres","1000000","H5T_FLOAT","0","","geSemiInterval"),"iD"=>("ID","","0","H5T_INTEGER","1","","geSemiInterval"),_=>(code,"metres","1000000","H5T_FLOAT","-14","11050","closedInterval")};
- Self{code:text(code),name:text(name),unit:text(unit),fillValue:text(fill),datatype:text(datatype),lower:text(lower),upper:text(upper),closure:text(closure)}
-}}
-fn declarations(g:&hdf5::Group) {
- g.new_dataset::<VarLenAscii>().shape(2).create("featureCode").unwrap().write_raw(&["BathymetryCoverage","QualityOfBathymetryCoverage"].map(|s|VarLenAscii::from_ascii(s).unwrap())).unwrap();
- g.new_dataset::<Definition>().shape(1).create("QualityOfBathymetryCoverage").unwrap().write_raw(&[Definition::for_code("iD")]).unwrap();
+impl Definition {
+    fn for_code(code: &str) -> Self {
+        let text = |s: &str| VarLenAscii::from_ascii(s).unwrap();
+        let (name, unit, fill, datatype, lower, upper, closure) = match code {
+            "uncertainty" => (
+                code,
+                "metres",
+                "1000000",
+                "H5T_FLOAT",
+                "0",
+                "",
+                "geSemiInterval",
+            ),
+            "iD" => ("ID", "", "0", "H5T_INTEGER", "1", "", "geSemiInterval"),
+            _ => (
+                code,
+                "metres",
+                "1000000",
+                "H5T_FLOAT",
+                "-14",
+                "11050",
+                "closedInterval",
+            ),
+        };
+        Self {
+            code: text(code),
+            name: text(name),
+            unit: text(unit),
+            fillValue: text(fill),
+            datatype: text(datatype),
+            lower: text(lower),
+            upper: text(upper),
+            closure: text(closure),
+        }
+    }
+}
+fn declarations(g: &hdf5::Group) {
+    g.new_dataset::<VarLenAscii>()
+        .shape(2)
+        .create("featureCode")
+        .unwrap()
+        .write_raw(
+            &["BathymetryCoverage", "QualityOfBathymetryCoverage"]
+                .map(|s| VarLenAscii::from_ascii(s).unwrap()),
+        )
+        .unwrap();
+    g.new_dataset::<Definition>()
+        .shape(1)
+        .create("QualityOfBathymetryCoverage")
+        .unwrap()
+        .write_raw(&[Definition::for_code("iD")])
+        .unwrap();
 }
 fn attr<T: hdf5::H5Type>(g: &hdf5::Group, name: &str, value: T) {
     g.new_attr::<T>()
@@ -48,29 +103,66 @@ fn text(g: &hdf5::Group, name: &str, value: &str) {
     );
 }
 // Signed orientations are generic kernel tests, not S102 product encodings.
-struct OrientedFixture { coverage:BathymetryCoverage, grid:GridGeometry }
+struct OrientedFixture {
+    coverage: BathymetryCoverage,
+    grid: GridGeometry,
+}
 impl CoverageSource for OrientedFixture {
-    fn geometry(&self)->&GridGeometry {&self.grid}
-    fn read_window(&self,window:GridWindow)->Result<ferrite_kernel::CoverageTile> {
-        window.validate(&self.grid)?;self.coverage.read_window(window)
+    fn geometry(&self) -> &GridGeometry {
+        &self.grid
+    }
+    fn read_window(&self, window: GridWindow) -> Result<ferrite_kernel::CoverageTile> {
+        window.validate(&self.grid)?;
+        self.coverage.read_window(window)
     }
 }
 fn fixture(path: &std::path::Path, grid: GridGeometry) -> OrientedFixture {
     {
         let f = hdf5::File::create(path).unwrap();
         text(&f, "productSpecification", "INT.IHO.S-102.3.0.0");
-        text(&f,"issueDate","20261006");
-        for (n,v) in [("westBoundLongitude",grid.origin_x-grid.spacing_x.abs()*0.5),("eastBoundLongitude",grid.origin_x+(grid.width as f64-0.5)*grid.spacing_x.abs()),("southBoundLatitude",grid.origin_y-grid.spacing_y.abs()*0.5),("northBoundLatitude",grid.origin_y+(grid.height as f64-0.5)*grid.spacing_y.abs())] {attr(&f,n,v as f32);}
+        text(&f, "issueDate", "20261006");
+        for (n, v) in [
+            (
+                "westBoundLongitude",
+                grid.origin_x - grid.spacing_x.abs() * 0.5,
+            ),
+            (
+                "eastBoundLongitude",
+                grid.origin_x + (grid.width as f64 - 0.5) * grid.spacing_x.abs(),
+            ),
+            (
+                "southBoundLatitude",
+                grid.origin_y - grid.spacing_y.abs() * 0.5,
+            ),
+            (
+                "northBoundLatitude",
+                grid.origin_y + (grid.height as f64 - 0.5) * grid.spacing_y.abs(),
+            ),
+        ] {
+            attr(&f, n, v as f32);
+        }
         attr(&f, "horizontalCRS", 4326u32);
         attr(&f, "verticalCS", 6498u32);
-        attr(&f,"verticalCoordinateBase",2u8);
+        attr(&f, "verticalCoordinateBase", 2u8);
         attr(&f, "verticalDatum", 10u32);
-        attr(&f,"verticalDatumReference",1u8);
+        attr(&f, "verticalDatumReference", 1u8);
         let b = f.create_group("BathymetryCoverage").unwrap();
-        b.new_dataset::<VarLenAscii>().shape(2).create("axisNames").unwrap().write_raw(&[VarLenAscii::from_ascii("Latitude").unwrap(),VarLenAscii::from_ascii("Longitude").unwrap()]).unwrap();
-        attr(&b,"horizontalPositionUncertainty",-1f32);attr(&b,"verticalUncertainty",-1f32);
+        b.new_dataset::<VarLenAscii>()
+            .shape(2)
+            .create("axisNames")
+            .unwrap()
+            .write_raw(&[
+                VarLenAscii::from_ascii("Latitude").unwrap(),
+                VarLenAscii::from_ascii("Longitude").unwrap(),
+            ])
+            .unwrap();
+        attr(&b, "horizontalPositionUncertainty", -1f32);
+        attr(&b, "verticalUncertainty", -1f32);
         attr(&b, "dataCodingFormat", 2u8);
-        attr(&b,"dimension",2u8);attr(&b,"commonPointRule",2u8);attr(&b,"interpolationType",1u8);attr(&b,"numInstances",1u8);
+        attr(&b, "dimension", 2u8);
+        attr(&b, "commonPointRule", 2u8);
+        attr(&b, "interpolationType", 1u8);
+        attr(&b, "numInstances", 1u8);
         attr(&b, "dataOffsetCode", 5u8);
         attr(&b, "sequencingRule.type", 1u8);
         text(&b, "sequencingRule.scanDirection", "Longitude, Latitude");
@@ -83,11 +175,32 @@ fn fixture(path: &std::path::Path, grid: GridGeometry) -> OrientedFixture {
         attr(&g, "gridOriginLatitude", grid.origin_y);
         attr(&g, "gridSpacingLongitudinal", grid.spacing_x.abs());
         attr(&g, "gridSpacingLatitudinal", grid.spacing_y.abs());
-        for (n,v) in [("westBoundLongitude",grid.origin_x-grid.spacing_x.abs()*0.5),("eastBoundLongitude",grid.origin_x+(grid.width as f64-0.5)*grid.spacing_x.abs()),("southBoundLatitude",grid.origin_y-grid.spacing_y.abs()*0.5),("northBoundLatitude",grid.origin_y+(grid.height as f64-0.5)*grid.spacing_y.abs())] {attr(&g,n,v as f32);}
+        for (n, v) in [
+            (
+                "westBoundLongitude",
+                grid.origin_x - grid.spacing_x.abs() * 0.5,
+            ),
+            (
+                "eastBoundLongitude",
+                grid.origin_x + (grid.width as f64 - 0.5) * grid.spacing_x.abs(),
+            ),
+            (
+                "southBoundLatitude",
+                grid.origin_y - grid.spacing_y.abs() * 0.5,
+            ),
+            (
+                "northBoundLatitude",
+                grid.origin_y + (grid.height as f64 - 0.5) * grid.spacing_y.abs(),
+            ),
+        ] {
+            attr(&g, n, v as f32);
+        }
         let data = g.create_group("Group_001").unwrap();
         attr(&data, "minimumDepth", 7f32);
         attr(&data, "maximumDepth", 60f32);
-        attr(&data,"minimumUncertainty",0.5f32);attr(&data,"maximumUncertainty",0.5f32);text(&data,"timePoint","00010101T000000Z");
+        attr(&data, "minimumUncertainty", 0.5f32);
+        attr(&data, "maximumUncertainty", 0.5f32);
+        text(&data, "timePoint", "00010101T000000Z");
         let values: Vec<_> = (0..grid.height)
             .flat_map(|y| {
                 (0..grid.width).map(move |x| DepthValue {
@@ -110,10 +223,11 @@ fn fixture(path: &std::path::Path, grid: GridGeometry) -> OrientedFixture {
             .unwrap()
             .write_raw(&values)
             .unwrap();
-        let info = f.create_group("Group_F").unwrap();declarations(&info);
+        let info = f.create_group("Group_F").unwrap();
+        declarations(&info);
         let definitions: Vec<_> = ["depth", "uncertainty"]
             .iter()
-            .map(|name|Definition::for_code(name))
+            .map(|name| Definition::for_code(name))
             .collect();
         info.new_dataset::<Definition>()
             .shape(2)
@@ -122,7 +236,10 @@ fn fixture(path: &std::path::Path, grid: GridGeometry) -> OrientedFixture {
             .write_raw(&definitions)
             .unwrap();
     }
-    OrientedFixture{coverage:BathymetryCoverage::open(path).unwrap().remove(0),grid}
+    OrientedFixture {
+        coverage: BathymetryCoverage::open(path).unwrap().remove(0),
+        grid,
+    }
 }
 struct Smoke {
     mercator: bool,
@@ -134,12 +251,14 @@ impl ApplicationHandler for Smoke {
             el.create_window(
                 Window::default_attributes()
                     .with_title("Larger-than-device coverage oracle")
-                    .with_visible(false).with_active(false)
+                    .with_visible(false)
+                    .with_active(false)
                     .with_inner_size(PhysicalSize::new(1200, 800)),
             )
             .unwrap(),
         );
-        assert!(!w.is_visible().unwrap_or(true));assert!(!w.has_focus());
+        assert!(!w.is_visible().unwrap_or(true));
+        assert!(!w.has_focus());
         let size = w.inner_size();
         let mut r = pollster::block_on(WgpuRenderer::new(w.clone())).unwrap();
         r.background_color = Color::WHITE;
@@ -287,7 +406,8 @@ impl ApplicationHandler for Smoke {
             }
         }
         std::fs::write(self.out.join("result.json"),serde_json::to_vec_pretty(&serde_json::json!({"source":"synthetic S-102 HDF5 fixture; not a certified exchange set","gpu_texture_limit":limit,"cases":cases,"native_os_input_verified":false,"window_visible":false,"window_focused":false})).unwrap()).unwrap();
-        assert!(!w.is_visible().unwrap_or(true));assert!(!w.has_focus());
+        assert!(!w.is_visible().unwrap_or(true));
+        assert!(!w.has_focus());
         el.exit();
     }
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}

@@ -31,9 +31,15 @@ pub struct GeographicDrawingCopy {
     longitude: f64,
 }
 impl GeographicDrawingCopy {
-    pub fn position(self) -> GeographicPosition { self.position }
-    pub fn latitude(self) -> f64 { self.position.latitude() }
-    pub fn longitude(self) -> f64 { self.longitude }
+    pub fn position(self) -> GeographicPosition {
+        self.position
+    }
+    pub fn latitude(self) -> f64 {
+        self.position.latitude()
+    }
+    pub fn longitude(self) -> f64 {
+        self.longitude
+    }
 }
 impl GeographicPosition {
     pub fn new(latitude: f64, longitude: f64) -> Result<Self> {
@@ -144,15 +150,36 @@ pub struct GeodesicRadiusArc {
     sweep_deg: f64,
 }
 impl GeodesicRadiusArc {
-    pub fn new(center: GeographicPosition, radius_m: f64, start_azimuth_deg: f64, sweep_deg: f64) -> Result<Self> {
-        ensure!(radius_m.is_finite() && radius_m >= 0., "Invalid geographic arc radius");
-        ensure!(start_azimuth_deg.is_finite() && sweep_deg.is_finite(), "Invalid geographic arc angle");
-        Ok(Self { center, radius_m, start_azimuth_deg, sweep_deg })
+    pub fn new(
+        center: GeographicPosition,
+        radius_m: f64,
+        start_azimuth_deg: f64,
+        sweep_deg: f64,
+    ) -> Result<Self> {
+        ensure!(
+            radius_m.is_finite() && radius_m >= 0.,
+            "Invalid geographic arc radius"
+        );
+        ensure!(
+            start_azimuth_deg.is_finite() && sweep_deg.is_finite(),
+            "Invalid geographic arc angle"
+        );
+        Ok(Self {
+            center,
+            radius_m,
+            start_azimuth_deg,
+            sweep_deg,
+        })
     }
     /// Evaluate a fraction of the signed arc, including exact endpoints.
     pub fn position_at(self, fraction: f64) -> Result<GeographicPosition> {
-        ensure!(fraction.is_finite() && (0.0..=1.0).contains(&fraction), "Invalid arc fraction");
-        if self.radius_m == 0. { return Ok(self.center); }
+        ensure!(
+            fraction.is_finite() && (0.0..=1.0).contains(&fraction),
+            "Invalid arc fraction"
+        );
+        if self.radius_m == 0. {
+            return Ok(self.center);
+        }
         let angle = self.start_azimuth_deg + self.sweep_deg * fraction;
         ensure!(angle.is_finite(), "Geographic arc angle overflow");
         direct(self.center, angle, self.radius_m)
@@ -160,19 +187,40 @@ impl GeodesicRadiusArc {
     /// Samples with an explicit azimuth-step bound and vertex budget. This is
     /// an angular sampling contract, not a screen-pixel error guarantee.
     /// A renderer must choose/refine sampling for its projection and camera.
-    pub fn sample(self, max_azimuth_step_deg: f64, max_vertices: usize) -> Result<Vec<GeographicPosition>> {
-        ensure!(max_azimuth_step_deg.is_finite() && max_azimuth_step_deg > 0. && max_azimuth_step_deg <= 180., "Invalid arc sampling step");
-        ensure!((2..=1_000_001).contains(&max_vertices), "Invalid arc vertex budget");
+    pub fn sample(
+        self,
+        max_azimuth_step_deg: f64,
+        max_vertices: usize,
+    ) -> Result<Vec<GeographicPosition>> {
+        ensure!(
+            max_azimuth_step_deg.is_finite()
+                && max_azimuth_step_deg > 0.
+                && max_azimuth_step_deg <= 180.,
+            "Invalid arc sampling step"
+        );
+        ensure!(
+            (2..=1_000_001).contains(&max_vertices),
+            "Invalid arc vertex budget"
+        );
         let segments = (self.sweep_deg.abs() / max_azimuth_step_deg).ceil().max(1.);
-        ensure!(segments.is_finite() && segments <= (max_vertices - 1) as f64, "Geographic arc vertex budget exceeded");
+        ensure!(
+            segments.is_finite() && segments <= (max_vertices - 1) as f64,
+            "Geographic arc vertex budget exceeded"
+        );
         let segments = segments as usize;
         let first = self.position_at(0.)?;
         let mut points = Vec::with_capacity(segments + 1);
         points.push(first);
-        for i in 1..segments { points.push(self.position_at(i as f64 / segments as f64)?); }
+        for i in 1..segments {
+            points.push(self.position_at(i as f64 / segments as f64)?);
+        }
         // Closed turns have identical endpoint bits. Avoid a false tiny gap
         // from separate trigonometric evaluations of equivalent bearings.
-        points.push(if self.sweep_deg.rem_euclid(360.) == 0. { first } else { self.position_at(1.)? });
+        points.push(if self.sweep_deg.rem_euclid(360.) == 0. {
+            first
+        } else {
+            self.position_at(1.)?
+        });
         Ok(points)
     }
     /// Lift successive longitudes to nearby drawing copies without modifying
@@ -181,8 +229,16 @@ impl GeodesicRadiusArc {
     /// introduce a spurious map-wide segment. Sampling remains an angular
     /// contract: callers must refine for their projection/camera, especially
     /// at polar singularities or a 180-degree nearest-copy tie.
-    pub fn sample_drawing_copies(self, max_azimuth_step_deg: f64, max_vertices: usize, reference_meridian: f64) -> Result<Vec<GeographicDrawingCopy>> {
-        ensure!(reference_meridian.is_finite() && reference_meridian.abs() <= 1e9, "Invalid drawing reference meridian");
+    pub fn sample_drawing_copies(
+        self,
+        max_azimuth_step_deg: f64,
+        max_vertices: usize,
+        reference_meridian: f64,
+    ) -> Result<Vec<GeographicDrawingCopy>> {
+        ensure!(
+            reference_meridian.is_finite() && reference_meridian.abs() <= 1e9,
+            "Invalid drawing reference meridian"
+        );
         let positions = self.sample(max_azimuth_step_deg, max_vertices)?;
         let mut previous = reference_meridian;
         let mut copies = Vec::with_capacity(positions.len());
@@ -193,7 +249,10 @@ impl GeodesicRadiusArc {
             // A tie selects the -180-degree displacement, like longitude_near.
             let turns = ((previous - position.longitude() - 180.) / 360.).ceil();
             let longitude = position.longitude() + 360. * turns;
-            copies.push(GeographicDrawingCopy { position, longitude });
+            copies.push(GeographicDrawingCopy {
+                position,
+                longitude,
+            });
             previous = longitude;
         }
         Ok(copies)
@@ -396,7 +455,6 @@ mod tests {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -404,73 +462,107 @@ mod geographic_arc_tests {
     use super::*;
     #[test]
     fn drawing_copies_preserve_source_and_polar_winding_without_a_long_bridge() {
-        for (lat,lon) in [(50.,179.9),(50.,-179.9),(89.9,179.9),(-89.9,-179.9)] {
-            let center=GeographicPosition::new(lat,lon).unwrap();
-            for sweep in [360.,-360.,720.,-720.] {
-                let arc=GeodesicRadiusArc::new(center,50_000.,35.,sweep).unwrap();
-                let source=arc.sample(5.,300).unwrap();
-                let copies=arc.sample_drawing_copies(5.,300,lon).unwrap();
-                assert_eq!(copies.len(),source.len());
-                for (p,q) in source.iter().zip(&copies) {
-                    assert_eq!(*p,q.position());
-                    assert_eq!(p.latitude().to_bits(),q.latitude().to_bits());
-                    assert!((q.longitude()-p.longitude()).rem_euclid(360.).min((p.longitude()-q.longitude()).rem_euclid(360.))<1e-10);
-                    let original=p.to_ecef(0.).unwrap();
-                    let radians=q.longitude().to_radians();
-                    let planar=original[0].hypot(original[1]);
-                    assert!((planar*radians.cos()-original[0]).abs()<1e-6);
-                    assert!((planar*radians.sin()-original[1]).abs()<1e-6);
+        for (lat, lon) in [(50., 179.9), (50., -179.9), (89.9, 179.9), (-89.9, -179.9)] {
+            let center = GeographicPosition::new(lat, lon).unwrap();
+            for sweep in [360., -360., 720., -720.] {
+                let arc = GeodesicRadiusArc::new(center, 50_000., 35., sweep).unwrap();
+                let source = arc.sample(5., 300).unwrap();
+                let copies = arc.sample_drawing_copies(5., 300, lon).unwrap();
+                assert_eq!(copies.len(), source.len());
+                for (p, q) in source.iter().zip(&copies) {
+                    assert_eq!(*p, q.position());
+                    assert_eq!(p.latitude().to_bits(), q.latitude().to_bits());
+                    assert!(
+                        (q.longitude() - p.longitude())
+                            .rem_euclid(360.)
+                            .min((p.longitude() - q.longitude()).rem_euclid(360.))
+                            < 1e-10
+                    );
+                    let original = p.to_ecef(0.).unwrap();
+                    let radians = q.longitude().to_radians();
+                    let planar = original[0].hypot(original[1]);
+                    assert!((planar * radians.cos() - original[0]).abs() < 1e-6);
+                    assert!((planar * radians.sin() - original[1]).abs() < 1e-6);
                 }
-                assert!(copies.windows(2).all(|p| (p[1].longitude()-p[0].longitude()).abs()<180.));
-                assert_eq!(copies.first().unwrap().position(),copies.last().unwrap().position());
-                let winding=copies.last().unwrap().longitude()-copies.first().unwrap().longitude();
-                if lat.abs()<80. {
-                    assert_eq!(copies.first(),copies.last());
+                assert!(copies
+                    .windows(2)
+                    .all(|p| (p[1].longitude() - p[0].longitude()).abs() < 180.));
+                assert_eq!(
+                    copies.first().unwrap().position(),
+                    copies.last().unwrap().position()
+                );
+                let winding =
+                    copies.last().unwrap().longitude() - copies.first().unwrap().longitude();
+                if lat.abs() < 80. {
+                    assert_eq!(copies.first(), copies.last());
                 } else {
-                    assert!((winding.abs()-sweep.abs()).abs()<1e-10);
+                    assert!((winding.abs() - sweep.abs()).abs() < 1e-10);
                 }
             }
         }
-        let center=GeographicPosition::new(50.,179.9).unwrap();
-        let zero=GeodesicRadiusArc::new(center,0.,0.,360.).unwrap();
-        assert!(zero.sample_drawing_copies(5.,100,f64::NAN).is_err());
-        assert!(zero.sample_drawing_copies(5.,100,1e10).is_err());
-        assert!(zero.sample_drawing_copies(1.,360,179.9).is_err());
-        let points=zero.sample_drawing_copies(90.,5,179.9).unwrap();
-        assert!(points.iter().all(|p| p.position()==center && p.longitude().to_bits()==center.longitude().to_bits()));
+        let center = GeographicPosition::new(50., 179.9).unwrap();
+        let zero = GeodesicRadiusArc::new(center, 0., 0., 360.).unwrap();
+        assert!(zero.sample_drawing_copies(5., 100, f64::NAN).is_err());
+        assert!(zero.sample_drawing_copies(5., 100, 1e10).is_err());
+        assert!(zero.sample_drawing_copies(1., 360, 179.9).is_err());
+        let points = zero.sample_drawing_copies(90., 5, 179.9).unwrap();
+        assert!(points
+            .iter()
+            .all(|p| p.position() == center
+                && p.longitude().to_bits() == center.longitude().to_bits()));
     }
     #[test]
     fn geographic_radius_arcs_keep_metric_radius_and_signed_bearings() {
-        for (lat,lon) in [(0.,0.), (50.,179.9), (89.5,-179.9),(-89.5,179.9)] {
-            let center=GeographicPosition::new(lat,lon).unwrap();
-            for sweep in [270.,-270.,720.,-360.] {
-                let arc=GeodesicRadiusArc::new(center,50_000.,35.,sweep).unwrap();
-                let points=arc.sample(5.,200).unwrap();
-                for (i,p) in points.iter().enumerate() {
-                    let measure=inverse(center,*p).unwrap();
-                    assert!((measure.distance_m-50_000.).abs()<1e-6);
-                    let expected=35.+sweep*i as f64/(points.len()-1) as f64;
-                    let error=(measure.initial_azimuth_deg-expected+180.).rem_euclid(360.)-180.;
-                    assert!(error.abs()<1e-8, "{lat} {lon} {sweep} {i} {error}");
+        for (lat, lon) in [(0., 0.), (50., 179.9), (89.5, -179.9), (-89.5, 179.9)] {
+            let center = GeographicPosition::new(lat, lon).unwrap();
+            for sweep in [270., -270., 720., -360.] {
+                let arc = GeodesicRadiusArc::new(center, 50_000., 35., sweep).unwrap();
+                let points = arc.sample(5., 200).unwrap();
+                for (i, p) in points.iter().enumerate() {
+                    let measure = inverse(center, *p).unwrap();
+                    assert!((measure.distance_m - 50_000.).abs() < 1e-6);
+                    let expected = 35. + sweep * i as f64 / (points.len() - 1) as f64;
+                    let error =
+                        (measure.initial_azimuth_deg - expected + 180.).rem_euclid(360.) - 180.;
+                    assert!(error.abs() < 1e-8, "{lat} {lon} {sweep} {i} {error}");
                 }
-                if sweep.rem_euclid(360.)==0. { assert_eq!(points.first(),points.last()); }
+                if sweep.rem_euclid(360.) == 0. {
+                    assert_eq!(points.first(), points.last());
+                }
             }
         }
     }
     #[test]
     fn geographic_arc_budget_and_degenerate_inputs_are_explicit() {
-        let center=GeographicPosition::new(50.,0.).unwrap();
-        for radius in [-1.,f64::NAN,f64::INFINITY] { assert!(GeodesicRadiusArc::new(center,radius,0.,360.).is_err()); }
-        assert!(GeodesicRadiusArc::new(center,1.,f64::INFINITY,360.).is_err());
-        let arc=GeodesicRadiusArc::new(center,10.,0.,360.).unwrap();
-        for step in [0.,-1.,181.,f64::NAN] { assert!(arc.sample(step,100).is_err()); }
-        assert!(arc.sample(1.,360).is_err());
-        assert_eq!(arc.sample(1.,361).unwrap().len(),361);
+        let center = GeographicPosition::new(50., 0.).unwrap();
+        for radius in [-1., f64::NAN, f64::INFINITY] {
+            assert!(GeodesicRadiusArc::new(center, radius, 0., 360.).is_err());
+        }
+        assert!(GeodesicRadiusArc::new(center, 1., f64::INFINITY, 360.).is_err());
+        let arc = GeodesicRadiusArc::new(center, 10., 0., 360.).unwrap();
+        for step in [0., -1., 181., f64::NAN] {
+            assert!(arc.sample(step, 100).is_err());
+        }
+        assert!(arc.sample(1., 360).is_err());
+        assert_eq!(arc.sample(1., 361).unwrap().len(), 361);
         assert!(arc.position_at(-0.1).is_err());
         assert!(arc.position_at(f64::NAN).is_err());
-        let point_arc=GeodesicRadiusArc::new(center,0.,13.,-360.).unwrap().sample(90.,5).unwrap();
-        assert!(point_arc.iter().all(|p| *p==center));
-        assert_eq!(GeodesicRadiusArc::new(center,10.,0.,0.).unwrap().sample(90.,2).unwrap().len(),2);
-        assert!(GeodesicRadiusArc::new(center,10.,0.,f64::MAX).unwrap().sample(1.,1000).is_err());
+        let point_arc = GeodesicRadiusArc::new(center, 0., 13., -360.)
+            .unwrap()
+            .sample(90., 5)
+            .unwrap();
+        assert!(point_arc.iter().all(|p| *p == center));
+        assert_eq!(
+            GeodesicRadiusArc::new(center, 10., 0., 0.)
+                .unwrap()
+                .sample(90., 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(GeodesicRadiusArc::new(center, 10., 0., f64::MAX)
+            .unwrap()
+            .sample(1., 1000)
+            .is_err());
     }
 }

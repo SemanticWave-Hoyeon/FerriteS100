@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Rust-1.70+-orange?logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/Rust-1.99+-orange?logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/License-PolyForm%20NC-blue" alt="License">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/GPU-Vulkan%20%7C%20DX12%20%7C%20Metal-green" alt="GPU">
@@ -84,7 +84,7 @@ FerriteS100 supports plugins for extended functionality. Each plugin:
 
 ### Prerequisites
 
-- **Rust 1.70+** with Cargo
+- **Rust 1.99+** with Cargo
 - GPU with **Vulkan**, **DirectX 12**, or **Metal** support
 
 ### Build from Source

@@ -115,12 +115,14 @@ fn bounded_base64(encoded: &str, limit: usize) -> Result<Vec<u8>> {
 }
 fn decode_hex(encoded: &str) -> Result<Vec<u8>> {
     ensure!(
-        !encoded.is_empty() && encoded.len() <= 512 && encoded.len() % 2 == 0,
+        !encoded.is_empty() && encoded.len() <= 512 && encoded.len().is_multiple_of(2),
         "Invalid signature hex length"
     );
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |c: u8| {
                 (c as char)

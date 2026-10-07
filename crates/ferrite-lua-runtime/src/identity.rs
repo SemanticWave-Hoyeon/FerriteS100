@@ -59,7 +59,8 @@ mod tests {
         // configuration makes only persistent output identity unavailable.
         // SAFETY: the same immutable, NUL-terminated vendored static as the API.
         let linked = unsafe { CStr::from_ptr(std::ptr::addr_of!(lua_ident)) }
-            .to_str().expect("vendored Lua release is UTF-8");
+            .to_str()
+            .expect("vendored Lua release is UTF-8");
         assert!(linked.starts_with(&format!("$LuaVersion: {}.", selected_version().name())));
         assert!(linked.contains("Lua.org, PUC-Rio"));
         assert!(linked.contains("$LuaAuthors:"));
@@ -69,9 +70,16 @@ mod tests {
             build_fingerprint: BUILD_FINGERPRINT,
         };
         if BUILD_ID_COMPLETE {
-            assert_eq!(runtime_identity().expect("managed vendored Lua identity"), identity);
+            assert_eq!(
+                runtime_identity().expect("managed vendored Lua identity"),
+                identity
+            );
         } else {
-            assert_eq!(runtime_identity(), None, "Incomplete build must disable persistent cache identity");
+            assert_eq!(
+                runtime_identity(),
+                None,
+                "Incomplete build must disable persistent cache identity"
+            );
         }
         assert_eq!(identity.backend, selected_version());
         assert_eq!(identity.build_fingerprint.len(), 64);
@@ -99,6 +107,10 @@ mod tests {
         };
         assert_ne!(key(identity), key(changed_patch));
         assert_ne!(key(identity), key(changed_build));
-        println!("LINKED_RUNTIME {:?}; BUILD_ID_COMPLETE={BUILD_ID_COMPLETE}; PUBLIC_IDENTITY={:?}", identity, runtime_identity());
+        println!(
+            "LINKED_RUNTIME {:?}; BUILD_ID_COMPLETE={BUILD_ID_COMPLETE}; PUBLIC_IDENTITY={:?}",
+            identity,
+            runtime_identity()
+        );
     }
 }

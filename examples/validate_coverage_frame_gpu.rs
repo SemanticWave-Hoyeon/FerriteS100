@@ -1,8 +1,4 @@
 use anyhow::{ensure, Context, Result};
-use ferrite_wgpu::coverage_clip::{clip_wgsl, create_clip_layout, ClipTransform};
-use ferrite_wgpu::coverage_gpu_frame::{
-    CoverageGpuBinding, CoverageGpuFrame, CoverageGpuPlan,
-};
 use ferrite_kernel::coverage_frame::CoverageFrame;
 use ferrite_kernel::coverage_selection::{CoverageFootprint, Region, SelectedCoverage, Selection};
 use ferrite_kernel::scale_policy::CoverageScaleRange;
@@ -10,6 +6,8 @@ use ferrite_render::{
     DrawingInstruction, InstructionCoverageClass, PointInstruction, PortrayalOrigin,
     PreparedCoverage, PreparedCoveragePass, WorldPoint,
 };
+use ferrite_wgpu::coverage_clip::{clip_wgsl, create_clip_layout, ClipTransform};
+use ferrite_wgpu::coverage_gpu_frame::{CoverageGpuBinding, CoverageGpuFrame, CoverageGpuPlan};
 use std::sync::Arc;
 fn trace(_: &str) {}
 fn read_frame(

@@ -152,14 +152,26 @@ impl BathymetryPortrayal {
     }
     /// Staged original-candidate export. The renderer requires an independently
     /// qualified frame before it can commit this packed material to a scene.
-    pub fn continuous_raster_window(&self, coverages:&[BathymetryCoverage],
-        corrections:crate::continuous::ConstantDatumAdjustments,window:GridWindow,id:String,
-        max_texture_dimension:u32)->Result<ferrite_render::ContinuousRasterLayer> {
-        let packet=crate::continuous::ContinuousDepthTile::capture(coverages,corrections,window,self)?;
-        let atlas=packet.atlas(max_texture_dimension)?;
+    pub fn continuous_raster_window(
+        &self,
+        coverages: &[BathymetryCoverage],
+        corrections: crate::continuous::ConstantDatumAdjustments,
+        window: GridWindow,
+        id: String,
+        max_texture_dimension: u32,
+    ) -> Result<ferrite_render::ContinuousRasterLayer> {
+        let packet =
+            crate::continuous::ContinuousDepthTile::capture(coverages, corrections, window, self)?;
+        let atlas = packet.atlas(max_texture_dimension)?;
         ferrite_render::ContinuousRasterLayer::new(RasterLayer {
-            draw_order:self.draw_order,viewing_groups:self.viewing_groups.clone(),id,bounds:packet.bounds,
-            width:atlas.width,height:atlas.height,rgba:atlas.bytes,grid:Some(packet.grid),
+            draw_order: self.draw_order,
+            viewing_groups: self.viewing_groups.clone(),
+            id,
+            bounds: packet.bounds,
+            width: atlas.width,
+            height: atlas.height,
+            rgba: atlas.bytes,
+            grid: Some(packet.grid),
         })
     }
     /// Read only this source window, oriented west-to-east and north-to-south.
@@ -341,15 +353,44 @@ mod numeric_tests {
     fn geometric_sources_cannot_silently_enter_centroid_raster_path() {
         struct Masked(GridGeometry);
         impl NumericCoverageSource for Masked {
-            fn numeric_geometry(&self)->&GridGeometry {&self.0}
-            fn requires_spatial_mask(&self)->bool {true}
-            fn visit_window_values(&self,_:GridWindow,_:&mut dyn FnMut(usize,Option<f64>)->Result<()>)->Result<()> {
+            fn numeric_geometry(&self) -> &GridGeometry {
+                &self.0
+            }
+            fn requires_spatial_mask(&self) -> bool {
+                true
+            }
+            fn visit_window_values(
+                &self,
+                _: GridWindow,
+                _: &mut dyn FnMut(usize, Option<f64>) -> Result<()>,
+            ) -> Result<()> {
                 panic!("Geometric source must be rejected before reading/flattening values");
             }
         }
-        let source=Masked(GridGeometry{width:1,height:1,origin_x:0.5,origin_y:0.5,spacing_x:1.,spacing_y:1.,horizontal_crs:4326});
-        let result=portrayal().raster_window(&source,GridWindow{column:0,row:0,width:1,height:1},"masked".into());
-        assert!(result.err().unwrap().to_string().contains("continuous clipping"));
+        let source = Masked(GridGeometry {
+            width: 1,
+            height: 1,
+            origin_x: 0.5,
+            origin_y: 0.5,
+            spacing_x: 1.,
+            spacing_y: 1.,
+            horizontal_crs: 4326,
+        });
+        let result = portrayal().raster_window(
+            &source,
+            GridWindow {
+                column: 0,
+                row: 0,
+                width: 1,
+                height: 1,
+            },
+            "masked".into(),
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("continuous clipping"));
     }
     #[test]
     fn adjusted_f64_depth_is_classified_without_f32_rounding() {

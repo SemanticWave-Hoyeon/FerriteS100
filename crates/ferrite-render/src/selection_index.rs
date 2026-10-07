@@ -1,6 +1,6 @@
 //! Conservative screen-space selection broad phase. The exact portrayal hit
 //! predicates remain authoritative for dash gaps, suppressed spans and holes.
-use crate::{DrawingInstruction, LineSpan, Scaler, ScreenPoint, WorldPoint};
+use crate::{DrawingInstruction, LineSpan, Scaler, ScreenPoint};
 use rstar::{RTree, RTreeObject, AABB};
 #[derive(Debug, Clone)]
 struct Envelope {
@@ -208,7 +208,9 @@ impl SelectionIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AreaInstruction, Color, GeoBounds, LineInstruction, LineStyle, Viewport};
+    use crate::{
+        AreaInstruction, Color, GeoBounds, LineInstruction, LineStyle, Viewport, WorldPoint,
+    };
     fn scaler() -> Scaler {
         Scaler::new(
             GeoBounds::new(-10., -10., 10., 10.),

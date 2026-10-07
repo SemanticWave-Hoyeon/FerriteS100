@@ -1,8 +1,8 @@
 //! Portrayal Catalogue container and loading
 
+use crate::{BoundPortrayalCatalogue, CatalogueSources};
 use std::collections::HashMap;
 use std::io::BufReader;
-use crate::{BoundPortrayalCatalogue, CatalogueSources};
 use std::path::{Path, PathBuf};
 
 use quick_xml::events::{BytesStart, Event};
@@ -525,7 +525,11 @@ impl PortrayalCatalogue {
     ///   <palette name="Night">...</palette>
     /// </colorProfile>
     /// ```
-    fn parse_color_profiles_all(&self, path: &Path, sources: &CatalogueSources) -> Result<Vec<ColorProfile>> {
+    fn parse_color_profiles_all(
+        &self,
+        path: &Path,
+        sources: &CatalogueSources,
+    ) -> Result<Vec<ColorProfile>> {
         let bytes = sources.read_path(path)?;
         let reader = BufReader::new(bytes.as_ref());
         let mut xml_reader = Reader::from_reader(reader);
@@ -705,7 +709,8 @@ impl PortrayalCatalogue {
                         "LineStyle catalogue input budget exceeded".into(),
                     ));
                 }
-                let definition = crate::line_style_xml::parse_bytes(&sources.read_path(&path)?, &id)?;
+                let definition =
+                    crate::line_style_xml::parse_bytes(&sources.read_path(&path)?, &id)?;
                 if definitions.insert(id.clone(), definition).is_some() {
                     return Err(PCError::InvalidValue(format!(
                         "Duplicate LineStyle ID {id}"
@@ -754,7 +759,12 @@ impl PortrayalCatalogue {
     ///   <v2><x>0</x><y>43.13</y></v2>
     /// </af:symbolFill>
     /// ```
-    fn parse_area_fill_xml(&self, path: &Path, id: &str, sources: &CatalogueSources) -> Result<AreaFill> {
+    fn parse_area_fill_xml(
+        &self,
+        path: &Path,
+        id: &str,
+        sources: &CatalogueSources,
+    ) -> Result<AreaFill> {
         let bytes = sources.read_path(path)?;
         let reader = BufReader::new(bytes.as_ref());
         let mut xml_reader = Reader::from_reader(reader);

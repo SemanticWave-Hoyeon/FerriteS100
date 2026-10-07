@@ -356,21 +356,21 @@ impl PointInstruction {
             curve_tangent_bearing,
             line_placement: None,
             symbol_ref: self.symbol_ref.clone(),
-            rotation: self.rotation.clone(),
-            rotation_crs: self.rotation_crs.clone(),
-            scale: self.scale.clone(),
-            local_offset: self.local_offset.clone(),
-            priority: self.priority.clone(),
-            viewing_group: self.viewing_group.clone(),
+            rotation: self.rotation,
+            rotation_crs: self.rotation_crs,
+            scale: self.scale,
+            local_offset: self.local_offset,
+            priority: self.priority,
+            viewing_group: self.viewing_group,
             additional_viewing_groups: self.additional_viewing_groups.clone(),
-            scale_range: self.scale_range.clone(),
-            display_plane: self.display_plane.clone(),
-            feature_id: self.feature_id.clone(),
-            cell_index: self.cell_index.clone(),
+            scale_range: self.scale_range,
+            display_plane: self.display_plane,
+            feature_id: self.feature_id,
+            cell_index: self.cell_index,
             time_intervals: self.time_intervals.clone(),
             dependency: self.dependency.clone(),
             portrayal_origin: self.portrayal_origin.clone(),
-            depth: self.depth.clone(),
+            depth: self.depth,
         }
     }
     pub fn with_line_placement(mut self, value: crate::LineSymbolPlacement) -> Self {
@@ -801,7 +801,9 @@ pub struct AreaInstruction {
     pub portrayal_origin: crate::PortrayalOrigin,
 }
 
-fn default_pattern_clip_symbols() -> bool { true }
+fn default_pattern_clip_symbols() -> bool {
+    true
+}
 
 impl AreaInstruction {
     #[inline]
@@ -1764,16 +1766,21 @@ mod catalogue_plane_tests {
     use super::*;
     #[test]
     fn catalogue_plane_orders_share_composition_sorting_and_roundtrip_without_truncation() {
-        let mut planes=Vec::new();
-        for value in [i32::MIN,-701,-1,1,90000,i32::MAX] {
-            let p=DisplayPlane::from_catalogue_order(std::num::NonZeroI32::new(value).unwrap());
-            assert_eq!(p.order().get(),value);
-            let restored:DisplayPlane=serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
-            assert_eq!(restored,p);
-            assert_eq!(p.composition_plane(ferrite_kernel::CompositionStage::Chart),DisplayPlane::Interoperability(p.order()).composition_plane(ferrite_kernel::CompositionStage::Chart));
+        let mut planes = Vec::new();
+        for value in [i32::MIN, -701, -1, 1, 90000, i32::MAX] {
+            let p = DisplayPlane::from_catalogue_order(std::num::NonZeroI32::new(value).unwrap());
+            assert_eq!(p.order().get(), value);
+            let restored: DisplayPlane =
+                serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+            assert_eq!(restored, p);
+            assert_eq!(
+                p.composition_plane(ferrite_kernel::CompositionStage::Chart),
+                DisplayPlane::Interoperability(p.order())
+                    .composition_plane(ferrite_kernel::CompositionStage::Chart)
+            );
             planes.push(p.composition_plane(ferrite_kernel::CompositionStage::Chart));
         }
-        assert!(planes.windows(2).all(|p|p[0]<p[1]));
+        assert!(planes.windows(2).all(|p| p[0] < p[1]));
         assert!(serde_json::from_str::<DisplayPlane>(r#"{"Catalogue":0}"#).is_err());
     }
 }

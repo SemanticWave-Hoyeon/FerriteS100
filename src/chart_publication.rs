@@ -316,6 +316,7 @@ pub(crate) struct CellPublication {
 }
 impl CellPublication {
     /// Validate every key before mutating any cell. No unchanged cell is cloned.
+    #[cfg(test)]
     pub(crate) fn stage(
         cells: &mut Vec<S101Cell>,
         identities: &mut LoadedSourceIdentities,

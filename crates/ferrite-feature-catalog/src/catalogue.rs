@@ -51,10 +51,9 @@ impl FeatureCatalogue {
             }
             let (bindings, parent) = if let Some(feature) = self.feature_types.get(code) {
                 (&feature.attribute_bindings, feature.super_type.as_deref())
-            } else if let Some(info) = self.information_types.get(code) {
-                (&info.attribute_bindings, info.super_type.as_deref())
             } else {
-                return None;
+                let info = self.information_types.get(code)?;
+                (&info.attribute_bindings, info.super_type.as_deref())
             };
             if let Some(binding) = bindings.iter().find(|b| b.attribute_code == attribute) {
                 return Some(binding.visibility);
@@ -76,9 +75,13 @@ impl FeatureCatalogue {
         tracing::info!("Loading Feature Catalogue: {}", path.display());
 
         let mut bytes = Vec::new();
-        File::open(path)?.take(Self::MAX_XML_SIZE + 1).read_to_end(&mut bytes)?;
+        File::open(path)?
+            .take(Self::MAX_XML_SIZE + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > Self::MAX_XML_SIZE {
-            return Err(crate::FCError::InvalidValue("FC XML byte limit exceeded (50 MiB)".into()));
+            return Err(crate::FCError::InvalidValue(
+                "FC XML byte limit exceeded (50 MiB)".into(),
+            ));
         }
         Self::parse_bytes(path, &bytes)
     }
@@ -88,12 +91,19 @@ impl FeatureCatalogue {
         use sha2::Digest;
         let path = path.as_ref();
         let mut bytes = Vec::new();
-        File::open(path)?.take(Self::MAX_XML_SIZE + 1).read_to_end(&mut bytes)?;
+        File::open(path)?
+            .take(Self::MAX_XML_SIZE + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > Self::MAX_XML_SIZE {
-            return Err(crate::FCError::InvalidValue("FC XML byte limit exceeded (50 MiB)".into()));
+            return Err(crate::FCError::InvalidValue(
+                "FC XML byte limit exceeded (50 MiB)".into(),
+            ));
         }
         let digest = sha2::Sha256::digest(&bytes).into();
-        Ok(BoundFeatureCatalogue { catalogue: Self::parse_bytes(path, &bytes)?, digest })
+        Ok(BoundFeatureCatalogue {
+            catalogue: Self::parse_bytes(path, &bytes)?,
+            digest,
+        })
     }
 
     fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<Self> {
@@ -563,12 +573,11 @@ fn parse_attribute_binding<R: std::io::BufRead>(
                         }
                     }
                     // Handle self-closing upper tag: <S100Base:upper xsi:nil="true" infinite="true" />
-                    "upper" => {
-                        if get_attr_value(e, "infinite") == Some("true".to_string())
-                            || get_attr_value(e, "nil") == Some("true".to_string())
-                        {
-                            binding.multiplicity.upper = None; // unbounded
-                        }
+                    "upper"
+                        if (get_attr_value(e, "infinite") == Some("true".to_string())
+                            || get_attr_value(e, "nil") == Some("true".to_string())) =>
+                    {
+                        binding.multiplicity.upper = None; // unbounded
                     }
                     _ => {}
                 }
@@ -755,12 +764,21 @@ mod feature_use_tests {
 
 /// Parsed catalogue and exact source identity, replaced as one value.
 #[derive(Debug, Clone)]
-pub struct BoundFeatureCatalogue { catalogue: FeatureCatalogue, digest: [u8; 32] }
+pub struct BoundFeatureCatalogue {
+    catalogue: FeatureCatalogue,
+    digest: [u8; 32],
+}
 impl std::ops::Deref for BoundFeatureCatalogue {
     type Target = FeatureCatalogue;
-    fn deref(&self) -> &Self::Target { &self.catalogue }
+    fn deref(&self) -> &Self::Target {
+        &self.catalogue
+    }
 }
-impl BoundFeatureCatalogue { pub fn source_digest(&self) -> &[u8; 32] { &self.digest } }
+impl BoundFeatureCatalogue {
+    pub fn source_digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
 
 #[cfg(test)]
 mod source_identity_tests {
@@ -768,14 +786,27 @@ mod source_identity_tests {
     #[test]
     fn bound_metadata_and_digest_survive_original_edit_and_deletion() {
         use sha2::Digest;
-        let path = std::env::temp_dir().join(format!("ferrite-fc-source-{}-{}.xml", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let xml = |name: &str| format!("<S100_FC_FeatureCatalogue><name>{name}</name><versionNumber>2.0</versionNumber><productId>S-101</productId></S100_FC_FeatureCatalogue>");
-        let a = xml("A"); let b = xml("B");
+        let path = std::env::temp_dir().join(format!(
+            "ferrite-fc-source-{}-{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let xml = |name: &str| {
+            format!("<S100_FC_FeatureCatalogue><name>{name}</name><versionNumber>2.0</versionNumber><productId>S-101</productId></S100_FC_FeatureCatalogue>")
+        };
+        let a = xml("A");
+        let b = xml("B");
         std::fs::write(&path, &a).unwrap();
         let first = FeatureCatalogue::load_bound(&path).unwrap();
         assert_eq!(FeatureCatalogue::load(&path).unwrap().name, first.name);
         assert_eq!(first.name, "A");
-        assert_eq!(first.source_digest().as_slice(), sha2::Sha256::digest(a.as_bytes()).as_slice());
+        assert_eq!(
+            first.source_digest().as_slice(),
+            sha2::Sha256::digest(a.as_bytes()).as_slice()
+        );
         std::fs::write(&path, &b).unwrap();
         let second = FeatureCatalogue::load_bound(&path).unwrap();
         assert_eq!(second.name, "B");

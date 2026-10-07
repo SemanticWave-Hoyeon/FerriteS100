@@ -229,7 +229,7 @@ pub(crate) fn capture(
             );
             let discovery = bound.discovery();
             ensure!(
-                discovery.edition_number > 0 && discovery.update_number.map_or(true, |n| n <= 999),
+                discovery.edition_number > 0 && discovery.update_number.is_none_or(|n| n <= 999),
                 "Lifecycle catalogue edition/update range is invalid"
             );
             Ok(Some(MetadataEvidence {
@@ -319,12 +319,12 @@ pub(crate) fn capture(
             });
             let update = updates.next().map(|n| number(text(n)?)).transpose()?;
             ensure!(
-                updates.next().is_none() && update.map_or(true, |n| n <= 999),
+                updates.next().is_none() && update.is_none_or(|n| n <= 999),
                 "Lifecycle catalogue update is duplicate or exceeds999"
             );
             let issue_date = date(text(child(entry, "issueDate")?)?)?;
             let (raw_resource_sha256, _, _) = resource_digest(retained_data)?;
-            Ok(Some(MetadataEvidence {
+            let evidence = MetadataEvidence {
                 purpose,
                 edition,
                 update,
@@ -333,7 +333,16 @@ pub(crate) fn capture(
                 raw_resource_sha256,
                 catalogue_xml_hash: CatalogueHash::UnverifiedSha256(Sha256::digest(&bytes).into()),
                 provenance: Provenance::UnverifiedCatalogue,
-            }))
+            };
+            // Retain and report the exact OFF catalogue identity without treating
+            // its digest as authentication or requiring identical XML packaging.
+            if let CatalogueHash::UnverifiedSha256(digest) = &evidence.catalogue_xml_hash {
+                tracing::debug!(
+                    "Captured unverified lifecycle catalogue SHA256={:02x?}; no authentication claim",
+                    digest
+                );
+            }
+            Ok(Some(evidence))
         }
     }
 }

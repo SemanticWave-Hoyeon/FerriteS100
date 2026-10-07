@@ -169,31 +169,37 @@ impl ApplicationHandler for App {
                     );
                     assert_eq!(renderer.requires_visibility_rebuild_for_navigation(), local);
                     assert_eq!(renderer.set_gpu_view_scaler(&c.scaler), !local);
-                    let before=(renderer.get_pan_offset(),renderer.fast_view_scales());
+                    let before = (renderer.get_pan_offset(), renderer.fast_view_scales());
                     if local {
-                        assert!(!renderer.set_pan_offset(20.,-10.));
-                        assert!(!renderer.set_gpu_zoom(4.,10.,20.));
-                        assert_eq!(renderer.add_pan_offset(20.,-10.),None);
+                        assert!(!renderer.set_pan_offset(20., -10.));
+                        assert!(!renderer.set_gpu_zoom(4., 10., 20.));
+                        assert_eq!(renderer.add_pan_offset(20., -10.), None);
                     } else {
-                        for scale in [0.,-1.,f32::NAN,f32::INFINITY,f32::from_bits(1)] {
-                            assert!(!renderer.set_gpu_zoom(scale,10.,20.));
+                        for scale in [0., -1., f32::NAN, f32::INFINITY, f32::from_bits(1)] {
+                            assert!(!renderer.set_gpu_zoom(scale, 10., 20.));
                         }
-                        assert!(!renderer.set_gpu_zoom(f32::MAX,-f32::MAX,f32::MAX));
-                        assert!(!renderer.set_pan_offset(f32::NAN,0.));
-                        assert_eq!(renderer.add_pan_offset(f32::INFINITY,0.),None);
-                        assert!(!renderer.set_gpu_zoom(1.,f32::INFINITY,0.));
-                        assert_eq!((renderer.get_pan_offset(),renderer.fast_view_scales()),before);
-                        assert!(renderer.set_pan_offset(f32::MAX,0.));
-                        assert_eq!(renderer.add_pan_offset(f32::MAX,0.),None);
-                        assert_eq!(renderer.get_pan_offset(),(f32::MAX,0.));
+                        assert!(!renderer.set_gpu_zoom(f32::MAX, -f32::MAX, f32::MAX));
+                        assert!(!renderer.set_pan_offset(f32::NAN, 0.));
+                        assert_eq!(renderer.add_pan_offset(f32::INFINITY, 0.), None);
+                        assert!(!renderer.set_gpu_zoom(1., f32::INFINITY, 0.));
+                        assert_eq!(
+                            (renderer.get_pan_offset(), renderer.fast_view_scales()),
+                            before
+                        );
+                        assert!(renderer.set_pan_offset(f32::MAX, 0.));
+                        assert_eq!(renderer.add_pan_offset(f32::MAX, 0.), None);
+                        assert_eq!(renderer.get_pan_offset(), (f32::MAX, 0.));
                         renderer.reset_pan_offset();
-                        assert!(renderer.set_gpu_zoom(2.,10.,20.));
-                        assert!(renderer.set_pan_offset(10.,-5.));
-                        assert_eq!(renderer.add_pan_offset(5.,2.),Some((15.,-3.)));
+                        assert!(renderer.set_gpu_zoom(2., 10., 20.));
+                        assert!(renderer.set_pan_offset(10., -5.));
+                        assert_eq!(renderer.add_pan_offset(5., 2.), Some((15., -3.)));
                         renderer.reset_pan_offset();
                         assert!(renderer.set_gpu_view_scaler(&c.scaler));
                     }
-                    assert_eq!((renderer.get_pan_offset(),renderer.fast_view_scales()),before);
+                    assert_eq!(
+                        (renderer.get_pan_offset(), renderer.fast_view_scales()),
+                        before
+                    );
 
                     let path = self.out.join(format!(
                         "{kind}-{zoom}-{}.png",

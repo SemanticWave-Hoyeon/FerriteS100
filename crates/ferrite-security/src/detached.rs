@@ -11,6 +11,10 @@ pub enum DetachedAlgorithm {
 
 /// Roots must be supplied from independent configuration, never from message metadata.
 /// The caller selects the PKI for this transport; S-100 Part 15 roots are not implicit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each transport authentication input is explicit; preserve the public verification API."
+)]
 pub fn verify_detached(
     data: &[u8],
     signature: &[u8],

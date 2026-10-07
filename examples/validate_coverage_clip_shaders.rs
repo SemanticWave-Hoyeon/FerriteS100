@@ -75,9 +75,10 @@ async fn run() -> Result<()> {
             let _legacy = ferrite_wgpu::coverage_pipeline::CoveragePipelines::new(
                 &device, format, samples, &view, &asset, &asset,
             )?;
-            let _instanced = ferrite_wgpu::coverage_pipeline::CoveragePipelines::new_with_symbol_instancing(
-                &device, format, samples, &view, &asset, &asset, true,
-            )?;
+            let _instanced =
+                ferrite_wgpu::coverage_pipeline::CoveragePipelines::new_with_symbol_instancing(
+                    &device, format, samples, &view, &asset, &asset, true,
+                )?;
         }
     }
     device.poll(wgpu::Maintain::Wait);

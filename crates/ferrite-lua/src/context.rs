@@ -633,107 +633,116 @@ impl CellData {
     /// Build owned host input directly without unused Rust portrayal items or
     /// a temporary shared context. Extraction and source ordering are identical
     /// to PortrayalContext::from_cell; VM initialization remains the caller's job.
-    pub fn from_cell(cell: &S101Cell) -> Self { build_owned_cell_data(cell, false).0 }
+    pub fn from_cell(cell: &S101Cell) -> Self {
+        build_owned_cell_data(cell, false).0
+    }
 }
 
-fn build_owned_cell_data(cell: &S101Cell, retain_items: bool) -> (CellData, Vec<FeaturePortrayalItem>) {
-        let mut features = Vec::new();
-        let mut cell_data = CellData {
-            features: HashMap::new(),
-            information_types: HashMap::new(),
-            spatials: HashMap::new(),
-            feature_associations: HashMap::new(),
-            information_associations: HashMap::new(),
-            spatial_to_features: HashMap::new(),
+fn build_owned_cell_data(
+    cell: &S101Cell,
+    retain_items: bool,
+) -> (CellData, Vec<FeaturePortrayalItem>) {
+    let mut features = Vec::new();
+    let mut cell_data = CellData {
+        features: HashMap::new(),
+        information_types: HashMap::new(),
+        spatials: HashMap::new(),
+        feature_associations: HashMap::new(),
+        information_associations: HashMap::new(),
+        spatial_to_features: HashMap::new(),
+    };
+
+    // Extract features
+    for (key, feature) in &cell.features {
+        let mut feature_code = feature
+            .feature_code
+            .clone()
+            .unwrap_or_else(|| format!("UNKNOWN_{}", feature.frid.nftc));
+
+        let primitive_type = PrimitiveType::from(feature.primitive_type);
+
+        // Extract attributes - handle both simple and complex attributes
+        // Complex attributes have child attributes (paix points to parent's atix)
+        let (attributes, complex_attributes) =
+            extract_attributes(&feature.attributes, Some(&feature_code));
+
+        // Extract spatial references with orientation
+        let spatial_refs: Vec<SpatialRef> = feature
+            .spatial_associations
+            .iter()
+            .map(|sa| {
+                // Determine spatial type from the RCNM in spatial_id
+                let spatial_type = match sa.spatial_id.rcnm {
+                    110 => PrimitiveType::Point,
+                    115 => PrimitiveType::MultiPoint,
+                    120 => PrimitiveType::Curve,
+                    125 => PrimitiveType::CompositeCurve,
+                    130 => PrimitiveType::Surface,
+                    _ => PrimitiveType::None,
+                };
+                SpatialRef {
+                    spatial_id: sa.spatial_id.key(),
+                    spatial_type,
+                    orientation: sa.ornt,
+                    scale_minimum: sa.scale_minimum,
+                    scale_maximum: sa.scale_maximum,
+                }
+            })
+            .collect();
+
+        // Build spatial → feature reverse mapping
+        for spatial_ref in &spatial_refs {
+            cell_data
+                .spatial_to_features
+                .entry(spatial_ref.spatial_id)
+                .or_default()
+                .push(*key);
+        }
+
+        // Extract feature associations (FASC field)
+        let mut feat_assocs = Vec::new();
+        for fasc in &feature.feature_associations {
+            feat_assocs.push(FeatureAssociation {
+                target_id: fasc.feature_id.key(),
+                // Use numeric codes as strings (will be mapped later via FC if needed)
+                association_code: format!("{}", fasc.nfac),
+                role_code: format!("{}", fasc.narc),
+            });
+        }
+        if !feat_assocs.is_empty() {
+            cell_data.feature_associations.insert(*key, feat_assocs);
+        }
+
+        // Extract information associations (INAS field)
+        let mut info_assocs = Vec::new();
+        for inas in &feature.information_associations {
+            info_assocs.push(InformationAssociation {
+                info_id: inas.info_id.key(),
+                // Use numeric codes as strings (will be mapped later via FC if needed)
+                association_code: format!("{}", inas.niac),
+                role_code: format!("{}", inas.narc),
+            });
+        }
+        if !info_assocs.is_empty() {
+            cell_data.information_associations.insert(*key, info_assocs);
+        }
+
+        let feature_info = FeatureInfo {
+            id: *key,
+            code: if retain_items {
+                feature_code.clone()
+            } else {
+                std::mem::take(&mut feature_code)
+            },
+            primitive_type,
+            attributes,
+            complex_attributes,
+            spatial_refs,
         };
 
-        // Extract features
-        for (key, feature) in &cell.features {
-            let mut feature_code = feature
-                .feature_code
-                .clone()
-                .unwrap_or_else(|| format!("UNKNOWN_{}", feature.frid.nftc));
+        cell_data.features.insert(*key, feature_info);
 
-            let primitive_type = PrimitiveType::from(feature.primitive_type);
-
-            // Extract attributes - handle both simple and complex attributes
-            // Complex attributes have child attributes (paix points to parent's atix)
-            let (attributes, complex_attributes) =
-                extract_attributes(&feature.attributes, Some(&feature_code));
-
-            // Extract spatial references with orientation
-            let spatial_refs: Vec<SpatialRef> = feature
-                .spatial_associations
-                .iter()
-                .map(|sa| {
-                    // Determine spatial type from the RCNM in spatial_id
-                    let spatial_type = match sa.spatial_id.rcnm {
-                        110 => PrimitiveType::Point,
-                        115 => PrimitiveType::MultiPoint,
-                        120 => PrimitiveType::Curve,
-                        125 => PrimitiveType::CompositeCurve,
-                        130 => PrimitiveType::Surface,
-                        _ => PrimitiveType::None,
-                    };
-                    SpatialRef {
-                        spatial_id: sa.spatial_id.key(),
-                        spatial_type,
-                        orientation: sa.ornt,
-                        scale_minimum: sa.scale_minimum,
-                        scale_maximum: sa.scale_maximum,
-                    }
-                })
-                .collect();
-
-            // Build spatial → feature reverse mapping
-            for spatial_ref in &spatial_refs {
-                cell_data
-                    .spatial_to_features
-                    .entry(spatial_ref.spatial_id)
-                    .or_default()
-                    .push(*key);
-            }
-
-            // Extract feature associations (FASC field)
-            let mut feat_assocs = Vec::new();
-            for fasc in &feature.feature_associations {
-                feat_assocs.push(FeatureAssociation {
-                    target_id: fasc.feature_id.key(),
-                    // Use numeric codes as strings (will be mapped later via FC if needed)
-                    association_code: format!("{}", fasc.nfac),
-                    role_code: format!("{}", fasc.narc),
-                });
-            }
-            if !feat_assocs.is_empty() {
-                cell_data.feature_associations.insert(*key, feat_assocs);
-            }
-
-            // Extract information associations (INAS field)
-            let mut info_assocs = Vec::new();
-            for inas in &feature.information_associations {
-                info_assocs.push(InformationAssociation {
-                    info_id: inas.info_id.key(),
-                    // Use numeric codes as strings (will be mapped later via FC if needed)
-                    association_code: format!("{}", inas.niac),
-                    role_code: format!("{}", inas.narc),
-                });
-            }
-            if !info_assocs.is_empty() {
-                cell_data.information_associations.insert(*key, info_assocs);
-            }
-
-            let feature_info = FeatureInfo {
-                id: *key,
-                code: if retain_items { feature_code.clone() } else { std::mem::take(&mut feature_code) },
-                primitive_type,
-                attributes,
-                complex_attributes,
-                spatial_refs,
-            };
-
-            cell_data.features.insert(*key, feature_info);
-
-            if retain_items {
+        if retain_items {
             features.push(FeaturePortrayalItem {
                 feature_id: *key,
                 feature_code: feature_code.clone(),
@@ -744,143 +753,141 @@ fn build_owned_cell_data(cell: &S101Cell, retain_items: bool) -> (CellData, Vec<
                 },
                 observed_parameters: Vec::new(),
             });
-            }
         }
+    }
 
-        // Extract information types
-        for (key, info) in &cell.information {
-            let info_code = info
-                .info_code
-                .clone()
-                .unwrap_or_else(|| format!("UNKNOWN_{}", info.irid.nitc));
+    // Extract information types
+    for (key, info) in &cell.information {
+        let info_code = info
+            .info_code
+            .clone()
+            .unwrap_or_else(|| format!("UNKNOWN_{}", info.irid.nitc));
 
-            let (attributes, complex_attributes) =
-                extract_attributes(&info.attributes, Some(&info_code));
+        let (attributes, complex_attributes) =
+            extract_attributes(&info.attributes, Some(&info_code));
 
-            cell_data.information_types.insert(
-                *key,
-                InformationInfo {
-                    id: *key,
-                    code: info_code,
-                    attributes,
-                    complex_attributes,
-                },
-            );
-        }
+        cell_data.information_types.insert(
+            *key,
+            InformationInfo {
+                id: *key,
+                code: info_code,
+                attributes,
+                complex_attributes,
+            },
+        );
+    }
 
-        // Extract point spatials
-        for (key, point) in &cell.points {
-            cell_data.spatials.insert(
-                *key,
-                SpatialInfo {
-                    id: *key,
-                    spatial_type: PrimitiveType::Point,
-                    coordinates: vec![(point.position.x, point.position.y)],
-                    z_coordinates: vec![point.position.depth()],
-                    curve_associations: Vec::new(),
-                    interior_curve_associations: Vec::new(),
-                },
-            );
-        }
+    // Extract point spatials
+    for (key, point) in &cell.points {
+        cell_data.spatials.insert(
+            *key,
+            SpatialInfo {
+                id: *key,
+                spatial_type: PrimitiveType::Point,
+                coordinates: vec![(point.position.x, point.position.y)],
+                z_coordinates: vec![point.position.depth()],
+                curve_associations: Vec::new(),
+                interior_curve_associations: Vec::new(),
+            },
+        );
+    }
 
-        // Extract multi-point spatials (for Sounding features)
-        // Reference: S-100 standard uses multiPoint for Sounding with multiple depth values
-        for (key, multi_point) in &cell.multi_points {
-            let coords: Vec<(f64, f64)> =
-                multi_point.positions.iter().map(|c| (c.x, c.y)).collect();
-            let z_coords: Vec<Option<f64>> =
-                multi_point.positions.iter().map(|c| c.depth()).collect();
-            cell_data.spatials.insert(
-                *key,
-                SpatialInfo {
-                    id: *key,
-                    spatial_type: PrimitiveType::MultiPoint,
-                    coordinates: coords,
-                    z_coordinates: z_coords,
-                    curve_associations: Vec::new(),
-                    interior_curve_associations: Vec::new(),
-                },
-            );
-        }
+    // Extract multi-point spatials (for Sounding features)
+    // Reference: S-100 standard uses multiPoint for Sounding with multiple depth values
+    for (key, multi_point) in &cell.multi_points {
+        let coords: Vec<(f64, f64)> = multi_point.positions.iter().map(|c| (c.x, c.y)).collect();
+        let z_coords: Vec<Option<f64>> = multi_point.positions.iter().map(|c| c.depth()).collect();
+        cell_data.spatials.insert(
+            *key,
+            SpatialInfo {
+                id: *key,
+                spatial_type: PrimitiveType::MultiPoint,
+                coordinates: coords,
+                z_coordinates: z_coords,
+                curve_associations: Vec::new(),
+                interior_curve_associations: Vec::new(),
+            },
+        );
+    }
 
-        // Extract curve spatials
-        for (key, curve) in &cell.curves {
-            let coords: Vec<(f64, f64)> = curve.positions_iter().map(|c| (c.x, c.y)).collect();
-            cell_data.spatials.insert(
-                *key,
-                SpatialInfo {
-                    id: *key,
-                    spatial_type: PrimitiveType::Curve,
-                    coordinates: coords,
-                    z_coordinates: Vec::new(), // Curves don't have Z
-                    curve_associations: Vec::new(),
-                    interior_curve_associations: Vec::new(),
-                },
-            );
-        }
+    // Extract curve spatials
+    for (key, curve) in &cell.curves {
+        let coords: Vec<(f64, f64)> = curve.positions_iter().map(|c| (c.x, c.y)).collect();
+        cell_data.spatials.insert(
+            *key,
+            SpatialInfo {
+                id: *key,
+                spatial_type: PrimitiveType::Curve,
+                coordinates: coords,
+                z_coordinates: Vec::new(), // Curves don't have Z
+                curve_associations: Vec::new(),
+                interior_curve_associations: Vec::new(),
+            },
+        );
+    }
 
-        // Extract composite curve spatials (following S-100 standard's host_data.cpp pattern)
-        // Reference: S-100 standard/GISLibrary/host_data.cpp - hd_get_composite_curve()
-        for (key, composite) in &cell.composite_curves {
-            // Build curve associations from CUCO records (oriented curves)
-            let associations: Vec<CurveAssociation> = composite
-                .curves
-                .iter()
-                .map(|oriented_curve| CurveAssociation {
-                    curve_id: oriented_curve.curve_id.key(),
-                    rcnm: oriented_curve.curve_id.rcnm,
-                    orientation: oriented_curve.orientation,
-                })
-                .collect();
+    // Extract composite curve spatials (following S-100 standard's host_data.cpp pattern)
+    // Reference: S-100 standard/GISLibrary/host_data.cpp - hd_get_composite_curve()
+    for (key, composite) in &cell.composite_curves {
+        // Build curve associations from CUCO records (oriented curves)
+        let associations: Vec<CurveAssociation> = composite
+            .curves
+            .iter()
+            .map(|oriented_curve| CurveAssociation {
+                curve_id: oriented_curve.curve_id.key(),
+                rcnm: oriented_curve.curve_id.rcnm,
+                orientation: oriented_curve.orientation,
+            })
+            .collect();
 
-            cell_data.spatials.insert(
-                *key,
-                SpatialInfo {
-                    id: *key,
-                    spatial_type: PrimitiveType::CompositeCurve,
-                    coordinates: Vec::new(), // CompositeCurve derives coords from member curves
-                    z_coordinates: Vec::new(),
-                    curve_associations: associations,
-                    interior_curve_associations: Vec::new(),
-                },
-            );
-        }
+        cell_data.spatials.insert(
+            *key,
+            SpatialInfo {
+                id: *key,
+                spatial_type: PrimitiveType::CompositeCurve,
+                coordinates: Vec::new(), // CompositeCurve derives coords from member curves
+                z_coordinates: Vec::new(),
+                curve_associations: associations,
+                interior_curve_associations: Vec::new(),
+            },
+        );
+    }
 
-        // Extract surface spatials (for Surface primitive type)
-        for (key, surface) in &cell.surfaces {
-            // Preserve real surface boundary references for Lua geometry access
-            cell_data.spatials.insert(
-                *key,
-                SpatialInfo {
-                    id: *key,
-                    spatial_type: PrimitiveType::Surface,
-                    coordinates: Vec::new(), // Surfaces derive coords from ring curves
-                    z_coordinates: Vec::new(),
-                    curve_associations: surface
-                        .exterior_ring
-                        .iter()
-                        .map(|c| CurveAssociation {
-                            curve_id: c.curve_id.key(),
-                            rcnm: c.curve_id.rcnm,
-                            orientation: c.orientation,
-                        })
-                        .collect(),
-                    interior_curve_associations: surface
-                        .interior_rings
-                        .iter()
-                        .map(|ring| {
-                            ring.iter()
-                                .map(|c| CurveAssociation {
-                                    curve_id: c.curve_id.key(),
-                                    rcnm: c.curve_id.rcnm,
-                                    orientation: c.orientation,
-                                })
-                                .collect()
-                        })
-                        .collect(),
-                },
-            );
-        }
+    // Extract surface spatials (for Surface primitive type)
+    for (key, surface) in &cell.surfaces {
+        // Preserve real surface boundary references for Lua geometry access
+        cell_data.spatials.insert(
+            *key,
+            SpatialInfo {
+                id: *key,
+                spatial_type: PrimitiveType::Surface,
+                coordinates: Vec::new(), // Surfaces derive coords from ring curves
+                z_coordinates: Vec::new(),
+                curve_associations: surface
+                    .exterior_ring
+                    .iter()
+                    .map(|c| CurveAssociation {
+                        curve_id: c.curve_id.key(),
+                        rcnm: c.curve_id.rcnm,
+                        orientation: c.orientation,
+                    })
+                    .collect(),
+                interior_curve_associations: surface
+                    .interior_rings
+                    .iter()
+                    .map(|ring| {
+                        ring.iter()
+                            .map(|c| CurveAssociation {
+                                curve_id: c.curve_id.key(),
+                                rcnm: c.curve_id.rcnm,
+                                orientation: c.orientation,
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            },
+        );
+    }
 
     (cell_data, features)
 }
@@ -889,7 +896,11 @@ impl PortrayalContext {
     /// Create new portrayal context from S101 cell
     pub fn from_cell(cell: &S101Cell, parameters: ContextParameters) -> Self {
         let (cell_data, features) = build_owned_cell_data(cell, true);
-        PortrayalContext { parameters, features, cell: Arc::new(RwLock::new(cell_data)) }
+        PortrayalContext {
+            parameters,
+            features,
+            cell: Arc::new(RwLock::new(cell_data)),
+        }
     }
 
     /// Get feature info by ID
@@ -983,11 +994,13 @@ impl PortrayalContext {
     /// data is rejected rather than silently replacing it with empty maps.
     pub fn into_cell_data(self) -> crate::Result<CellData> {
         match Arc::try_unwrap(self.cell) {
-            Ok(lock) => lock.into_inner().map_err(|_| crate::LuaError::Portrayal(
-                "Cell data lock poisoned".into())),
+            Ok(lock) => lock
+                .into_inner()
+                .map_err(|_| crate::LuaError::Portrayal("Cell data lock poisoned".into())),
             Err(shared) => {
-                let data = shared.read().map_err(|_| crate::LuaError::Portrayal(
-                    "Cell data lock poisoned".into()))?;
+                let data = shared
+                    .read()
+                    .map_err(|_| crate::LuaError::Portrayal("Cell data lock poisoned".into()))?;
                 Ok(data.clone())
             }
         }
@@ -1068,35 +1081,47 @@ mod curve_conversion_benchmark {
 mod owned_context_tests {
     use super::*;
     fn context() -> PortrayalContext {
-        PortrayalContext {parameters:ContextParameters::default(),features:Vec::new(),
-            cell:Arc::new(RwLock::new(CellData {
-                features:HashMap::new(),information_types:HashMap::new(),spatials:HashMap::new(),
-                feature_associations:HashMap::new(),information_associations:HashMap::new(),
-                spatial_to_features:HashMap::from([(9,vec![7,3,7])]),
-            }))}
+        PortrayalContext {
+            parameters: ContextParameters::default(),
+            features: Vec::new(),
+            cell: Arc::new(RwLock::new(CellData {
+                features: HashMap::new(),
+                information_types: HashMap::new(),
+                spatials: HashMap::new(),
+                feature_associations: HashMap::new(),
+                information_associations: HashMap::new(),
+                spatial_to_features: HashMap::from([(9, vec![7, 3, 7])]),
+            })),
+        }
     }
     #[test]
     fn consuming_unique_context_moves_allocation_shared_context_keeps_independent_snapshot() {
-        let unique=context();
-        let pointer=unique.cell.read().unwrap().spatial_to_features[&9].as_ptr();
-        let moved=unique.into_cell_data().unwrap();
-        assert_eq!(moved.spatial_to_features[&9].as_ptr(),pointer);
-        let shared=context();
-        let external=shared.cell_data();
-        let pointer=external.read().unwrap().spatial_to_features[&9].as_ptr();
-        let mut copied=shared.into_cell_data().unwrap();
-        assert_ne!(copied.spatial_to_features[&9].as_ptr(),pointer);
-        copied.spatial_to_features.get_mut(&9).unwrap()[0]=100;
-        assert_eq!(external.read().unwrap().spatial_to_features[&9],[7,3,7]);
+        let unique = context();
+        let pointer = unique.cell.read().unwrap().spatial_to_features[&9].as_ptr();
+        let moved = unique.into_cell_data().unwrap();
+        assert_eq!(moved.spatial_to_features[&9].as_ptr(), pointer);
+        let shared = context();
+        let external = shared.cell_data();
+        let pointer = external.read().unwrap().spatial_to_features[&9].as_ptr();
+        let mut copied = shared.into_cell_data().unwrap();
+        assert_ne!(copied.spatial_to_features[&9].as_ptr(), pointer);
+        copied.spatial_to_features.get_mut(&9).unwrap()[0] = 100;
+        assert_eq!(external.read().unwrap().spatial_to_features[&9], [7, 3, 7]);
     }
     #[test]
     fn poisoned_context_rejects_both_unique_and_shared_extraction() {
-        for shared in [false,true] {
-            let context=context();
-            let external=context.cell_data();
-            let poison=Arc::clone(&external);
-            let _=std::thread::spawn(move || {let _guard=poison.write().unwrap();panic!("poison fixture");}).join();
-            if !shared {drop(external);}
+        for shared in [false, true] {
+            let context = context();
+            let external = context.cell_data();
+            let poison = Arc::clone(&external);
+            let _ = std::thread::spawn(move || {
+                let _guard = poison.write().unwrap();
+                panic!("poison fixture");
+            })
+            .join();
+            if !shared {
+                drop(external);
+            }
             assert!(context.into_cell_data().is_err());
         }
     }

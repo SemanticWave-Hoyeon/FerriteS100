@@ -314,9 +314,24 @@ impl Scaler {
     pub fn flat_encoded_identity(&self) -> Option<[u64; 16]> {
         let ferrite_kernel::map_camera::MapCamera::Flat(camera) = &self.camera;
         let c = camera.encoded_identity();
-        Some([c[0],c[1],c[2],c[3],c[4],c[5],c[6],
-            self.geo_bounds.min_x.to_bits(),self.geo_bounds.min_y.to_bits(),self.geo_bounds.max_x.to_bits(),self.geo_bounds.max_y.to_bits(),
-            u64::from(self.viewport.x.to_bits()),u64::from(self.viewport.y.to_bits()),u64::from(self.viewport.width.to_bits()),u64::from(self.viewport.height.to_bits()),self.pixel_ratio.to_bits()])
+        Some([
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            c[6],
+            self.geo_bounds.min_x.to_bits(),
+            self.geo_bounds.min_y.to_bits(),
+            self.geo_bounds.max_x.to_bits(),
+            self.geo_bounds.max_y.to_bits(),
+            u64::from(self.viewport.x.to_bits()),
+            u64::from(self.viewport.y.to_bits()),
+            u64::from(self.viewport.width.to_bits()),
+            u64::from(self.viewport.height.to_bits()),
+            self.pixel_ratio.to_bits(),
+        ])
     }
     pub fn flat_transform(&self) -> FlatTransform {
         FlatTransform {
@@ -512,21 +527,30 @@ impl Scaler {
     /// Unrounded projection for tessellation error checks. Display vertices
     /// still use world_to_screen's existing f32 conversion.
     pub fn world_to_screen_f64(&self, world: WorldPoint) -> [f64; 2] {
-        let p = self
-            .camera
+        self.camera
             .project([world.x, world.y])
             .ok()
             .flatten()
-            .unwrap_or([f64::NAN; 2]);
-        p
+            .unwrap_or([f64::NAN; 2])
     }
 
-    pub fn prepare_flat_northing(&self, latitude: f64) -> anyhow::Result<ferrite_kernel::map_camera::PreparedFlatNorthing> {
+    pub fn prepare_flat_northing(
+        &self,
+        latitude: f64,
+    ) -> anyhow::Result<ferrite_kernel::map_camera::PreparedFlatNorthing> {
         self.camera.prepare_flat_northing(latitude)
     }
-    pub fn world_to_screen_with_prepared_northing(&self, world: WorldPoint, prepared: &ferrite_kernel::map_camera::PreparedFlatNorthing) -> ScreenPoint {
-        let p = self.camera.project_with_prepared_northing([world.x, world.y], prepared)
-            .ok().flatten().unwrap_or([f64::NAN; 2]);
+    pub fn world_to_screen_with_prepared_northing(
+        &self,
+        world: WorldPoint,
+        prepared: &ferrite_kernel::map_camera::PreparedFlatNorthing,
+    ) -> ScreenPoint {
+        let p = self
+            .camera
+            .project_with_prepared_northing([world.x, world.y], prepared)
+            .ok()
+            .flatten()
+            .unwrap_or([f64::NAN; 2]);
         ScreenPoint::new(p[0] as f32, p[1] as f32)
     }
     /// Convert screen coordinate to world coordinate

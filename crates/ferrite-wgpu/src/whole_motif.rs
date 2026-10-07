@@ -168,7 +168,7 @@ pub(crate) fn build_natural_motif(
     {
         return Err("Whole motif transparent raster guard violated".into());
     }
-    let has_coverage = pixels.chunks_exact(4).any(|p| p[3] != 0);
+    let has_coverage = pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
     Ok(Some(NaturalMotifResource {
         resource_key,
         support: Arc::new(support),

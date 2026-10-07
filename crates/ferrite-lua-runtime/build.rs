@@ -37,8 +37,11 @@ fn main() {
                 let workspace_manifest = root.join("Cargo.toml");
                 if workspace_manifest.is_file() {
                     println!("cargo:rerun-if-changed={}", workspace_manifest.display());
-                    field(&mut hash, "Cargo.toml", &fs::read(workspace_manifest)
-                        .expect("read workspace build configuration"));
+                    field(
+                        &mut hash,
+                        "Cargo.toml",
+                        &fs::read(workspace_manifest).expect("read workspace build configuration"),
+                    );
                 } else {
                     complete = false;
                 }
@@ -47,8 +50,14 @@ fn main() {
                 // so adding/removing either config filename also invalidates us.
                 // Watching the workspace root would recursively include target output.
                 let config_directory = root.join(".cargo");
-                let safe_directory_watch = config_directory.canonicalize().ok()
-                    .zip(PathBuf::from(env::var_os("OUT_DIR").unwrap()).canonicalize().ok())
+                let safe_directory_watch = config_directory
+                    .canonicalize()
+                    .ok()
+                    .zip(
+                        PathBuf::from(env::var_os("OUT_DIR").unwrap())
+                            .canonicalize()
+                            .ok(),
+                    )
                     .is_some_and(|(config, output)| config.is_dir() && !output.starts_with(config));
                 if safe_directory_watch {
                     println!("cargo:rerun-if-changed={}", config_directory.display());
@@ -65,8 +74,11 @@ fn main() {
                         // File watches remain safe even if directory watching is not.
                         println!("cargo:rerun-if-changed={}", path.display());
                         field(&mut hash, &format!("{name}-state"), b"present");
-                        field(&mut hash, name, &fs::read(path)
-                            .expect("read Cargo build configuration"));
+                        field(
+                            &mut hash,
+                            name,
+                            &fs::read(path).expect("read Cargo build configuration"),
+                        );
                     } else {
                         field(&mut hash, &format!("{name}-state"), b"absent");
                     }
@@ -174,8 +186,8 @@ fn main() {
     field(&mut hash, "c-compiler-stderr", &output.stderr);
     let fingerprint = format!("{:x}", hash.finalize());
     let generated = format!("pub const BUILD_FINGERPRINT: &str = {fingerprint:?};\npub const BUILD_ID_COMPLETE: bool = {complete};\n");
-    let output_path = PathBuf::from(env::var_os("OUT_DIR").unwrap())
-        .join("runtime_build_identity.rs");
+    let output_path =
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("runtime_build_identity.rs");
     // Preserve generated-source mtime on an otherwise equivalent build-script run.
     if fs::read(&output_path).ok().as_deref() != Some(generated.as_bytes()) {
         fs::write(output_path, generated).expect("save runtime build identity");

@@ -260,10 +260,7 @@ impl S100RecordStore {
                         "Invalid raw spatial reference type",
                     )?;
                     if f.tag == "PTAS" {
-                        check(
-                            matches!(t[5], 1 | 2 | 3),
-                            "Invalid point topology indicator",
-                        )?;
+                        check(matches!(t[5], 1..=3), "Invalid point topology indicator")?;
                     }
                     if matches!(f.tag.as_str(), "CUCO" | "RIAS") {
                         check(matches!(t[5], 1 | 2), "Invalid curve orientation")?;
@@ -572,17 +569,17 @@ fn components(fields: &[RawField], max: usize) -> Result<Vec<[u8; 6]>> {
     let mut out = Vec::new();
     for f in fields.iter().filter(|f| f.tag == "CUCO") {
         let d = f.data_trimmed();
-        check(d.len() % 6 == 0, "Truncated curve component")?;
+        check(d.len().is_multiple_of(6), "Truncated curve component")?;
         check(
             out.len().checked_add(d.len() / 6).is_some_and(|n| n <= max),
             "Component item budget exceeded",
         )?;
-        for c in d.chunks_exact(6) {
+        for c in d.as_chunks::<6>().0.iter() {
             check(
                 matches!(c[0], 120 | 125) && matches!(c[5], 1 | 2),
                 "Invalid component reference/orientation",
             )?;
-            out.push(c.try_into().unwrap());
+            out.push(*c);
         }
     }
     Ok(out)

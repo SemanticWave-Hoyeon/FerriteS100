@@ -131,7 +131,7 @@ impl PluginSystem {
     pub fn get_drawing_instructions(&self) -> Vec<DrawingInstruction> {
         let mut instructions = Vec::new();
         for plugin in self.manager.all_plugins() {
-            instructions.extend(plugin.get_drawing_instructions().into_iter());
+            instructions.extend(plugin.get_drawing_instructions());
         }
         instructions
     }

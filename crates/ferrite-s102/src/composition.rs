@@ -169,12 +169,21 @@ impl<'a, P: DepthAdjustmentProvider> ConservativeCoverage<'a, P> {
     /// and that source's own continuous validity domain both contain it.
     /// This distinguishes a valid fill location from absence of coverage.
     pub fn covers_position(&self, x: f64, y: f64) -> Result<bool> {
-        if !x.is_finite() || !y.is_finite() { return Ok(false); }
+        if !x.is_finite() || !y.is_finite() {
+            return Ok(false);
+        }
         for source in &self.sources {
-            if !source.coverage.is_valid_position(x,y) { continue; }
-            let g=source.coverage.geometry();
-            if cells_at_axis(g.origin_x,g.spacing_x,g.width,x)?.iter().any(Option::is_some)
-                && cells_at_axis(g.origin_y,g.spacing_y,g.height,y)?.iter().any(Option::is_some) {
+            if !source.coverage.is_valid_position(x, y) {
+                continue;
+            }
+            let g = source.coverage.geometry();
+            if cells_at_axis(g.origin_x, g.spacing_x, g.width, x)?
+                .iter()
+                .any(Option::is_some)
+                && cells_at_axis(g.origin_y, g.spacing_y, g.height, y)?
+                    .iter()
+                    .any(Option::is_some)
+            {
                 return Ok(true);
             }
         }
@@ -186,7 +195,9 @@ impl<'a, P: DepthAdjustmentProvider> ConservativeCoverage<'a, P> {
         }
         let mut selected = ShoalestDepth::new(self.target, x, y)?;
         for (instance, source) in self.sources.iter().enumerate() {
-            if !source.coverage.is_valid_position(x,y) {continue;}
+            if !source.coverage.is_valid_position(x, y) {
+                continue;
+            }
             let g = source.coverage.geometry();
             let columns = cells_at_axis(g.origin_x, g.spacing_x, g.width, x)?;
             let rows = cells_at_axis(g.origin_y, g.spacing_y, g.height, y)?;
@@ -227,7 +238,11 @@ impl<'a, P: DepthAdjustmentProvider> ConservativeCoverage<'a, P> {
     }
 }
 impl<P: DepthAdjustmentProvider> NumericCoverageSource for ConservativeCoverage<'_, P> {
-    fn requires_spatial_mask(&self)->bool {self.sources.iter().any(|s|s.coverage.requires_geometric_mask())}
+    fn requires_spatial_mask(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|s| s.coverage.requires_geometric_mask())
+    }
     fn numeric_geometry(&self) -> &GridGeometry {
         &self.geometry
     }
@@ -279,8 +294,16 @@ impl<P: DepthAdjustmentProvider> NumericCoverageSource for ConservativeCoverage<
                         window.column + index % window.width,
                         window.row + start + index / window.width,
                     );
-                    let p=self.geometry.position(window.column+index%window.width,window.row+start+index/window.width).context("Invalid domain comparison position")?;
-                    if !source.coverage.is_valid_position(p.0,p.1) {continue;}
+                    let p = self
+                        .geometry
+                        .position(
+                            window.column + index % window.width,
+                            window.row + start + index / window.width,
+                        )
+                        .context("Invalid domain comparison position")?;
+                    if !source.coverage.is_valid_position(p.0, p.1) {
+                        continue;
+                    }
                     let sample = tile.samples[(row - part.row) * part.width + column - part.column];
                     let node = source
                         .coverage

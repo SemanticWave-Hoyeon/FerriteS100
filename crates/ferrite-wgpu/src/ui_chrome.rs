@@ -70,27 +70,28 @@ impl Theme {
         style.visuals.extreme_bg_color = self.panel;
         style.visuals.override_text_color = Some(self.text);
         style.visuals.selection.bg_fill = self.selection;
-        style.visuals.selection.stroke = Stroke::new(1.0, self.accent);
+        style.visuals.selection.stroke = Stroke::new(1.0_f32, self.accent);
         style.visuals.hyperlink_color = self.accent;
-        style.visuals.window_stroke = Stroke::new(1.0, self.raised);
+        style.visuals.window_stroke = Stroke::new(1.0_f32, self.raised);
         for widget in [
             &mut style.visuals.widgets.inactive,
             &mut style.visuals.widgets.noninteractive,
         ] {
             widget.bg_fill = self.raised;
             widget.weak_bg_fill = self.raised;
-            widget.fg_stroke = Stroke::new(1.0, self.text);
-            widget.bg_stroke = Stroke::new(1.0, self.raised);
+            widget.fg_stroke = Stroke::new(1.0_f32, self.text);
+            widget.bg_stroke = Stroke::new(1.0_f32, self.raised);
             widget.corner_radius = egui::CornerRadius::same(5);
         }
         style.visuals.widgets.hovered.bg_fill = self.selection;
         style.visuals.widgets.hovered.weak_bg_fill = self.selection;
-        style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, self.accent);
-        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, self.accent.gamma_multiply(0.5));
+        style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, self.accent);
+        style.visuals.widgets.hovered.bg_stroke =
+            Stroke::new(1.0_f32, self.accent.gamma_multiply(0.5));
         style.visuals.widgets.active.bg_fill = self.selection;
         style.visuals.widgets.active.weak_bg_fill = self.selection;
-        style.visuals.widgets.active.fg_stroke = Stroke::new(1.5, self.accent);
-        style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, self.accent);
+        style.visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, self.accent);
+        style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, self.accent);
         style.spacing.item_spacing = egui::vec2(8., 7.);
         style.spacing.button_padding = egui::vec2(9., 6.);
         style.spacing.interact_size = egui::vec2(34., 30.);

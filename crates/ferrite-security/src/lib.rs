@@ -69,14 +69,16 @@ pub struct AuthenticatedSnapshot {
 }
 /// Private frozen input for host corrections when dataset authentication is disabled.
 /// This type carries no verification status and must never count as authenticated.
-pub struct UnauthenticatedSnapshot { file:tempfile::NamedTempFile }
+pub struct UnauthenticatedSnapshot {
+    file: tempfile::NamedTempFile,
+}
 impl UnauthenticatedSnapshot {
-    pub fn copy(source:&Path)->Result<Self> {
-        let mut input=File::open(source)?;
-        let mut file=tempfile::NamedTempFile::new()?;
-        std::io::copy(&mut input,&mut file)?;
+    pub fn copy(source: &Path) -> Result<Self> {
+        let mut input = File::open(source)?;
+        let mut file = tempfile::NamedTempFile::new()?;
+        std::io::copy(&mut input, &mut file)?;
         file.flush()?;
-        Ok(Self {file})
+        Ok(Self { file })
     }
     /// Capture a regular source with a receiver byte budget. The extra byte
     /// detects growth after metadata was checked; std::io::copy is streaming.
@@ -84,16 +86,26 @@ impl UnauthenticatedSnapshot {
         let input = File::open(source)?;
         let metadata = input.metadata()?;
         ensure!(metadata.is_file(), "Snapshot source is not a regular file");
-        ensure!(metadata.len() <= max_bytes, "Snapshot source exceeds receiver byte budget");
-        let read_limit = max_bytes.checked_add(1).context("Snapshot byte budget overflow")?;
+        ensure!(
+            metadata.len() <= max_bytes,
+            "Snapshot source exceeds receiver byte budget"
+        );
+        let read_limit = max_bytes
+            .checked_add(1)
+            .context("Snapshot byte budget overflow")?;
         let mut input = input.take(read_limit);
         let mut file = tempfile::NamedTempFile::new()?;
         let copied = std::io::copy(&mut input, &mut file)?;
-        ensure!(copied <= max_bytes, "Snapshot grew beyond receiver byte budget");
+        ensure!(
+            copied <= max_bytes,
+            "Snapshot grew beyond receiver byte budget"
+        );
         file.flush()?;
         Ok(Self { file })
     }
-    pub fn path(&self)->&Path {self.file.path()}
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
 }
 impl AuthenticatedSnapshot {
     pub fn path(&self) -> &Path {
@@ -102,10 +114,22 @@ impl AuthenticatedSnapshot {
 }
 impl VerifiedResource {
     pub fn snapshot(&self) -> Result<AuthenticatedSnapshot> {
-        ensure!(self.path == self.authentication.path && self.sha384 == self.authentication.sha384
-            && self.size == self.authentication.size
-            && self.signature_ids.iter().map(String::as_str).eq(self.authentication.signatures.iter().map(|s| s.id.as_str()))
-            && self.certificate_ids.iter().map(String::as_str).eq(self.authentication.signatures.iter().map(|s| s.certificate_id.as_str())), "Resource report differs from retained authentication");
+        ensure!(
+            self.path == self.authentication.path
+                && self.sha384 == self.authentication.sha384
+                && self.size == self.authentication.size
+                && self.signature_ids.iter().map(String::as_str).eq(self
+                    .authentication
+                    .signatures
+                    .iter()
+                    .map(|s| s.id.as_str()))
+                && self.certificate_ids.iter().map(String::as_str).eq(self
+                    .authentication
+                    .signatures
+                    .iter()
+                    .map(|s| s.certificate_id.as_str())),
+            "Resource report differs from retained authentication"
+        );
         self.authentication.snapshot()
     }
 }
@@ -425,7 +449,10 @@ fn verify_resource_with_limit(
     max_bytes: Option<u64>,
 ) -> Result<VerifiedResource> {
     if let Some(limit) = max_bytes {
-        ensure!(std::fs::metadata(&path)?.len() <= limit, "Signed resource exceeds receiver byte budget");
+        ensure!(
+            std::fs::metadata(&path)?.len() <= limit,
+            "Signed resource exceeds receiver byte budget"
+        );
     }
     ensure!(!signatures.is_empty(), "Missing resource signature");
     let mut ids = HashMap::with_capacity(signatures.len());
@@ -489,7 +516,10 @@ fn verify_resource_with_limit(
         size = size
             .checked_add(n as u64)
             .context("Resource size overflow")?;
-        ensure!(max_bytes.is_none_or(|limit| size <= limit), "Signed resource grew beyond receiver byte budget");
+        ensure!(
+            max_bytes.is_none_or(|limit| size <= limit),
+            "Signed resource grew beyond receiver byte budget"
+        );
         digest.update(&buffer[..n])?;
     }
     let digest = digest.finish()?;
@@ -499,7 +529,7 @@ fn verify_resource_with_limit(
         let signed = if let Some(parent) = parents[i] {
             hash(MessageDigest::sha384(), &signatures[parent].bytes)?
         } else {
-            digest.clone()
+            digest
         };
         let valid = parsed_signatures[i].verify(&signed, &keys[&s.certificate])?;
         if s.target.is_some() {
@@ -517,21 +547,34 @@ fn verify_resource_with_limit(
     }
     ensure!(validated == signatures.len(), "Signature reference cycle");
     // Shared once per distinct signer within this resource, not cloned per signature.
-    let signer_der = keys.keys().map(|id| {
-        let cert = certificates.get(id).context("Missing verified signer")?;
-        Ok((id.clone(), std::sync::Arc::<[u8]>::from(cert.to_der()?)))
-    }).collect::<Result<HashMap<_, _>>>()?;
-    let descriptors = signatures.iter().map(|s| {
-        let cert = certificates.get(&s.certificate).context("Missing verified signer")?;
-        Ok(VerifiedSignatureDescriptor {
-            id: s.id.clone(), certificate_id: s.certificate.clone(),
-            der: s.bytes.clone(), signer_certificate_sha256: hex(&cert.digest(MessageDigest::sha256())?),
-            signer_certificate_der: signer_der[&s.certificate].clone(),
-            signature_target: s.target.clone(),
+    let signer_der = keys
+        .keys()
+        .map(|id| {
+            let cert = certificates.get(id).context("Missing verified signer")?;
+            Ok((id.clone(), std::sync::Arc::<[u8]>::from(cert.to_der()?)))
         })
-    }).collect::<Result<Vec<_>>>()?;
+        .collect::<Result<HashMap<_, _>>>()?;
+    let descriptors = signatures
+        .iter()
+        .map(|s| {
+            let cert = certificates
+                .get(&s.certificate)
+                .context("Missing verified signer")?;
+            Ok(VerifiedSignatureDescriptor {
+                id: s.id.clone(),
+                certificate_id: s.certificate.clone(),
+                der: s.bytes.clone(),
+                signer_certificate_sha256: hex(&cert.digest(MessageDigest::sha256())?),
+                signer_certificate_der: signer_der[&s.certificate].clone(),
+                signature_target: s.target.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let authentication = std::sync::Arc::new(ResourceAuthentication {
-        path: path.clone(), sha384: hex(&digest), size, signatures: descriptors,
+        path: path.clone(),
+        sha384: hex(&digest),
+        size,
+        signatures: descriptors,
     });
     Ok(VerifiedResource {
         authentication,
@@ -633,9 +676,19 @@ pub fn verify_exchange(
         let resource = verify_resource(path, signatures, &certs)?;
         if is(entry, XC, "S100_DatasetDiscoveryMetadata") {
             let discovery = dataset_discovery::parse(entry)?;
-            dataset_discovery.insert(resource.path.clone(),
-                AuthenticatedDatasetDiscovery::bind(discovery, &resource, &catalogue,
-                    bytes.clone(), time, trust_anchor_sha256.clone(), filename.to_owned(), entry.range()));
+            dataset_discovery.insert(
+                resource.path.clone(),
+                AuthenticatedDatasetDiscovery::bind(
+                    discovery,
+                    &resource,
+                    &catalogue,
+                    bytes.clone(),
+                    time,
+                    trust_anchor_sha256.clone(),
+                    filename.to_owned(),
+                    entry.range(),
+                ),
+            );
         }
         resources.push(resource);
     }
@@ -674,29 +727,68 @@ impl AuthorizedDatasets {
     /// Bind the public maps back to one retained authenticated resource before
     /// a product planner consumes metadata. `canonical` is the original key
     /// captured during authorization; no live source/catalogue is reread.
-    pub fn checked_dataset_discovery(&self, canonical: &Path) -> Result<&DatasetDiscoveryAuthorization> {
-        ensure!(canonical.is_absolute() && !canonical.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)),
-            "Dataset discovery needs its retained canonical key");
-        let metadata=self.dataset_discovery.get(canonical).context("Missing dataset discovery authorization")?;
-        let snapshot=self.snapshots.get(canonical).context("Missing aligned dataset snapshot")?;
+    pub fn checked_dataset_discovery(
+        &self,
+        canonical: &Path,
+    ) -> Result<&DatasetDiscoveryAuthorization> {
+        ensure!(
+            canonical.is_absolute()
+                && !canonical.components().any(|c| matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )),
+            "Dataset discovery needs its retained canonical key"
+        );
+        let metadata = self
+            .dataset_discovery
+            .get(canonical)
+            .context("Missing dataset discovery authorization")?;
+        let snapshot = self
+            .snapshots
+            .get(canonical)
+            .context("Missing aligned dataset snapshot")?;
         match metadata {
             DatasetDiscoveryAuthorization::Authenticated(bound) => {
-                let snapshot=snapshot.as_ref().context("Authenticated discovery has no retained snapshot")?;
-                ensure!(bound.resource_path()==canonical && snapshot.source==canonical,
-                    "Authenticated discovery resource/snapshot path mismatch");
-                let mut input=File::open(snapshot.path())?;
-                let mut digest=openssl::hash::Hasher::new(MessageDigest::sha384())?;
-                let mut buffer=[0u8;64*1024];
-                let mut total=0u64;
-                loop {let n=input.read(&mut buffer)?;if n==0 {break;}
-                    total=total.checked_add(n as u64).context("Snapshot length overflow")?;
-                    ensure!(total<=bound.resource_size(),"Retained snapshot exceeds authenticated resource size");
-                    digest.update(&buffer[..n])?;}
-                ensure!(total==bound.resource_size(),"Retained snapshot length differs from authenticated resource");
-                ensure!(hex(&digest.finish()?)==bound.resource_sha384(),"Retained snapshot differs from authenticated discovery resource");
+                let snapshot = snapshot
+                    .as_ref()
+                    .context("Authenticated discovery has no retained snapshot")?;
+                ensure!(
+                    bound.resource_path() == canonical && snapshot.source == canonical,
+                    "Authenticated discovery resource/snapshot path mismatch"
+                );
+                let mut input = File::open(snapshot.path())?;
+                let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
+                let mut buffer = [0u8; 64 * 1024];
+                let mut total = 0u64;
+                loop {
+                    let n = input.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    total = total
+                        .checked_add(n as u64)
+                        .context("Snapshot length overflow")?;
+                    ensure!(
+                        total <= bound.resource_size(),
+                        "Retained snapshot exceeds authenticated resource size"
+                    );
+                    digest.update(&buffer[..n])?;
+                }
+                ensure!(
+                    total == bound.resource_size(),
+                    "Retained snapshot length differs from authenticated resource"
+                );
+                ensure!(
+                    hex(&digest.finish()?) == bound.resource_sha384(),
+                    "Retained snapshot differs from authenticated discovery resource"
+                );
             }
-            DatasetDiscoveryAuthorization::SignatureVerificationDisabled | DatasetDiscoveryAuthorization::UnsignedEvaluation => {
-                ensure!(snapshot.is_none(),"Unauthenticated discovery has an authenticated snapshot");
+            DatasetDiscoveryAuthorization::SignatureVerificationDisabled
+            | DatasetDiscoveryAuthorization::UnsignedEvaluation => {
+                ensure!(
+                    snapshot.is_none(),
+                    "Unauthenticated discovery has an authenticated snapshot"
+                );
             }
         }
         Ok(metadata)
@@ -741,11 +833,16 @@ pub fn authorize_datasets(
                 .iter()
                 .find(|r| r.path == canonical)
                 .context("Requested dataset is not signed by its exchange catalogue")?;
-            let discovery = reports[&root].dataset_discovery.get(&canonical)
-                .context("Requested dataset has no authenticated dataset discovery metadata")?.clone();
+            let discovery = reports[&root]
+                .dataset_discovery
+                .get(&canonical)
+                .context("Requested dataset has no authenticated dataset discovery metadata")?
+                .clone();
             let snapshot = std::sync::Arc::new(resource.snapshot()?);
-            out.dataset_discovery.insert(canonical.clone(),
-                DatasetDiscoveryAuthorization::Authenticated(discovery));
+            out.dataset_discovery.insert(
+                canonical.clone(),
+                DatasetDiscoveryAuthorization::Authenticated(discovery),
+            );
             out.snapshots.insert(canonical, Some(snapshot));
             out.signed_count += 1;
         } else {
@@ -754,8 +851,10 @@ pub fn authorize_datasets(
                 "Unsigned dataset rejected: {}",
                 path.display()
             );
-            out.dataset_discovery.insert(canonical.clone(),
-                DatasetDiscoveryAuthorization::UnsignedEvaluation);
+            out.dataset_discovery.insert(
+                canonical.clone(),
+                DatasetDiscoveryAuthorization::UnsignedEvaluation,
+            );
             out.snapshots.insert(canonical, None);
             out.unsigned_count += 1;
         }
@@ -774,19 +873,27 @@ mod unverified_input_tests {
     use super::*;
     #[test]
     fn frozen_unsigned_input_is_independent_from_replaced_source() {
-        let mut source=tempfile::NamedTempFile::new().unwrap();source.write_all(b"original").unwrap();source.flush().unwrap();
-        let snapshot=UnauthenticatedSnapshot::copy(source.path()).unwrap();
-        std::fs::write(source.path(),b"replacement").unwrap();
-        assert_eq!(std::fs::read(snapshot.path()).unwrap(),b"original");
-        assert_eq!(std::fs::read(source.path()).unwrap(),b"replacement");
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(b"original").unwrap();
+        source.flush().unwrap();
+        let snapshot = UnauthenticatedSnapshot::copy(source.path()).unwrap();
+        std::fs::write(source.path(), b"replacement").unwrap();
+        assert_eq!(std::fs::read(snapshot.path()).unwrap(), b"original");
+        assert_eq!(std::fs::read(source.path()).unwrap(), b"replacement");
     }
 }
 
 mod original_authentication;
-pub use original_authentication::{OriginalDatasetAuthentication, VerifiedSignatureDescriptor};
 use original_authentication::ResourceAuthentication;
+pub use original_authentication::{OriginalDatasetAuthentication, VerifiedSignatureDescriptor};
 mod dataset_discovery;
-pub use dataset_discovery::{AuthenticatedDatasetDiscovery, DatasetDiscovery, DatasetDiscoveryAuthorization, DatasetIssueDate, DatasetPurpose};
+pub use dataset_discovery::{
+    AuthenticatedDatasetDiscovery, DatasetDiscovery, DatasetDiscoveryAuthorization,
+    DatasetIssueDate, DatasetPurpose,
+};
 
 mod exchange_catalogue_authentication;
-pub use exchange_catalogue_authentication::{verify_exchange_catalogue, AuthenticatedExchangeCatalogue, CatalogueDiscoveryView, OriginalEntryView};
+pub use exchange_catalogue_authentication::{
+    verify_exchange_catalogue, AuthenticatedExchangeCatalogue, CatalogueDiscoveryView,
+    OriginalEntryView,
+};

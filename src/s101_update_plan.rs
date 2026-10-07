@@ -103,6 +103,7 @@ pub(crate) fn dataset_key(id: &DatasetIdentification) -> Result<(String, String)
 }
 
 /// Only inspect private authenticated inputs when verification is required.
+#[cfg(test)]
 pub(crate) fn authorized_plans(
     candidates: Vec<PathBuf>,
     authorization: &ferrite_security::AuthorizedDatasets,

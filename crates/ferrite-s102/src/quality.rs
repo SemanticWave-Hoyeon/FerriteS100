@@ -195,12 +195,12 @@ impl QualityRecord {
 }
 #[derive(Debug)]
 pub struct QualityCoverage {
-    pub horizontal_position_uncertainty:f32,
-    pub vertical_position_uncertainty:f32,
-    pub axes:crate::AxisMetadata,
-    pub root_enclosure:Option<crate::RootEnclosure>,
-    pub domain:crate::InstanceDomain,
-    outside_domain:std::sync::atomic::AtomicBool,
+    pub horizontal_position_uncertainty: f32,
+    pub vertical_position_uncertainty: f32,
+    pub axes: crate::AxisMetadata,
+    pub root_enclosure: Option<crate::RootEnclosure>,
+    pub domain: crate::InstanceDomain,
+    outside_domain: std::sync::atomic::AtomicBool,
     geometry: GridGeometry,
     values: hdf5::Dataset,
     records: HashMap<u32, QualityRecord>,
@@ -217,12 +217,23 @@ impl QualityCoverage {
         // S-1023.0.0 section10.2.8 inherits Table10-4 attributes. Quality remains
         // one shared instance even when bathymetry has several vertical datums.
         // No missing metadata is substituted from the bathymetry container.
-        ensure!(crate::validate_container(&q)?==1,"Quality must have one shared instance");
-        let [horizontal_position_uncertainty,vertical_position_uncertainty]=crate::position_uncertainties(&q)?;
-        let bathymetry=file.group("BathymetryCoverage").context("Quality without BathymetryCoverage container")?;
-        let inherited=crate::position_uncertainties(&bathymetry)?;
-        ensure!([horizontal_position_uncertainty,vertical_position_uncertainty]==inherited,
-            "Quality container position uncertainties must match BathymetryCoverage");
+        ensure!(
+            crate::validate_container(&q)? == 1,
+            "Quality must have one shared instance"
+        );
+        let [horizontal_position_uncertainty, vertical_position_uncertainty] =
+            crate::position_uncertainties(&q)?;
+        let bathymetry = file
+            .group("BathymetryCoverage")
+            .context("Quality without BathymetryCoverage container")?;
+        let inherited = crate::position_uncertainties(&bathymetry)?;
+        ensure!(
+            [
+                horizontal_position_uncertainty,
+                vertical_position_uncertainty
+            ] == inherited,
+            "Quality container position uncertainties must match BathymetryCoverage"
+        );
         ensure!(
             crate::scalar::u8(&q, "dataCodingFormat")? == 9,
             "Quality grid requires dataCodingFormat=9"
@@ -239,10 +250,21 @@ impl QualityCoverage {
             string_attr(&q, "sequencingRule.scanDirection")?
                 .split(',')
                 .map(str::trim)
-                .eq(super::canonical_axes(grids.first().context("Quality without bathymetry")?.horizontal_crs)?),
+                .eq(super::canonical_axes(
+                    grids
+                        .first()
+                        .context("Quality without bathymetry")?
+                        .horizontal_crs
+                )?),
             "Unsupported quality scan direction"
         );
-        let axes=crate::AxisMetadata::read(&q,grids.first().context("Quality without bathymetry")?.horizontal_crs)?;
+        let axes = crate::AxisMetadata::read(
+            &q,
+            grids
+                .first()
+                .context("Quality without bathymetry")?
+                .horizontal_crs,
+        )?;
         let names: Vec<_> = q
             .member_names()?
             .into_iter()
@@ -451,17 +473,31 @@ impl QualityCoverage {
                 "Duplicate quality record id {id}"
             );
         }
-        let domain=crate::InstanceDomain::read(&g,&geometry)?;
+        let domain = crate::InstanceDomain::read(&g, &geometry)?;
         // Standalone quality-adapter fixtures need not be whole products. The
         // BathymetryCoverage product entrypoint requires the root attributes.
-        let root_names=["westBoundLongitude","eastBoundLongitude","southBoundLatitude","northBoundLatitude"];
-        let attrs=file.attr_names()?;
-        let root_enclosure=if root_names.iter().any(|n|attrs.iter().any(|a|a.as_str()==*n)) {
-            Some(crate::RootBounds::read(file)?.assess(&geometry,&domain,&g)?)
-        }else{None};
+        let root_names = [
+            "westBoundLongitude",
+            "eastBoundLongitude",
+            "southBoundLatitude",
+            "northBoundLatitude",
+        ];
+        let attrs = file.attr_names()?;
+        let root_enclosure = if root_names
+            .iter()
+            .any(|n| attrs.iter().any(|a| a.as_str() == *n))
+        {
+            Some(crate::RootBounds::read(file)?.assess(&geometry, &domain, &g)?)
+        } else {
+            None
+        };
         Ok(Some(Arc::new(Self {
-            axes,root_enclosure,domain,horizontal_position_uncertainty,vertical_position_uncertainty,
-            outside_domain:std::sync::atomic::AtomicBool::new(false),
+            axes,
+            root_enclosure,
+            domain,
+            horizontal_position_uncertainty,
+            vertical_position_uncertainty,
+            outside_domain: std::sync::atomic::AtomicBool::new(false),
             geometry,
             values,
             records,
@@ -479,8 +515,9 @@ impl QualityCoverage {
     /// Nonzero IDs at original sample positions outside this quality instance's
     /// own domain, observed only in successfully decoded requested windows.
     /// This diagnostic does not overwrite IDs or borrow any bathymetry VD mask.
-    pub fn observed_id_centroids_outside_domain(&self)->bool {
-        self.outside_domain.load(std::sync::atomic::Ordering::Relaxed)
+    pub fn observed_id_centroids_outside_domain(&self) -> bool {
+        self.outside_domain
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn read_window_ids(&self, window: GridWindow) -> Result<Vec<u32>> {
         window.validate(&self.geometry)?;
@@ -497,15 +534,30 @@ impl QualityCoverage {
                 .all(|id| *id == 0 || self.records.contains_key(id)),
             "Quality grid references a missing attribute record"
         );
-        if self.domain.requires_mask() && ids.iter().enumerate().any(|(index,id)| {
-            if *id==0 {return false;}
-            let (x,y)=self.geometry.position(window.column+index%window.width,window.row+index/window.width).expect("Validated quality window");
-            !self.domain.contains(x,y)
-        }) {self.outside_domain.store(true,std::sync::atomic::Ordering::Relaxed);}
+        if self.domain.requires_mask()
+            && ids.iter().enumerate().any(|(index, id)| {
+                if *id == 0 {
+                    return false;
+                }
+                let (x, y) = self
+                    .geometry
+                    .position(
+                        window.column + index % window.width,
+                        window.row + index / window.width,
+                    )
+                    .expect("Validated quality window");
+                !self.domain.contains(x, y)
+            })
+        {
+            self.outside_domain
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(ids)
     }
     pub fn sample_nearest(&self, x: f64, y: f64) -> Result<Option<&QualityRecord>> {
-        if !self.domain.contains(x,y) {return Ok(None);}
+        if !self.domain.contains(x, y) {
+            return Ok(None);
+        }
         let Some((column, row)) = self.geometry.nearest(x, y) else {
             return Ok(None);
         };
@@ -562,12 +614,20 @@ mod tests {
         ));
         let f = hdf5::File::create(&path).unwrap();
         let q = f.create_group("QualityOfBathymetryCoverage").unwrap();
-        let b=f.create_group("BathymetryCoverage").unwrap();
-        for group in [&q,&b] {
-            for (n,v) in [("dimension",2u8),("commonPointRule",2),("interpolationType",1),("numInstances",1)] {attr(group,n,v);}
-            attr(group,"horizontalPositionUncertainty",-1f32);attr(group,"verticalUncertainty",-1f32);
+        let b = f.create_group("BathymetryCoverage").unwrap();
+        for group in [&q, &b] {
+            for (n, v) in [
+                ("dimension", 2u8),
+                ("commonPointRule", 2),
+                ("interpolationType", 1),
+                ("numInstances", 1),
+            ] {
+                attr(group, n, v);
+            }
+            attr(group, "horizontalPositionUncertainty", -1f32);
+            attr(group, "verticalUncertainty", -1f32);
         }
-        crate::write_test_axes(&q,4326);
+        crate::write_test_axes(&q, 4326);
         attr(&q, "dataCodingFormat", 9u8);
         attr(&q, "dataOffsetCode", 5u8);
         attr(&q, "sequencingRule.type", 1u8);
@@ -581,7 +641,14 @@ mod tests {
         attr(&g, "gridOriginLatitude", 20f64);
         attr(&g, "gridSpacingLongitudinal", 1f64);
         attr(&g, "gridSpacingLatitudinal", 1f64);
-        for (n,v) in [("westBoundLongitude",0.5f32),("eastBoundLongitude",3.5),("southBoundLatitude",19.5),("northBoundLatitude",21.5)] {attr(&g,n,v);}
+        for (n, v) in [
+            ("westBoundLongitude", 0.5f32),
+            ("eastBoundLongitude", 3.5),
+            ("southBoundLatitude", 19.5),
+            ("northBoundLatitude", 21.5),
+        ] {
+            attr(&g, n, v);
+        }
         let values = g
             .create_group("Group_001")
             .unwrap()
@@ -624,34 +691,139 @@ mod tests {
     use std::str::FromStr;
     #[test]
     fn missing_quality_metadata_and_wrong_precision_fail_before_values_loading() {
-        for missing in ["dimension","commonPointRule","interpolationType","horizontalPositionUncertainty","verticalUncertainty","wrongPrecision"] {
-            let (template,geometry)=fixture(vec![1;6],false,false);
-            let p=std::env::temp_dir().join(format!("s102-quality-missing-{}-{}.h5",std::process::id(),missing));
-            {let f=hdf5::File::create(&p).unwrap();let q=f.create_group("QualityOfBathymetryCoverage").unwrap();
-             for (n,v) in [("dimension",2u8),("commonPointRule",2),("interpolationType",1),("numInstances",1)] {if n!=missing {attr(&q,n,v);}}
-             for n in ["horizontalPositionUncertainty","verticalUncertainty"] {if n!=missing {if missing=="wrongPrecision"&&n=="horizontalPositionUncertainty" {attr(&q,n,-1f64);}else{attr(&q,n,-1f32);}}}
+        for missing in [
+            "dimension",
+            "commonPointRule",
+            "interpolationType",
+            "horizontalPositionUncertainty",
+            "verticalUncertainty",
+            "wrongPrecision",
+        ] {
+            let (template, geometry) = fixture(vec![1; 6], false, false);
+            let p = std::env::temp_dir().join(format!(
+                "s102-quality-missing-{}-{}.h5",
+                std::process::id(),
+                missing
+            ));
+            {
+                let f = hdf5::File::create(&p).unwrap();
+                let q = f.create_group("QualityOfBathymetryCoverage").unwrap();
+                for (n, v) in [
+                    ("dimension", 2u8),
+                    ("commonPointRule", 2),
+                    ("interpolationType", 1),
+                    ("numInstances", 1),
+                ] {
+                    if n != missing {
+                        attr(&q, n, v);
+                    }
+                }
+                for n in ["horizontalPositionUncertainty", "verticalUncertainty"] {
+                    if n != missing {
+                        if missing == "wrongPrecision" && n == "horizontalPositionUncertainty" {
+                            attr(&q, n, -1f64);
+                        } else {
+                            attr(&q, n, -1f32);
+                        }
+                    }
+                }
             }
-            {let f=hdf5::File::open(&p).unwrap();let error=QualityCoverage::open_optional(&f,&[geometry]).unwrap_err().to_string();assert!(error.contains(if missing=="wrongPrecision" {"float32"}else{missing}),"{missing}: {error}");}
-            std::fs::remove_file(p).unwrap();std::fs::remove_file(template).unwrap();
+            {
+                let f = hdf5::File::open(&p).unwrap();
+                let error = QualityCoverage::open_optional(&f, &[geometry])
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(if missing == "wrongPrecision" {
+                        "float32"
+                    } else {
+                        missing
+                    }),
+                    "{missing}: {error}"
+                );
+            }
+            std::fs::remove_file(p).unwrap();
+            std::fs::remove_file(template).unwrap();
         }
-        let (p,g)=fixture(vec![1;6],false,false);
-        {let f=hdf5::File::open_rw(&p).unwrap();f.group("QualityOfBathymetryCoverage").unwrap().attr("verticalUncertainty").unwrap().write_scalar(&0.25f32).unwrap();}
-        {let f=hdf5::File::open(&p).unwrap();assert!(QualityCoverage::open_optional(&f,&[g]).unwrap_err().to_string().contains("must match"));}
+        let (p, g) = fixture(vec![1; 6], false, false);
+        {
+            let f = hdf5::File::open_rw(&p).unwrap();
+            f.group("QualityOfBathymetryCoverage")
+                .unwrap()
+                .attr("verticalUncertainty")
+                .unwrap()
+                .write_scalar(&0.25f32)
+                .unwrap();
+        }
+        {
+            let f = hdf5::File::open(&p).unwrap();
+            assert!(QualityCoverage::open_optional(&f, &[g])
+                .unwrap_err()
+                .to_string()
+                .contains("must match"));
+        }
         std::fs::remove_file(p).unwrap();
     }
     #[test]
     fn shared_quality_requires_complete_inherited_metadata_without_silent_substitution() {
-        for (field,value) in [("dimension",3u8),("commonPointRule",1),("interpolationType",2)] {
-            let (p,g)=fixture(vec![1;6],false,false);
-            {let f=hdf5::File::open_rw(&p).unwrap();f.group("QualityOfBathymetryCoverage").unwrap().attr(field).unwrap().write_scalar(&value).unwrap();}
-            {let f=hdf5::File::open(&p).unwrap();assert!(QualityCoverage::open_optional(&f,&[g]).is_err(),"{field}");}
+        for (field, value) in [
+            ("dimension", 3u8),
+            ("commonPointRule", 1),
+            ("interpolationType", 2),
+        ] {
+            let (p, g) = fixture(vec![1; 6], false, false);
+            {
+                let f = hdf5::File::open_rw(&p).unwrap();
+                f.group("QualityOfBathymetryCoverage")
+                    .unwrap()
+                    .attr(field)
+                    .unwrap()
+                    .write_scalar(&value)
+                    .unwrap();
+            }
+            {
+                let f = hdf5::File::open(&p).unwrap();
+                assert!(QualityCoverage::open_optional(&f, &[g]).is_err(), "{field}");
+            }
             std::fs::remove_file(p).unwrap();
         }
-        let (p,g)=fixture(vec![1;6],false,false);
-        {let f=hdf5::File::open_rw(&p).unwrap();f.group("QualityOfBathymetryCoverage").unwrap().attr("horizontalPositionUncertainty").unwrap().write_scalar(&0.5f32).unwrap();}
-        {let f=hdf5::File::open(&p).unwrap();assert!(QualityCoverage::open_optional(&f,&[g]).is_err());}
-        {let f=hdf5::File::open_rw(&p).unwrap();f.group("BathymetryCoverage").unwrap().attr("horizontalPositionUncertainty").unwrap().write_scalar(&0.5f32).unwrap();f.group("BathymetryCoverage").unwrap().attr("numInstances").unwrap().write_scalar(&2u8).unwrap();}
-        {let f=hdf5::File::open(&p).unwrap();let q=QualityCoverage::open_optional(&f,&[g,g]).unwrap().unwrap();assert_eq!(q.horizontal_position_uncertainty,0.5);assert_eq!(q.vertical_position_uncertainty,-1.);}
+        let (p, g) = fixture(vec![1; 6], false, false);
+        {
+            let f = hdf5::File::open_rw(&p).unwrap();
+            f.group("QualityOfBathymetryCoverage")
+                .unwrap()
+                .attr("horizontalPositionUncertainty")
+                .unwrap()
+                .write_scalar(&0.5f32)
+                .unwrap();
+        }
+        {
+            let f = hdf5::File::open(&p).unwrap();
+            assert!(QualityCoverage::open_optional(&f, &[g]).is_err());
+        }
+        {
+            let f = hdf5::File::open_rw(&p).unwrap();
+            f.group("BathymetryCoverage")
+                .unwrap()
+                .attr("horizontalPositionUncertainty")
+                .unwrap()
+                .write_scalar(&0.5f32)
+                .unwrap();
+            f.group("BathymetryCoverage")
+                .unwrap()
+                .attr("numInstances")
+                .unwrap()
+                .write_scalar(&2u8)
+                .unwrap();
+        }
+        {
+            let f = hdf5::File::open(&p).unwrap();
+            let q = QualityCoverage::open_optional(&f, &[g, g])
+                .unwrap()
+                .unwrap();
+            assert_eq!(q.horizontal_position_uncertainty, 0.5);
+            assert_eq!(q.vertical_position_uncertainty, -1.);
+        }
         std::fs::remove_file(p).unwrap();
     }
     #[test]
@@ -683,29 +855,96 @@ mod tests {
     }
     #[test]
     fn quality_uses_own_continuous_polygon_and_retains_original_ids() {
-        #[derive(H5Type,Clone,Copy)] #[repr(C)] struct Vertex {longitude:f64,latitude:f64}
-        let (path,geometry)=fixture(vec![1;6],false,false);
-        {
-            let f=hdf5::File::open_rw(&path).unwrap();let container=f.group("QualityOfBathymetryCoverage").unwrap();
-            container.relink("QualityOfBathymetryCoverage.01","Saved").unwrap();let old=container.group("Saved").unwrap();
-            let g=container.create_group("QualityOfBathymetryCoverage.01").unwrap();
-            for name in ["numGRP","numPointsLongitudinal","numPointsLatitudinal"] {attr(&g,name,old.attr(name).unwrap().read_scalar::<u32>().unwrap());}
-            for name in ["gridOriginLongitude","gridOriginLatitude","gridSpacingLongitudinal","gridSpacingLatitudinal"] {attr(&g,name,old.attr(name).unwrap().read_scalar::<f64>().unwrap());}
-            text(&g,"startSequence","0,0");
-            old.relink("Group_001","/QualityOfBathymetryCoverage/QualityOfBathymetryCoverage.01/Group_001").unwrap();
-            let vertices=[[0.5,19.5],[3.5,19.5],[0.5,21.5],[0.5,19.5]].map(|p|Vertex{longitude:p[0],latitude:p[1]});
-            g.new_dataset::<Vertex>().shape(4).create("domainExtent.polygon").unwrap().write_raw(&vertices).unwrap();container.unlink("Saved").unwrap();
+        #[derive(H5Type, Clone, Copy)]
+        #[repr(C)]
+        struct Vertex {
+            longitude: f64,
+            latitude: f64,
         }
-        let f=hdf5::File::open(&path).unwrap();let q=QualityCoverage::open_optional(&f,&[geometry]).unwrap().unwrap();
+        let (path, geometry) = fixture(vec![1; 6], false, false);
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let container = f.group("QualityOfBathymetryCoverage").unwrap();
+            container
+                .relink("QualityOfBathymetryCoverage.01", "Saved")
+                .unwrap();
+            let old = container.group("Saved").unwrap();
+            let g = container
+                .create_group("QualityOfBathymetryCoverage.01")
+                .unwrap();
+            for name in ["numGRP", "numPointsLongitudinal", "numPointsLatitudinal"] {
+                attr(
+                    &g,
+                    name,
+                    old.attr(name).unwrap().read_scalar::<u32>().unwrap(),
+                );
+            }
+            for name in [
+                "gridOriginLongitude",
+                "gridOriginLatitude",
+                "gridSpacingLongitudinal",
+                "gridSpacingLatitudinal",
+            ] {
+                attr(
+                    &g,
+                    name,
+                    old.attr(name).unwrap().read_scalar::<f64>().unwrap(),
+                );
+            }
+            text(&g, "startSequence", "0,0");
+            old.relink(
+                "Group_001",
+                "/QualityOfBathymetryCoverage/QualityOfBathymetryCoverage.01/Group_001",
+            )
+            .unwrap();
+            let vertices = [[0.5, 19.5], [3.5, 19.5], [0.5, 21.5], [0.5, 19.5]].map(|p| Vertex {
+                longitude: p[0],
+                latitude: p[1],
+            });
+            g.new_dataset::<Vertex>()
+                .shape(4)
+                .create("domainExtent.polygon")
+                .unwrap()
+                .write_raw(&vertices)
+                .unwrap();
+            container.unlink("Saved").unwrap();
+        }
+        let f = hdf5::File::open(&path).unwrap();
+        let q = QualityCoverage::open_optional(&f, &[geometry])
+            .unwrap()
+            .unwrap();
         assert!(!q.observed_id_centroids_outside_domain());
-        assert_eq!(q.sample_nearest(1.,20.).unwrap().unwrap().id,1);assert!(!q.observed_id_centroids_outside_domain());
-        assert!(q.sample_nearest(3.,20.).unwrap().is_none());assert!(!q.observed_id_centroids_outside_domain());
-        assert_eq!(q.sample_nearest(2.75,19.75).unwrap().unwrap().id,1);assert!(q.observed_id_centroids_outside_domain());
-        assert_eq!(q.sample_nearest(2.75,20.).unwrap().unwrap().id,1);
-        assert!(q.sample_nearest(2.75,f64::from_bits(20f64.to_bits()+1)).unwrap().is_none());
-        assert_eq!(q.sample_nearest(2.75,f64::from_bits(20f64.to_bits()-1)).unwrap().unwrap().id,1);
-        assert_eq!(q.read_window_ids(GridWindow{column:0,row:0,width:3,height:2}).unwrap(),[1;6]);
-        drop(q);drop(f);std::fs::remove_file(path).unwrap();
+        assert_eq!(q.sample_nearest(1., 20.).unwrap().unwrap().id, 1);
+        assert!(!q.observed_id_centroids_outside_domain());
+        assert!(q.sample_nearest(3., 20.).unwrap().is_none());
+        assert!(!q.observed_id_centroids_outside_domain());
+        assert_eq!(q.sample_nearest(2.75, 19.75).unwrap().unwrap().id, 1);
+        assert!(q.observed_id_centroids_outside_domain());
+        assert_eq!(q.sample_nearest(2.75, 20.).unwrap().unwrap().id, 1);
+        assert!(q
+            .sample_nearest(2.75, f64::from_bits(20f64.to_bits() + 1))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            q.sample_nearest(2.75, f64::from_bits(20f64.to_bits() - 1))
+                .unwrap()
+                .unwrap()
+                .id,
+            1
+        );
+        assert_eq!(
+            q.read_window_ids(GridWindow {
+                column: 0,
+                row: 0,
+                width: 3,
+                height: 2
+            })
+            .unwrap(),
+            [1; 6]
+        );
+        drop(q);
+        drop(f);
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn duplicate_records_and_invalid_boolean_are_rejected() {

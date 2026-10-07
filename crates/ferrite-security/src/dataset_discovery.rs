@@ -88,6 +88,10 @@ impl AuthenticatedDatasetDiscovery {
     pub fn catalogue_sha384(&self) -> &str {
         &self.catalogue_sha384
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Bind all independent authenticated resource and catalogue provenance fields together."
+    )]
     pub(super) fn bind(
         discovery: DatasetDiscovery,
         resource: &VerifiedResource,
@@ -101,8 +105,12 @@ impl AuthenticatedDatasetDiscovery {
         Self {
             original_authentication: std::sync::Arc::new(OriginalDatasetAuthentication {
                 resource: resource.authentication.clone(),
-                catalogue: catalogue.authentication.clone(), catalogue_bytes,
-                verified_unix_seconds, trust_anchor_sha256, resource_uri, discovery_range,
+                catalogue: catalogue.authentication.clone(),
+                catalogue_bytes,
+                verified_unix_seconds,
+                trust_anchor_sha256,
+                resource_uri,
+                discovery_range,
             }),
             discovery,
             resource_path: resource.path.clone(),

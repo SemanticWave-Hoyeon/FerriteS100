@@ -92,7 +92,9 @@ fn record(bytes: &[u8]) -> Result<(&[u8], &[u8], Leader)> {
         leader.size_field_tag == 4
             && leader.size_field_length > 0
             && leader.size_field_position > 0
-            && directory.len() % leader.directory_entry_size() == 0
+            && directory
+                .len()
+                .is_multiple_of(leader.directory_entry_size())
             && !directory.contains(&FIELD_TERMINATOR),
         "Cancellation directory has invalid widths or early terminator"
     );

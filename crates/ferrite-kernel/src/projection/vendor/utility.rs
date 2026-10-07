@@ -26,16 +26,14 @@ fn special_sum(u: f64, v: f64) -> (f64, f64) {
     let up = up - u;
     let vpp = vpp - v;
 
-    let t = s.is_zero().ternary_lazy(||s, || -(up + vpp));
+    let t = s.is_zero().ternary_lazy(|| s, || -(up + vpp));
 
     (s, t)
 }
 
 /// Evaluate a polynomial
 pub(crate) fn polyval(p: &[f64], x: f64) -> f64 {
-    p
-        .iter()
-        .fold(0_f64, |acc, val| acc*x + val)
+    p.iter().fold(0_f64, |acc, val| acc * x + val)
 }
 
 pub(crate) trait GeoMath {
@@ -64,8 +62,7 @@ impl GeoMath for f64 {
 
         if value.abs().eps_eq(hd) {
             hd.copysign(*self)
-        }
-        else {
+        } else {
             value
         }
     }
@@ -78,7 +75,7 @@ impl GeoMath for f64 {
         // This second sum can only change d if abs(d) < 128, so don't need to
         // apply remainder yet again.
         let (diff, err) = special_sum(diff.remainder(td), err);
-        
+
         let hd = f64::from(dms::HD);
         // Fix the sign if d = -180, 0, 180.
         if diff.is_zero() || diff.abs().eps_eq(hd) {
@@ -86,8 +83,7 @@ impl GeoMath for f64 {
             // else (e != 0, implies d = +/-180), d and e must have opposite signs
             let sign = if err.is_zero() { other - *self } else { -err };
             diff.copysign(sign)
-        }
-        else {
+        } else {
             diff
         }
     }

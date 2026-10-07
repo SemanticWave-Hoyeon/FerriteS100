@@ -121,7 +121,10 @@ impl LuaSession {
     }
 
     /// Use a retained immutable PC map; no live disk fallback is permitted.
-    pub fn set_rules_sources(&mut self, sources: Arc<ferrite_portrayal_catalog::CatalogueSources>) -> Result<()> {
+    pub fn set_rules_sources(
+        &mut self,
+        sources: Arc<ferrite_portrayal_catalog::CatalogueSources>,
+    ) -> Result<()> {
         let path = sources.root_path().join("Rules");
         self.rules_path = path.clone();
         self.sources = Some(Arc::clone(&sources));
@@ -129,7 +132,10 @@ impl LuaSession {
     }
 
     fn main_available(&self, path: &Path) -> bool {
-        match &self.sources { Some(s) => s.read_path(path).is_ok(), None => path.exists() }
+        match &self.sources {
+            Some(s) => s.read_path(path).is_ok(),
+            None => path.exists(),
+        }
     }
 
     /// Install a custom Lua searcher that validates resolved file paths
@@ -144,13 +150,22 @@ impl LuaSession {
         if let Some(sources) = sources {
             let rules = rules_dir.to_path_buf();
             let searcher = lua.create_function(move |lua, module_name: String| {
-                if module_name.contains('/') || module_name.contains('\\') || module_name.split('.').any(str::is_empty) {
-                    return Err(mlua::Error::RuntimeError("PC snapshot require path escape rejected".into()));
+                if module_name.contains('/')
+                    || module_name.contains('\\')
+                    || module_name.split('.').any(str::is_empty)
+                {
+                    return Err(mlua::Error::RuntimeError(
+                        "PC snapshot require path escape rejected".into(),
+                    ));
                 }
                 let relative = module_name.replace('.', std::path::MAIN_SEPARATOR_STR);
                 let path = rules.join(format!("{relative}.lua"));
-                let source = sources.read_path(&path).map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
-                cache.compile(lua, &source, &format!("@{}", path.display())).map(mlua::Value::Function)
+                let source = sources
+                    .read_path(&path)
+                    .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                cache
+                    .compile(lua, &source, &format!("@{}", path.display()))
+                    .map(mlua::Value::Function)
             })?;
             let package: mlua::Table = lua.globals().get("package")?;
             let searchers: mlua::Table = package.get("searchers")?;
@@ -211,9 +226,14 @@ impl LuaSession {
     fn read_main_source(&self, main_path: &Path) -> Result<Vec<u8>> {
         if let Some(sources) = &self.sources {
             if main_path.parent() != Some(self.rules_path.as_path()) {
-                return Err(LuaError::ScriptNotFound("PC snapshot main path escapes rules root".into()));
+                return Err(LuaError::ScriptNotFound(
+                    "PC snapshot main path escapes rules root".into(),
+                ));
             }
-            return sources.read_path(main_path).map(|b| b.to_vec()).map_err(|e| LuaError::ScriptNotFound(e.to_string()));
+            return sources
+                .read_path(main_path)
+                .map(|b| b.to_vec())
+                .map_err(|e| LuaError::ScriptNotFound(e.to_string()));
         }
         let root = self
             .rules_path
@@ -482,10 +502,13 @@ impl LuaSession {
     pub fn load_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
         let script = match &self.sources {
-            Some(s) => s.read_path(path.as_ref()).map(|b| b.to_vec()).map_err(|e| std::io::Error::other(e.to_string())),
+            Some(s) => s
+                .read_path(path.as_ref())
+                .map(|b| b.to_vec())
+                .map_err(|e| std::io::Error::other(e.to_string())),
             None => std::fs::read(path),
         }
-            .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
+        .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
 
         self.lua
             .load(script.as_slice())
@@ -550,8 +573,13 @@ impl PortrayalEngine {
         })
     }
 
-    pub fn new_with_sources(sources: Arc<ferrite_portrayal_catalog::CatalogueSources>) -> Result<Self> {
-        Self::new_with_sources_and_chunk_cache(sources, ferrite_lua_runtime::ChunkCache::process_shared())
+    pub fn new_with_sources(
+        sources: Arc<ferrite_portrayal_catalog::CatalogueSources>,
+    ) -> Result<Self> {
+        Self::new_with_sources_and_chunk_cache(
+            sources,
+            ferrite_lua_runtime::ChunkCache::process_shared(),
+        )
     }
 
     /// Choose a bounded compiler cache without changing snapshot/VM semantics.
@@ -564,7 +592,10 @@ impl PortrayalEngine {
         let mut session = LuaSession::new()?;
         session.chunk_cache = cache;
         session.set_rules_sources(sources)?;
-        Ok(Self { session, type_catalogue: None })
+        Ok(Self {
+            session,
+            type_catalogue: None,
+        })
     }
 
     /// Initialize the engine (load main script)
@@ -876,21 +907,33 @@ mod immutable_source_tests {
     use super::*;
     #[test]
     fn shared_engine_compilation_reruns_with_changed_fc_and_context() {
-        let root = std::env::temp_dir().join(format!("ferrite-lua-process-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "ferrite-lua-process-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(root.join("Rules")).unwrap();
         std::fs::write(root.join("Rules/main.lua"), "iteration=0; function PortrayalMain() iteration=iteration+1; HostPortrayalEmit(HostGetFeatureTypeCodes()[1] .. ':' .. tostring(HostGetContextParameter('IsolatedDangers')) .. ':' .. iteration, 'PointInstruction:WRECKS01', 'IsolatedDangers'); return true end").unwrap();
         let sources = ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
         for (code, danger) in [("Wreck", true), ("Sounding", false)] {
             let mut engine = PortrayalEngine::new_with_sources(Arc::clone(&sources)).unwrap();
-            engine.set_type_catalogue(TypeCatalogue { feature_codes:vec![code.into()], ..Default::default() });
+            engine.set_type_catalogue(TypeCatalogue {
+                feature_codes: vec![code.into()],
+                ..Default::default()
+            });
             engine.initialize().unwrap();
-            engine.session_mut().set_context(ContextParameters { isolated_dangers:danger, ..Default::default() });
+            engine.session_mut().set_context(ContextParameters {
+                isolated_dangers: danger,
+                ..Default::default()
+            });
             for iteration in 1..=2 {
-                let result=engine.session_mut().execute_portrayal().unwrap();
-                assert_eq!(result.len(),1);
-                assert_eq!(result[0].feature_id,format!("{code}:{danger}:{iteration}"));
-                assert_eq!(result[0].observed_parameters,["IsolatedDangers"]);
+                let result = engine.session_mut().execute_portrayal().unwrap();
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].feature_id, format!("{code}:{danger}:{iteration}"));
+                assert_eq!(result[0].observed_parameters, ["IsolatedDangers"]);
             }
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -898,7 +941,14 @@ mod immutable_source_tests {
 
     #[test]
     fn main_require_reset_and_vm_tables_use_retained_sources_after_original_changes() {
-        let root = std::env::temp_dir().join(format!("ferrite-lua-source-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "ferrite-lua-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(root.join("Rules")).unwrap();
         let main = "loaded = require('dep'); function PortrayalMain() return true end";
         std::fs::write(root.join("Rules/main.lua"), main).unwrap();
@@ -907,7 +957,11 @@ mod immutable_source_tests {
         let mut a = PortrayalEngine::new_with_sources(Arc::clone(&source_a)).unwrap();
         a.initialize().unwrap();
         assert_eq!(a.session().eval::<String>("loaded.tag").unwrap(), "A");
-        a.session().lua.load("loaded.tag = 'mutated'; leak = true").exec().unwrap();
+        a.session()
+            .lua
+            .load("loaded.tag = 'mutated'; leak = true")
+            .exec()
+            .unwrap();
         std::fs::write(root.join("Rules/main.lua"), main).unwrap();
         std::fs::write(root.join("Rules/dep.lua"), "return {tag='B'}").unwrap();
         let source_b = ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
@@ -932,16 +986,36 @@ mod immutable_source_tests {
 mod owned_engine_tests {
     use super::*;
     use crate::PrimitiveType;
-    fn data(id:i64) -> CellData {
-        CellData {features:HashMap::from([(id,FeatureInfo {id,code:format!("Cell{id}"),
-            primitive_type:PrimitiveType::None,attributes:HashMap::new(),complex_attributes:HashMap::new(),spatial_refs:Vec::new()})]),
-            information_types:HashMap::new(),spatials:HashMap::new(),feature_associations:HashMap::new(),
-            information_associations:HashMap::new(),spatial_to_features:HashMap::new()}
+    fn data(id: i64) -> CellData {
+        CellData {
+            features: HashMap::from([(
+                id,
+                FeatureInfo {
+                    id,
+                    code: format!("Cell{id}"),
+                    primitive_type: PrimitiveType::None,
+                    attributes: HashMap::new(),
+                    complex_attributes: HashMap::new(),
+                    spatial_refs: Vec::new(),
+                },
+            )]),
+            information_types: HashMap::new(),
+            spatials: HashMap::new(),
+            feature_associations: HashMap::new(),
+            information_associations: HashMap::new(),
+            spatial_to_features: HashMap::new(),
+        }
     }
     #[test]
     fn owned_and_borrowed_engines_agree_and_reset_data_globals_fc_context_and_failed_results() {
-        let root=std::env::temp_dir().join(format!("ferrite-owned-cell-{}-{}",std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "ferrite-owned-cell-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(root.join("Rules")).unwrap();
         std::fs::write(root.join("Rules/main.lua"),r#"
             iteration=0
@@ -956,25 +1030,39 @@ mod owned_engine_tests {
                 return true
             end
         "#).unwrap();
-        let sources=ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
-        let mut borrowed=PortrayalEngine::new_with_sources(Arc::clone(&sources)).unwrap();
-        let mut owned=PortrayalEngine::new_with_sources(sources).unwrap();
-        for (id,code,danger) in [(7,"First",true),(3,"Second",true),(9,"Failed",false),(2,"Recovery",true)] {
-            for engine in [&mut borrowed,&mut owned] {
-                engine.set_type_catalogue(TypeCatalogue {feature_codes:vec![code.into()],..Default::default()});
+        let sources = ferrite_portrayal_catalog::CatalogueSources::capture(&root).unwrap();
+        let mut borrowed = PortrayalEngine::new_with_sources(Arc::clone(&sources)).unwrap();
+        let mut owned = PortrayalEngine::new_with_sources(sources).unwrap();
+        for (id, code, danger) in [
+            (7, "First", true),
+            (3, "Second", true),
+            (9, "Failed", false),
+            (2, "Recovery", true),
+        ] {
+            for engine in [&mut borrowed, &mut owned] {
+                engine.set_type_catalogue(TypeCatalogue {
+                    feature_codes: vec![code.into()],
+                    ..Default::default()
+                });
             }
-            let data=data(id);
-            let ctx=ContextParameters {isolated_dangers:danger,..Default::default()};
-            let a=borrowed.process_cell(&data,ctx.clone());
-            assert_eq!(data.features[&id].code,format!("Cell{id}"));
-            let b=owned.process_owned_cell(data,ctx);
+            let data = data(id);
+            let ctx = ContextParameters {
+                isolated_dangers: danger,
+                ..Default::default()
+            };
+            let a = borrowed.process_cell(&data, ctx.clone());
+            assert_eq!(data.features[&id].code, format!("Cell{id}"));
+            let b = owned.process_owned_cell(data, ctx);
             if danger {
-                let a=a.unwrap();let b=b.unwrap();
-                assert_eq!(format!("{a:?}"),format!("{b:?}"));
-                assert_eq!(a.len(),1);assert_eq!(a[0].feature_id,id.to_string());
+                let a = a.unwrap();
+                let b = b.unwrap();
+                assert_eq!(format!("{a:?}"), format!("{b:?}"));
+                assert_eq!(a.len(), 1);
+                assert_eq!(a[0].feature_id, id.to_string());
                 assert!(format!("{a:?}").contains(&format!("Cell{id}:{code}:1")));
             } else {
-                assert!(a.is_err());assert!(b.is_err());
+                assert!(a.is_err());
+                assert!(b.is_err());
                 assert!(borrowed.session.host.get_results().is_empty());
                 assert!(owned.session.host.get_results().is_empty());
             }

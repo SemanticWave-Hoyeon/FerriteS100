@@ -229,7 +229,7 @@ pub fn rasterize(region: &Region, extent: [u32; 2], byte_budget: usize) -> Resul
             "Unpaired coverage scanline intersections"
         );
         let offset = row as usize * size[0] as usize;
-        for pair in crossings.chunks_exact(2) {
+        for pair in crossings.as_chunks::<2>().0 {
             // A centre lies in [left,right), independent of ring winding.
             let start = clamp((pair[0] - 0.5).ceil(), extent[0]).max(origin[0]);
             let stop = clamp((pair[1] - 0.5).ceil(), extent[0]).min(end[0]);

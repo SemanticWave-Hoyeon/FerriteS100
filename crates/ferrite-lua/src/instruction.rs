@@ -11,6 +11,8 @@
 //! State commands modify variables; drawing commands consume them.
 //! State is reset per feature instance.
 
+type CoverageColorDefinition = (String, f64, Option<(String, f64)>, f64);
+
 use crate::Result;
 use ferrite_kernel::{IntervalClosure, TemporalBounds, TemporalInterval};
 
@@ -392,7 +394,9 @@ fn def_decode(s: &str) -> String {
     // Output never grows: each recognized two-byte escape becomes one byte.
     // Decode original tokens only. In particular, &as becomes literal &s;
     // decoding the ampersand does not recursively interpret the following s.
-    let Some(first) = s.find('&') else { return s.to_owned(); };
+    let Some(first) = s.find('&') else {
+        return s.to_owned();
+    };
     let mut output = String::with_capacity(s.len());
     output.push_str(&s[..first]);
     let mut rest = &s[first..];
@@ -491,7 +495,7 @@ struct DrawingState {
 
     // ── Coverage (9a-11.2.2.8) ──
     lookup_entries: Vec<LookupEntry>,
-    coverage_color: Option<(String, f64, Option<(String, f64)>, f64)>,
+    coverage_color: Option<CoverageColorDefinition>,
     coverage_symbol: Option<String>,
     coverage_text: Option<String>,
 
@@ -666,13 +670,16 @@ fn transparency_parameter(params: &[&str], index: usize, default: f64) -> Result
 fn geometry_number(params: &[&str], index: usize, default: Option<f64>) -> Result<f64> {
     let raw = params.get(index).filter(|p| !p.is_empty());
     let value = match raw {
-        Some(raw) => raw.parse::<f64>().map_err(|_| crate::LuaError::InvalidInstruction(
-            "Invalid geometry number".into()))?,
-        None => default.ok_or_else(|| crate::LuaError::InvalidInstruction(
-            "Missing geometry number".into()))?,
+        Some(raw) => raw
+            .parse::<f64>()
+            .map_err(|_| crate::LuaError::InvalidInstruction("Invalid geometry number".into()))?,
+        None => default
+            .ok_or_else(|| crate::LuaError::InvalidInstruction("Missing geometry number".into()))?,
     };
     if !value.is_finite() {
-        return Err(crate::LuaError::InvalidInstruction("Non-finite geometry number".into()));
+        return Err(crate::LuaError::InvalidInstruction(
+            "Non-finite geometry number".into(),
+        ));
     }
     Ok(value)
 }
@@ -680,12 +687,18 @@ fn geometry_crs(value: &str) -> Result<String> {
     if matches!(value, "GeographicCRS" | "LocalCRS" | "PortrayalCRS") {
         Ok(value.to_owned())
     } else {
-        Err(crate::LuaError::InvalidInstruction("Unsupported geometry CRS".into()))
+        Err(crate::LuaError::InvalidInstruction(
+            "Unsupported geometry CRS".into(),
+        ))
     }
 }
 fn geometry_arity(params: &[&str], minimum: usize, maximum: usize) -> Result<()> {
-    if (minimum..=maximum).contains(&params.len()) { Ok(()) } else {
-        Err(crate::LuaError::InvalidInstruction("Wrong geometry argument count".into()))
+    if (minimum..=maximum).contains(&params.len()) {
+        Ok(())
+    } else {
+        Err(crate::LuaError::InvalidInstruction(
+            "Wrong geometry argument count".into(),
+        ))
     }
 }
 
@@ -760,7 +773,9 @@ fn parse_command(
         }
         "DisplayPlane" => {
             if params.len() != 1 || value.is_empty() {
-                return Err(crate::LuaError::InvalidInstruction("DisplayPlane requires one catalogue identifier".into()));
+                return Err(crate::LuaError::InvalidInstruction(
+                    "DisplayPlane requires one catalogue identifier".into(),
+                ));
             }
             state.display_plane = match def_decode(value).as_str() {
                 "UnderRadar" => DisplayPlane::UnderRadar,
@@ -770,17 +785,23 @@ fn parse_command(
         }
         "DrawingPriority" => {
             state.drawing_priority = value.parse::<i32>().map_err(|_| {
-                crate::LuaError::InvalidInstruction("DrawingPriority requires one supported integer".into())
+                crate::LuaError::InvalidInstruction(
+                    "DrawingPriority requires one supported integer".into(),
+                )
             })?;
         }
         "ScaleMinimum" => {
             state.scale_minimum = Some(value.parse::<u32>().map_err(|_| {
-                crate::LuaError::InvalidInstruction("ScaleMinimum requires one nonnegative supported denominator".into())
+                crate::LuaError::InvalidInstruction(
+                    "ScaleMinimum requires one nonnegative supported denominator".into(),
+                )
             })?);
         }
         "ScaleMaximum" => {
             state.scale_maximum = Some(value.parse::<u32>().map_err(|_| {
-                crate::LuaError::InvalidInstruction("ScaleMaximum requires one nonnegative supported denominator".into())
+                crate::LuaError::InvalidInstruction(
+                    "ScaleMaximum requires one nonnegative supported denominator".into(),
+                )
             })?);
         }
         "Id" => {
@@ -801,7 +822,11 @@ fn parse_command(
             state.hover = match value {
                 "true" => true,
                 "false" => false,
-                _ => return Err(crate::LuaError::InvalidInstruction("Hover requires true or false".into())),
+                _ => {
+                    return Err(crate::LuaError::InvalidInstruction(
+                        "Hover requires true or false".into(),
+                    ))
+                }
             };
         }
 
@@ -1087,15 +1112,24 @@ fn parse_command(
             geometry_arity(&params, 1, 2)?;
             let spatial_id = def_decode(params[0]);
             if spatial_id.is_empty() {
-                return Err(crate::LuaError::InvalidInstruction("Missing spatial reference".into()));
+                return Err(crate::LuaError::InvalidInstruction(
+                    "Missing spatial reference".into(),
+                ));
             }
             let forward = match params.get(1).copied().unwrap_or("") {
                 "" | "true" => true,
                 "false" => false,
-                _ => return Err(crate::LuaError::InvalidInstruction("SpatialReference forward requires a boolean".into())),
+                _ => {
+                    return Err(crate::LuaError::InvalidInstruction(
+                        "SpatialReference forward requires a boolean".into(),
+                    ))
+                }
             };
             state.spatial_references.push((spatial_id.clone(), forward));
-            result.commands.push(DrawingCommand::SpatialReference { spatial_id, forward });
+            result.commands.push(DrawingCommand::SpatialReference {
+                spatial_id,
+                forward,
+            });
         }
         "AugmentedPoint" => {
             if params.len() != 3
@@ -1133,9 +1167,16 @@ fn parse_command(
             let length_crs = geometry_crs(params[2])?;
             let length = geometry_number(&params, 3, None)?;
             if length < 0. {
-                return Err(crate::LuaError::InvalidInstruction("Negative augmented ray length".into()));
+                return Err(crate::LuaError::InvalidInstruction(
+                    "Negative augmented ray length".into(),
+                ));
             }
-            state.augmented_ray = Some(AugmentedRayDef { direction_crs, direction, length_crs, length });
+            state.augmented_ray = Some(AugmentedRayDef {
+                direction_crs,
+                direction,
+                length_crs,
+                length,
+            });
             state.augmented_point = None;
             state.augmented_point_crs = None;
             state.augmented_path = None;
@@ -1148,43 +1189,73 @@ fn parse_command(
                 crs_distance: geometry_crs(params[2])?,
             };
             state.augmented_path = Some(AugmentedPathDef {
-                crs, segments: std::mem::take(&mut state.segment_list),
+                crs,
+                segments: std::mem::take(&mut state.segment_list),
             });
             state.augmented_point = None;
             state.augmented_point_crs = None;
             state.augmented_ray = None;
         }
         "Polyline" => {
-            if params.len() < 4 || params.len() % 2 != 0 {
-                return Err(crate::LuaError::InvalidInstruction("Polyline requires at least two complete coordinate pairs".into()));
+            if params.len() < 4 || !params.len().is_multiple_of(2) {
+                return Err(crate::LuaError::InvalidInstruction(
+                    "Polyline requires at least two complete coordinate pairs".into(),
+                ));
             }
             let mut points = Vec::with_capacity(params.len() / 2);
             for index in (0..params.len()).step_by(2) {
-                points.push((geometry_number(&params, index, None)?, geometry_number(&params, index+1, None)?));
+                points.push((
+                    geometry_number(&params, index, None)?,
+                    geometry_number(&params, index + 1, None)?,
+                ));
             }
             state.segment_list.push(PathSegment::Polyline(points));
         }
         "Arc3Points" => {
             geometry_arity(&params, 6, 6)?;
-            let start = (geometry_number(&params, 0, None)?, geometry_number(&params, 1, None)?);
-            let median = (geometry_number(&params, 2, None)?, geometry_number(&params, 3, None)?);
-            let end = (geometry_number(&params, 4, None)?, geometry_number(&params, 5, None)?);
-            state.segment_list.push(PathSegment::Arc3Points { start, median, end });
+            let start = (
+                geometry_number(&params, 0, None)?,
+                geometry_number(&params, 1, None)?,
+            );
+            let median = (
+                geometry_number(&params, 2, None)?,
+                geometry_number(&params, 3, None)?,
+            );
+            let end = (
+                geometry_number(&params, 4, None)?,
+                geometry_number(&params, 5, None)?,
+            );
+            state
+                .segment_list
+                .push(PathSegment::Arc3Points { start, median, end });
         }
         "ArcByRadius" => {
             geometry_arity(&params, 3, 5)?;
-            let center = (geometry_number(&params, 0, None)?, geometry_number(&params, 1, None)?);
+            let center = (
+                geometry_number(&params, 0, None)?,
+                geometry_number(&params, 1, None)?,
+            );
             let radius = geometry_number(&params, 2, None)?;
             let start_angle = geometry_number(&params, 3, Some(0.))?;
             let angular_distance = geometry_number(&params, 4, Some(360.))?;
             if radius < 0. {
-                return Err(crate::LuaError::InvalidInstruction("Negative arc radius".into()));
+                return Err(crate::LuaError::InvalidInstruction(
+                    "Negative arc radius".into(),
+                ));
             }
-            state.segment_list.push(PathSegment::ArcByRadius { center, radius, start_angle, angular_distance });
+            state.segment_list.push(PathSegment::ArcByRadius {
+                center,
+                radius,
+                start_angle,
+                angular_distance,
+            });
         }
         "Annulus" => {
             geometry_arity(&params, 3, 6)?;
-            let center = (geometry_number(&params, 0, None)?, geometry_number(&params, 1, None)?);
+            let center = (
+                geometry_number(&params, 0, None)?,
+                geometry_number(&params, 1, None)?,
+            );
             let outer_radius = geometry_number(&params, 2, None)?;
             // Clause 9a-11.2.2.6 says omitted inner radius describes a sector.
             // Keep the application's established zero-radius policy. Table9a-12
@@ -1193,13 +1264,23 @@ fn parse_command(
             let start_angle = geometry_number(&params, 4, Some(0.))?;
             let angular_distance = geometry_number(&params, 5, Some(360.))?;
             if inner_radius < 0. || outer_radius < inner_radius {
-                return Err(crate::LuaError::InvalidInstruction("Invalid annulus radii".into()));
+                return Err(crate::LuaError::InvalidInstruction(
+                    "Invalid annulus radii".into(),
+                ));
             }
-            state.segment_list.push(PathSegment::Annulus { center, outer_radius, inner_radius, start_angle, angular_distance });
+            state.segment_list.push(PathSegment::Annulus {
+                center,
+                outer_radius,
+                inner_radius,
+                start_angle,
+                angular_distance,
+            });
         }
         "ClearGeometry" => {
             if !value.is_empty() {
-                return Err(crate::LuaError::InvalidInstruction("ClearGeometry takes no parameters".into()));
+                return Err(crate::LuaError::InvalidInstruction(
+                    "ClearGeometry takes no parameters".into(),
+                ));
             }
             state.spatial_references.clear();
             state.augmented_point = None;
@@ -1564,8 +1645,11 @@ pub struct ObservedContextParameter<'a> {
 }
 
 fn parse_observed_parameters(encoded: &str) -> Result<Vec<String>> {
-    if encoded.trim().is_empty() { return Ok(Vec::new()); }
-    let malformed = || crate::LuaError::InvalidInstruction("Invalid observed context parameters".into());
+    if encoded.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let malformed =
+        || crate::LuaError::InvalidInstruction("Invalid observed context parameters".into());
     let mut records = std::collections::BTreeMap::new();
     // Published Part 9a-14.2.1 specifies DEF. Official S-101 emits a
     // semicolon-separated name:value set via pairs(), whose order is undefined.
@@ -1573,27 +1657,46 @@ fn parse_observed_parameters(encoded: &str) -> Result<Vec<String>> {
     if encoded.contains(':') || encoded.contains(';') {
         let mut fields = encoded.split(';').peekable();
         while let Some(record) = fields.next() {
-            if record.is_empty() && fields.peek().is_none() { continue; } // DEF terminator
+            if record.is_empty() && fields.peek().is_none() {
+                continue;
+            } // DEF terminator
             let (name, value) = record.split_once(':').ok_or_else(malformed)?;
-            if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == ',') {
+            if name.is_empty()
+                || name
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == ',')
+            {
                 return Err(malformed());
             }
-            if records.insert(name.to_owned(), Some(value.to_owned())).is_some() {
-                return Err(crate::LuaError::InvalidInstruction(format!("Duplicate observed context parameter {name}")));
+            if records
+                .insert(name.to_owned(), Some(value.to_owned()))
+                .is_some()
+            {
+                return Err(crate::LuaError::InvalidInstruction(format!(
+                    "Duplicate observed context parameter {name}"
+                )));
             }
         }
     } else {
         // Compatibility with older host callers that emitted names only.
         for name in encoded.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            if name.chars().any(|c| c.is_whitespace() || c.is_control()) { return Err(malformed()); }
+            if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(malformed());
+            }
             if records.insert(name.to_owned(), None).is_some() {
-                return Err(crate::LuaError::InvalidInstruction(format!("Duplicate observed context parameter {name}")));
+                return Err(crate::LuaError::InvalidInstruction(format!(
+                    "Duplicate observed context parameter {name}"
+                )));
             }
         }
     }
-    Ok(records.into_iter().map(|(name, value)| match value {
-        Some(value) => format!("{name}:{value}"), None => name,
-    }).collect())
+    Ok(records
+        .into_iter()
+        .map(|(name, value)| match value {
+            Some(value) => format!("{name}:{value}"),
+            None => name,
+        })
+        .collect())
 }
 
 /// Result from Lua portrayal emission
@@ -1618,16 +1721,27 @@ impl PortrayalResult {
 
     /// Structured borrowed view; values are exact encoded strings, not normalized
     /// numbers/booleans or decoded text. Produced results have unique names.
-    pub fn observed_context_parameters(&self) -> impl Iterator<Item=ObservedContextParameter<'_>> {
-        self.observed_parameters.iter().map(|record| match record.split_once(':') {
-            Some((name,value)) => ObservedContextParameter {name,encoded_value:Some(value)},
-            None => ObservedContextParameter {name:record.as_str(),encoded_value:None},
-        })
+    pub fn observed_context_parameters(
+        &self,
+    ) -> impl Iterator<Item = ObservedContextParameter<'_>> {
+        self.observed_parameters
+            .iter()
+            .map(|record| match record.split_once(':') {
+                Some((name, value)) => ObservedContextParameter {
+                    name,
+                    encoded_value: Some(value),
+                },
+                None => ObservedContextParameter {
+                    name: record.as_str(),
+                    encoded_value: None,
+                },
+            })
     }
 
     /// Names actually read by portrayal; values remain available independently.
-    pub fn observed_parameter_names(&self) -> impl Iterator<Item=&str> {
-        self.observed_context_parameters().map(|parameter|parameter.name)
+    pub fn observed_parameter_names(&self) -> impl Iterator<Item = &str> {
+        self.observed_context_parameters()
+            .map(|parameter| parameter.name)
     }
 
     /// Parse from Lua output (featureID, drawingInstructions, observedParams)
@@ -2395,37 +2509,58 @@ mod visibility_state_contract {
     #[test]
     fn initial_state_and_per_emission_reset_follow_table_9a_7() {
         let first=parse_instruction_string("one", "ViewingGroup:31011;DrawingPriority:42;ScaleMinimum:10000;ScaleMaximum:100;Hover:true;PointInstruction:A").unwrap();
-        let first=first.commands[0].visibility().unwrap();
-        assert_eq!(first.drawing_priority,42); assert_eq!(first.viewing_groups,[31011]);
-        assert_eq!(first.scale_minimum,Some(10000)); assert_eq!(first.scale_maximum,Some(100)); assert!(first.hover);
-        let second=parse_instruction_string("two", "PointInstruction:A").unwrap();
-        let v=second.commands[0].visibility().unwrap();
-        assert!(v.viewing_groups.is_empty()); assert!(v.named_viewing_groups.is_empty());
-        assert_eq!(v.drawing_priority,0); assert!(!v.hover);
+        let first = first.commands[0].visibility().unwrap();
+        assert_eq!(first.drawing_priority, 42);
+        assert_eq!(first.viewing_groups, [31011]);
+        assert_eq!(first.scale_minimum, Some(10000));
+        assert_eq!(first.scale_maximum, Some(100));
+        assert!(first.hover);
+        let second = parse_instruction_string("two", "PointInstruction:A").unwrap();
+        let v = second.commands[0].visibility().unwrap();
+        assert!(v.viewing_groups.is_empty());
+        assert!(v.named_viewing_groups.is_empty());
+        assert_eq!(v.drawing_priority, 0);
+        assert!(!v.hover);
         // None is the consumer's unbounded scale representation, rather than
         // a hard-coded arbitrary maximum/minimum denominator.
-        assert_eq!(v.scale_minimum,None); assert_eq!(v.scale_maximum,None);
-        assert_eq!(ParsedInstruction::new("empty".into()).drawing_priority(),0);
+        assert_eq!(v.scale_minimum, None);
+        assert_eq!(v.scale_maximum, None);
+        assert_eq!(ParsedInstruction::new("empty".into()).drawing_priority(), 0);
         assert!(VisibilityState::default().viewing_groups.is_empty());
-        assert_eq!(VisibilityState::default().drawing_priority,0);
+        assert_eq!(VisibilityState::default().drawing_priority, 0);
     }
     #[test]
     fn malformed_visibility_values_cannot_reuse_previous_or_clear_restriction() {
         for (command, values) in [
-            ("DrawingPriority", vec!["", "1.5", "NaN", "2147483648", "4,5", "bad"]),
-            ("ScaleMinimum",vec!["", "-1", "1.5", "4294967296", "1,2", "NaN"]),
-            ("ScaleMaximum",vec!["", "-1", "1.5", "4294967296", "1,2", "NaN"]),
-            ("Hover",vec!["", "TRUE", "0", "false,true", "bad"]),
+            (
+                "DrawingPriority",
+                vec!["", "1.5", "NaN", "2147483648", "4,5", "bad"],
+            ),
+            (
+                "ScaleMinimum",
+                vec!["", "-1", "1.5", "4294967296", "1,2", "NaN"],
+            ),
+            (
+                "ScaleMaximum",
+                vec!["", "-1", "1.5", "4294967296", "1,2", "NaN"],
+            ),
+            ("Hover", vec!["", "TRUE", "0", "false,true", "bad"]),
         ] {
             for value in values {
                 let def=format!("DrawingPriority:42;ScaleMinimum:1000;ScaleMaximum:100;Hover:true;{command}:{value};PointInstruction:A");
-                assert!(parse_instruction_string("f", &def).is_err(),"{def}");
+                assert!(parse_instruction_string("f", &def).is_err(), "{def}");
             }
         }
         let parsed=parse_instruction_string("f", "DrawingPriority:-2147483648;PointInstruction:A;DrawingPriority:2147483647;ScaleMinimum:4294967295;ScaleMaximum:0;Hover:false;PointInstruction:B").unwrap();
-        assert_eq!(parsed.commands[0].visibility().unwrap().drawing_priority,i32::MIN);
-        let v=parsed.commands[1].visibility().unwrap();assert_eq!(v.drawing_priority,i32::MAX);
-        assert_eq!(v.scale_minimum,Some(u32::MAX));assert_eq!(v.scale_maximum,Some(0));assert!(!v.hover);
+        assert_eq!(
+            parsed.commands[0].visibility().unwrap().drawing_priority,
+            i32::MIN
+        );
+        let v = parsed.commands[1].visibility().unwrap();
+        assert_eq!(v.drawing_priority, i32::MAX);
+        assert_eq!(v.scale_minimum, Some(u32::MAX));
+        assert_eq!(v.scale_maximum, Some(0));
+        assert!(!v.hover);
     }
 }
 
@@ -2435,18 +2570,49 @@ mod display_plane_reference_tests {
     #[test]
     fn case_sensitive_decoded_names_survive_snapshots_and_emission_reset() {
         let p=parse_instruction_string("f", "DisplayPlane:overRadar;PointInstruction:A;DisplayPlane:OverRadar;PointInstruction:B;DisplayPlane:plane&csection&sone&mtwo&aend;PointInstruction:C").unwrap();
-        let refs:Vec<_>=p.commands.iter().map(|c|c.visibility().unwrap().display_plane.reference()).collect();
-        assert_eq!(refs,[Some("overRadar"),Some("OverRadar"),Some("plane:section;one,two&end")]);
-        assert_eq!(p.display_plane().reference(),Some("overRadar"));
-        let shared=parse_instruction_string("s","DisplayPlane:OverRADAR;PointInstruction:A;PointInstruction:B").unwrap();
-        let DisplayPlane::Named(a)=&shared.commands[0].visibility().unwrap().display_plane else { panic!() };
-        let DisplayPlane::Named(b)=&shared.commands[1].visibility().unwrap().display_plane else { panic!() };
-        assert_eq!(a.as_ref(),"OverRADAR");
-        assert!(std::sync::Arc::ptr_eq(a,b),"immutable plane identifiers must not allocate once per drawing command");
+        let refs: Vec<_> = p
+            .commands
+            .iter()
+            .map(|c| c.visibility().unwrap().display_plane.reference())
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                Some("overRadar"),
+                Some("OverRadar"),
+                Some("plane:section;one,two&end")
+            ]
+        );
+        assert_eq!(p.display_plane().reference(), Some("overRadar"));
+        let shared = parse_instruction_string(
+            "s",
+            "DisplayPlane:OverRADAR;PointInstruction:A;PointInstruction:B",
+        )
+        .unwrap();
+        let DisplayPlane::Named(a) = &shared.commands[0].visibility().unwrap().display_plane else {
+            panic!()
+        };
+        let DisplayPlane::Named(b) = &shared.commands[1].visibility().unwrap().display_plane else {
+            panic!()
+        };
+        assert_eq!(a.as_ref(), "OverRADAR");
+        assert!(
+            std::sync::Arc::ptr_eq(a, b),
+            "immutable plane identifiers must not allocate once per drawing command"
+        );
 
-        assert_eq!(parse_instruction_string("g","PointInstruction:A").unwrap().display_plane(),DisplayPlane::Unspecified);
-        for def in ["DisplayPlane;PointInstruction:A","DisplayPlane:;PointInstruction:A","DisplayPlane:A,B;PointInstruction:A"] {
-            assert!(parse_instruction_string("f",def).is_err(),"{def}");
+        assert_eq!(
+            parse_instruction_string("g", "PointInstruction:A")
+                .unwrap()
+                .display_plane(),
+            DisplayPlane::Unspecified
+        );
+        for def in [
+            "DisplayPlane;PointInstruction:A",
+            "DisplayPlane:;PointInstruction:A",
+            "DisplayPlane:A,B;PointInstruction:A",
+        ] {
+            assert!(parse_instruction_string("f", def).is_err(), "{def}");
         }
     }
 }
@@ -2457,41 +2623,111 @@ mod geometry_validation_tests {
     #[test]
     fn malformed_numbers_and_argument_lists_never_create_replacement_geometry() {
         for input in [
-            "SpatialReference:", "SpatialReference:12,maybe", "SpatialReference:12,false,extra",
-            "Polyline:", "Polyline:1,2", "Polyline:1,2,3", "Polyline:1,2,bad,4", "Polyline:1,2,3,NaN",
-            "Arc3Points:1,2,3,4,5", "Arc3Points:1,2,3,4,5,6,7", "Arc3Points:1,2,3,4,NaN,6",
-            "ArcByRadius:1,2", "ArcByRadius:1,2,bad", "ArcByRadius:1,2,-1", "ArcByRadius:1,2,3,bad", "ArcByRadius:1,2,3,0,inf", "ArcByRadius:1,2,3,0,90,extra",
-            "Annulus:1,2,3,bad", "Annulus:1,2,3,4", "Annulus:1,2,3,-1", "Annulus:1,2,3,2,0,NaN", "Annulus:1,2,3,2,0,90,extra",
-            "AugmentedRay:LocalCRS,foo,LocalCRS,10", "AugmentedRay:unknown,90,LocalCRS,10", "AugmentedRay:LocalCRS,90,LocalCRS,-1", "AugmentedRay:LocalCRS,90,LocalCRS,inf", "AugmentedRay:LocalCRS,90,LocalCRS,1,extra",
-            "AugmentedPath:LocalCRS,LocalCRS", "AugmentedPath:LocalCRS,bogus,LocalCRS", "AugmentedPath:LocalCRS,LocalCRS,LocalCRS,extra",
+            "SpatialReference:",
+            "SpatialReference:12,maybe",
+            "SpatialReference:12,false,extra",
+            "Polyline:",
+            "Polyline:1,2",
+            "Polyline:1,2,3",
+            "Polyline:1,2,bad,4",
+            "Polyline:1,2,3,NaN",
+            "Arc3Points:1,2,3,4,5",
+            "Arc3Points:1,2,3,4,5,6,7",
+            "Arc3Points:1,2,3,4,NaN,6",
+            "ArcByRadius:1,2",
+            "ArcByRadius:1,2,bad",
+            "ArcByRadius:1,2,-1",
+            "ArcByRadius:1,2,3,bad",
+            "ArcByRadius:1,2,3,0,inf",
+            "ArcByRadius:1,2,3,0,90,extra",
+            "Annulus:1,2,3,bad",
+            "Annulus:1,2,3,4",
+            "Annulus:1,2,3,-1",
+            "Annulus:1,2,3,2,0,NaN",
+            "Annulus:1,2,3,2,0,90,extra",
+            "AugmentedRay:LocalCRS,foo,LocalCRS,10",
+            "AugmentedRay:unknown,90,LocalCRS,10",
+            "AugmentedRay:LocalCRS,90,LocalCRS,-1",
+            "AugmentedRay:LocalCRS,90,LocalCRS,inf",
+            "AugmentedRay:LocalCRS,90,LocalCRS,1,extra",
+            "AugmentedPath:LocalCRS,LocalCRS",
+            "AugmentedPath:LocalCRS,bogus,LocalCRS",
+            "AugmentedPath:LocalCRS,LocalCRS,LocalCRS,extra",
             "ClearGeometry:extra",
         ] {
-            assert!(parse_instruction_string("f", &format!("PointInstruction:VALID;{input};LineInstruction:L")).is_err(), "{input}");
+            assert!(
+                parse_instruction_string(
+                    "f",
+                    &format!("PointInstruction:VALID;{input};LineInstruction:L")
+                )
+                .is_err(),
+                "{input}"
+            );
         }
     }
     #[test]
     fn invalid_geometry_command_does_not_mutate_active_pending_or_drawn_state() {
-        let mut state=DrawingState::default(); let mut result=ParsedInstruction::new("f".into());
-        for (name,value) in [("SpatialReference","12,false"),("Polyline","0,0,1,1"),("AugmentedRay","GeographicCRS,30,PortrayalCRS,5"),("LineInstruction","L")] {
-            parse_command(&mut result,&mut state,name,value).unwrap();
+        let mut state = DrawingState::default();
+        let mut result = ParsedInstruction::new("f".into());
+        for (name, value) in [
+            ("SpatialReference", "12,false"),
+            ("Polyline", "0,0,1,1"),
+            ("AugmentedRay", "GeographicCRS,30,PortrayalCRS,5"),
+            ("LineInstruction", "L"),
+        ] {
+            parse_command(&mut result, &mut state, name, value).unwrap();
         }
-        let before=format!("{state:?}");let commands=format!("{:?}",result.commands);
-        for (name,value) in [("SpatialReference","14,maybe"),("Polyline","0,0,bad,1"),("Arc3Points","0,0,1,2,3,NaN"),("ArcByRadius","0,0,5,inf"),("Annulus","0,0,5,6"),("AugmentedPath","LocalCRS,unknown,LocalCRS"),("AugmentedRay","GeographicCRS,30,PortrayalCRS,-5"),("ClearGeometry","x")] {
-            assert!(parse_command(&mut result,&mut state,name,value).is_err());
-            assert_eq!(format!("{state:?}"),before,"{name}");assert_eq!(format!("{:?}",result.commands),commands,"{name}");
+        let before = format!("{state:?}");
+        let commands = format!("{:?}", result.commands);
+        for (name, value) in [
+            ("SpatialReference", "14,maybe"),
+            ("Polyline", "0,0,bad,1"),
+            ("Arc3Points", "0,0,1,2,3,NaN"),
+            ("ArcByRadius", "0,0,5,inf"),
+            ("Annulus", "0,0,5,6"),
+            ("AugmentedPath", "LocalCRS,unknown,LocalCRS"),
+            ("AugmentedRay", "GeographicCRS,30,PortrayalCRS,-5"),
+            ("ClearGeometry", "x"),
+        ] {
+            assert!(parse_command(&mut result, &mut state, name, value).is_err());
+            assert_eq!(format!("{state:?}"), before, "{name}");
+            assert_eq!(format!("{:?}", result.commands), commands, "{name}");
         }
     }
     #[test]
     fn finite_signed_geometry_defaults_and_segment_order_remain_intact() {
         let p=parse_instruction_string("f","SpatialReference:A&cB,false;Polyline:0,0,1,2;Arc3Points:0,1,1,0,0,-1;ArcByRadius:3,4,5,,-90;Annulus:0,0,9,,10,-30;AugmentedPath:LocalCRS,GeographicCRS,PortrayalCRS;LineInstruction:L;ClearGeometry;LineInstruction:M").unwrap();
-        let lines=p.commands.iter().filter_map(|c|if let DrawingCommand::LineInstruction{augmented_segments,augmented_crs,spatial_refs,..}=c {Some((augmented_segments,augmented_crs,spatial_refs))}else{None}).collect::<Vec<_>>();
-        assert_eq!(lines.len(),2);assert_eq!(lines[0].0.len(),4);
-        assert_eq!(*lines[0].2,vec![("A:B".into(),false)]);
+        let lines = p
+            .commands
+            .iter()
+            .filter_map(|c| {
+                if let DrawingCommand::LineInstruction {
+                    augmented_segments,
+                    augmented_crs,
+                    spatial_refs,
+                    ..
+                } = c
+                {
+                    Some((augmented_segments, augmented_crs, spatial_refs))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0.len(), 4);
+        assert_eq!(*lines[0].2, vec![("A:B".into(), false)]);
         assert!(matches!(&lines[0].0[0],PathSegment::Polyline(v) if v==&vec![(0.,0.),(1.,2.)]));
-        assert!(matches!(&lines[0].0[1],PathSegment::Arc3Points{start,median,end} if *start==(0.,1.) && *median==(1.,0.) && *end==(0.,-1.)));
-        assert!(matches!(&lines[0].0[2],PathSegment::ArcByRadius{start_angle,angular_distance,..} if *start_angle==0. && *angular_distance== -90.));
-        assert!(matches!(&lines[0].0[3],PathSegment::Annulus{inner_radius,start_angle,angular_distance,..} if *inner_radius==0. && *start_angle==10. && *angular_distance== -30.));
-        assert_eq!(lines[0].1.as_ref().unwrap().crs_angle,"GeographicCRS");
+        assert!(
+            matches!(&lines[0].0[1],PathSegment::Arc3Points{start,median,end} if *start==(0.,1.) && *median==(1.,0.) && *end==(0.,-1.))
+        );
+        assert!(
+            matches!(&lines[0].0[2],PathSegment::ArcByRadius{start_angle,angular_distance,..} if *start_angle==0. && *angular_distance== -90.)
+        );
+        assert!(
+            matches!(&lines[0].0[3],PathSegment::Annulus{inner_radius,start_angle,angular_distance,..} if *inner_radius==0. && *start_angle==10. && *angular_distance== -30.)
+        );
+        assert_eq!(lines[0].1.as_ref().unwrap().crs_angle, "GeographicCRS");
         assert!(lines[1].0.is_empty() && lines[1].1.is_none() && lines[1].2.is_empty());
     }
 }
@@ -2499,40 +2735,85 @@ mod geometry_validation_tests {
 #[cfg(test)]
 mod observed_def_tests {
     use super::*;
-    fn result(observed:&str)->PortrayalResult {
-        PortrayalResult::parse("1","PointInstruction:WRECKS01",observed).unwrap()
+    fn result(observed: &str) -> PortrayalResult {
+        PortrayalResult::parse("1", "PointInstruction:WRECKS01", observed).unwrap()
     }
     #[test]
     fn official_def_dependencies_are_typed_order_independent_and_value_exact() {
-        let a=result("SafetyDepth:30;SafetyContour:30;IgnoreScaleMinimum:false;RadarOverlay:false");
-        let b=result("RadarOverlay:false;IgnoreScaleMinimum:false;SafetyContour:30;SafetyDepth:30");
-        assert_eq!(format!("{a:?}"),format!("{b:?}"));
-        assert_eq!(a.observed_parameter_names().collect::<Vec<_>>(),["IgnoreScaleMinimum","RadarOverlay","SafetyContour","SafetyDepth"]);
-        assert_eq!(a.observed_context_parameters().find(|v|v.name=="SafetyDepth").unwrap().encoded_value,Some("30"));
-        let exact=result("PreferredLanguage:eng,fra;Text:a&sb&cc&m:d;Number:30.00;Empty:;Spaced: text ");
-        let values=exact.observed_context_parameters().collect::<Vec<_>>();
-        assert!(values.contains(&ObservedContextParameter{name:"PreferredLanguage",encoded_value:Some("eng,fra")}));
-        assert!(values.contains(&ObservedContextParameter{name:"Text",encoded_value:Some("a&sb&cc&m:d")}));
-        assert!(values.contains(&ObservedContextParameter{name:"Number",encoded_value:Some("30.00")}));
-        assert!(values.contains(&ObservedContextParameter{name:"Empty",encoded_value:Some("")}));
-        assert!(values.contains(&ObservedContextParameter{name:"Spaced",encoded_value:Some(" text ")}));
-        assert_ne!(result("SafetyDepth:30").observed_parameters,result("SafetyDepth:30.0").observed_parameters);
+        let a =
+            result("SafetyDepth:30;SafetyContour:30;IgnoreScaleMinimum:false;RadarOverlay:false");
+        let b =
+            result("RadarOverlay:false;IgnoreScaleMinimum:false;SafetyContour:30;SafetyDepth:30");
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        assert_eq!(
+            a.observed_parameter_names().collect::<Vec<_>>(),
+            [
+                "IgnoreScaleMinimum",
+                "RadarOverlay",
+                "SafetyContour",
+                "SafetyDepth"
+            ]
+        );
+        assert_eq!(
+            a.observed_context_parameters()
+                .find(|v| v.name == "SafetyDepth")
+                .unwrap()
+                .encoded_value,
+            Some("30")
+        );
+        let exact =
+            result("PreferredLanguage:eng,fra;Text:a&sb&cc&m:d;Number:30.00;Empty:;Spaced: text ");
+        let values = exact.observed_context_parameters().collect::<Vec<_>>();
+        assert!(values.contains(&ObservedContextParameter {
+            name: "PreferredLanguage",
+            encoded_value: Some("eng,fra")
+        }));
+        assert!(values.contains(&ObservedContextParameter {
+            name: "Text",
+            encoded_value: Some("a&sb&cc&m:d")
+        }));
+        assert!(values.contains(&ObservedContextParameter {
+            name: "Number",
+            encoded_value: Some("30.00")
+        }));
+        assert!(values.contains(&ObservedContextParameter {
+            name: "Empty",
+            encoded_value: Some("")
+        }));
+        assert!(values.contains(&ObservedContextParameter {
+            name: "Spaced",
+            encoded_value: Some(" text ")
+        }));
+        assert_ne!(
+            result("SafetyDepth:30").observed_parameters,
+            result("SafetyDepth:30.0").observed_parameters
+        );
     }
     #[test]
     fn legacy_name_only_output_remains_supported_without_inventing_values() {
-        assert_eq!(result("SafetyDepth").observed_parameters,["SafetyDepth"]);
-        let legacy=result(" RadarOverlay, SafetyDepth, ");
-        assert_eq!(legacy.observed_parameter_names().collect::<Vec<_>>(),["RadarOverlay","SafetyDepth"]);
-        assert!(legacy.observed_context_parameters().all(|v|v.encoded_value.is_none()));
+        assert_eq!(result("SafetyDepth").observed_parameters, ["SafetyDepth"]);
+        let legacy = result(" RadarOverlay, SafetyDepth, ");
+        assert_eq!(
+            legacy.observed_parameter_names().collect::<Vec<_>>(),
+            ["RadarOverlay", "SafetyDepth"]
+        );
+        assert!(legacy
+            .observed_context_parameters()
+            .all(|v| v.encoded_value.is_none()));
         assert!(result("").observed_parameters.is_empty());
-        assert_eq!(result("A:1;").observed_parameters,["A:1"]);
+        assert_eq!(result("A:1;").observed_parameters, ["A:1"]);
     }
     #[test]
     fn duplicate_conflicting_and_mixed_grammars_fail_instead_of_dropping_dependencies() {
-        for invalid in ["A:1;A:1","A:1;A:2","A,A","A:1;B","A;B",":1","A:1;;B:2","A,B:1"," A:1"] {
-            assert!(PortrayalResult::parse("1","PointInstruction:WRECKS01",invalid).is_err(),"{invalid}");
+        for invalid in [
+            "A:1;A:1", "A:1;A:2", "A,A", "A:1;B", "A;B", ":1", "A:1;;B:2", "A,B:1", " A:1",
+        ] {
+            assert!(
+                PortrayalResult::parse("1", "PointInstruction:WRECKS01", invalid).is_err(),
+                "{invalid}"
+            );
         }
-        assert_eq!(result("a:1;A:2").observed_parameters,["A:2","a:1"]);
+        assert_eq!(result("a:1;A:2").observed_parameters, ["A:2", "a:1"]);
     }
 }
 
@@ -2540,30 +2821,50 @@ mod observed_def_tests {
 mod def_decode_reference_controls {
     use super::*;
     fn reference(input: &str) -> String {
-        input.replace("&s", ";").replace("&c", ":").replace("&m", ",").replace("&a", "&")
+        input
+            .replace("&s", ";")
+            .replace("&c", ":")
+            .replace("&m", ",")
+            .replace("&a", "&")
     }
     #[test]
     fn original_escape_tokens_match_legacy_order_including_unicode_and_overlaps() {
         fn enumerate(prefix: &mut String, depth: usize) {
             assert_eq!(def_decode(prefix), reference(prefix), "input={prefix:?}");
-            if depth == 0 { return; }
+            if depth == 0 {
+                return;
+            }
             for piece in ["&", "s", "c", "m", "a", "X", "한"] {
-                let length=prefix.len();prefix.push_str(piece);
-                enumerate(prefix,depth-1);prefix.truncate(length);
+                let length = prefix.len();
+                prefix.push_str(piece);
+                enumerate(prefix, depth - 1);
+                prefix.truncate(length);
             }
         }
-        enumerate(&mut String::new(),5);
-        for input in ["&as", "&ac", "&am", "&aa", "&&as", "&a&s&c&m", "끝🌊&a&s마지막&", "&unknown;&"] {
-            assert_eq!(def_decode(input),reference(input),"input={input:?}");
+        enumerate(&mut String::new(), 5);
+        for input in [
+            "&as",
+            "&ac",
+            "&am",
+            "&aa",
+            "&&as",
+            "&a&s&c&m",
+            "끝🌊&a&s마지막&",
+            "&unknown;&",
+        ] {
+            assert_eq!(def_decode(input), reference(input), "input={input:?}");
         }
-        assert_eq!(def_decode("&as &ac &am &aa"),"&s &c &m &a");
+        assert_eq!(def_decode("&as &ac &am &aa"), "&s &c &m &a");
     }
     #[test]
     fn long_plaintext_and_mixed_escaped_text_preserve_full_content() {
-        for input in ["Plain 한글🌊 without escapes".repeat(8192),"&a&s&m&c🌊&unknown&as&&".repeat(8192)] {
-            let result=def_decode(&input);
-            assert_eq!(result,reference(&input));
-            assert!(result.len()<=input.len());
+        for input in [
+            "Plain 한글🌊 without escapes".repeat(8192),
+            "&a&s&m&c🌊&unknown&as&&".repeat(8192),
+        ] {
+            let result = def_decode(&input);
+            assert_eq!(result, reference(&input));
+            assert!(result.len() <= input.len());
         }
     }
 }
