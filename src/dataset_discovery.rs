@@ -29,8 +29,21 @@ pub fn discover_exchange_folder(
     anyhow::ensure!(root.is_dir(), "Exchange set path is not a folder");
     let mut charts = Vec::new();
     let mut rasters = Vec::new();
+    let containers = catalogue_containers(root)?;
+    let selected_is_exchange = containers.iter().any(|p| p == root);
     let mut entries = 0usize;
-    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            !selected_is_exchange
+                || !entry.file_type().is_dir()
+                || entry.path() == root
+                || containers
+                    .binary_search_by(|p| p.as_path().cmp(entry.path()))
+                    .is_err()
+        })
+    {
         let entry = entry?;
         entries += 1;
         anyhow::ensure!(
@@ -54,9 +67,92 @@ pub fn discover_exchange_folder(
     Ok((charts, rasters))
 }
 
+/// A collection folder contains separate producer deliveries, which must not
+/// silently share a conflicting base. Return catalogue containers for selection.
+pub fn exchange_set_choices(root: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let choices = catalogue_containers(root)?;
+    if choices.iter().any(|p| p == root) {
+        return Ok(Vec::new());
+    }
+    Ok(if choices.len() > 1 {
+        choices
+    } else {
+        Vec::new()
+    })
+}
+
+fn catalogue_containers(root: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    anyhow::ensure!(root.is_dir(), "Exchange set path is not a folder");
+    let mut choices = std::collections::BTreeSet::new();
+    for (count, entry) in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        anyhow::ensure!(
+            count < 100_000,
+            "Exchange collection discovery exceeds entry limit"
+        );
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && entry.file_name().to_str().is_some_and(|name| {
+                name.rsplit('\\')
+                    .next()
+                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case("CATALOG.XML"))
+            })
+        {
+            if let Some(parent) = entry.path().parent() {
+                choices.insert(parent.to_path_buf());
+                anyhow::ensure!(choices.len() <= 4096, "Too many exchange set containers");
+            }
+        }
+    }
+    Ok(choices.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn collection_choices_keep_conflicting_deliveries_separate() {
+        let root = std::env::temp_dir().join(format!("ferrite-collection-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/S100_ROOT")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/S100_ROOT/CATALOG.XML"), []).unwrap();
+        std::fs::write(root.join("b/S100_ROOT\\CATALOG.XML"), []).unwrap();
+        assert_eq!(
+            exchange_set_choices(&root).unwrap(),
+            vec![root.join("a/S100_ROOT"), root.join("b")]
+        );
+        assert!(exchange_set_choices(&root.join("a/S100_ROOT"))
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn selected_exchange_does_not_merge_nested_delivery() {
+        let root =
+            std::env::temp_dir().join(format!("ferrite-nested-exchange-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        for file in [
+            "CATALOG.XML",
+            "ENC.000",
+            "child/CATALOG.XML",
+            "child/ENC.000",
+        ] {
+            std::fs::write(root.join(file), []).unwrap();
+        }
+        assert!(exchange_set_choices(&root).unwrap().is_empty());
+        assert_eq!(
+            discover_exchange_folder(&root).unwrap().0,
+            vec![root.join("ENC.000")]
+        );
+        assert_eq!(
+            discover_exchange_folder(&root.join("child")).unwrap().0,
+            vec![root.join("child/ENC.000")]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn scans_product_files_without_appledouble_metadata() {
         for (name, extension, expected) in [

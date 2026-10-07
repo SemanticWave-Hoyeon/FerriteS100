@@ -38,6 +38,34 @@ pub(crate) struct MetadataEvidence {
     provenance: Provenance,
 }
 impl MetadataEvidence {
+    pub(crate) fn compatible_optional(a: Option<&Self>, b: Option<&Self>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_operation(b),
+            // Optional OFF metadata may be retained only with the entire input
+            // it was captured from; it cannot confer authenticated provenance.
+            (Some(metadata), None) | (None, Some(metadata)) => !metadata.is_authenticated(),
+        }
+    }
+    /// Compare the operation, retaining one complete path-bound proof. Unverified
+    /// catalogues may package the same operation differently. Authenticated
+    /// copies require the same signed catalogue identity as well.
+    pub(crate) fn same_operation(&self, other: &Self) -> bool {
+        self.purpose == other.purpose
+            && self.edition == other.edition
+            && self.update == other.update
+            && self.issue_date == other.issue_date
+            && self.raw_resource_sha256 == other.raw_resource_sha256
+            && match (&self.catalogue_xml_hash, &other.catalogue_xml_hash) {
+                (CatalogueHash::AuthenticatedSha384(a), CatalogueHash::AuthenticatedSha384(b)) => {
+                    self.is_authenticated() && other.is_authenticated() && a == b
+                }
+                (CatalogueHash::UnverifiedSha256(_), CatalogueHash::UnverifiedSha256(_)) => {
+                    !self.is_authenticated() && !other.is_authenticated()
+                }
+                _ => false,
+            }
+    }
     /// `original` is the retained canonical authorization key, not a live path
     /// to reopen. A deleted/changed original or catalogue cannot change evidence.
     pub(crate) fn verify_resource(&self, original: &Path, retained_data: &Path) -> Result<()> {
@@ -357,6 +385,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn operation_equivalence_preserves_lifecycle_and_authentication_boundaries() {
+        let a = MetadataEvidence {
+            purpose: DatasetPurpose::Update,
+            edition: 1,
+            update: Some(1),
+            issue_date: NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(),
+            original_canonical_key: "/a/101TEST.001".into(),
+            raw_resource_sha256: [1; 32],
+            catalogue_xml_hash: CatalogueHash::UnverifiedSha256([2; 32]),
+            provenance: Provenance::UnverifiedCatalogue,
+        };
+        let mut b = a.clone();
+        b.original_canonical_key = "/b/101TEST.001".into();
+        b.catalogue_xml_hash = CatalogueHash::UnverifiedSha256([3; 32]);
+        assert!(a.same_operation(&b));
+        assert!(MetadataEvidence::compatible_optional(Some(&a), None));
+        assert!(MetadataEvidence::compatible_optional(None, Some(&a)));
+        b.issue_date = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        assert!(!a.same_operation(&b));
+        b = a.clone();
+        b.provenance = Provenance::AuthenticatedCatalogue;
+        b.catalogue_xml_hash = CatalogueHash::AuthenticatedSha384("signed-a".into());
+        assert!(!a.same_operation(&b));
+        let mut c = b.clone();
+        assert!(!MetadataEvidence::compatible_optional(Some(&b), None));
+        assert!(!MetadataEvidence::compatible_optional(None, Some(&b)));
+        c.original_canonical_key = "/c/101TEST.001".into();
+        assert!(b.same_operation(&c));
+        c.catalogue_xml_hash = CatalogueHash::AuthenticatedSha384("signed-b".into());
+        assert!(!b.same_operation(&c));
+    }
     #[test]
     fn off_captured_values_and_resource_survive_live_xml_change_without_trust_promotion() {
         let f = Fixture::new();

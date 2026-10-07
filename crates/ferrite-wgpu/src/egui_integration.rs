@@ -121,6 +121,8 @@ pub struct AppUiState {
     pub object_detail_sections: ObjectDetailSections,
     pub object_attribute_query: String,
     pub open_exchange_requested: bool,
+    pub exchange_set_choices: Vec<std::path::PathBuf>,
+    pub selected_exchange_set: Option<std::path::PathBuf>,
     pub close_requested: bool,
     pub notice: Option<String>,
     selection_ui_identity: Option<(Option<u32>, i64)>,
@@ -923,6 +925,20 @@ impl EguiIntegration {
                 if let Some(notice)=ui_state.notice.clone() {
                     ui.colored_label(theme.error,&notice);
                     if ui.small_button("Dismiss message").clicked(){ui_state.notice=None;}
+                    ui.separator();
+                }
+                if !ui_state.exchange_set_choices.is_empty() {
+                    ui.label("Choose one exchange set from this collection:");
+                    let mut selected = None;
+                    for path in &ui_state.exchange_set_choices {
+                        let label = path.display().to_string();
+                        if ui.button(&label).clicked() { selected = Some(path.clone()); }
+                    }
+                    if let Some(path) = selected {
+                        ui_state.selected_exchange_set = Some(path);
+                        ui_state.exchange_set_choices.clear();
+                    }
+                    if ui.small_button("Cancel selection").clicked() { ui_state.exchange_set_choices.clear(); }
                     ui.separator();
                 }
                 if !ui_state.interoperability_status.is_empty() {

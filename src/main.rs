@@ -5509,13 +5509,26 @@ impl ApplicationHandler for ChartApp {
                     event_loop.exit();
                     return;
                 }
-                if open_exchange {
-                    if let Some(folder) = rfd::FileDialog::new()
+                let selected_exchange = self.renderer.as_mut()
+                    .and_then(|r| r.ui_state.selected_exchange_set.take());
+                if open_exchange || selected_exchange.is_some() {
+                    if let Some(folder) = selected_exchange.or_else(|| rfd::FileDialog::new()
                         .set_title("Open S-101 / S-102 exchange set folder")
-                        .pick_folder()
+                        .pick_folder())
                     {
-                        match dataset_discovery::discover_exchange_folder(&folder) {
-                            Ok((charts, rasters)) => {
+                        match dataset_discovery::exchange_set_choices(&folder).and_then(|choices| {
+                            if !choices.is_empty() {
+                                if let Some(r) = &mut self.renderer {
+                                    r.ui_state.notice = None;
+                                    r.ui_state.exchange_set_choices = choices;
+                                }
+                                Ok(None)
+                            } else {
+                                dataset_discovery::discover_exchange_folder(&folder).map(Some)
+                            }
+                        }) {
+                            Ok(None) => {}
+                            Ok(Some((charts, rasters))) => {
                                 if let Some(r) = &mut self.renderer {
                                     r.ui_state.notice = None;
                                 }

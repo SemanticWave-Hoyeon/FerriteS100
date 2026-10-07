@@ -452,6 +452,53 @@ fn validate_catalogue_identity(
     Ok(())
 }
 
+fn same_operation(a: &Input, b: &Input) -> bool {
+    let (x, y) = (&a.id, &b.id);
+    a.data_length == b.data_length
+        && a.data_sha256 == b.data_sha256
+        && x.dataset_name == y.dataset_name
+        && x.dataset_title == y.dataset_title
+        && x.product_identifier == y.product_identifier
+        && x.product_edition == y.product_edition
+        && x.edition_number == y.edition_number
+        && x.update_number == y.update_number
+        && x.application_profile == y.application_profile
+        && x.update_application_date == y.update_application_date
+        && x.issue_date == y.issue_date
+        && crate::s101_lifecycle_metadata::MetadataEvidence::compatible_optional(
+            a.metadata.as_ref(),
+            b.metadata.as_ref(),
+        )
+}
+
+fn insert_operation(
+    operations: &mut BTreeMap<u16, Input>,
+    counter: u16,
+    input: Input,
+) -> Result<()> {
+    match operations.entry(counter) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(input);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let previous = entry.get();
+            ensure!(same_operation(previous, &input),
+                "Conflicting duplicate S-101 operation: dataset {}, edition {}, counter {:03}: {} and {}",
+                input.id.dataset_name, input.id.edition_number, counter,
+                previous.original.display(), input.original.display());
+            // Preserve the chosen snapshot and its complete metadata proof together.
+            // Prefer optional OFF evidence with its original owner; never attach
+            // that proof to the metadata-free copy. Then choose a stable path.
+            let richer_unverified = input.metadata.is_some() && previous.metadata.is_none();
+            let same_evidence_presence = input.metadata.is_some() == previous.metadata.is_some();
+            if richer_unverified || (same_evidence_presence && input.original < previous.original) {
+                entry.insert(input);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn plans(inputs: Vec<Input>) -> Result<Vec<Plan>> {
     ensure!(inputs.len() <= MAX_INPUTS, "Too many S-101 chain inputs");
     let mut groups: BTreeMap<(String, String), Vec<Input>> = BTreeMap::new();
@@ -492,21 +539,18 @@ pub(crate) fn plans(inputs: Vec<Input>) -> Result<Vec<Plan>> {
             .into_iter()
             .max()
             .context("Update chain has no profile-1 base in its latest edition")?;
-        let mut bases = Vec::new();
+        let mut bases = BTreeMap::new();
         let mut updates = BTreeMap::new();
         for input in group {
             let counter = filename_counter(&input.id)?;
             if input.id.application_profile == "1" && counter == base_counter {
-                bases.push(input);
+                insert_operation(&mut bases, counter, input)?;
             } else if input.id.application_profile == "2" && counter > base_counter {
-                ensure!(
-                    updates.insert(counter, input).is_none(),
-                    "Ambiguous duplicate update counter"
-                );
+                insert_operation(&mut updates, counter, input)?;
             }
         }
         ensure!(bases.len() == 1, "Ambiguous duplicate base/reissue");
-        let base = bases.pop().unwrap();
+        let base = bases.pop_first().unwrap().1;
         let mut expected = base_counter;
         for (&counter, input) in &updates {
             expected = expected.checked_add(1).context("Update counter overflow")?;
@@ -687,11 +731,52 @@ mod tests {
         assert_eq!(p[0].input_paths().len(), 3);
     }
     #[test]
-    fn rejects_gaps_latest_edition_without_base_and_ambiguous_copies() {
+    fn rejects_gaps_latest_edition_without_base_and_conflicting_copies() {
         assert!(plans(vec![input(1, 0, "1"), input(1, 2, "2")]).is_err());
         assert!(plans(vec![input(1, 0, "1"), input(2, 1, "2")]).is_err());
-        assert!(plans(vec![input(1, 0, "1"), input(1, 0, "1")]).is_err());
-        assert!(plans(vec![input(1, 0, "1"), input(1, 1, "2"), input(1, 1, "2")]).is_err());
+        let mut different = input(1, 0, "1");
+        different.data_sha256[0] = 1;
+        assert!(plans(vec![input(1, 0, "1"), different]).is_err());
+        let mut different = input(1, 1, "2");
+        different.id.issue_date = "20261007".into();
+        assert!(plans(vec![input(1, 0, "1"), input(1, 1, "2"), different]).is_err());
+    }
+    #[test]
+    fn equivalent_base_reissue_updates_coalesce_in_stable_path_order() {
+        for profile in ["1", "2"] {
+            for reversed in [false, true] {
+                let mut a = input(2, 1, profile);
+                a.original = "a/101TEST.001".into();
+                let mut b = input(2, 1, profile);
+                b.original = "b/101TEST.001".into();
+                let mut copies = if reversed { vec![b, a] } else { vec![a, b] };
+                if profile == "2" {
+                    copies.push(input(2, 0, "1"));
+                }
+                let p = plans(copies).unwrap();
+                let chosen = if profile == "1" {
+                    &p[0].base
+                } else {
+                    &p[0].updates[0]
+                };
+                assert_eq!(chosen.original, PathBuf::from("a/101TEST.001"));
+            }
+        }
+    }
+    #[test]
+    fn conflicting_duplicate_reports_both_paths_and_counter() {
+        let mut different = input(1, 1, "2");
+        different.original = "other/101TEST.001".into();
+        different.data_length = 1;
+        let error = plans(vec![input(1, 0, "1"), input(1, 1, "2"), different])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("counter 001")
+                && error.contains("ed1/101TEST.001")
+                && error.contains("other/101TEST.001")
+        );
     }
     #[test]
     fn rejects_product_counter_and_filename_changes() {
@@ -722,6 +807,106 @@ mod tests {
             .to_string();
         assert!(error.contains("Required authenticated dataset snapshot"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// External official producer fixtures are opt-in; this is the exact
+    #[test]
+    #[ignore = "requires FERRITE_SHOM_EXCHANGE_FOLDER and FERRITE_SHOM_FOLDER_REPORT"]
+    fn actual_shom_exchange_folder_all_chains() {
+        let folder: PathBuf = std::env::var_os("FERRITE_SHOM_EXCHANGE_FOLDER")
+            .unwrap()
+            .into();
+        let choices = crate::dataset_discovery::exchange_set_choices(&folder).unwrap();
+        assert!(choices.len() > 1);
+        let mut rows = Vec::new();
+        for choice in &choices {
+            let (charts, _) = crate::dataset_discovery::discover_exchange_folder(choice).unwrap();
+            let candidates = expand_candidates(&charts, &[]).unwrap();
+            let authorization =
+                crate::dataset_signature_policy::unchecked_datasets(&candidates).unwrap();
+            match authorized_plans(candidates, &authorization, false) {
+                Ok(plans) => {
+                    for plan in plans {
+                        let (cell, identity) = plan.load().unwrap();
+                        rows.push(serde_json::json!({"choice":choice,"dataset":cell.dsid.dataset_name,
+                        "edition":cell.dsid.edition_number,"update":cell.dsid.update_number,
+                        "features":cell.features.len(),"sha256":identity.sha256(),"paths":plan.input_paths()}));
+                    }
+                }
+                Err(error) => {
+                    assert!(error.to_string().contains("no profile-1 base"));
+                    rows.push(serde_json::json!({"choice":choice,"requires_loaded_base":true,"error":error.to_string()}));
+                }
+            }
+        }
+        assert!(rows
+            .iter()
+            .any(|r| r["features"].as_u64().is_some_and(|n| n > 0)));
+        let (all, _) = crate::dataset_discovery::discover_exchange_folder(&folder).unwrap();
+        let all = expand_candidates(&all, &[]).unwrap();
+        let authorization = crate::dataset_signature_policy::unchecked_datasets(&all).unwrap();
+        let error = authorized_plans(all.clone(), &authorization, false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Conflicting duplicate S-101 operation"));
+        let (inputs, _) = authorized_inputs(all, &authorization, false).unwrap();
+        let equivalent: Vec<_> = inputs
+            .into_iter()
+            .filter(|i| i.id.dataset_name.starts_with("101FR00571300.") && i.id.edition_number == 1)
+            .collect();
+        assert!(equivalent.len() > 3);
+        let merged = plans(equivalent).unwrap();
+        assert_eq!(merged.len(), 1);
+        let (cell, _) = merged[0].load().unwrap();
+        assert_eq!(cell.dsid.update_number, 2);
+        let normalized = folder.parent().unwrap().join("NormalizedExchangeSets");
+        let (normalized_charts, _) =
+            crate::dataset_discovery::discover_exchange_folder(&normalized).unwrap();
+        let selected: Vec<_> = merged[0]
+            .input_paths()
+            .into_iter()
+            .chain(normalized_charts)
+            .collect();
+        let candidates = expand_candidates(&selected, &[]).unwrap();
+        let authorization =
+            crate::dataset_signature_policy::unchecked_datasets(&candidates).unwrap();
+        let (inputs, _) = authorized_inputs(candidates, &authorization, false).unwrap();
+        let mixed: Vec<_> = inputs
+            .into_iter()
+            .filter(|i| i.id.dataset_name.starts_with("101FR00571300.") && i.id.edition_number == 1)
+            .collect();
+        assert!(mixed.iter().any(|i| i.metadata.is_none()));
+        assert!(mixed.iter().any(|i| i.metadata.is_some()));
+        let mixed = plans(mixed).unwrap();
+        assert!(std::iter::once(&mixed[0].base)
+            .chain(mixed[0].updates.iter())
+            .all(
+                |i| i.metadata.as_ref().is_some_and(|m| !m.is_authenticated())
+                    && i.original.starts_with(&normalized)
+            ));
+        let (mixed_cell, mixed_identity) = mixed[0].load().unwrap();
+        let (_, merged_identity) = merged[0].load().unwrap();
+        assert_eq!(mixed_cell.features.len(), cell.features.len());
+        assert_eq!(mixed_identity.sha256(), merged_identity.sha256());
+        rows.push(serde_json::json!({"actual_identical_copies_merged":true,
+            "dataset":cell.dsid.dataset_name,"edition":cell.dsid.edition_number,
+            "update":cell.dsid.update_number,"features":cell.features.len(),
+            "actual_conflict_preserved":error}));
+        rows.push(serde_json::json!({"raw_normalized_copies_merged":true,
+            "retained_unverified_metadata_owner":mixed[0].input_paths(),
+            "same_raw_chain_identity":true,"features":mixed_cell.features.len()}));
+        let report: PathBuf = std::env::var_os("FERRITE_SHOM_FOLDER_REPORT")
+            .unwrap()
+            .into();
+        std::fs::write(
+            report,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "folder":folder,"choices":choices,
+                "signature_verified":false,"chains":rows,"native_render_verified":false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
     /// External official producer fixtures are opt-in; this is the exact
     /// expansion/authorization/planning/materialization path used by the App.
