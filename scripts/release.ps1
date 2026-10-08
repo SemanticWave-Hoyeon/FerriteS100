@@ -83,7 +83,7 @@ Copy-Item "$TargetDir\ferrite-s100.exe" "$ReleaseDir\FerriteS100.exe"
 Write-Host "  Copied: FerriteS100.exe" -ForegroundColor Gray
 
 if ($KMOU) {
-    # KMOU Edition: Copy actual Catalogues and ChartData
+    # KMOU Edition: Copy actual Catalogues and TestData
     Write-Host "  Copying Catalogues (S-101 & S-421)..." -ForegroundColor Gray
     if (Test-Path "$ProjectRoot\Catalogues") {
         Copy-Item -Recurse "$ProjectRoot\Catalogues" "$ReleaseDir\Catalogues"
@@ -91,11 +91,11 @@ if ($KMOU) {
         Write-Host "  Warning: Catalogues directory not found" -ForegroundColor Yellow
     }
 
-    Write-Host "  Copying ChartData..." -ForegroundColor Gray
-    if (Test-Path "$ProjectRoot\ChartData") {
-        Copy-Item -Recurse "$ProjectRoot\ChartData" "$ReleaseDir\ChartData"
+    Write-Host "  Copying TestData..." -ForegroundColor Gray
+    if (Test-Path "$ProjectRoot\TestData") {
+        Copy-Item -Recurse "$ProjectRoot\TestData" "$ReleaseDir\TestData"
     } else {
-        Write-Host "  Warning: ChartData directory not found" -ForegroundColor Yellow
+        Write-Host "  Warning: TestData directory not found" -ForegroundColor Yellow
     }
 } else {
     # Standard Edition: Create empty folders with README
@@ -104,7 +104,7 @@ if ($KMOU) {
         "Catalogues\PC\S-101",
         "Catalogues\FC\S-421",
         "Catalogues\PC\S-421",
-        "ChartData"
+        "TestData"
     )
     foreach ($folder in $folders) {
         $path = "$ReleaseDir\$folder"
@@ -148,7 +148,7 @@ Required for Route Plugin functionality.
 
 @"
 Place S-101 chart files (*.000) here.
-"@ | Out-File -FilePath "$ReleaseDir\ChartData\README.txt" -Encoding UTF8
+"@ | Out-File -FilePath "$ReleaseDir\TestData\README.txt" -Encoding UTF8
 }
 
 # Copy plugins from plugins_out (already built and deployed by build section)
