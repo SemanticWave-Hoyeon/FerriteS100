@@ -83,9 +83,9 @@ mod dataset_discovery;
 mod dataset_open_plan;
 mod dataset_signature_policy;
 mod interoperability;
+mod native_mcp;
 mod navigation;
 mod plugins;
-mod native_mcp;
 mod process_stats;
 mod s101_catalogue_selection;
 mod s101_lifecycle_metadata;
@@ -3780,7 +3780,9 @@ impl ChartApp {
     }
 
     fn clear_charts(&mut self) {
-        if let Some(server) = &self.s100_mcp.server { server.clear(); }
+        if let Some(server) = &self.s100_mcp.server {
+            server.clear();
+        }
         // Drop the receiver so a previously started load cannot repopulate cleared charts.
         self.loading_state = None;
         self.dataset_open_discovery = None;
