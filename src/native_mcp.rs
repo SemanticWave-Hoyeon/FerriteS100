@@ -44,7 +44,7 @@ impl super::ChartApp {
                 }
             }
         }
-        if self.s100_mcp.server.is_some() {
+        if let Some(server) = &self.s100_mcp.server {
             // The tree contains only committed loaded datasets; it changes on load/unload or catalogue switch.
             let layers = self
                 .renderer
@@ -61,7 +61,7 @@ impl super::ChartApp {
             if (ui.refresh || signature != self.s100_mcp.signature)
                 && self.s100_mcp.pending.is_some()
             {
-                self.s100_mcp.server.as_ref().unwrap().clear();
+                server.clear();
                 ui.refresh = true;
             }
             if (ui.refresh || signature != self.s100_mcp.signature)
@@ -69,7 +69,7 @@ impl super::ChartApp {
             {
                 ui.refresh = false;
                 // Invalidate old state synchronously before rebuilding so an unload cannot retain stale data.
-                self.s100_mcp.server.as_ref().unwrap().clear();
+                server.clear();
                 self.s100_mcp.pending = None;
                 let mut datasets = Vec::new();
                 for layer in &layers {
@@ -131,11 +131,7 @@ impl super::ChartApp {
                 match result {
                     Ok(registry) if !ui.refresh && self.s100_mcp.signature == signature => {
                         self.s100_mcp.published = registry.len();
-                        self.s100_mcp
-                            .server
-                            .as_ref()
-                            .unwrap()
-                            .set_registry(registry);
+                        server.set_registry(registry);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -143,7 +139,6 @@ impl super::ChartApp {
                     }
                 }
             }
-            let server = self.s100_mcp.server.as_ref().unwrap();
             let info = server.info();
             ui.url = info.public_url.unwrap_or(info.url);
             ui.status = if self.s100_mcp.pending.is_some() {
