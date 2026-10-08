@@ -247,3 +247,7 @@ See [LICENSE](LICENSE) for the **PolyForm Noncommercial License 1.0.0** terms.
 
 Developed by [Hoyeon Cho](https://github.com/SemanticWave-Hoyeon) at Korea Maritime
 and Ocean University, with standards and catalogue resources from the IHO.
+
+### Native S-100 MCP
+
+Open **Help → S-100 MCP** to enable read-only access to loaded datasets. No plugin DLL or separate server binary is required. The service starts disabled; a public ngrok tunnel is a separate opt-in. Common tools expose dataset/product/FC/PC metadata, and the S-101 adapter adds catalogue, attribute and feature queries. Multiple loaded datasets require an explicit dataset ID. See [S-100 MCP usage and limits](docs/S100-MCP.md).

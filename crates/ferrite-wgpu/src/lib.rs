@@ -68,3 +68,5 @@ pub use continuous_raster_selector::ValidatedContinuousFrame;
 mod raster_publication_budget;
 
 mod immutable_payload_cache;
+
+pub mod mcp_ui;

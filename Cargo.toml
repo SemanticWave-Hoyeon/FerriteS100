@@ -17,9 +17,10 @@ members = [
     "crates/ferrite-lua-runtime",
     "crates/ferrite-plugin-api",
     "crates/ferrite-plugin-loader",
+    "crates/ferrite-mcp",
 ]
 exclude = [
-    "plugins/*",
+    "plugins/route-plugin",
 ]
 
 [workspace.package]
@@ -99,6 +100,7 @@ ferrite-wgpu = { path = "crates/ferrite-wgpu" }
 ferrite-lua = { path = "crates/ferrite-lua", default-features = false }
 ferrite-plugin-api = { path = "crates/ferrite-plugin-api" }
 ferrite-plugin-loader = { path = "crates/ferrite-plugin-loader" }
+ferrite-mcp = { path = "crates/ferrite-mcp" }
 
 [package]
 name = "ferrite-s100"
@@ -135,6 +137,7 @@ ferrite-wgpu.workspace = true
 ferrite-lua.workspace = true
 ferrite-plugin-api.workspace = true
 ferrite-plugin-loader.workspace = true
+ferrite-mcp.workspace = true
 abi_stable.workspace = true
 winit.workspace = true
 pollster.workspace = true

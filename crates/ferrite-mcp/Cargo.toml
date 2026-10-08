@@ -1,0 +1,29 @@
+[package]
+name = "ferrite-mcp"
+version.workspace = true
+edition.workspace = true
+license = "PolyForm-Noncommercial-1.0.0"
+description = "Native read-only S-100 dataset MCP service"
+
+[dependencies]
+ferrite-iso8211.workspace = true
+ferrite-s100-core.workspace = true
+ferrite-feature-catalog.workspace = true
+ferrite-portrayal-catalog.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+rustc-hash.workspace = true
+rstar = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "form", "query"] }
+rand = "0.8"
+jsonwebtoken = "9"
+urlencoding = "2"
+base64 = "0.22"
+url = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

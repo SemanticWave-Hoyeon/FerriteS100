@@ -85,6 +85,7 @@ mod dataset_signature_policy;
 mod interoperability;
 mod navigation;
 mod plugins;
+mod native_mcp;
 mod process_stats;
 mod s101_catalogue_selection;
 mod s101_lifecycle_metadata;
@@ -867,6 +868,7 @@ impl DatasetOpenSession {
 
 /// Chart viewer application for winit
 struct ChartApp {
+    s100_mcp: native_mcp::Controller,
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     render_context: RenderContext,
@@ -1024,6 +1026,7 @@ impl ChartApp {
         auto_center: Option<(f64, f64)>,
     ) -> Self {
         ChartApp {
+            s100_mcp: native_mcp::Controller::default(),
             window: None,
             renderer: None,
             render_context: {
@@ -2715,6 +2718,7 @@ impl ChartApp {
                 renderer.ui_state.selected_dataset = None;
             }
         }
+        self.service_mcp_ui();
     }
 
     fn unload_dataset(&mut self, id: ferrite_wgpu::DatasetLayerId) -> Result<()> {
@@ -3776,6 +3780,7 @@ impl ChartApp {
     }
 
     fn clear_charts(&mut self) {
+        if let Some(server) = &self.s100_mcp.server { server.clear(); }
         // Drop the receiver so a previously started load cannot repopulate cleared charts.
         self.loading_state = None;
         self.dataset_open_discovery = None;
@@ -7119,6 +7124,7 @@ impl ApplicationHandler for ChartApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.service_mcp_ui();
                 let diagnostic_callback_entry = self
                     .flat_eventloop_audit
                     .as_ref()

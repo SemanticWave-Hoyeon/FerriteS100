@@ -39,6 +39,9 @@ jobs:
     - name: Build
       run: cargo build --release --verbose
 
+    - name: Test S-100 MCP service
+      run: cargo test -p ferrite-mcp --locked
+
     - name: Run tests
       run: cargo test --verbose
 

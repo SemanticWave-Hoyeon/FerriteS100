@@ -135,6 +135,7 @@ pub struct DatasetProductLayer {
 /// Application state shared between egui UI and main app
 #[derive(Debug, Clone, Default)]
 pub struct AppUiState {
+    pub s100_mcp: crate::mcp_ui::State,
     pub reduced_motion: bool,
     pub dataset_tree_hidden: bool,
     pub dataset_layers: Vec<DatasetProductLayer>,
@@ -851,6 +852,10 @@ impl EguiIntegration {
 
                     // Help menu
                     ui.menu_button("Help", |ui| {
+                        if ui.button("S-100 MCP…").clicked() {
+                            ui_state.s100_mcp.open = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Catalogues...").clicked() {
                             ui_state.show_catalogues = true;
                             ui.close_menu();
@@ -937,6 +942,8 @@ impl EguiIntegration {
 
         // Route panel (left side) - shown when route plugin is active
         Self::draw_route_panel(&self.ctx, ui_state);
+
+        crate::mcp_ui::draw(&self.ctx, &mut ui_state.s100_mcp);
 
         // Status bar
         egui::TopBottomPanel::bottom("status_bar")

@@ -44,7 +44,7 @@ impl CellSourceIdentity {
 }
 
 /// S-101 Cell container
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct S101Cell {
     /// Source file path
     pub file_path: PathBuf,
