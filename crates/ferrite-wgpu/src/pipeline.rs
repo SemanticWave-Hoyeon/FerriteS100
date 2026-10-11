@@ -1015,7 +1015,7 @@ impl RasterVertex {
         }
     }
 }
-const RASTER_SHADER: &str = r#"
+pub(crate) const RASTER_SHADER: &str = r#"
 struct Input { @location(0) position:vec2<f32>, @location(1) anchor:vec2<f32>, @location(2) origin:vec2<f32>, @location(3) step:vec2<f32>, @location(4) offset:vec2<u32>, @location(5) size:vec2<u32>, @location(6) row_bounds:vec2<f32>, @location(7) row_index:u32 }
 struct Output { @builtin(position) position:vec4<f32>, @location(0) @interpolate(flat) origin:vec2<f32>, @location(1) @interpolate(flat) step:vec2<f32>, @location(2) @interpolate(flat) offset:vec2<u32>, @location(3) @interpolate(flat) size:vec2<u32>, @location(4) @interpolate(flat) row_bounds:vec2<f32>, @location(5) @interpolate(flat) row_index:u32 }
 struct ViewUniforms {view_proj:mat4x4<f32>,viewport_size:vec2<f32>,scale:f32,_padding:f32,pan_offset:vec2<f32>,zoom_scale:f32,zoom_scale_y:f32,zoom_pivot:vec2<f32>,_padding3:vec2<f32>}

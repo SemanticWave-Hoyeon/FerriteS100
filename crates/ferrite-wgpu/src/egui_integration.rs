@@ -128,6 +128,8 @@ pub enum DatasetLayerId {
         name: String,
     },
     S102(std::path::PathBuf),
+    /// S-102 2.1 trial inspection; never a depth raster.
+    S102Trial(std::path::PathBuf),
     /// Native route lifetime; not an ENC cell index or a raster path.
     S421 {
         route_id: u32,
@@ -166,10 +168,22 @@ pub struct CoverageScaleIndication {
     pub sclbr: Option<egui::Color32>,
 }
 
+/// S-101 2.0.0 4.6 own-ship indication.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnShipIndication {
+    /// Physical-pixel screen position; None while off screen or during an
+    /// affine navigation preview.
+    pub screen: Option<[f32; 2]>,
+    /// Finest optimum scale denominator at own ship that is larger scale than
+    /// the mariner's selected viewing scale.
+    pub larger_scale: Option<u32>,
+}
+
 /// Application state shared between egui UI and main app
 #[derive(Debug, Clone, Default)]
 pub struct AppUiState {
     pub s100_mcp: crate::mcp_ui::State,
+    pub llm_chat: crate::llm_chat_ui::State,
     pub reduced_motion: bool,
     /// Optional edge annotations; never mutate chart geometry or portrayal settings.
     pub coordinate_rulers: bool,
@@ -226,6 +240,9 @@ pub struct AppUiState {
     pub bathymetry_count: usize,
     pub coverage_info: Option<String>,
     pub coverage_scale_indication: Option<CoverageScaleIndication>,
+    pub own_ship: Option<OwnShipIndication>,
+    /// Physical-pixel screen position of the chat's "Show on Chart" marker.
+    pub chat_marker: Option<[f32; 2]>,
     pub security_status: String,
     /// Application load policy, separate from portrayal settings. Default OFF.
     pub verify_dataset_signatures: bool,
@@ -798,7 +815,20 @@ impl EguiIntegration {
                     .iter()
                     .map(|p| p.product.as_str())
                     .collect();
-                products.extend(state.dataset_layers.iter().map(|p| p.product.as_str()));
+                // Inspection-only S-102 2.1 trials have no catalogue binding.
+                products.extend(
+                    state
+                        .dataset_layers
+                        .iter()
+                        .filter(|p| {
+                            !p.files.is_empty()
+                                && !p
+                                    .files
+                                    .iter()
+                                    .all(|f| matches!(f.id, DatasetLayerId::S102Trial(_)))
+                        })
+                        .map(|p| p.product.as_str()),
+                );
                 if products.is_empty() {
                     products.push("S-101");
                 }
@@ -1311,6 +1341,7 @@ impl EguiIntegration {
         Self::draw_route_panel(&self.ctx, ui_state);
 
         crate::mcp_ui::draw(&self.ctx, &mut ui_state.s100_mcp);
+        crate::llm_chat_ui::draw(&self.ctx, &mut ui_state.llm_chat, &ui_state.s100_mcp);
 
         // Status bar
         egui::TopBottomPanel::bottom("status_bar")
@@ -1540,6 +1571,67 @@ impl EguiIntegration {
                 );
         }
 
+        if let Some([x, y]) = ui_state.chat_marker {
+            let painter = self
+                .ctx
+                .layer_painter(egui::LayerId::new(
+                    egui::Order::Background,
+                    egui::Id::new("chat_position_marker"),
+                ))
+                .with_clip_rect(egui::Rect::from_min_size(
+                    egui::pos2(chart_x, chart_y),
+                    egui::vec2(chart_width, chart_height),
+                ));
+            let c = egui::pos2(x / pixels_per_point, y / pixels_per_point);
+            let stroke = egui::Stroke::new(2_f32, theme.accent);
+            painter.circle_stroke(c, 10., stroke);
+            for (dx, dy) in [(1., 0.), (-1., 0.), (0., 1.), (0., -1.)] {
+                painter.line_segment(
+                    [
+                        c + egui::vec2(dx * 6., dy * 6.),
+                        c + egui::vec2(dx * 16., dy * 16.),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        if let Some(own_ship) = ui_state.own_ship {
+            let painter = self
+                .ctx
+                .layer_painter(egui::LayerId::new(
+                    egui::Order::Background,
+                    egui::Id::new("own_ship_indication"),
+                ))
+                .with_clip_rect(egui::Rect::from_min_size(
+                    egui::pos2(chart_x, chart_y),
+                    egui::vec2(chart_width, chart_height),
+                ));
+            if let Some([x, y]) = own_ship.screen {
+                let centre = egui::pos2(x / pixels_per_point, y / pixels_per_point);
+                let stroke = egui::Stroke::new(2_f32, theme.text);
+                painter.circle_stroke(centre, 7., stroke);
+                painter.circle_stroke(centre, 2., stroke);
+            }
+            // Shown on the chart screen itself, as 4.6 requires.
+            if let Some(denominator) = own_ship.larger_scale {
+                let galley = painter.layout_no_wrap(
+                    format!("Larger Scale Data Available at Own Ship (1:{denominator})"),
+                    egui::FontId::proportional(14.),
+                    theme.warning,
+                );
+                let origin = egui::pos2(
+                    chart_x + 12.,
+                    chart_y + chart_height - 36. - galley.size().y,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_size(origin, galley.size()).expand(4.),
+                    4.,
+                    theme.panel,
+                );
+                painter.galley(origin, galley, theme.warning);
+            }
+        }
+
         // Debug overlay (only in debug mode)
         if ui_state.debug_mode {
             Self::draw_debug_overlay(&self.ctx, ui_state, chart_x, chart_y);
@@ -1658,6 +1750,10 @@ impl EguiIntegration {
             }
             if ui.button("S-100 MCP Service…").clicked() {
                 ui_state.s100_mcp.open = true;
+                ui.close_menu();
+            }
+            if ui.button("LLM Chat…").clicked() {
+                ui_state.llm_chat.open = true;
                 ui.close_menu();
             }
             ui.separator();
@@ -1802,6 +1898,9 @@ impl EguiIntegration {
         .clicked()
         {
             ui_state.s100_mcp.open = !ui_state.s100_mcp.open;
+        }
+        if icon_toggle(ui, Icon::Chat, "LLM Chat…", ui_state.llm_chat.open).clicked() {
+            ui_state.llm_chat.open = !ui_state.llm_chat.open;
         }
         ui.separator();
         if icon_toggle(ui, Icon::Status, "Load Status", ui_state.show_load_status).clicked() {
@@ -2055,6 +2154,7 @@ impl EguiIntegration {
                                         "clear" => r#"{"type":"Clear"}"#,
                                         "export" => r#"{"type":"Export"}"#,
                                         "import" => r#"{"type":"Import"}"#,
+                                        "copy" => r#"{"type":"CopyAsAuthored"}"#,
                                         _ => continue,
                                     };
                                     ui_state

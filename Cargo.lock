@@ -1402,9 +1402,12 @@ name = "ferrite-interoperability"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "ferrite-kernel",
  "ferrite-security",
+ "openssl",
  "roxmltree",
+ "tempfile",
 ]
 
 [[package]]

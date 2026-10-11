@@ -7,6 +7,7 @@ pub mod validate;
 pub use indices::Indices;
 mod attributes;
 pub mod http;
+pub mod nearest;
 mod oauth;
 pub mod service;
 

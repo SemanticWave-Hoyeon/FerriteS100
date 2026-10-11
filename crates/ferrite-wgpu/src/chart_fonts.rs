@@ -15,6 +15,19 @@ pub(crate) fn chart_font_definitions() -> egui::FontDefinitions {
         ))
         .into(),
     );
+    // Text such as LLM replies or Korean ENC names may need Hangul or other
+    // CJK glyphs that the bundled faces lack. A system face is appended as
+    // the last fallback (only glyphs that would otherwise be missing), before
+    // the chart chains copy the proportional fallback order.
+    for (index, (name, data)) in system_cjk_fallbacks().iter().enumerate() {
+        let key = format!("SystemCjk{index}-{name}");
+        fonts
+            .font_data
+            .insert(key.clone(), std::sync::Arc::new(data.clone()));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(key.clone());
+        }
+    }
     let mut medium_fallback = fonts.families[&egui::FontFamily::Proportional].clone();
     medium_fallback.insert(0, "ChartMedium".into());
     fonts.families.insert(
@@ -27,6 +40,41 @@ pub(crate) fn chart_font_definitions() -> egui::FontDefinitions {
         .families
         .insert(egui::FontFamily::Name("ChartBold".into()), fallback);
     fonts
+}
+
+/// First readable face per script group, read once per process.
+fn system_cjk_fallbacks() -> &'static [(String, egui::FontData)] {
+    static FONTS: std::sync::OnceLock<Vec<(String, egui::FontData)>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        // One Korean face: KS X 1001 faces also carry kana and the common
+        // Hanja, so a separate 50+ MB Chinese face is not kept resident.
+        let groups: [&[&str]; 1] = [&[
+            "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+            "C:\\Windows\\Fonts\\malgun.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        ]];
+        const MAX_BYTES: u64 = 64 * 1024 * 1024;
+        groups
+            .iter()
+            .filter_map(|paths| {
+                paths.iter().find_map(|path| {
+                    let path = std::path::Path::new(path);
+                    let len = std::fs::metadata(path).ok()?.len();
+                    if len > MAX_BYTES {
+                        return None;
+                    }
+                    let bytes = std::fs::read(path).ok()?;
+                    let name = path.file_stem()?.to_string_lossy().replace(' ', "");
+                    // Read once per process and borrowed by every font
+                    // context, so a new context never copies the face.
+                    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                    Some((name, egui::FontData::from_static(bytes)))
+                })
+            })
+            .collect()
+    })
 }
 
 /// Receiver best-match policy, not an ordering prescribed by S-100.

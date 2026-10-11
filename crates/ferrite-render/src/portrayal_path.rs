@@ -43,6 +43,112 @@ pub enum PortrayalPath {
         start: f64,
         sweep: f64,
     },
+    /// S-100 9-11.1.13 Portrayal CRS: the inner path is in millimetres from the
+    /// chart viewport's lower-left corner, +Y up, fixed on the output device.
+    /// Appended variant preserves the existing bincode variant discriminants.
+    Device(Box<PortrayalPath>),
+    /// S-100 Part 9a AugmentedPath/AugmentedRay with GeographicCRS positions
+    /// and metre distances but Portrayal/Local CRS angles: the inner
+    /// geographic path's angles are clockwise from the Portrayal CRS +Y axis
+    /// and become true bearings through the active projection at the centre.
+    ScreenAngled(Box<PortrayalPath>),
+    /// WGS84 origin (X=longitude, Y=latitude); clockwise true-north bearing;
+    /// geodesic length in metres.
+    GeographicRay {
+        origin: (f64, f64),
+        bearing: f64,
+        length_m: f64,
+    },
+}
+/// The true bearing whose projected direction at `center` is `angle`
+/// degrees clockwise from the Portrayal CRS +Y axis in this view.
+fn screen_angle_to_bearing(center: (f64, f64), angle: f64, scaler: &Scaler) -> Option<f64> {
+    use ferrite_kernel::geodesy::{direct, GeographicPosition};
+    let c = GeographicPosition::new(center.1, center.0).ok()?;
+    let at = |bearing: f64| -> Option<[f64; 2]> {
+        let p = direct(c, bearing, 10.).ok()?;
+        let q = scaler.world_to_screen_f64(WorldPoint::new(
+            p.longitude_near(center.0).ok()?,
+            p.latitude(),
+        ));
+        Some(q)
+    };
+    let o = scaler.world_to_screen_f64(WorldPoint::new(center.0, center.1));
+    let (n, e) = (at(0.)?, at(90.)?);
+    // Portrayal CRS is +Y up; device pixels are +Y down.
+    let north = [n[0] - o[0], o[1] - n[1]];
+    let east = [e[0] - o[0], o[1] - e[1]];
+    let det = east[0] * north[1] - north[0] * east[1];
+    if !det.is_finite() || det.abs() < 1e-18 {
+        return None;
+    }
+    let (u, v) = (angle.to_radians().sin(), angle.to_radians().cos());
+    // Solve a*east + b*north = (u, v) for metre components a (east), b (north).
+    let a = (u * north[1] - north[0] * v) / det;
+    let b = (east[0] * v - u * east[1]) / det;
+    Some(a.atan2(b).to_degrees())
+}
+impl PortrayalPath {
+    /// Resolve Portrayal CRS angles of a ScreenAngled inner path to bearings.
+    fn with_bearings(&self, scaler: &Scaler) -> Option<Self> {
+        let sweep_of = |center, start: f64, sweep: f64| -> Option<(f64, f64)> {
+            let from = screen_angle_to_bearing(center, start, scaler)?;
+            if sweep.abs() >= 360. {
+                return Some((from, sweep));
+            }
+            let to = screen_angle_to_bearing(center, start + sweep, scaler)?;
+            // The mapping preserves orientation; keep the authored sense.
+            let delta = (to - from).rem_euclid(360.);
+            Some((from, if sweep >= 0. { delta } else { delta - 360. }))
+        };
+        Some(match self {
+            Self::GeographicArc {
+                center,
+                radius_m,
+                start,
+                sweep,
+            } => {
+                let (start, sweep) = sweep_of(*center, *start, *sweep)?;
+                Self::GeographicArc {
+                    center: *center,
+                    radius_m: *radius_m,
+                    start,
+                    sweep,
+                }
+            }
+            Self::GeographicAnnulus {
+                center,
+                outer,
+                inner,
+                start,
+                sweep,
+            } => {
+                let (start, sweep) = sweep_of(*center, *start, *sweep)?;
+                Self::GeographicAnnulus {
+                    center: *center,
+                    outer: *outer,
+                    inner: *inner,
+                    start,
+                    sweep,
+                }
+            }
+            Self::GeographicRay {
+                origin,
+                bearing,
+                length_m,
+            } => Self::GeographicRay {
+                origin: *origin,
+                bearing: screen_angle_to_bearing(*origin, *bearing, scaler)?,
+                length_m: *length_m,
+            },
+            _ => return None,
+        })
+    }
+}
+/// The world point under the Portrayal CRS origin (viewport lower-left).
+fn device_origin(scaler: &Scaler) -> WorldPoint {
+    let v = scaler.viewport;
+    scaler.screen_to_world(ScreenPoint::new(v.x, v.y + v.height))
 }
 impl PortrayalPath {
     /// Resolve connected segments as one run, keeping disjoint boundaries separate.
@@ -57,6 +163,20 @@ impl PortrayalPath {
             if let Self::Group(children) = path {
                 stack.extend(children.iter().rev().map(|p| (p, depth + 1)));
                 continue;
+            }
+            if let Self::Device(inner) = path {
+                if depth > 0 {
+                    return Vec::new();
+                }
+                return inner.world_paths(device_origin(scaler), scaler);
+            }
+            if let Self::ScreenAngled(inner) = path {
+                if depth > 0 {
+                    return Vec::new();
+                }
+                return inner
+                    .with_bearings(scaler)
+                    .map_or_else(Vec::new, |p| p.world_paths(origin, scaler));
             }
             let paths = if let Self::GeographicAnnulus {
                 center,
@@ -101,6 +221,35 @@ impl PortrayalPath {
     }
     /// A single connected run; disjoint groups must be consumed through world_paths.
     pub fn world_points(&self, origin: WorldPoint, scaler: &Scaler) -> Vec<WorldPoint> {
+        if let Self::Device(inner) = self {
+            return match inner.as_ref() {
+                Self::Device(_) => Vec::new(),
+                inner => inner.world_points(device_origin(scaler), scaler),
+            };
+        }
+        if let Self::ScreenAngled(inner) = self {
+            return inner
+                .with_bearings(scaler)
+                .map_or_else(Vec::new, |p| p.world_points(origin, scaler));
+        }
+        if let Self::GeographicRay {
+            origin,
+            bearing,
+            length_m,
+        } = self
+        {
+            use ferrite_kernel::geodesy::{direct, GeographicPosition};
+            let end = GeographicPosition::new(origin.1, origin.0)
+                .and_then(|o| direct(o, *bearing, *length_m))
+                .and_then(|e| Ok((e.longitude_near(origin.0)?, e.latitude())));
+            return match end {
+                Ok(end) if length_m.is_finite() && *length_m >= 0. => vec![
+                    WorldPoint::new(origin.0, origin.1),
+                    WorldPoint::new(end.0, end.1),
+                ],
+                _ => Vec::new(),
+            };
+        }
         let anchor = scaler.world_to_screen(origin);
         let ppm = scaler.pixels_per_mm();
         let local = |p: (f64, f64)| {
@@ -173,6 +322,9 @@ impl PortrayalPath {
                 } else {
                     Vec::new()
                 };
+            }
+            Self::Device(_) | Self::ScreenAngled(_) | Self::GeographicRay { .. } => {
+                unreachable!("resolved above")
             }
             Self::Group(_) => {
                 let mut p = self.world_paths(origin, scaler);
@@ -503,6 +655,92 @@ fn geographic_radial_world_points(
 mod tests {
     use super::*;
     use crate::{GeoBounds, Viewport};
+    #[test]
+    fn device_paths_stay_fixed_to_the_viewport_lower_left_in_millimetres() {
+        let path = PortrayalPath::Device(Box::new(PortrayalPath::Group(vec![
+            PortrayalPath::Polyline(vec![(0., 0.), (10., 5.)]),
+        ])));
+        for (bounds, viewport) in [
+            (GeoBounds::new(-1., 49., 1., 51.), Viewport::new(800., 600.)),
+            (
+                GeoBounds::new(120., -10., 121., -9.),
+                Viewport::with_origin(40., 20., 640., 480.),
+            ),
+        ] {
+            let scaler = Scaler::new(bounds, viewport);
+            let runs = path.world_paths(WorldPoint::new(0., 0.), &scaler);
+            assert_eq!(runs.len(), 1);
+            let screen: Vec<_> = runs[0]
+                .iter()
+                .map(|p| scaler.world_to_screen_f64(*p))
+                .collect();
+            let ppm = scaler.pixels_per_mm();
+            let corner = [viewport.x as f64, (viewport.y + viewport.height) as f64];
+            assert!(
+                (screen[0][0] - corner[0]).abs() < 0.01 && (screen[0][1] - corner[1]).abs() < 0.01
+            );
+            assert!((screen[1][0] - (corner[0] + 10. * ppm)).abs() < 0.01);
+            assert!((screen[1][1] - (corner[1] - 5. * ppm)).abs() < 0.01);
+        }
+    }
+    #[test]
+    fn portrayal_angles_with_metre_distances_follow_the_projected_screen_direction() {
+        for projection in [
+            crate::FlatProjection::LocalGeographic,
+            crate::FlatProjection::EllipsoidalMercator,
+        ] {
+            let mut scaler =
+                Scaler::new(GeoBounds::new(-2., 59., 2., 61.), Viewport::new(800., 600.));
+            scaler.set_projection(projection);
+            for angle in [0., 45., 90., 200.] {
+                let ray = PortrayalPath::ScreenAngled(Box::new(PortrayalPath::GeographicRay {
+                    origin: (0., 60.),
+                    bearing: angle,
+                    length_m: 5_000.,
+                }));
+                let points = ray.world_points(WorldPoint::new(0., 60.), &scaler);
+                assert_eq!(points.len(), 2);
+                let [a, b] = [points[0], points[1]].map(|p| scaler.world_to_screen_f64(p));
+                // Screen +Y is down; Portrayal angles are clockwise from +Y up.
+                let screen_angle = (b[0] - a[0])
+                    .atan2(a[1] - b[1])
+                    .to_degrees()
+                    .rem_euclid(360.);
+                assert!(
+                    (screen_angle - angle).abs() < 0.05,
+                    "{projection:?} {angle} {screen_angle}"
+                );
+                let geographic = PortrayalPath::GeographicRay {
+                    origin: (0., 60.),
+                    bearing: angle,
+                    length_m: 5_000.,
+                };
+                let p = geographic.world_points(WorldPoint::new(0., 60.), &scaler);
+                let [a, b] = [p[0], p[1]].map(|p| scaler.world_to_screen_f64(p));
+                let projected = (b[0] - a[0])
+                    .atan2(a[1] - b[1])
+                    .to_degrees()
+                    .rem_euclid(360.);
+                if projection == crate::FlatProjection::EllipsoidalMercator {
+                    // Conformal: a bearing keeps its screen direction.
+                    assert!((projected - angle).abs() < 0.05);
+                }
+            }
+            // An arc keeps its authored sense and sweep sign.
+            let arc = PortrayalPath::GeographicArc {
+                center: (0., 60.),
+                radius_m: 2_000.,
+                start: 0.,
+                sweep: -90.,
+            };
+            let PortrayalPath::GeographicArc { start, sweep, .. } =
+                arc.with_bearings(&scaler).unwrap()
+            else {
+                panic!()
+            };
+            assert!(start.abs() < 1e-6 && sweep < 0. && sweep > -180.);
+        }
+    }
     #[test]
     fn geographic_annulus_rings_sectors_and_radial_boundaries_follow_metric_source() {
         use ferrite_kernel::geodesy::{inverse, GeographicPosition};

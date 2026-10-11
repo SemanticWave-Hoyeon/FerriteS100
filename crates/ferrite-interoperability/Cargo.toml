@@ -9,3 +9,8 @@ ferrite-kernel.workspace = true
 roxmltree = "=0.20.0"
 
 ferrite-security.workspace = true
+
+[dev-dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+base64 = "=0.22.1"
+tempfile = "3"

@@ -18,13 +18,40 @@ pub fn display_plan(
     denominator: f64,
     viewport: &Region,
 ) -> Result<S101DisplayPlan> {
-    let band = display_scale_band(denominator)?;
-    let mut bands = inventory
+    display_plan_with_retention(
+        inventory,
+        denominator,
+        viewport,
+        &retention(inventory, denominator),
+    )
+}
+
+/// Every retention decision is `denominator >= t` for a minimum or optimum
+/// denominator `t`, so the count of thresholds passed identifies the result.
+pub fn retention_key(inventory: &[CoverageFootprint], denominator: f64) -> usize {
+    let mut thresholds: Vec<u32> = inventory
         .iter()
-        .map(|c| c.scales.scale_bands())
-        .collect::<Result<Vec<_>>>()?;
-    let mut eligible = inventory.to_vec();
-    let mut retained = Vec::new();
+        .flat_map(|c| {
+            [
+                c.scales.minimum_denominator,
+                Some(c.scales.optimum_denominator),
+            ]
+        })
+        .flatten()
+        .collect();
+    thresholds.sort_unstable();
+    thresholds.dedup();
+    thresholds
+        .iter()
+        .filter(|t| denominator >= **t as f64)
+        .count()
+}
+
+/// 4.6 retention: the region each coverage keeps at/beyond its minimum display
+/// scale. Only polygon differences, so it commutes with an affine projection
+/// and can be computed once per `retention_key` in a camera-independent plane.
+pub fn retention(inventory: &[CoverageFootprint], denominator: f64) -> Vec<(usize, Region)> {
+    let mut out = Vec::new();
     for (index, coverage) in inventory.iter().enumerate() {
         let Some(minimum) = coverage.scales.minimum_denominator else {
             continue;
@@ -44,10 +71,32 @@ pub fn display_plan(
                 region = region.difference(&other.region);
             }
         }
-        eligible[index].region = region;
-        if !eligible[index].region.is_empty() {
-            bands[index] |= 1 << (band - 1);
-            retained.push(index);
+        out.push((index, region));
+    }
+    out
+}
+
+/// `retained` is `retention(inventory, denominator)`, possibly computed in
+/// another affine-equivalent plane and mapped into the inventory's space.
+pub fn display_plan_with_retention(
+    inventory: &[CoverageFootprint],
+    denominator: f64,
+    viewport: &Region,
+    retained: &[(usize, Region)],
+) -> Result<S101DisplayPlan> {
+    let band = display_scale_band(denominator)?;
+    let mut bands = inventory
+        .iter()
+        .map(|c| c.scales.scale_bands())
+        .collect::<Result<Vec<_>>>()?;
+    let mut eligible = inventory.to_vec();
+    let mut minimum_retention = Vec::new();
+    for (index, region) in retained {
+        anyhow::ensure!(*index < inventory.len(), "Retention outside inventory");
+        eligible[*index].region = region.clone();
+        if !region.is_empty() {
+            bands[*index] |= 1 << (band - 1);
+            minimum_retention.push(*index);
         }
     }
     let selection = select_with_band_membership(&eligible, denominator, viewport, &bands)?;
@@ -56,7 +105,7 @@ pub fn display_plan(
         eligible_inventory: eligible,
         selection,
         masks,
-        minimum_retention: retained,
+        minimum_retention,
     })
 }
 #[cfg(test)]
@@ -81,6 +130,57 @@ mod tests {
             },
             region,
         }
+    }
+    /// Retention computed once per key in another affine plane and mapped back
+    /// gives the same plan as computing it in the device space.
+    #[test]
+    fn retention_key_and_affine_plane_reproduce_device_plan() {
+        let inv = vec![
+            c(0, 180000, 90000, 45000, rect(0., 5.)),
+            c(1, 45000, 12000, 6000, rect(0., 10.)),
+            c(2, 700000, 350000, 180000, rect(2., 3.)),
+        ];
+        // Flipped, scaled and translated plane, like (longitude, northing).
+        let to_plane = |p: [f64; 2]| [p[0] * 0.25 - 3., 7. - p[1] * 0.5];
+        let to_device = |p: [f64; 2]| [(p[0] + 3.) * 4., (7. - p[1]) * 2.];
+        let plane: Vec<_> = inv
+            .iter()
+            .map(|f| CoverageFootprint {
+                region: f.region.map_affine(to_plane).unwrap(),
+                ..f.clone()
+            })
+            .collect();
+        let mut seen = std::collections::BTreeMap::new();
+        for d in [
+            5000., 6000., 12000., 44999., 45000., 60000., 90000., 179999., 180000., 350000.,
+            700000., 900000.,
+        ] {
+            let direct = display_plan(&inv, d, &rect(0., 10.)).unwrap();
+            let key = retention_key(&inv, d);
+            let retained = seen
+                .entry(key)
+                .or_insert_with(|| retention(&plane, d))
+                .iter()
+                .map(|(i, r)| (*i, r.map_affine(to_device).unwrap()))
+                .collect::<Vec<_>>();
+            let cached = display_plan_with_retention(&inv, d, &rect(0., 10.), &retained).unwrap();
+            assert_eq!(cached.minimum_retention, direct.minimum_retention, "{d}");
+            assert_eq!(
+                cached.selection.coverages, direct.selection.coverages,
+                "{d}"
+            );
+            for (a, b) in cached
+                .eligible_inventory
+                .iter()
+                .zip(&direct.eligible_inventory)
+            {
+                assert!((a.region.area() - b.region.area()).abs() < 1e-9, "{d}");
+            }
+            for (a, b) in cached.masks.coverages.iter().zip(&direct.masks.coverages) {
+                assert!((a.visible.area() - b.visible.area()).abs() < 1e-9, "{d}");
+            }
+        }
+        assert!(seen.len() > 3, "thresholds must produce distinct keys");
     }
     #[test]
     fn no_coarser_data_remains_visible_at_and_beyond_minimum() {

@@ -93,6 +93,7 @@ mod flat_event_burst;
 mod flat_event_coalescing;
 mod gpu_usage;
 mod interoperability;
+mod llm_chat;
 mod native_mcp;
 mod native_s421;
 mod navigation;
@@ -112,9 +113,11 @@ mod s102_input_capture;
 mod s102_journal_admission;
 mod s102_original_inputs;
 mod s102_quality_worker;
+mod s102_trial_worker;
 mod s421_dataset_input;
 mod secure_instruction_cache;
 mod thread_stats;
+mod ui_feature_audit;
 
 mod flat_eventloop_diagnostics;
 mod flat_service_trajectory;
@@ -127,6 +130,18 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+/// `<latitude>,<longitude>` in decimal degrees to [longitude, latitude].
+fn parse_own_ship(value: &str) -> Result<[f64; 2]> {
+    let (lat, lon) = value
+        .split_once(',')
+        .context("--own-ship requires <latitude>,<longitude>")?;
+    let (lat, lon): (f64, f64) = (lat.trim().parse()?, lon.trim().parse()?);
+    anyhow::ensure!(
+        (-90. ..=90.).contains(&lat) && (-180. ..=180.).contains(&lon),
+        "--own-ship position out of range"
+    );
+    Ok([lon, lat])
+}
 /// Audit/capture requests must fail without waiting for interactive dismissal.
 #[cfg(any(test, all(windows, not(debug_assertions))))]
 fn noninteractive_diagnostics(arguments: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
@@ -422,6 +437,10 @@ struct AppConfig {
     require_signatures: bool,
     operational_mode: bool,
     ic_path: Option<PathBuf>,
+    /// S-98 Level 2 predefined combination selected by the mariner.
+    ic_combination: Option<String>,
+    /// `--own-ship <lat>,<lon>`, parsed at startup.
+    own_ship: Option<String>,
     initial_interoperability_enabled: bool,
     ic_transition_audit: Option<PathBuf>,
     ic_trust_root: Option<PathBuf>,
@@ -570,6 +589,14 @@ impl AppConfig {
                 .windows(2)
                 .find(|p| p[0] == "--ic")
                 .map(|p| PathBuf::from(&p[1])),
+            ic_combination: args
+                .windows(2)
+                .find(|p| p[0] == "--ic-combination")
+                .map(|p| p[1].clone()),
+            own_ship: args
+                .windows(2)
+                .find(|p| p[0] == "--own-ship")
+                .map(|p| p[1].clone()),
             ic_trust_root: args
                 .windows(2)
                 .find(|p| p[0] == "--ic-trust-root")
@@ -965,12 +992,16 @@ impl DatasetOpenSession {
 /// Chart viewer application for winit
 struct ChartApp {
     s100_mcp: native_mcp::Controller,
+    llm_chat: llm_chat::Controller,
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     render_context: RenderContext,
     bounds: GeoBounds,
     /// Symbol cache for SVG symbol rendering
     symbol_cache: SymbolCache,
+    /// Revision of the stand-in cache while a single-catalogue background
+    /// build owns `symbol_cache`; the build returns it unless replaced.
+    symbol_cache_lent: Option<u64>,
     cell_resources: Option<ferrite_wgpu::CellPortrayalResources>,
     /// Current color profile name (Day, Dusk, Night)
     pending_portrayal_change: Option<PortrayalChangeRequest>,
@@ -1026,6 +1057,16 @@ struct ChartApp {
     coverage_inventory: Option<Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>>,
 
     ic: Option<Arc<ferrite_interoperability::AuthenticatedCatalogue>>,
+    ic_combination: Option<String>,
+    own_ship: Option<[f64; 2]>,
+    /// Thread-safe, non-blocking wake-up for worker threads. A worker must not
+    /// call Window::request_redraw: on macOS that synchronously dispatches to
+    /// the main thread, which may itself be waiting for the worker.
+    wake_proxy: Option<winit::event_loop::EventLoopProxy<()>>,
+    /// Position chosen with the chat's "Show on Chart" ([longitude, latitude]).
+    chat_marker: Option<[f64; 2]>,
+    /// S-102 2.1 trial files opened for inspection only (never depth).
+    s102_trials: Vec<(PathBuf, ferrite_s102::trial_inspection::TrialInspection)>,
     ic_assigned_vectors: usize,
     initial_interoperability_enabled: bool,
     ic_transition_audit: Option<PathBuf>,
@@ -1146,6 +1187,7 @@ impl ChartApp {
     ) -> Self {
         ChartApp {
             s100_mcp: native_mcp::Controller::default(),
+            llm_chat: llm_chat::Controller::default(),
             window: None,
             renderer: None,
             render_context: {
@@ -1202,6 +1244,11 @@ impl ChartApp {
             coverage_inventory: None,
 
             ic: None,
+            ic_combination: None,
+            own_ship: None,
+            wake_proxy: None,
+            chat_marker: None,
+            s102_trials: Vec::new(),
             ic_assigned_vectors: 0,
             initial_interoperability_enabled: true,
             ic_transition_audit: None,
@@ -1323,6 +1370,7 @@ impl ChartApp {
                 std::env::var_os("FERRITE_FLAT_EVENT_COALESCING").as_deref(),
             ),
             scene_build: None,
+            symbol_cache_lent: None,
             // Background builds are only shown through the motion preview;
             // without it they would add settle work and no smoother frames.
             background_scene_builds: std::env::var_os("FERRITE_BACKGROUND_SCENE_BUILD")
@@ -1393,6 +1441,173 @@ impl ChartApp {
         self.commit_portrayal_change(prepared)
     }
 
+    fn install_trial_inspections(
+        &mut self,
+        inspections: Vec<(
+            PathBuf,
+            Result<ferrite_s102::trial_inspection::TrialInspection, String>,
+        )>,
+        notices: &mut Vec<String>,
+    ) {
+        if inspections.is_empty() {
+            return;
+        }
+        for (path, result) in inspections {
+            match result {
+                Ok(inspection) => {
+                    let missing = inspection.metadata().missing_vertical_datum();
+                    notices.push(format!(
+                        "S-102 2.1 trial opened for inspection only{}; not used for depth \
+                         or safety queries: {}",
+                        if missing {
+                            " (vertical datum missing; not inferred)"
+                        } else {
+                            ""
+                        },
+                        path.display()
+                    ));
+                    self.s102_trials.retain(|(p, _)| *p != path);
+                    self.s102_trials.push((path, inspection));
+                }
+                Err(error) => notices.push(format!(
+                    "S-102 2.1 trial could not be inspected {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+        self.refresh_dataset_tree();
+    }
+    /// S-98 Level 2: an active combination suppressing S-102 layers clips the
+    /// bathymetry rasters to the area outside the displayed S-101 coverage.
+    fn update_raster_suppression(&mut self) {
+        let suppress = self.active_ic().is_some_and(|ic| {
+            let mut displayed = Vec::new();
+            if !self.cells.is_empty() {
+                displayed.push("S-101");
+            }
+            if !self.bathymetry.is_empty() {
+                displayed.push("S-102");
+            }
+            ic.catalogue
+                .select(self.ic_combination.as_deref(), &displayed)
+                .ok()
+                .and_then(|selection| ic.catalogue.active_combination(selection))
+                .is_some_and(|c| c.suppressed.iter().any(|l| l.product == "S-102"))
+        });
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_raster_layer_suppression(suppress);
+        }
+    }
+    /// S-101 2.0.0 4.6: indicate larger-scale data at own ship on the chart screen.
+    fn update_own_ship_indication(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(position) = self.own_ship else {
+            renderer.ui_state.own_ship = None;
+            return;
+        };
+        let (pan, zoom, _) = renderer.fast_view_transform();
+        let exact = pan == (0., 0.) && zoom == 1.;
+        let screen = exact
+            .then(|| {
+                self.render_context
+                    .scaler
+                    .world_to_screen_f64(WorldPoint::new(position[0], position[1]))
+            })
+            .filter(|p| p.iter().all(|v| v.is_finite()))
+            .map(|[x, y]| [x as f32, y as f32]);
+        // The MSVS is the committed scene's display scale; during an affine
+        // preview keep the last answer rather than flicker.
+        let msvs = self.render_context.scaler.display_scale;
+        let larger_scale = match self.coverage_inventory.as_ref() {
+            Some(inventory) if exact && msvs.is_finite() && msvs > 0. => {
+                inventory.larger_scale_at(position, msvs)
+            }
+            Some(_) => renderer
+                .ui_state
+                .own_ship
+                .and_then(|previous| previous.larger_scale),
+            None => None,
+        };
+        let previous = renderer.ui_state.own_ship.and_then(|o| o.larger_scale);
+        if previous != larger_scale {
+            match larger_scale {
+                Some(d) => info!("Own ship: larger scale data available (1:{d})"),
+                None => info!("Own ship: no larger scale data at the viewing scale"),
+            }
+        }
+        renderer.ui_state.own_ship = Some(ferrite_wgpu::OwnShipIndication {
+            screen,
+            larger_scale,
+        });
+    }
+    /// Screen position of the chat's "Show on Chart" marker (hidden during
+    /// affine previews, like the own-ship marker).
+    fn update_chat_marker(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let (pan, zoom, _) = renderer.fast_view_transform();
+        renderer.ui_state.chat_marker = self
+            .chat_marker
+            .filter(|_| pan == (0., 0.) && zoom == 1.)
+            .map(|[lon, lat]| {
+                self.render_context
+                    .scaler
+                    .world_to_screen_f64(WorldPoint::new(lon, lat))
+            })
+            .filter(|p| p.iter().all(|v| v.is_finite()))
+            .map(|[x, y]| [x as f32, y as f32]);
+    }
+    /// S-98 Level 2 context for the products currently on display.
+    fn ic_level2(
+        &self,
+        ic: &ferrite_interoperability::AuthenticatedCatalogue,
+    ) -> Result<interoperability::Level2> {
+        let mut displayed = Vec::new();
+        if !self.cells.is_empty() {
+            displayed.push("S-101");
+        }
+        if !self.bathymetry.is_empty() {
+            displayed.push("S-102");
+        }
+        interoperability::Level2::new(
+            ic,
+            self.ic_combination.as_deref(),
+            &displayed,
+            self.bathymetry
+                .iter()
+                .map(|(_, c, _)| c as &dyn ferrite_kernel::NumericCoverageSource),
+        )
+    }
+    /// Selection for S-102 rasters being composed now: S-102 is on display.
+    fn ic_s102_selection(
+        &self,
+        ic: &ferrite_interoperability::AuthenticatedCatalogue,
+    ) -> Result<ferrite_interoperability::Selection> {
+        let mut displayed = vec!["S-102"];
+        if !self.cells.is_empty() {
+            displayed.push("S-101");
+        }
+        ic.catalogue
+            .select(self.ic_combination.as_deref(), &displayed)
+    }
+    /// Suppression depends on which products are displayed and where S-102
+    /// has data, so a change to the S-102 set recomposes the vectors.
+    fn recompose_for_level2(&mut self) {
+        let suppresses = self.active_ic().is_some_and(|ic| {
+            ic.catalogue.combinations.iter().any(|c| {
+                Some(&c.identifier) == self.ic_combination.as_ref() && !c.suppressed.is_empty()
+            })
+        });
+        if suppresses && !self.cells.is_empty() {
+            self.queue_portrayal_change(PortrayalChangeRequest {
+                profile: self.current_profile_name.clone(),
+                settings: self.applied_settings.clone(),
+            });
+        }
+    }
     fn active_ic(&self) -> Option<Arc<ferrite_interoperability::AuthenticatedCatalogue>> {
         let enabled = self
             .renderer
@@ -1762,6 +1977,11 @@ impl ChartApp {
         let (portrayal, pc_status, raster_groups) = self.bathymetry_portrayal_with_status()?;
         let edge = self.bathymetry_tile_edge()?;
         let active_ic = self.active_ic();
+        let s102_selection = active_ic
+            .as_ref()
+            .map(|ic| self.ic_s102_selection(ic))
+            .transpose()?
+            .unwrap_or_default();
         let mut pending = Vec::new();
         let mut instance_count = 0usize;
         // Receiver snapshot admission policy, not a product-specification limit.
@@ -1872,13 +2092,13 @@ impl ChartApp {
                     }
                     let assignment = active_ic
                         .as_ref()
-                        .map(|ic| coverages[0].interoperability_assignment(&ic.catalogue))
+                        .map(|ic| coverages[0].interoperability_assignment_in(&ic.catalogue, s102_selection))
                         .transpose()?
                         .flatten();
                     if let Some(ic) = active_ic.as_ref() {
                         for c in coverages {
                             anyhow::ensure!(
-                        c.interoperability_assignment(&ic.catalogue)? == assignment,
+                        c.interoperability_assignment_in(&ic.catalogue, s102_selection)? == assignment,
                         "Cannot compose S102 instances with different interoperability assignments"
                     );
                         }
@@ -2086,6 +2306,7 @@ impl ChartApp {
         }
         self.s102_pc_status = pc_status;
         info!("S-102 loaded: {} coverages", self.bathymetry.len());
+        self.recompose_for_level2();
         Ok(())
     }
 
@@ -2397,6 +2618,11 @@ impl ChartApp {
         } else {
             None
         };
+        let s102_selection = active_ic
+            .as_ref()
+            .map(|ic| self.ic_s102_selection(ic))
+            .transpose()?
+            .unwrap_or_default();
         let ic_changed = if let Some(ic) = active_ic.as_ref() {
             if owned {
                 let fcs = self
@@ -2409,9 +2635,36 @@ impl ChartApp {
                             .context("Missing IC cell FC owner")
                     })
                     .collect::<Result<Vec<_>>>()?;
-                interoperability::compose_vectors_for_cells(ic, &self.cells, &fcs, &mut next)?
+                let pcs = self
+                    .cells
+                    .iter()
+                    .map(|cell| {
+                        catalogue_registry
+                            .owner_for(&Self::catalogue_dataset_key(&cell.dsid)?)
+                            .map(|owner| &***owner.pc())
+                            .context("Missing IC cell PC owner")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let level2 = self.ic_level2(ic)?;
+                interoperability::compose_vectors_for_cells(
+                    ic,
+                    &level2,
+                    &self.cells,
+                    &fcs,
+                    &pcs,
+                    &request.profile,
+                    &mut next,
+                )?
             } else {
-                interoperability::compose_vectors(ic, &self.cells, fc, &mut next)?
+                let level2 = self.ic_level2(ic)?;
+                interoperability::compose_vectors(
+                    ic,
+                    &level2,
+                    &self.cells,
+                    fc,
+                    (pc, &request.profile),
+                    &mut next,
+                )?
             }
         } else {
             0
@@ -2499,13 +2752,18 @@ impl ChartApp {
                             };
                         let assignment = active_ic
                             .as_ref()
-                            .map(|ic| first.interoperability_assignment(&ic.catalogue))
+                            .map(|ic| {
+                                first.interoperability_assignment_in(&ic.catalogue, s102_selection)
+                            })
                             .transpose()?
                             .flatten();
                         if let Some(ic) = active_ic.as_ref() {
                             for (_, c, _) in group {
                                 anyhow::ensure!(
-                                    c.interoperability_assignment(&ic.catalogue)? == assignment,
+                                    c.interoperability_assignment_in(
+                                        &ic.catalogue,
+                                        s102_selection
+                                    )? == assignment,
                                     "Cannot compose differing interoperability assignments"
                                 );
                             }
@@ -3341,6 +3599,20 @@ impl ChartApp {
                 });
             }
         }
+        let trial_files: Vec<_> = self
+            .s102_trials
+            .iter()
+            .map(|(path, inspection)| DatasetLayerEntry {
+                id: DatasetLayerId::S102Trial(path.clone()),
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                source: path.display().to_string(),
+                detail: s102_trial_worker::summary(inspection),
+            })
+            .collect();
         let native_files = self.native_s421.dataset_rows();
         let native_catalogue = self.native_s421.catalogue_layer();
         for row in &native_files {
@@ -3383,6 +3655,14 @@ impl ChartApp {
                     files: raster_files,
                 },
             ];
+            if !trial_files.is_empty() {
+                renderer.ui_state.dataset_layers.push(DatasetProductLayer {
+                    product: "S-102 2.1 Trial (Inspection Only)".into(),
+                    fc: "No feature catalogue binding".into(),
+                    pc: "Not portrayed".into(),
+                    files: trial_files,
+                });
+            }
             renderer
                 .ui_state
                 .catalogue_layers
@@ -3476,6 +3756,20 @@ impl ChartApp {
             ferrite_wgpu::DatasetLayerId::S421 { .. } => {
                 anyhow::bail!("Native route dispatch state changed")
             }
+            ferrite_wgpu::DatasetLayerId::S102Trial(path) => {
+                // Same pre-commit failure hook as published datasets: an
+                // injected failure leaves the inspection list untouched.
+                anyhow::ensure!(
+                    !self.publication_test_fail_before_commit,
+                    "Injected publication failure before commit"
+                );
+                let before = self.s102_trials.len();
+                self.s102_trials.retain(|(p, _)| *p != path);
+                anyhow::ensure!(
+                    self.s102_trials.len() < before,
+                    "Dataset is no longer loaded"
+                );
+            }
             ferrite_wgpu::DatasetLayerId::S102(path) => {
                 anyhow::ensure!(
                     self.bathymetry.iter().any(|(loaded, _, _)| *loaded == path),
@@ -3553,7 +3847,11 @@ impl ChartApp {
                     dataset_open_plan::discover(&path)
                 } else {
                     dataset_open_plan::single_file(&path)
-                };
+                }
+                .map(|mut plan| {
+                    plan.inspect_trials();
+                    plan
+                });
                 let _ = sender.send(plan);
             })?;
         self.dataset_open_discovery = Some(receiver);
@@ -3582,7 +3880,11 @@ impl ChartApp {
             if let Some(plan) = plan {
                 self.dataset_open_discovery = None;
                 match plan {
-                    Ok(plan) => {
+                    Ok(mut plan) => {
+                        self.install_trial_inspections(
+                            std::mem::take(&mut plan.trial_inspections),
+                            &mut plan.notices,
+                        );
                         self.dataset_open_session = Some(DatasetOpenSession {
                             routes: plan.routes.into(),
                             rasters: plan.rasters.into(),
@@ -5168,7 +5470,15 @@ impl ChartApp {
         }
 
         let ic_changed = if let Some(ic) = self.active_ic() {
-            interoperability::compose_vectors(&ic, &self.cells, &self.fc, &mut next)?
+            let level2 = self.ic_level2(&ic)?;
+            interoperability::compose_vectors(
+                &ic,
+                &level2,
+                &self.cells,
+                &self.fc,
+                (&self.pc, &self.current_profile_name),
+                &mut next,
+            )?
         } else {
             0
         };
@@ -5946,6 +6256,8 @@ impl ChartApp {
         // Qualify the actual recursive-open layout with all files and summary present.
         self.renderer.as_mut().unwrap().ui_state.debug_mode = false;
         for _ in 0..12 {
+            self.update_own_ship_indication();
+            self.update_raster_suppression();
             self.renderer.as_mut().unwrap().render()?;
             if self.sync_chart_layout() {
                 self.update_view();
@@ -10926,7 +11238,6 @@ impl ChartApp {
             || self.loading_state.is_some()
             || self.navigation_flush_active
             || self.plugin_system.has_loaded_plugins()
-            || self.cell_resources.is_none()
             || !self
                 .renderer
                 .as_ref()
@@ -10948,8 +11259,23 @@ impl ChartApp {
             return false;
         }
         let groups = self.get_visible_viewing_groups();
-        let Some(resources) = self.cell_resources.take() else {
-            return false;
+        // Per-cell owners, or the single-catalogue cache and palette that the
+        // UI-thread rebuild would use; the worker returns them on install.
+        let resources = match self.cell_resources.take() {
+            Some(resources) => ferrite_wgpu::SceneResources::Owners(resources),
+            None => {
+                let stand_in = self.symbol_cache.fork_empty();
+                self.symbol_cache_lent = Some(stand_in.resource_revision());
+                ferrite_wgpu::SceneResources::Single {
+                    symbol_cache: Box::new(std::mem::replace(&mut self.symbol_cache, stand_in)),
+                    color_profile: self
+                        .pc
+                        .color_profiles
+                        .profiles
+                        .get(&self.current_profile_name)
+                        .cloned(),
+                }
+            }
         };
         let renderer = self.renderer.as_mut().expect("checked above");
         // Same camera prefix as rebuild_view_ex, on a source fork.
@@ -10987,6 +11313,7 @@ impl ChartApp {
             Err(_) => {
                 // The worker owned the resources; rebuild them synchronously.
                 tracing::error!("Background scene build panicked");
+                self.symbol_cache_lent = None;
                 self.startup_error = Some("Background scene build panicked".into());
                 return;
             }
@@ -10996,7 +11323,17 @@ impl ChartApp {
             return;
         };
         let installed = renderer.install_built_scene(built, &self.render_context);
-        self.cell_resources = Some(installed.resources);
+        match installed.resources {
+            ferrite_wgpu::SceneResources::Owners(resources) => {
+                self.cell_resources = Some(resources);
+            }
+            ferrite_wgpu::SceneResources::Single { symbol_cache, .. } => {
+                // A portrayal change replaced the stand-in: keep the newer cache.
+                if self.symbol_cache_lent.take() == Some(self.symbol_cache.resource_revision()) {
+                    self.symbol_cache = *symbol_cache;
+                }
+            }
+        }
         if !installed.installed {
             tracing::debug!(
                 "Background scene discarded: {}",
@@ -12403,6 +12740,12 @@ impl ChartApp {
 }
 
 impl ApplicationHandler for ChartApp {
+    /// Worker wake-ups (see `wake_proxy`), delivered on the main thread.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             // Load window icon
@@ -12606,6 +12949,29 @@ impl ApplicationHandler for ChartApp {
                                     event_loop.exit();
                                     return;
                                 }
+                            }
+                            if let Some(path) = std::env::var_os("FERRITE_LLM_CHAT_UI_AUDIT") {
+                                std::env::remove_var("FERRITE_LLM_CHAT_UI_AUDIT");
+                                if let Err(error) = self.audit_llm_chat_ui(&PathBuf::from(path)) {
+                                    self.startup_error =
+                                        Some(format!("LLM chat UI audit failed: {error:#}"));
+                                }
+                                event_loop.exit();
+                                return;
+                            }
+                            if let Some(path) = std::env::var_os("FERRITE_S421_EDIT_COPY_AUDIT") {
+                                std::env::remove_var("FERRITE_S421_EDIT_COPY_AUDIT");
+                                let input = std::env::var_os("FERRITE_S421_EDIT_COPY_INPUT")
+                                    .map(PathBuf::from)
+                                    .unwrap_or_default();
+                                if let Err(error) =
+                                    self.audit_s421_edit_copy(&PathBuf::from(path), &input)
+                                {
+                                    self.startup_error =
+                                        Some(format!("S-421 edit copy audit failed: {error:#}"));
+                                }
+                                event_loop.exit();
+                                return;
                             }
                             if let Some(path) = std::env::var_os("FERRITE_DATASET_UI_AUDIT") {
                                 std::env::remove_var("FERRITE_DATASET_UI_AUDIT");
@@ -12881,6 +13247,7 @@ impl ApplicationHandler for ChartApp {
             }
             WindowEvent::RedrawRequested => {
                 self.service_mcp_ui();
+                self.service_llm_chat_ui();
                 if let Err(error) = self.ensure_s102_journal_ready() {
                     self.startup_error = Some(format!("S102 history recovery required: {error:#}"));
                     event_loop.exit();
@@ -12916,6 +13283,9 @@ impl ApplicationHandler for ChartApp {
                 // Poll for completed async hit-test build
                 self.poll_hit_test();
                 self.poll_scene_build(false);
+                self.update_own_ship_indication();
+                self.update_chat_marker();
+                self.update_raster_suppression();
 
                 // Process inertia/momentum
                 let now = std::time::Instant::now();
@@ -14746,6 +15116,14 @@ impl ApplicationHandler for ChartApp {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(s102_trial_worker::FLAG))
+    {
+        if let Err(error) = s102_trial_worker::run_child() {
+            eprintln!("S-102 trial inspector: {error:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(s102_quality_worker::FLAG))
     {
@@ -14866,6 +15244,45 @@ fn run_app() -> Result<()> {
             "Authenticated IC: {} {} (supported plane rules; full S-98 not verified)",
             ic.catalogue.name, ic.catalogue.version
         );
+        for finding in &ic.profile_findings {
+            warn!("IC S-98 profile: {finding}");
+        }
+        if let Some(id) = &config.ic_combination {
+            let all: Vec<&str> = ic
+                .catalogue
+                .products
+                .iter()
+                .map(|p| p.code.as_str())
+                .collect();
+            let selection = ic.catalogue.select(Some(id), &all)?;
+            let combination = ic
+                .catalogue
+                .active_combination(selection)
+                .expect("all products");
+            // S-101 layers are hidden per feature; S-102 rasters are clipped
+            // to the area outside the displayed S-101 coverage. Any other
+            // replacing product has no coverage this application can evaluate.
+            anyhow::ensure!(
+                combination
+                    .suppressed
+                    .iter()
+                    .all(|l| match l.product.as_str() {
+                        "S-101" => true,
+                        "S-102" => {
+                            l.replacement_products.iter().all(|p| p == "S-101")
+                                && combination.products.iter().any(|p| p == "S-101")
+                        }
+                        _ => false,
+                    }),
+                "IC combination {id} suppresses a layer whose replacement this application \
+                 cannot evaluate"
+            );
+            info!(
+                "IC predefined combination {id}: {} ({} suppressed feature layers)",
+                combination.name,
+                combination.suppressed.len()
+            );
+        }
         Some(Arc::new(ic))
     } else {
         None
@@ -14972,6 +15389,8 @@ fn run_app() -> Result<()> {
     app.applied_settings.viewing_layers = config.initial_viewing_layers.into_iter().collect();
     primary_viewing_layers::capture_primary(&app.pc, &mut app.applied_settings)?;
     app.ic = authenticated_ic;
+    app.ic_combination = config.ic_combination;
+    app.own_ship = config.own_ship.as_deref().map(parse_own_ship).transpose()?;
     app.ic_audit = config.ic_audit;
     app.portrayal_audit = config.portrayal_audit;
     app.selection_audit = config.selection_audit;
@@ -14992,6 +15411,7 @@ fn run_app() -> Result<()> {
     app.s102_journal_gate = s102_journal_gate;
     app.initial_interoperability_enabled = config.initial_interoperability_enabled;
     app.ic_transition_audit = config.ic_transition_audit;
+    app.wake_proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app).context("Event loop error")?;
     if let Some(error) = app.startup_error {
         anyhow::bail!(error);

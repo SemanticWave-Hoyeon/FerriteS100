@@ -136,6 +136,118 @@ pub fn direct(
     GeographicPosition::new(lat, lon)
 }
 
+/// The arc of the geodesic circle through three WGS84 positions: the centre
+/// is equidistant (geodesic metres) from all three, the arc runs from `start`
+/// through `median` to `end`. S-100 Part 9 9-12.2.2.13 Arc3Points in
+/// GeographicCRS, where a "circle" is the locus at constant geodesic distance
+/// (the same model as ArcByRadius/Annulus in GeographicCRS).
+pub fn arc_through_three_points(
+    start: GeographicPosition,
+    median: GeographicPosition,
+    end: GeographicPosition,
+) -> Result<GeodesicRadiusArc> {
+    let unit = |p: GeographicPosition| {
+        let (lat, lon) = (p.latitude.to_radians(), p.longitude.to_radians());
+        [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+    };
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let (a, b, c) = (unit(start), unit(median), unit(end));
+    let (u, v) = (sub(b, a), sub(c, a));
+    let mut n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let norm = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    // Normal of the plane through the three points; tiny for colinear
+    // (same great circle) or coincident points, which Part 9 forbids.
+    ensure!(
+        norm > 1e-15,
+        "Arc3Points positions are colinear or coincident"
+    );
+    n = n.map(|x| x / norm);
+    // The small circle's pole on the same side as the points (< hemisphere).
+    let offset = n[0] * a[0] + n[1] * a[1] + n[2] * a[2];
+    // A plane through the earth's centre is a great circle: the points lie on
+    // one geodesic, which is the spherical meaning of colinear.
+    ensure!(
+        offset.abs() > 1e-9,
+        "Arc3Points positions are colinear or coincident"
+    );
+    if offset < 0. {
+        n = n.map(|x| -x);
+    }
+    let mut center =
+        GeographicPosition::new(n[2].asin().to_degrees(), n[1].atan2(n[0]).to_degrees())?;
+    // Refine on the ellipsoid: equalise geodesic distances by Newton steps in
+    // the local tangent plane (d distance / d centre = -unit azimuth vector).
+    for _ in 0..32 {
+        let d = [
+            inverse(center, start)?,
+            inverse(center, median)?,
+            inverse(center, end)?,
+        ];
+        let g = d.map(|i| {
+            let az = i.initial_azimuth_deg.to_radians();
+            [-az.sin(), -az.cos()]
+        });
+        let f = [
+            d[1].distance_m - d[0].distance_m,
+            d[2].distance_m - d[0].distance_m,
+        ];
+        if f[0].abs().max(f[1].abs()) < 1e-9 * d[0].distance_m.max(1.) {
+            break;
+        }
+        let j = [
+            [g[1][0] - g[0][0], g[1][1] - g[0][1]],
+            [g[2][0] - g[0][0], g[2][1] - g[0][1]],
+        ];
+        let det = j[0][0] * j[1][1] - j[0][1] * j[1][0];
+        ensure!(
+            det.abs() > 1e-12,
+            "Arc3Points circle centre is ill-conditioned"
+        );
+        let east = -(f[0] * j[1][1] - f[1] * j[0][1]) / det;
+        let north = -(j[0][0] * f[1] - j[1][0] * f[0]) / det;
+        center = direct(center, east.atan2(north).to_degrees(), east.hypot(north))?;
+    }
+    let d = [
+        inverse(center, start)?,
+        inverse(center, median)?,
+        inverse(center, end)?,
+    ];
+    let radius = (d[0].distance_m + d[1].distance_m + d[2].distance_m) / 3.;
+    ensure!(
+        d.iter()
+            .all(|i| (i.distance_m - radius).abs() <= 1e-6 * radius.max(1.)),
+        "Arc3Points geodesic circle did not converge"
+    );
+    let from = d[0].initial_azimuth_deg;
+    let clockwise = |to: f64| (to - from).rem_euclid(360.);
+    let (through, to) = (
+        clockwise(d[1].initial_azimuth_deg),
+        clockwise(d[2].initial_azimuth_deg),
+    );
+    ensure!(to > 0., "Arc3Points start and end coincide");
+    // Positive sweep is clockwise; choose the direction that passes the median.
+    let sweep = if through < to { to } else { to - 360. };
+    GeodesicRadiusArc::new(center, radius, from, sweep)
+}
+impl GeodesicRadiusArc {
+    pub fn center(self) -> GeographicPosition {
+        self.center
+    }
+    pub fn radius_m(self) -> f64 {
+        self.radius_m
+    }
+    pub fn start_azimuth_deg(self) -> f64 {
+        self.start_azimuth_deg
+    }
+    pub fn sweep_deg(self) -> f64 {
+        self.sweep_deg
+    }
+}
+
 /// An arc reached at fixed geodesic travel distance from a WGS84 centre.
 /// This is a surface curve,
 /// not a Cartesian circle or a straight interpolation in longitude/latitude.
@@ -564,5 +676,39 @@ mod geographic_arc_tests {
             .unwrap()
             .sample(1., 1000)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod arc_three_points_tests {
+    use super::*;
+    fn p(lat: f64, lon: f64) -> GeographicPosition {
+        GeographicPosition::new(lat, lon).unwrap()
+    }
+    #[test]
+    fn three_points_on_a_geodesic_circle_recover_its_centre_radius_and_sense() {
+        let centre = p(50.75, -1.35);
+        let on = |az: f64| direct(centre, az, 1852.).unwrap();
+        // Clockwise through north-east: 0 -> 45 -> 90.
+        let arc = arc_through_three_points(on(0.), on(45.), on(90.)).unwrap();
+        assert!(inverse(arc.center(), centre).unwrap().distance_m < 1e-4);
+        assert!((arc.radius_m() - 1852.).abs() < 1e-4);
+        assert!(arc.start_azimuth_deg().abs() < 1e-6);
+        assert!((arc.sweep_deg() - 90.).abs() < 1e-6);
+        // The same endpoints through the west go anticlockwise the long way.
+        let arc = arc_through_three_points(on(0.), on(200.), on(90.)).unwrap();
+        assert!((arc.sweep_deg() + 270.).abs() < 1e-6);
+        // Large circle far from the equator still converges on the ellipsoid.
+        let far = p(70., 20.);
+        let on = |az: f64| direct(far, az, 200_000.).unwrap();
+        let arc = arc_through_three_points(on(10.), on(130.), on(250.)).unwrap();
+        assert!(inverse(arc.center(), far).unwrap().distance_m < 1e-2);
+        assert!((arc.sweep_deg() - 240.).abs() < 1e-6);
+    }
+    #[test]
+    fn colinear_or_coincident_points_are_refused() {
+        let a = p(0., 0.);
+        assert!(arc_through_three_points(a, p(0., 1.), p(0., 2.)).is_err());
+        assert!(arc_through_three_points(a, p(1., 1.), a).is_err());
     }
 }

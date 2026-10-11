@@ -136,3 +136,38 @@ fn catalogue_misses_and_missing_feature_remain_explicit() {
     );
     assert!(r.call("catalogue_search", json!({"term":"absent"})).is_ok());
 }
+#[test]
+fn nearest_searches_every_dataset_in_one_call_and_merges_duplicates() {
+    // Two cells hold the same object (-1.0, 50.0); a third holds one farther east.
+    let r = Registry::new([
+        fixture("a", "alpha", -1.0),
+        fixture("b", "alpha", -1.0),
+        fixture("c", "gamma", -0.9),
+    ])
+    .unwrap();
+    let out = r
+        .call(
+            "feature_nearest",
+            json!({"position":"50°00′00.00″N, 000°59′00.00″W","type":"TestPoint","limit":5}),
+        )
+        .unwrap();
+    let features = out["features"].as_array().unwrap();
+    assert_eq!(features.len(), 2, "{out}");
+    assert_eq!(features[0]["position"]["lon_dms"], "001°00′00.00″W");
+    assert_eq!(features[0]["also_in"].as_array().unwrap().len(), 1);
+    let first = features[0]["distance_m"].as_f64().unwrap();
+    assert!((first - 1192.0).abs() < 5.0, "{first}");
+    assert!(features[1]["distance_m"].as_f64().unwrap() > first);
+    assert!((features[0]["bearing_deg_true"].as_f64().unwrap() - 270.0).abs() < 0.5);
+    // One dataset only, decimal input, and an untyped radius-bounded search.
+    let one = r
+        .call(
+            "feature_nearest",
+            json!({"lat":50.0,"lon":-0.9,"dataset_id":"c"}),
+        )
+        .unwrap();
+    assert_eq!(one["features"][0]["dataset_id"], "c");
+    assert!(r
+        .call("feature_nearest", json!({"position":"nowhere"}))
+        .is_err());
+}

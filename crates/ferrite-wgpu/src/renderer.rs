@@ -171,8 +171,9 @@ fn point_in_ring(px: f32, py: f32, ring: &[(f32, f32)]) -> bool {
 /// Cached triangulation result (world-coordinate earcut)
 /// Stores indices and cleaned world vertices so earcut runs only once per polygon shape.
 struct CachedTriangulation {
-    /// Earcut triangle indices (into world_vertices)
-    indices: Vec<usize>,
+    /// Earcut triangle indices (into world_vertices), stored as u32 with no
+    /// spare capacity: a retained cache, not a growing buffer.
+    indices: Vec<u32>,
     /// Cleaned world-coordinate vertices [x0, y0, x1, y1, ...] (exterior + holes)
     world_vertices: Vec<f64>,
     /// World-coordinate axis-aligned bounding box (min_x, min_y, max_x, max_y)
@@ -269,7 +270,7 @@ impl AreaTriangulationRetention {
                 .and_then(|n| {
                     v.indices
                         .capacity()
-                        .checked_mul(std::mem::size_of::<usize>())
+                        .checked_mul(std::mem::size_of::<u32>())
                         .and_then(|m| n.checked_add(m))
                 })
                 .and_then(|n| {
@@ -1530,6 +1531,7 @@ pub struct WgpuRenderer {
     draw_range_index_enabled: bool,
 
     raster_layers: Vec<GpuRasterLayer>,
+    raster_suppression: crate::raster_suppression::RasterSuppression,
     continuous_owner: std::sync::Arc<()>,
     raster_epoch: Arc<()>,
     vector_scene_epoch: private_vector_gpu::VectorSceneEpoch,
@@ -1855,10 +1857,12 @@ impl WgpuRenderer {
                 static_line_bounds: crate::static_line_bounds::Cache::new(
                     std::env::var_os("FERRITE_STATIC_LINE_BOUNDS_CSE").as_deref(),
                 ),
+                // Pure function of the instruction list, invalidated with it;
+                // explicit 0 restores the per-frame scan.
                 static_source_classification_enabled: std::env::var(
                     "FERRITE_STATIC_SOURCE_CLASSIFICATION",
                 )
-                .is_ok_and(|v| v == "1"),
+                .map_or(true, |v| v != "0"),
                 suppression_tail: suppression_tail_enabled
                     .then(crate::suppression_tail::Collector::default),
                 symbol_class_cache: FxHashMap::with_capacity_and_hasher(256, Default::default()),
@@ -1935,6 +1939,7 @@ impl WgpuRenderer {
             view_bind_group,
             // Pre-allocate with typical initial capacities to avoid reallocation
             raster_layers: Vec::new(),
+            raster_suppression: Default::default(),
             continuous_owner: std::sync::Arc::new(()),
             raster_epoch: Arc::new(()),
             vector_scene_epoch: Default::default(),
@@ -3090,7 +3095,13 @@ impl WgpuRenderer {
             {
                 continue;
             }
-            pass.set_pipeline(if layer.continuous.is_some() {
+            let suppressed = self
+                .raster_suppression
+                .binding()
+                .filter(|_| layer.continuous.is_none());
+            pass.set_pipeline(if let Some((pipeline, _)) = suppressed {
+                pipeline
+            } else if layer.continuous.is_some() {
                 self.pipelines
                     .continuous_raster_pipeline
                     .as_ref()
@@ -3099,6 +3110,9 @@ impl WgpuRenderer {
                 &self.pipelines.raster_pipeline
             });
             pass.set_bind_group(1, &layer.bind_group, &[]);
+            if let Some((_, clip)) = suppressed {
+                pass.set_bind_group(2, clip, &[]);
+            }
             pass.set_vertex_buffer(0, layer.vertices.slice(..));
             pass.set_index_buffer(layer.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..layer.index_count, 0, 0..1);
@@ -3991,7 +4005,6 @@ impl WgpuRenderer {
                 .dependency_status
                 .iterations
                 > 0
-            || self.vector_emission.vector_frame.view_clipped_patterns
     }
 
     /// The affine shows retained placement/coverage, which differs from an
@@ -4006,6 +4019,9 @@ impl WgpuRenderer {
                 coverage.requires_scale_selection_rebuild()
             })
             || self.vector_emission.vector_frame.view_dependent_symbols
+            // Patterns are clipped to the viewport plus margin; rebuild once the
+            // motion settles so the next camera gets its own clip.
+            || self.vector_emission.vector_frame.view_clipped_patterns
     }
 
     /// True while the visible affine is an approximate motion preview; the
@@ -4210,7 +4226,8 @@ impl WgpuRenderer {
                     .iterations,
                 view_dependent_symbols: !previewed
                     && self.vector_emission.vector_frame.view_dependent_symbols,
-                view_clipped_patterns: self.vector_emission.vector_frame.view_clipped_patterns,
+                view_clipped_patterns: !previewed
+                    && self.vector_emission.vector_frame.view_clipped_patterns,
                 source_transform_present: self
                     .vector_emission
                     .vector_frame
@@ -6408,8 +6425,44 @@ impl WgpuRenderer {
     }
 
     /// Render the frame
+    /// S-98 Level 2: hide raster layers wherever the displayed vector
+    /// coverage replaces them (an active SuppressedFeatureLayer).
+    pub fn set_raster_layer_suppression(&mut self, enabled: bool) {
+        if self.raster_suppression.enabled() != enabled {
+            self.raster_suppression.set_enabled(enabled);
+            self.state.window.request_redraw();
+        }
+    }
+    fn prepare_raster_suppression(&mut self) {
+        if !self.raster_suppression.enabled() {
+            return;
+        }
+        let frame = &self.vector_emission.vector_frame;
+        // A failed coverage frame has no replacing area: draw unclipped.
+        let coverage = (!frame.coverage_failed)
+            .then_some(frame.prepared_coverage.as_ref())
+            .flatten()
+            .cloned();
+        let viewport = frame.chart_geometry_viewport;
+        let transform = self
+            .coverage_clip_transform()
+            .unwrap_or(crate::coverage_clip::ClipTransform::IDENTITY);
+        let extent = [self.state.size.width, self.state.size.height];
+        if let Err(error) = self.raster_suppression.prepare(
+            &self.state,
+            &self.pipelines,
+            coverage.as_ref(),
+            viewport,
+            extent,
+            transform,
+        ) {
+            tracing::error!("Raster suppression mask rejected: {error}");
+            self.raster_suppression.reset_clip();
+        }
+    }
     pub fn render(&mut self) -> Result<()> {
         self.native_route_last_encoded.set(false);
+        self.prepare_raster_suppression();
         let flat_acquire_span =
             self.flat_span(ferrite_render::flat_reuse_diagnostics::FlatFrameStage::CompletionWait);
         self.validate_continuous_frame()?;
@@ -6753,6 +6806,7 @@ impl WgpuRenderer {
     }
 
     fn save_image<P: AsRef<Path>>(&mut self, path: P, include_panels: bool) -> Result<()> {
+        self.prepare_raster_suppression();
         use crate::state::MSAA_SAMPLE_COUNT;
 
         let (width, height) = self.state.viewport_size();
@@ -9681,7 +9735,15 @@ impl VectorEmissionOwned {
                 .map_err(|e| e.to_string())?;
             Ok((vertices, indices))
         })();
-        let (vertices, indices) = match triangulated {
+        let (mut vertices, indices) = match triangulated.and_then(|(vertices, indices)| {
+            // Exact-size u32 copy; GPU index buffers are u32 as well.
+            let indices = indices
+                .into_iter()
+                .map(u32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| "Area triangulation exceeds u32 indices".to_string())?;
+            Ok((vertices, indices))
+        }) {
             Ok(result) => result,
             Err(error) => {
                 self.triangulation_failures.insert(cache_key);
@@ -9713,6 +9775,7 @@ impl VectorEmissionOwned {
             }
         }
 
+        vertices.shrink_to_fit();
         let cached = CachedTriangulation {
             indices,
             world_vertices: vertices,
@@ -9811,7 +9874,7 @@ impl VectorEmissionOwned {
                             owner
                                 .indices
                                 .capacity()
-                                .checked_mul(std::mem::size_of::<usize>())
+                                .checked_mul(std::mem::size_of::<u32>())
                                 .and_then(|i| n.checked_add(i))
                         })
                         .and_then(|n| n.checked_add(std::mem::size_of::<CachedTriangulation>()));
@@ -9847,7 +9910,7 @@ impl VectorEmissionOwned {
             self.vector_frame
                 .frame_cpu
                 .area_indices
-                .extend(indices.iter().map(|&i| base_index + i as u32));
+                .extend(indices.iter().map(|&i| base_index + i));
 
             // Retain immutable projected input only after the original emitter
             // has passed visibility, clipping/coverage and triangulation gates.
@@ -10021,12 +10084,16 @@ impl VectorEmissionOwned {
             .composition_plane(CompositionStage::Chart);
         if clipped {
             self.vector_frame.view_clipped_patterns = true;
+            // Clip with the same 50% margin as geographic culling: pixels in
+            // the viewport are unchanged, and a motion preview within its drift
+            // budget (1.5x zoom, 25% travel) never reaches the clipped edge.
             let v = scaler.viewport;
+            let (mx, my) = (v.width as f64 * 0.5 + 2., v.height as f64 * 0.5 + 2.);
             let rect = [
-                v.x as f64 - 2.,
-                v.y as f64 - 2.,
-                (v.x + v.width) as f64 + 2.,
-                (v.y + v.height) as f64 + 2.,
+                v.x as f64 - mx,
+                v.y as f64 - my,
+                (v.x + v.width) as f64 + mx,
+                (v.y + v.height) as f64 + my,
             ];
             let wraps = if self.vector_frame.lon_wrap_screen_px > 0. {
                 vec![0., -(360. * sx), 360. * sx]
@@ -10037,8 +10104,10 @@ impl VectorEmissionOwned {
                 let start = self.vector_frame.frame_cpu.pattern_indices.len();
                 let clipped_vertex_start = self.vector_frame.frame_cpu.pattern_vertices.len();
                 for tri in indices.as_chunks::<3>().0 {
-                    let points =
-                        std::array::from_fn(|i| [coords[2 * tri[i]] + dx, coords[2 * tri[i] + 1]]);
+                    let points = std::array::from_fn(|i| {
+                        let v = tri[i] as usize;
+                        [coords[2 * v] + dx, coords[2 * v + 1]]
+                    });
                     let Ok(polygon) = ferrite_render::clip_triangle_to_rect(points, rect) else {
                         continue;
                     };
@@ -10102,7 +10171,7 @@ impl VectorEmissionOwned {
             self.vector_frame
                 .frame_cpu
                 .pattern_indices
-                .extend(indices.iter().map(|i| base + *i as u32));
+                .extend(indices.iter().map(|i| base + *i));
         }
         let idx_end = self.vector_frame.frame_cpu.pattern_indices.len();
         let plane = area
@@ -11887,7 +11956,7 @@ mod single_pc_private_resource_controls {
 pub struct SceneBuildJob {
     emission: VectorEmissionOwned,
     context: RenderContext,
-    resources: crate::CellPortrayalResources,
+    resources: SceneResources,
     visible_viewing_groups: Option<std::collections::HashSet<u32>>,
     gpu: GpuState,
     pipelines: RenderPipelines,
@@ -11904,7 +11973,7 @@ pub struct SceneBuildJob {
 pub struct BuiltScene {
     emission: VectorEmissionOwned,
     context: RenderContext,
-    resources: crate::CellPortrayalResources,
+    resources: SceneResources,
     settings: VectorEmissionSettings,
     generation: u64,
     prebuilt: Vec<crate::state::PrebuiltBuffer>,
@@ -11913,10 +11982,21 @@ pub struct BuiltScene {
 }
 
 /// Ownership returned to the App whether or not the scene was installed.
+/// Portrayal resources a background build owns until install: per-cell
+/// owners, or the single-catalogue symbol cache and palette that the UI-thread
+/// rebuild passes to the same emission routine.
+pub enum SceneResources {
+    Owners(crate::CellPortrayalResources),
+    Single {
+        symbol_cache: Box<SymbolCache>,
+        color_profile: Option<ColorProfile>,
+    },
+}
+
 pub struct InstalledScene {
     /// The built context (its camera and prepared coverage), when installed.
     pub context: Option<RenderContext>,
-    pub resources: crate::CellPortrayalResources,
+    pub resources: SceneResources,
     pub installed: bool,
     pub reason: Option<String>,
 }
@@ -11961,19 +12041,32 @@ impl SceneBuildJob {
             };
             let scaler = self.context.scaler.clone();
             self.emission.add_world_map_lines(&mut services, &scaler);
-            self.resources
-                .seal_viewing_groups()
-                .and_then(|()| {
-                    self.emission.add_instructions_with_resources_impl(
-                        &mut services,
-                        &mut self.context,
-                        None,
-                        None,
-                        self.visible_viewing_groups.as_ref(),
-                        Some(&mut self.resources),
-                    )
-                })
-                .map_err(|error| error.to_string())
+            match &mut self.resources {
+                SceneResources::Owners(resources) => {
+                    resources.seal_viewing_groups().and_then(|()| {
+                        self.emission.add_instructions_with_resources_impl(
+                            &mut services,
+                            &mut self.context,
+                            None,
+                            None,
+                            self.visible_viewing_groups.as_ref(),
+                            Some(resources),
+                        )
+                    })
+                }
+                SceneResources::Single {
+                    symbol_cache,
+                    color_profile,
+                } => self.emission.add_instructions_with_resources_impl(
+                    &mut services,
+                    &mut self.context,
+                    Some(symbol_cache),
+                    color_profile.as_ref(),
+                    self.visible_viewing_groups.as_ref(),
+                    None,
+                ),
+            }
+            .map_err(|error| error.to_string())
         };
         if result.is_ok() {
             self.emission.prebuild_scene_buffers(&self.gpu);
@@ -12057,7 +12150,7 @@ impl WgpuRenderer {
     pub fn begin_scene_build(
         &mut self,
         context: RenderContext,
-        resources: crate::CellPortrayalResources,
+        resources: SceneResources,
         visible_viewing_groups: Option<std::collections::HashSet<u32>>,
     ) -> SceneBuildJob {
         // Window density is read here, on the UI thread: macOS window calls

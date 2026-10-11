@@ -89,6 +89,7 @@ mod continuous_raster_selector;
 pub use continuous_raster_selector::ValidatedContinuousFrame;
 
 mod raster_publication_budget;
+mod raster_suppression;
 
 mod immutable_payload_cache;
 
@@ -139,3 +140,6 @@ pub mod debug_metrics;
 mod route_turn_radius_ui;
 
 pub mod mcp_ui;
+
+/// Chat with locally installed LLM command-line clients.
+pub mod llm_chat_ui;

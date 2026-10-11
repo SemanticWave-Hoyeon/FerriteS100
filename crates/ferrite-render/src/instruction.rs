@@ -1640,7 +1640,9 @@ impl LineInstruction {
         if let (
             Some(
                 path @ (crate::PortrayalPath::Group(_)
-                | crate::PortrayalPath::GeographicAnnulus { .. }),
+                | crate::PortrayalPath::GeographicAnnulus { .. }
+                | crate::PortrayalPath::Device(_)
+                | crate::PortrayalPath::ScreenAngled(_)),
             ),
             Some(&origin),
         ) = (&self.portrayal_path, self.points.first())

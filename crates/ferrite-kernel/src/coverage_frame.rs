@@ -418,6 +418,10 @@ impl CoverageFrame {
             CoverageRenderPolicy::ClipNonPoint => FrameCoverageDecision::ClipDataset(dataset_id),
         })
     }
+    /// Every selected dataset's visible device mask.
+    pub fn visible_masks(&self) -> impl Iterator<Item = &PixelMask> {
+        self.selected.values().map(|d| &d.visible)
+    }
     pub fn mask(&self, dataset_id: usize) -> Option<&PixelMask> {
         self.selected.get(&dataset_id).map(|d| &d.visible)
     }

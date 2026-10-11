@@ -1,7 +1,7 @@
 //! FC-typed S-101 attribute paths and atomic portrayal composition plans.
 use anyhow::{ensure, Context, Result};
 use ferrite_feature_catalog::{AttributeValueType, FeatureCatalogue};
-use ferrite_interoperability::{Assignment, Catalogue, Decimal, Scalar};
+use ferrite_interoperability::{Assignment, Catalogue, Decimal, Scalar, Selection};
 use ferrite_render::{DisplayPlane, DrawingInstruction, GeometryType};
 use ferrite_s100_core::{Attribute, FeatureRecord, S101Cell, SpatialPrimitiveType};
 use std::collections::HashMap;
@@ -146,7 +146,235 @@ struct Change {
     cell: u32,
     feature: i64,
     geometry: GeometryType,
-    assignment: Assignment,
+    /// None removes the instruction (Level 2 feature-type suppression).
+    assignment: Option<Assignment>,
+    /// Resolved substituteSymbolization for this instruction's kind.
+    substitute: Option<Substitute>,
+}
+/// substituteSymbolization resolved against the owning portrayal catalogue.
+#[derive(Clone)]
+enum Substitute {
+    Symbol {
+        reference: String,
+        rotation: f32,
+        rotation_crs: ferrite_render::RotationCrs,
+        scale: f32,
+    },
+    LineStyle {
+        reference: String,
+        style: Box<ferrite_render::LineStyle>,
+    },
+    /// A template area carrying only the substituted fill and fill_ref.
+    AreaFill(Box<ferrite_render::AreaInstruction>),
+    Text(Box<TextSubstitute>),
+}
+#[derive(Clone)]
+struct TextSubstitute {
+    text: String,
+    size: f32,
+    color: (ferrite_render::Color, String, f32),
+    background: Option<(ferrite_render::Color, String, f32)>,
+    h_align: ferrite_render::HAlign,
+    v_align: ferrite_render::VAlign,
+    rotation: f32,
+}
+/// A colour token of the active profile, with Part 9 transparency.
+fn substitute_color(
+    pc: &ferrite_portrayal_catalog::PortrayalCatalogue,
+    profile: &str,
+    color: &ferrite_interoperability::ColorSubstitute,
+) -> Result<(ferrite_render::Color, String, f32)> {
+    ensure!(
+        pc.get_color(profile, &color.token).is_some(),
+        "Substitute colour {} is not in profile {profile}",
+        color.token
+    );
+    Ok((
+        crate::lookup_pc_color(pc, &color.token, profile),
+        color.token.clone(),
+        1. - color.transparency() as f32,
+    ))
+}
+/// Part 9 Symbol defaults apply to omitted attributes: the substitute
+/// replaces the whole symbol element, not individual attributes.
+fn resolve_substitute(
+    substitution: &ferrite_interoperability::Substitution,
+    instruction: &DrawingInstruction,
+    portrayal: Option<(&ferrite_portrayal_catalog::PortrayalCatalogue, &str)>,
+) -> Result<Option<Substitute>> {
+    match instruction {
+        DrawingInstruction::Point(_) => {
+            let Some(symbol) = &substitution.symbol else {
+                return Ok(None);
+            };
+            let (pc, _) =
+                portrayal.context("Symbol substitution requires the portrayal catalogue")?;
+            ensure!(
+                pc.get_symbol(&symbol.reference).is_some(),
+                "Substitute symbol {} is not in the portrayal catalogue",
+                symbol.reference
+            );
+            Ok(Some(Substitute::Symbol {
+                reference: symbol.reference.clone(),
+                rotation: symbol.rotation().unwrap_or(0.) as f32,
+                rotation_crs: ferrite_render::RotationCrs::from_lua(
+                    symbol.rotation_crs.as_deref().unwrap_or("PortrayalCRS"),
+                )
+                .map_err(anyhow::Error::msg)?,
+                scale: symbol.scale_factor().unwrap_or(1.) as f32,
+            }))
+        }
+        DrawingInstruction::Line(_) => {
+            let Some(reference) = &substitution.line_style else {
+                return Ok(None);
+            };
+            let (pc, profile) =
+                portrayal.context("Line style substitution requires the portrayal catalogue")?;
+            let mut styles =
+                crate::resolve_line_strokes(std::slice::from_ref(reference), None, pc, profile)
+                    .with_context(|| format!("Substitute line style {reference}"))?;
+            Ok(Some(Substitute::LineStyle {
+                reference: reference.clone(),
+                style: Box::new(styles.remove(0)),
+            }))
+        }
+        DrawingInstruction::Area(_) => {
+            use ferrite_interoperability::AreaFillSubstitute;
+            use ferrite_portrayal_catalog::AreaFillType;
+            let Some(fill) = &substitution.area_fill else {
+                return Ok(None);
+            };
+            let (pc, profile) =
+                portrayal.context("Area fill substitution requires the portrayal catalogue")?;
+            let lookup = |token: &str| -> Result<ferrite_render::Color> {
+                ensure!(
+                    pc.get_color(profile, token).is_some(),
+                    "Substitute colour {token} is not in profile {profile}"
+                );
+                Ok(crate::lookup_pc_color(pc, token, profile))
+            };
+            let template = ferrite_render::AreaInstruction::new(Vec::new());
+            let area = match fill {
+                AreaFillSubstitute::Color(color) => {
+                    let (c, token, opacity) = substitute_color(pc, profile, color)?;
+                    let mut area = template.with_solid_fill_token_opacity(c, &token, opacity);
+                    area.fill_ref = None;
+                    area
+                }
+                AreaFillSubstitute::Reference(reference) => {
+                    let fill = pc.area_fills.get(reference.as_str()).with_context(|| {
+                        format!("Substitute area fill {reference} is not in the PC")
+                    })?;
+                    let mut area = match &fill.fill_type {
+                        AreaFillType::Color(c) => {
+                            template.with_solid_fill_token(lookup(&c.color_token)?, &c.color_token)
+                        }
+                        AreaFillType::Hatch(h) => template.with_hatch_fill_token(
+                            lookup(&h.line_color)?,
+                            &h.line_color,
+                            h.line_width as f32,
+                            h.spacing as f32,
+                            h.angle as f32,
+                        ),
+                        AreaFillType::Symbol(f) => template.with_pattern_fill(
+                            f.symbol_ref.clone(),
+                            (f.v1.x as f32, f.v1.y as f32),
+                            (f.v2.x as f32, f.v2.y as f32),
+                        ),
+                        AreaFillType::Pattern(f) => template.with_pattern_fill(
+                            f.symbol_ref.clone(),
+                            (f.spacing_x as f32, 0.0),
+                            (0.0, f.spacing_y as f32),
+                        ),
+                        AreaFillType::Pixmap(_) => {
+                            anyhow::bail!("Substitute pixmap fill {reference} is not renderable")
+                        }
+                    };
+                    area.fill_ref = Some(reference.clone());
+                    area
+                }
+            };
+            Ok(Some(Substitute::AreaFill(Box::new(area))))
+        }
+        DrawingInstruction::Text(_) => {
+            let Some(text) = &substitution.text else {
+                return Ok(None);
+            };
+            let (pc, profile) =
+                portrayal.context("Text substitution requires the portrayal catalogue")?;
+            Ok(Some(Substitute::Text(Box::new(TextSubstitute {
+                text: text.text.clone(),
+                size: text.body_size() as f32,
+                color: substitute_color(pc, profile, &text.foreground)?,
+                background: text
+                    .background
+                    .as_ref()
+                    .map(|b| substitute_color(pc, profile, b))
+                    .transpose()?,
+                h_align: match text.horizontal_alignment.as_str() {
+                    "Center" => ferrite_render::HAlign::Center,
+                    "End" => ferrite_render::HAlign::Right,
+                    _ => ferrite_render::HAlign::Left,
+                },
+                v_align: match text.vertical_alignment.as_str() {
+                    "Top" => ferrite_render::VAlign::Top,
+                    "Center" => ferrite_render::VAlign::Middle,
+                    _ => ferrite_render::VAlign::Bottom,
+                },
+                rotation: text.rotation() as f32,
+            }))))
+        }
+    }
+}
+/// Geographic extent [west, south, east, north] of a feature's source geometry.
+/// None when any spatial reference is unresolved or there is no geometry, so
+/// an incomplete feature is never suppressed.
+fn feature_extent(cell: &S101Cell, f: &FeatureRecord) -> Option<[f64; 4]> {
+    let mut extent: Option<[f64; 4]> = None;
+    let mut add = |c: &ferrite_s100_core::Coordinate| {
+        let e = extent.get_or_insert([c.x, c.y, c.x, c.y]);
+        e[0] = e[0].min(c.x);
+        e[1] = e[1].min(c.y);
+        e[2] = e[2].max(c.x);
+        e[3] = e[3].max(c.y);
+    };
+    let curve = |key, add: &mut dyn FnMut(&ferrite_s100_core::Coordinate)| -> bool {
+        if let Some(c) = cell.curves.get(&key) {
+            c.positions_iter().for_each(&mut *add);
+            return true;
+        }
+        let Some(composite) = cell.composite_curves.get(&key) else {
+            return false;
+        };
+        composite.curves.iter().all(|sub| {
+            cell.curves
+                .get(&sub.curve_id.key())
+                .map(|c| c.positions_iter().for_each(&mut *add))
+                .is_some()
+        })
+    };
+    for spas in &f.spatial_associations {
+        let key = spas.spatial_id.key();
+        let resolved = if let Some(p) = cell.points.get(&key) {
+            add(&p.position);
+            true
+        } else if let Some(m) = cell.multi_points.get(&key) {
+            m.positions.iter().for_each(&mut add);
+            true
+        } else if let Some(surface) = cell.surfaces.get(&key) {
+            // The exterior ring bounds the surface.
+            surface
+                .exterior_ring
+                .iter()
+                .all(|r| curve(r.curve_id.key(), &mut add))
+        } else {
+            curve(key, &mut add)
+        };
+        if !resolved {
+            return None;
+        }
+    }
+    extent.filter(|e| e.iter().all(|v| v.is_finite()))
 }
 pub struct InteroperabilityPlan {
     changes: Vec<Change>,
@@ -159,7 +387,7 @@ impl InteroperabilityPlan {
         self.changes.is_empty()
     }
     /// Validate every target first. A stale or invalid plan changes no instructions.
-    pub fn apply(&self, instructions: &mut [DrawingInstruction]) -> Result<()> {
+    pub fn apply(&self, instructions: &mut Vec<DrawingInstruction>) -> Result<()> {
         for c in &self.changes {
             let i = instructions
                 .get(c.index)
@@ -170,20 +398,90 @@ impl InteroperabilityPlan {
                     && i.geometry_type() == c.geometry,
                 "Composition plan identity mismatch"
             );
-            ensure!(
-                c.assignment.plane.stage == ferrite_kernel::CompositionStage::Chart
-                    && c.assignment.priority >= 0,
-                "Invalid vector composition assignment"
-            );
+            if let Some(a) = &c.assignment {
+                ensure!(
+                    a.plane.stage == ferrite_kernel::CompositionStage::Chart && a.priority >= 0,
+                    "Invalid vector composition assignment"
+                );
+            }
         }
+        let mut removed = vec![false; instructions.len()];
         for c in &self.changes {
-            instructions[c.index].set_display_parameters(
-                DisplayPlane::Interoperability(c.assignment.plane.order),
-                c.assignment.priority,
-                c.assignment.viewing_group,
-            );
+            match &c.assignment {
+                Some(a) => instructions[c.index].set_display_parameters(
+                    DisplayPlane::Interoperability(a.plane.order),
+                    a.priority,
+                    a.viewing_group,
+                ),
+                None => removed[c.index] = true,
+            }
+            match (&c.substitute, &mut instructions[c.index]) {
+                (
+                    Some(Substitute::Symbol {
+                        reference,
+                        rotation,
+                        rotation_crs,
+                        scale,
+                    }),
+                    DrawingInstruction::Point(p),
+                ) => {
+                    p.symbol_ref = reference.clone();
+                    p.rotation = *rotation;
+                    p.rotation_crs = *rotation_crs;
+                    p.scale = *scale;
+                }
+                (Some(Substitute::LineStyle { reference, style }), DrawingInstruction::Line(l)) => {
+                    l.style_ref = Some(reference.clone());
+                    l.style = (**style).clone();
+                }
+                (Some(Substitute::AreaFill(template)), DrawingInstruction::Area(a)) => {
+                    a.fill = template.fill.clone();
+                    a.fill_ref = template.fill_ref.clone();
+                    a.fill_color_token = template.fill_color_token.clone();
+                    a.fill_opacity = template.fill_opacity;
+                    a.hatch_color_token = template.hatch_color_token.clone();
+                    a.hatch_line_style_refs = template.hatch_line_style_refs.clone();
+                    a.hatch_strokes = template.hatch_strokes.clone();
+                }
+                (Some(Substitute::Text(t)), DrawingInstruction::Text(x)) => {
+                    x.text = t.text.clone();
+                    x.font_size = t.size;
+                    (x.color, x.color_token, x.color_opacity) =
+                        (t.color.0, Some(t.color.1.clone()), t.color.2);
+                    match &t.background {
+                        Some((c, token, opacity)) => {
+                            x.background = Some(*c);
+                            x.background_color_token = Some(token.clone());
+                            x.background_opacity = *opacity;
+                        }
+                        None => {
+                            x.background = None;
+                            x.background_color_token = None;
+                        }
+                    }
+                    x.h_align = t.h_align;
+                    x.v_align = t.v_align;
+                    x.rotation = t.rotation;
+                    x.rotation_crs = ferrite_render::RotationCrs::Portrayal;
+                }
+                _ => {}
+            }
+        }
+        if removed.contains(&true) {
+            let mut index = 0;
+            instructions.retain(|_| {
+                index += 1;
+                !removed[index - 1]
+            });
         }
         Ok(())
+    }
+    /// Instructions removed by Level 2 feature-type suppression.
+    pub fn suppressed_len(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|c| c.assignment.is_none())
+            .count()
     }
 }
 /// Resolve once per (source feature, portrayal primitive), then share among its symbols/text/layers.
@@ -195,6 +493,36 @@ pub fn plan_interoperability(
     instructions: &[DrawingInstruction],
     cell_index: u32,
 ) -> Result<InteroperabilityPlan> {
+    plan_interoperability_in(
+        catalogue,
+        Selection::default(),
+        cell,
+        fc,
+        instructions,
+        cell_index,
+        &|_, _| false,
+        None,
+    )
+}
+/// Whether `product` has data coverage over the whole geographic extent
+/// [west, south, east, north].
+pub type ProductCoverage<'a> = dyn Fn(&str, [f64; 4]) -> bool + 'a;
+/// S-98 Part B B-7: feature-type suppression precedes interleaving. Suppression
+/// applies only where the replacing products also have coverage (Part B B-5.1);
+/// an instance is hidden only when its whole extent is covered, never partially.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_interoperability_in(
+    catalogue: &Catalogue,
+    selection: Selection,
+    cell: &S101Cell,
+    fc: &FeatureCatalogue,
+    instructions: &[DrawingInstruction],
+    cell_index: u32,
+    coverage: &ProductCoverage<'_>,
+    portrayal: Option<(&ferrite_portrayal_catalog::PortrayalCatalogue, &str)>,
+) -> Result<InteroperabilityPlan> {
+    let combination = catalogue.active_combination(selection);
+    let mut suppressed: HashMap<i64, bool> = HashMap::new();
     let mut assignments: HashMap<(i64, &str), Option<Assignment>> = HashMap::new();
     let mut changes = Vec::new();
     for (index, i) in instructions
@@ -213,7 +541,8 @@ pub fn plan_interoperability(
             .feature_code
             .as_deref()
             .context("Unmapped feature code")?;
-        if !catalogue.has_rules_for("S-101", code) {
+        let layer = catalogue.suppressed_layer(selection, "S-101", code);
+        if layer.is_none() && !catalogue.has_rules_for("S-101", code) {
             continue;
         }
         let definition = fc
@@ -228,32 +557,81 @@ pub fn plan_interoperability(
         if use_type == ferrite_feature_catalog::FeatureUseType::Meta {
             continue;
         }
+        if let (Some(layer), Some(combination)) = (layer, combination) {
+            let hidden = *suppressed.entry(id).or_insert_with(|| {
+                // Without replacement references the other included products
+                // stand for "another product".
+                let others: Vec<&str> = if layer.replacement_products.is_empty() {
+                    combination
+                        .products
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|p| *p != "S-101")
+                        .collect()
+                } else {
+                    layer
+                        .replacement_products
+                        .iter()
+                        .map(String::as_str)
+                        .collect()
+                };
+                feature_extent(cell, feature)
+                    .is_some_and(|extent| others.iter().all(|p| coverage(p, extent)))
+            });
+            if hidden {
+                changes.push(Change {
+                    index,
+                    cell: cell_index,
+                    feature: id,
+                    geometry: i.geometry_type(),
+                    assignment: None,
+                    substitute: None,
+                });
+                continue;
+            }
+            if !catalogue.has_rules_for("S-101", code) {
+                continue;
+            }
+        }
         let geometry = drawing_geometry(i);
         if let std::collections::hash_map::Entry::Vacant(entry) = assignments.entry((id, geometry))
         {
             let mut forest = None;
             let assignment = catalogue
-                .resolve_portrayal("S-101", code, feature_geometry(feature), geometry, |path| {
-                    ensure!(
-                        fc.attribute_visibility(code, &path[0]).is_some(),
-                        "IC filter root is not bound to feature in FC: {}",
-                        path[0]
-                    );
-                    if forest.is_none() {
-                        forest = Some(AttributeForest::new(&feature.attributes)?);
-                    }
-                    forest.as_ref().unwrap().scalar(path, fc)
-                })
+                .resolve_portrayal_in(
+                    selection,
+                    "S-101",
+                    code,
+                    feature_geometry(feature),
+                    geometry,
+                    |path| {
+                        ensure!(
+                            fc.attribute_visibility(code, &path[0]).is_some(),
+                            "IC filter root is not bound to feature in FC: {}",
+                            path[0]
+                        );
+                        if forest.is_none() {
+                            forest = Some(AttributeForest::new(&feature.attributes)?);
+                        }
+                        forest.as_ref().unwrap().scalar(path, fc)
+                    },
+                )
                 .with_context(|| format!("IC selection for {code} {id}"))?;
             entry.insert(assignment);
         }
         if let Some(assignment) = assignments[&(id, geometry)].clone() {
+            let substitute = match &assignment.substitution {
+                Some(substitution) => resolve_substitute(substitution, i, portrayal)
+                    .with_context(|| format!("IC substitution for {code} {id}"))?,
+                None => None,
+            };
             changes.push(Change {
                 index,
                 cell: cell_index,
                 feature: id,
                 geometry: i.geometry_type(),
-                assignment,
+                assignment: Some(assignment),
+                substitute,
             });
         }
     }
@@ -268,6 +646,29 @@ pub fn plan_interoperability_for_cells(
     fcs: &[&FeatureCatalogue],
     instructions: &[DrawingInstruction],
 ) -> Result<InteroperabilityPlan> {
+    plan_interoperability_for_cells_in(
+        catalogue,
+        Selection::default(),
+        cells,
+        fcs,
+        instructions,
+        &|_, _| false,
+        &[],
+    )
+}
+pub fn plan_interoperability_for_cells_in(
+    catalogue: &Catalogue,
+    selection: Selection,
+    cells: &[S101Cell],
+    fcs: &[&FeatureCatalogue],
+    instructions: &[DrawingInstruction],
+    coverage: &ProductCoverage<'_>,
+    portrayal: &[Option<(&ferrite_portrayal_catalog::PortrayalCatalogue, &str)>],
+) -> Result<InteroperabilityPlan> {
+    ensure!(
+        portrayal.is_empty() || portrayal.len() == cells.len(),
+        "IC cell portrayal owner count mismatch"
+    );
     ensure!(
         cells.len() == fcs.len(),
         "IC cell catalogue owner count mismatch"
@@ -286,7 +687,16 @@ pub fn plan_interoperability_for_cells(
     }
     let mut changes = Vec::new();
     for (index, (cell, fc)) in cells.iter().zip(fcs).enumerate() {
-        let plan = plan_interoperability(catalogue, cell, fc, instructions, u32::try_from(index)?)?;
+        let plan = plan_interoperability_in(
+            catalogue,
+            selection,
+            cell,
+            fc,
+            instructions,
+            u32::try_from(index)?,
+            coverage,
+            portrayal.get(index).copied().flatten(),
+        )?;
         changes.try_reserve(plan.changes.len())?;
         changes.extend(plan.changes);
     }
@@ -520,6 +930,206 @@ mod tests {
         );
     }
     #[test]
+    fn level2_suppression_hides_only_fully_covered_instances_of_the_active_combination() {
+        use ferrite_feature_catalog::FeatureUseType;
+        use ferrite_render::{PointInstruction, WorldPoint};
+        use ferrite_s100_core::{Coordinate, PointRecord, RecordId, SpatialAssociation};
+        let (fc, mut cell) = owner_fixture(FeatureUseType::Geographic);
+        let point = RecordId::new(110, 7);
+        cell.points.insert(
+            point.key(),
+            PointRecord {
+                id: point,
+                position: Coordinate::new(129., 35.),
+                update_instruction: 1,
+            },
+        );
+        cell.features.get_mut(&1).unwrap().spatial_associations = vec![SpatialAssociation {
+            spatial_id: point,
+            ornt: 1,
+            usag: 1,
+            mask: 2,
+            scale_minimum: None,
+            scale_maximum: None,
+            update_instruction: 1,
+        }];
+        let product = "codeList=\"urn:ferrite:test:products\"";
+        let xml = include_str!("../../ferrite-interoperability/tests/display-plane.xml")
+            .replace(
+                "<attributeCombination>categoryOfWreck = 1</attributeCombination>",
+                "",
+            )
+            .replace("<interoperabilityLevel>1", "<interoperabilityLevel>2")
+            .replace(
+                "</displayPlanes>",
+                &format!(
+                    "</displayPlanes><predefinedProductCombinations><S100_IC_PredefinedCombination>\
+                     <identifier>pdc</identifier><name>n</name><description>d</description>\
+                     <useConditions>u</useConditions><interoperabilityLevel>2</interoperabilityLevel>\
+                     <includedProduct {product} codeListValue=\"S-101\">a</includedProduct>\
+                     <includedProduct {product} codeListValue=\"S-102\">b</includedProduct>\
+                     <suppressedFeatureLayers><S100_IC_SuppressedFeatureLayer><identifier>s</identifier>\
+                     <featureCode>Wreck</featureCode><product {product} codeListValue=\"S-101\">a</product>\
+                     <featureRef>coverageRule</featureRef></S100_IC_SuppressedFeatureLayer>\
+                     </suppressedFeatureLayers></S100_IC_PredefinedCombination></predefinedProductCombinations>"
+                ),
+            );
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        let keep = DrawingInstruction::Point(
+            PointInstruction::new("OTHER".into(), WorldPoint::new(0., 0.))
+                .with_cell_index(1)
+                .with_feature_id(9),
+        );
+        let wreck = DrawingInstruction::Point(
+            PointInstruction::new("WRECK".into(), WorldPoint::new(129., 35.))
+                .with_cell_index(0)
+                .with_feature_id(1),
+        );
+        let original = vec![wreck.clone(), keep, wreck];
+        let covered = |p: &str, e: [f64; 4]| p == "S-102" && e == [129., 35., 129., 35.];
+        let run = |selection, coverage: &ProductCoverage<'_>| {
+            let plan = plan_interoperability_in(
+                &catalogue, selection, &cell, &fc, &original, 0, coverage, None,
+            )
+            .unwrap();
+            let mut out = original.clone();
+            plan.apply(&mut out).unwrap();
+            (plan.suppressed_len(), out)
+        };
+        let active = catalogue.select(Some("pdc"), &["S-101", "S-102"]).unwrap();
+        let (hidden, out) = run(active, &covered);
+        assert_eq!(hidden, 2);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].feature_id(), Some(9));
+        // Outside the replacing product's coverage the layer stays visible.
+        let (hidden, out) = run(active, &|_, _| false);
+        assert_eq!((hidden, out.len()), (0, 3));
+        // Without the combination, Level 1 portrayal is unchanged.
+        let (hidden, out) = run(Selection::default(), &covered);
+        assert_eq!((hidden, out.len()), (0, 3));
+        // An unresolved spatial reference is never suppressed.
+        cell.points.clear();
+        let plan =
+            plan_interoperability_in(&catalogue, active, &cell, &fc, &original, 0, &covered, None)
+                .unwrap();
+        assert_eq!(plan.suppressed_len(), 0);
+    }
+    #[test]
+    fn drawing_instruction_rules_substitute_point_symbols_from_the_owning_pc() {
+        use ferrite_feature_catalog::FeatureUseType;
+        use ferrite_render::{PointInstruction, WorldPoint};
+        let (fc, cell) = owner_fixture(FeatureUseType::Geographic);
+        let xml = include_str!("../../ferrite-interoperability/tests/display-plane.xml")
+            .replace("<attributeCombination>categoryOfWreck = 1</attributeCombination>", "")
+            .replace(
+                "<viewingGroup>11010</viewingGroup></S100_IC_DrawingInstruction>",
+                "<viewingGroup>11010</viewingGroup><substituteSymbolization><symbol reference=\"WRECKS99\" rotation=\"30\"/></substituteSymbolization></S100_IC_DrawingInstruction>",
+            );
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        let point = DrawingInstruction::Point(
+            PointInstruction::new("WRECKS01".into(), WorldPoint::new(0., 0.))
+                .with_cell_index(0)
+                .with_feature_id(1),
+        );
+        let mut pc = crate::hatch_resource_tests::catalogue();
+        let plan = |pc: Option<(&ferrite_portrayal_catalog::PortrayalCatalogue, &str)>| {
+            plan_interoperability_in(
+                &catalogue,
+                Selection::default(),
+                &cell,
+                &fc,
+                std::slice::from_ref(&point),
+                0,
+                &|_, _| false,
+                pc,
+            )
+        };
+        // The substitute must exist in the product's portrayal catalogue.
+        assert!(plan(Some((&pc, "Day"))).is_err());
+        assert!(plan(None).is_err());
+        pc.symbols.symbols.insert(
+            "WRECKS99".into(),
+            ferrite_portrayal_catalog::Symbol::new("WRECKS99".into(), "WRECKS99.svg".into()),
+        );
+        let mut out = vec![point.clone()];
+        plan(Some((&pc, "Day"))).unwrap().apply(&mut out).unwrap();
+        let DrawingInstruction::Point(p) = &out[0] else {
+            panic!()
+        };
+        assert_eq!(p.symbol_ref, "WRECKS99");
+        assert_eq!(p.rotation, 30.);
+        assert_eq!(p.rotation_crs, ferrite_render::RotationCrs::Portrayal);
+        assert_eq!(p.priority.0, 4);
+    }
+    #[test]
+    fn area_fill_and_text_substitutes_use_the_active_colour_profile() {
+        use ferrite_feature_catalog::FeatureUseType;
+        use ferrite_portrayal_catalog::{ColorDefinition, ColorProfile, SrgbColor};
+        use ferrite_render::{AreaInstruction, TextInstruction, WorldPoint};
+        let (fc, cell) = owner_fixture(FeatureUseType::Geographic);
+        let xml = include_str!("../../ferrite-interoperability/tests/display-plane.xml")
+            .replace("<attributeCombination>categoryOfWreck = 1</attributeCombination>", "")
+            .replace("<geometryType>point</geometryType>", "")
+            .replace(
+                "<viewingGroup>11010</viewingGroup></S100_IC_DrawingInstruction>",
+                "<viewingGroup>11010</viewingGroup><substituteSymbolization><colorFill><color transparency=\"0.5\">DEPDW</color></colorFill><textPoint horizontalAlignment=\"End\" verticalAlignment=\"Center\" rotation=\"15\"><element><text>WK</text><bodySize>11</bodySize><foreground>CHBLK</foreground></element></textPoint></substituteSymbolization></S100_IC_DrawingInstruction>",
+            );
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        let area = DrawingInstruction::Area(
+            AreaInstruction::new(vec![WorldPoint::new(0., 0.); 3])
+                .with_cell_index(0)
+                .with_feature_id(1),
+        );
+        let text = DrawingInstruction::Text(
+            TextInstruction::new("old".into(), WorldPoint::new(0., 0.))
+                .with_cell_index(0)
+                .with_feature_id(1),
+        );
+        let original = vec![area, text];
+        let mut pc = crate::hatch_resource_tests::catalogue();
+        let mut day = ColorProfile::new("Day".into(), "Day".into());
+        for (token, rgb) in [("DEPDW", (200, 220, 250)), ("CHBLK", (0, 0, 0))] {
+            day.colors.insert(
+                token.into(),
+                ColorDefinition {
+                    token: token.into(),
+                    srgb: Some(SrgbColor::new(rgb.0, rgb.1, rgb.2)),
+                    cie: None,
+                },
+            );
+        }
+        let plan = |pc: &ferrite_portrayal_catalog::PortrayalCatalogue| {
+            plan_interoperability_in(
+                &catalogue,
+                Selection::default(),
+                &cell,
+                &fc,
+                &original,
+                0,
+                &|_, _| false,
+                Some((pc, "Day")),
+            )
+        };
+        // Tokens must exist in the active profile.
+        assert!(plan(&pc).is_err());
+        pc.color_profiles.profiles.insert("Day".into(), day);
+        let mut out = original.clone();
+        plan(&pc).unwrap().apply(&mut out).unwrap();
+        let DrawingInstruction::Area(a) = &out[0] else {
+            panic!()
+        };
+        assert_eq!(a.fill_color_token.as_deref(), Some("DEPDW"));
+        assert_eq!(a.fill_opacity, 0.5);
+        let DrawingInstruction::Text(t) = &out[1] else {
+            panic!()
+        };
+        assert_eq!((t.text.as_str(), t.font_size), ("WK", 11.));
+        assert_eq!(t.color_token.as_deref(), Some("CHBLK"));
+        assert_eq!(t.h_align, ferrite_render::HAlign::Right);
+        assert_eq!(t.v_align, ferrite_render::VAlign::Middle);
+        assert_eq!(t.rotation, 15.);
+    }
+    #[test]
     fn ambiguous_planes_abort_aggregate_planning_without_changing_portrayal() {
         use ferrite_feature_catalog::FeatureUseType;
         use ferrite_render::{PointInstruction, WorldPoint};
@@ -659,6 +1269,7 @@ mod tests {
             ),
             priority: 2,
             viewing_group: 11010,
+            substitution: None,
         };
         let plan = InteroperabilityPlan {
             changes: vec![
@@ -667,14 +1278,16 @@ mod tests {
                     cell: 0,
                     feature: 1,
                     geometry: GeometryType::Point,
-                    assignment: assignment.clone(),
+                    assignment: Some(assignment.clone()),
+                    substitute: None,
                 },
                 Change {
                     index: 1,
                     cell: 0,
                     feature: 2,
                     geometry: GeometryType::Point,
-                    assignment,
+                    assignment: Some(assignment),
+                    substitute: None,
                 },
             ],
         };

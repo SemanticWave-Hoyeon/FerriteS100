@@ -74,6 +74,26 @@ impl Registry {
                     json!({"read_only":true,"common":["datasets_list","dataset_metadata","s100_capabilities"],"product_queries":{"S-101":"catalogue, feature and approximate spatial queries","S-102":"metadata-only","S-421":"metadata-only when loaded by host"},"portrayal_or_navigation_control":false}),
                 )
             }
+            // Cross-dataset: one call answers "nearest X to a position".
+            "feature_nearest" => {
+                let only = args.get("dataset_id").and_then(Value::as_str);
+                let datasets: Vec<crate::nearest::Candidate<'_>> = self
+                    .datasets
+                    .values()
+                    .filter(|d| only.is_none_or(|id| d.id == id))
+                    .filter_map(|d| {
+                        Some(crate::nearest::Candidate {
+                            dataset_id: &d.id,
+                            index: d.s101.as_deref()?,
+                        })
+                    })
+                    .collect();
+                ensure!(
+                    !datasets.is_empty(),
+                    "no S-101 dataset with spatial queries is loaded"
+                );
+                return crate::nearest::feature_nearest(&datasets, args);
+            }
             _ => {}
         }
         let dataset = self.select(&args)?;
@@ -107,6 +127,25 @@ pub fn descriptors() -> Vec<Value> {
         tool["annotations"] =
             json!({"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false});
     }
+    tools.push(json!({
+        "name": "feature_nearest",
+        "description": "Nearest features to a position across ALL loaded S-101 datasets in one call (use this for 'nearest/closest X' questions instead of paging feature_query_by_type). Distance is to the feature geometry, nearest first, with closest point (decimal and DMS), true bearing and key attributes. Duplicates of one object in overlapping cells are merged (see also_in).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "position": {"type": "string", "description": "Position as written by the user, e.g. \"50°37′24.00″N, 001°09′25.21″W\" or \"50.6233, -1.1570\". Alternative to lat/lon."},
+                "lat": {"type": "number"},
+                "lon": {"type": "number"},
+                "type": {"type": "string", "description": "Feature type code, e.g. Wreck, Obstruction, Sounding (case-insensitive). Without it the search is limited to max_radius_m (default 5000 m)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
+                "max_radius_m": {"type": "number", "minimum": 0},
+                "merge_duplicates": {"type": "boolean", "default": true},
+                "dataset_id": {"type": "string", "description": "Optional: search one dataset only."}
+            },
+            "additionalProperties": false
+        },
+        "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
+    }));
     for (name, description) in [
         (
             "datasets_list",
@@ -129,7 +168,7 @@ fn validate_args(a: &Value) -> Result<()> {
             "limit must be 1..1000"
         );
     }
-    for name in ["term", "code", "type", "dataset_id"] {
+    for name in ["term", "code", "type", "dataset_id", "position"] {
         if let Some(v) = a.get(name) {
             ensure!(
                 v.as_str().is_some_and(|s| s.len() <= 4096),
@@ -228,7 +267,7 @@ mod tests {
     #[test]
     fn no_hidden_mutating_tools() {
         let d = descriptors();
-        assert_eq!(d.len(), 11);
+        assert_eq!(d.len(), 12);
         for t in d {
             assert_eq!(t["annotations"]["readOnlyHint"], true);
         }

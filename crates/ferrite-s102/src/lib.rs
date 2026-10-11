@@ -1163,12 +1163,29 @@ impl BathymetryCoverage {
         &self,
         catalogue: &ferrite_interoperability::Catalogue,
     ) -> Result<Option<ferrite_interoperability::Assignment>> {
-        catalogue.resolve("S-102", "BathymetryCoverage", "coverage", |path| {
-            anyhow::bail!(
-                "S-102 grid/feature attribute selector is unsupported: {}",
-                path.join("/")
-            )
-        })
+        self.interoperability_assignment_in(catalogue, Default::default())
+    }
+    /// Under an S-98 Level 2 selection, planes scoped to the active
+    /// predefined combination also apply.
+    pub fn interoperability_assignment_in(
+        &self,
+        catalogue: &ferrite_interoperability::Catalogue,
+        selection: ferrite_interoperability::Selection,
+    ) -> Result<Option<ferrite_interoperability::Assignment>> {
+        let coverage = "coverage";
+        catalogue.resolve_portrayal_in(
+            selection,
+            "S-102",
+            "BathymetryCoverage",
+            coverage,
+            coverage,
+            |path| {
+                anyhow::bail!(
+                    "S-102 grid/feature attribute selector is unsupported: {}",
+                    path.join("/")
+                )
+            },
+        )
     }
 }
 

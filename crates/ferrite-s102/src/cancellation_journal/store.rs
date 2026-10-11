@@ -592,7 +592,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.log");
         let mut store = Store::initialize(&path).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        // The open store holds a Windows byte-range lock that forbids other
+        // readers; compare the length there and the bytes elsewhere.
+        let snapshot = |path: &std::path::Path| -> Vec<u8> {
+            if cfg!(windows) {
+                std::fs::metadata(path)
+                    .unwrap()
+                    .len()
+                    .to_le_bytes()
+                    .to_vec()
+            } else {
+                std::fs::read(path).unwrap()
+            }
+        };
+        let before = snapshot(&path);
         let mut fault = |s| {
             if s == Step::BeforeWrite {
                 Err(std::io::Error::other("before"))
@@ -604,7 +617,7 @@ mod tests {
             store.persist_with(receipt(0), &mut fault),
             CommitOutcome::Unchanged(_)
         ));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(snapshot(&path), before);
         assert!(store.journal().unwrap().is_empty());
         let mut fault = |s| {
             if s == Step::AfterWrite {

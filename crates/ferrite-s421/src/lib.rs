@@ -242,6 +242,37 @@ impl RoutePlugin {
         Ok(())
     }
 
+    /// The "separate authored route" for an imported source: a new local route
+    /// with the same waypoints, turn radii and declared legs. The retained
+    /// original stays untouched; the copy exports under its own identity.
+    pub fn copy_imported_as_authored(&mut self, id: u32) -> Result<u32, String> {
+        let source = self
+            .routes
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or("Unknown route")?;
+        if !self.imported_sources.contains_key(&id) {
+            return Err("Only an imported route needs an authored copy".into());
+        }
+        if self.routes.len() >= 128 {
+            return Err("Native route receiver route limit exceeded".into());
+        }
+        let copy_id = self.next_route_id;
+        let next = copy_id.checked_add(1).ok_or("Route counter exhausted")?;
+        let mut copy = source.clone();
+        copy.id = copy_id;
+        copy.name = Some(match &source.name {
+            Some(name) => format!("{name} copy"),
+            None => format!("Route {copy_id} copy"),
+        });
+        self.routes.push(copy);
+        self.next_route_id = next;
+        self.active_route_index = Some(self.routes.len() - 1);
+        self.editing = false;
+        self.request_redraw();
+        Ok(copy_id)
+    }
+
     /// Native controller access; no DLL loader needed. Editing and panel visibility are distinct.
     pub fn routes(&self) -> &[Route] {
         &self.routes
@@ -783,6 +814,18 @@ impl Plugin for RoutePlugin {
                 ui::UiEvent::SetTurnRadius { id, radius_nm } => {
                     match self.set_native_turn_radius(id, &radius_nm) {
                         Ok(()) => self.request_redraw(),
+                        Err(error) => self.log(&error),
+                    }
+                }
+                ui::UiEvent::CopyAsAuthored => {
+                    let Some(id) = self.active_route().map(|r| r.id) else {
+                        self.log("No active route");
+                        return;
+                    };
+                    match self.copy_imported_as_authored(id) {
+                        Ok(copy) => {
+                            self.log(&format!("Created authored copy {copy} of route {id}"))
+                        }
                         Err(error) => self.log(&error),
                     }
                 }

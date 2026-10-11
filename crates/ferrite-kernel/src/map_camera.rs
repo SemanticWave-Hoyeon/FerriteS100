@@ -45,6 +45,36 @@ pub struct PreparedFlatNorthing {
     latitude_bits: u64,
     northing: f64,
 }
+/// The camera split into a camera-independent (longitude, northing) plane and
+/// this camera's screen mapping. `screen(plane(p))` repeats `project(p)` bit
+/// for bit, so geometry prepared once in the plane can be reused every frame.
+#[derive(Debug, Clone, Copy)]
+pub struct FlatAffine {
+    projection: AngularProjection,
+    origin: [f64; 2],
+    scale: [f64; 2],
+    offset: [f64; 2],
+}
+impl FlatAffine {
+    /// Identifies the plane; equal identities share plane coordinates.
+    pub fn plane_identity(&self) -> [u64; 3] {
+        self.projection.northing_identity()
+    }
+    pub fn plane(&self, point: [f64; 2]) -> Result<[f64; 2]> {
+        ensure!(
+            point.iter().all(|v| v.is_finite()),
+            "Non-finite camera position"
+        );
+        Ok([point[0], self.projection.northing(point[1])?])
+    }
+    /// Non-degenerate (both scales positive), so polygon validity is preserved.
+    pub fn screen(&self, plane: [f64; 2]) -> [f64; 2] {
+        [
+            (plane[0] - self.origin[0]) * self.scale[0] + self.offset[0],
+            (self.origin[1] - plane[1]) * self.scale[1] + self.offset[1],
+        ]
+    }
+}
 #[derive(Debug, Clone)]
 pub struct FlatMapCamera {
     projection: AngularProjection,
@@ -142,6 +172,14 @@ impl FlatMapCamera {
         );
         Ok(p)
     }
+    fn affine(&self) -> FlatAffine {
+        FlatAffine {
+            projection: self.projection,
+            origin: self.origin,
+            scale: self.scale,
+            offset: self.offset,
+        }
+    }
     fn unproject(&self, point: [f64; 2]) -> Result<[f64; 2]> {
         ensure!(
             point.iter().all(|v| v.is_finite()),
@@ -169,6 +207,10 @@ impl MapCamera {
         let Self::Flat(camera) = self;
         Ok(Some(camera.project(point)?))
     }
+    pub fn flat_affine(&self) -> FlatAffine {
+        let Self::Flat(camera) = self;
+        camera.affine()
+    }
     pub fn prepare_flat_northing(&self, latitude: f64) -> Result<PreparedFlatNorthing> {
         let Self::Flat(camera) = self;
         camera.prepare_northing(latitude)
@@ -189,6 +231,25 @@ impl MapCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn affine_split_repeats_project_bit_for_bit() {
+        for projection in [
+            AngularProjection::Geographic,
+            AngularProjection::EllipsoidalMercator,
+        ] {
+            let c = MapCamera::Flat(
+                FlatMapCamera::new(projection, [-185., 80.], [123.4, 98.7], [17., 83.]).unwrap(),
+            );
+            let affine = c.flat_affine();
+            for lon in [-181., -2.5, 179., 539.] {
+                for lat in [-80., 0., 48.65, 80.] {
+                    let direct = c.project([lon, lat]).unwrap().unwrap();
+                    let split = affine.screen(affine.plane([lon, lat]).unwrap());
+                    assert_eq!(direct.map(f64::to_bits), split.map(f64::to_bits));
+                }
+            }
+        }
+    }
     #[test]
     fn flat_camera_keeps_longitude_copies_and_cached_northing_roundtrip() {
         for projection in [

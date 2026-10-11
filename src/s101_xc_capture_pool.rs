@@ -66,25 +66,27 @@ mod tests {
     #[test]
     fn exact_same_path_bytes_share_but_changed_or_foreign_bytes_do_not() {
         let mut p = Pool::default();
-        let key = Path::new("/xc/a.xml");
+        let root = std::env::temp_dir();
+        let key = &root.join("xc").join("a.xml");
         let a = p.retain(key, b"abc", 32).unwrap();
         let b = p.retain(key, b"abc", 32).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         let changed = p.retain(key, b"abd", 32).unwrap();
         assert!(!Arc::ptr_eq(&a, &changed));
-        let foreign = p.retain(Path::new("/xc/b.xml"), b"abc", 32).unwrap();
+        let foreign = p
+            .retain(&root.join("xc").join("b.xml"), b"abc", 32)
+            .unwrap();
         assert!(!Arc::ptr_eq(&a, &foreign));
     }
     #[test]
     fn joint_live_budget_checks_before_allocation_and_drop_reclaims_admission() {
         let mut p = Pool::default();
-        let a = p.retain(Path::new("/a"), b"abcd", 4).unwrap();
-        assert!(p.retain(Path::new("/b"), b"x", 4).is_err());
-        assert!(Arc::ptr_eq(
-            &a,
-            &p.retain(Path::new("/a"), b"abcd", 4).unwrap()
-        ));
+        let root = std::env::temp_dir();
+        let (pa, pb) = (root.join("a"), root.join("b"));
+        let a = p.retain(&pa, b"abcd", 4).unwrap();
+        assert!(p.retain(&pb, b"x", 4).is_err());
+        assert!(Arc::ptr_eq(&a, &p.retain(&pa, b"abcd", 4).unwrap()));
         drop(a);
-        assert!(p.retain(Path::new("/b"), b"abcd", 4).is_ok());
+        assert!(p.retain(&pb, b"abcd", 4).is_ok());
     }
 }

@@ -289,7 +289,7 @@ struct OwnedGrowthIndex {
 }
 impl OwnedGrowthIndex {
     fn stage(
-        selected: &[(usize, &crate::LineInstruction, Curve<'_>)],
+        selected: &[(usize, SourceLine<'_>, Curve<'_>)],
         covered: &[bool],
         new_covered: &[bool],
         prior: Option<&Self>,
@@ -372,7 +372,7 @@ impl OwnedGrowthIndex {
     }
     fn capture(
         &mut self,
-        selected: &[(usize, &crate::LineInstruction, Curve<'_>)],
+        selected: &[(usize, SourceLine<'_>, Curve<'_>)],
         covered: &[bool],
         old: bool,
         budget: usize,
@@ -410,7 +410,7 @@ impl OwnedGrowthIndex {
             return None;
         }
         for (i, line, _) in selected.iter().filter(|(i, _, _)| covered[*i] == old) {
-            let priority = (line.display_plane.order().get(), line.priority.0);
+            let priority = (line.plane, line.priority);
             for pair in line.points.windows(2) {
                 if let Some(segment) = Segment::new(pair[0], pair[1]) {
                     use rstar::RTreeObject;
@@ -806,7 +806,7 @@ impl LineSuppressionCache {
             };
             let base = instructions
                 .len()
-                .saturating_mul(std::mem::size_of::<DrawingInstruction>());
+                .saturating_mul(std::mem::size_of::<Option<ProjectedSource>>());
             let points = instructions
                 .iter()
                 .zip(&prepared)
@@ -832,25 +832,24 @@ impl LineSuppressionCache {
                     .iter()
                     .zip(&prepared)
                     .map(|(item, enabled)| {
-                        let mut out = crate::LineInstruction::new(Vec::new());
-                        if let DrawingInstruction::Line(line) = item {
-                            if *enabled
-                                && line.screen_ray.is_none()
-                                && line.portrayal_path.is_none()
-                            {
-                                out.points = line
-                                    .points
-                                    .iter()
-                                    .map(|p| WorldPoint::new(p.x, projection.project_y(p.y)))
-                                    .collect();
-                                out.priority = line.priority;
-                                out.display_plane = line.display_plane;
-                                out.suppressible = line.suppressible;
-                            }
-                        }
                         // Ineligible candidates need no projected point allocation.
                         // Newly eligible curves trigger bounded preparation above.
-                        DrawingInstruction::Line(out)
+                        match item {
+                            DrawingInstruction::Line(line)
+                                if *enabled
+                                    && line.screen_ray.is_none()
+                                    && line.portrayal_path.is_none() =>
+                            {
+                                Some(ProjectedSource::new(
+                                    line,
+                                    line.points
+                                        .iter()
+                                        .map(|p| WorldPoint::new(p.x, projection.project_y(p.y)))
+                                        .collect(),
+                                ))
+                            }
+                            _ => None,
+                        }
                     })
                     .collect();
                 if let (Some(w), Some(start)) = (self.growth_child_work.as_mut(), projection_start)
@@ -1005,7 +1004,7 @@ impl LineSuppressionCache {
         }
         let base = instructions
             .len()
-            .checked_mul(std::mem::size_of::<DrawingInstruction>())?;
+            .checked_mul(std::mem::size_of::<Option<ProjectedSource>>())?;
         if base.checked_add(points.checked_mul(std::mem::size_of::<WorldPoint>())?)?
             > transform_budget
             || segments.checked_mul(128)? > compiler_budget
@@ -1016,33 +1015,30 @@ impl LineSuppressionCache {
         let mut prepared = Vec::with_capacity(instructions.len());
         let mut transformed = Vec::with_capacity(instructions.len());
         for item in instructions {
-            let mut out = crate::LineInstruction::new(Vec::new());
+            let mut out = None;
             let mut selected = false;
             if let DrawingInstruction::Line(line) = item {
                 if line.screen_ray.is_none() && line.portrayal_path.is_none() {
                     selected = true;
                     // Identical original project_y expression and source order.
-                    out.points = line
+                    let points: Vec<_> = line
                         .points
                         .iter()
                         .map(|p| WorldPoint::new(p.x, projection.project_y(p.y)))
                         .collect();
-                    Curve::new(&out.points)?;
+                    Curve::new(&points)?;
                     // Extreme arithmetic is left to the original lazy planner.
-                    if out
-                        .points
+                    if points
                         .windows(2)
                         .any(|p| !(p[1].x - p[0].x).is_finite() || !(p[1].y - p[0].y).is_finite())
                     {
                         return None;
                     }
-                    out.priority = line.priority;
-                    out.display_plane = line.display_plane;
-                    out.suppressible = line.suppressible;
+                    out = Some(ProjectedSource::new(line, points));
                 }
             }
             prepared.push(selected);
-            transformed.push(DrawingInstruction::Line(out));
+            transformed.push(out);
         }
         let compiled = PreparedLineSuppression::compile(&transformed, compiler_budget)?;
         Some((prepared, compiled))
@@ -1081,7 +1077,7 @@ impl LineSuppressionCache {
         }
         let base = instructions
             .len()
-            .checked_mul(std::mem::size_of::<DrawingInstruction>())?;
+            .checked_mul(std::mem::size_of::<Option<ProjectedSource>>())?;
         if base.checked_add(points.checked_mul(std::mem::size_of::<WorldPoint>())?)?
             > transform_budget
             || segments.checked_mul(128)? > compiler_budget
@@ -1092,7 +1088,7 @@ impl LineSuppressionCache {
         let mut prepared = Vec::with_capacity(instructions.len());
         let mut transformed = Vec::with_capacity(instructions.len());
         for item in instructions {
-            let mut out = crate::LineInstruction::new(Vec::new());
+            let mut out = None;
             let mut selected = false;
             if let DrawingInstruction::Line(line) = item {
                 if line.screen_ray.is_none() && line.portrayal_path.is_none() {
@@ -1101,31 +1097,28 @@ impl LineSuppressionCache {
                         // Covered because it remains absent in both legacy and
                         // compiled suppression. Raw emission/picking is untouched.
                         prepared.push(true);
-                        transformed.push(DrawingInstruction::Line(out));
+                        transformed.push(None);
                         continue;
                     }
                     // Identical original project_y expression and source order.
-                    out.points = line
+                    let points: Vec<_> = line
                         .points
                         .iter()
                         .map(|p| WorldPoint::new(p.x, projection.project_y(p.y)))
                         .collect();
-                    Curve::new(&out.points)?;
+                    Curve::new(&points)?;
                     // Extreme arithmetic is left to the original lazy planner.
-                    if out
-                        .points
+                    if points
                         .windows(2)
                         .any(|p| !(p[1].x - p[0].x).is_finite() || !(p[1].y - p[0].y).is_finite())
                     {
                         return None;
                     }
-                    out.priority = line.priority;
-                    out.display_plane = line.display_plane;
-                    out.suppressible = line.suppressible;
+                    out = Some(ProjectedSource::new(line, points));
                 }
             }
             prepared.push(selected);
-            transformed.push(DrawingInstruction::Line(out));
+            transformed.push(out);
         }
         let compiled = PreparedLineSuppression::compile(&transformed, compiler_budget)?;
         Some((prepared, compiled))
@@ -1785,6 +1778,80 @@ mod plane_suppression_tests {
     }
 }
 
+/// The fields overlap compilation reads from one source ordinal.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct SourceLine<'a> {
+    points: &'a [WorldPoint],
+    plane: i32,
+    priority: i32,
+    suppressible: bool,
+}
+/// An ordinal of overlap-compilation input; None excludes it.
+pub trait SuppressionInput {
+    #[doc(hidden)]
+    fn suppression_line(&self) -> Option<SourceLine<'_>>;
+}
+impl SuppressionInput for DrawingInstruction {
+    fn suppression_line(&self) -> Option<SourceLine<'_>> {
+        let DrawingInstruction::Line(line) = self else {
+            return None;
+        };
+        if line.screen_ray.is_some()
+            || line.portrayal_path.is_some()
+            || !line.style.has_visible_stroke()
+        {
+            return None;
+        }
+        Some(SourceLine {
+            points: &line.points,
+            plane: line.display_plane.order().get(),
+            priority: line.priority.0,
+            suppressible: line.suppressible,
+        })
+    }
+}
+/// Projected line source for compilation: only the compiled fields, instead of
+/// a full placeholder `DrawingInstruction` (464 B) per ordinal. Large charts
+/// otherwise exceed the transform budget and fall back to per-frame hashing.
+/// Sources carry the default `LineInstruction` stroke, like those placeholders;
+/// eligibility of the original style is applied separately on every plan.
+pub(crate) struct ProjectedSource {
+    points: Vec<WorldPoint>,
+    plane: i32,
+    priority: i32,
+    suppressible: bool,
+}
+impl ProjectedSource {
+    fn new(line: &crate::LineInstruction, points: Vec<WorldPoint>) -> Self {
+        Self {
+            points,
+            plane: line.display_plane.order().get(),
+            priority: line.priority.0,
+            suppressible: line.suppressible,
+        }
+    }
+}
+fn default_stroke_visible() -> bool {
+    static VISIBLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VISIBLE.get_or_init(|| {
+        crate::LineInstruction::new(Vec::new())
+            .style
+            .has_visible_stroke()
+    })
+}
+impl SuppressionInput for Option<ProjectedSource> {
+    fn suppression_line(&self) -> Option<SourceLine<'_>> {
+        let source = self.as_ref().filter(|_| default_stroke_visible())?;
+        Some(SourceLine {
+            points: &source.points,
+            plane: source.plane,
+            priority: source.priority,
+            suppressible: source.suppressible,
+        })
+    }
+}
+
 /// Camera-independent overlap relations. The host compiles stable projected
 /// geometry once and supplies current date/group/resource/dependency eligibility.
 /// A bounded compilation can decline dense input; hosts then use the ordinary
@@ -1816,22 +1883,14 @@ impl rstar::RTreeObject for IndexedSegment {
     }
 }
 impl PreparedLineSuppression {
-    pub fn compile(instructions: &[DrawingInstruction], budget: usize) -> Option<Self> {
+    pub fn compile<S: SuppressionInput>(instructions: &[S], budget: usize) -> Option<Self> {
         use rstar::RTreeObject;
         let selected: Vec<_> = instructions
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                let DrawingInstruction::Line(line) = item else {
-                    return None;
-                };
-                if line.screen_ray.is_some()
-                    || line.portrayal_path.is_some()
-                    || !line.style.has_visible_stroke()
-                {
-                    return None;
-                }
-                Some((i, line, Curve::new(&line.points)?))
+                let line = item.suppression_line()?;
+                Some((i, line, Curve::new(line.points)?))
             })
             .collect();
         let segment_count: usize = selected
@@ -1846,7 +1905,7 @@ impl PreparedLineSuppression {
         let mut groups: CoincidentSourceGroups<'_> = HashMap::new();
         let mut segments = Vec::with_capacity(segment_count);
         for (i, line, curve) in &selected {
-            let priority = (line.display_plane.order().get(), line.priority.0);
+            let priority = (line.plane, line.priority);
             groups.entry(*curve).or_default().push((*i, priority));
             for pair in line.points.windows(2) {
                 if let Some(segment) = Segment::new(pair[0], pair[1]) {
@@ -1865,7 +1924,7 @@ impl PreparedLineSuppression {
             if !line.suppressible {
                 continue;
             }
-            let priority = (line.display_plane.order().get(), line.priority.0);
+            let priority = (line.plane, line.priority);
             let full_higher: Vec<_> = groups[&curve]
                 .iter()
                 .filter(|(_, p)| *p > priority)
@@ -1942,8 +2001,8 @@ impl PreparedLineSuppression {
     /// Private caller must prove same opaque context epoch/projection and union
     /// coverage. Only old-old relations are reused; all new relations use overlap.
     #[cfg(test)]
-    fn compile_growth(
-        instructions: &[DrawingInstruction],
+    fn compile_growth<S: SuppressionInput>(
+        instructions: &[S],
         budget: usize,
         previous: &Self,
         covered: &[bool],
@@ -1951,8 +2010,8 @@ impl PreparedLineSuppression {
         Self::compile_growth_with_work(instructions, budget, previous, covered, None)
     }
     #[cfg(test)]
-    fn compile_growth_with_work(
-        instructions: &[DrawingInstruction],
+    fn compile_growth_with_work<S: SuppressionInput>(
+        instructions: &[S],
         budget: usize,
         previous: &Self,
         covered: &[bool],
@@ -1967,8 +2026,8 @@ impl PreparedLineSuppression {
             false,
         )
     }
-    fn compile_growth_with_unchanged_targets(
-        instructions: &[DrawingInstruction],
+    fn compile_growth_with_unchanged_targets<S: SuppressionInput>(
+        instructions: &[S],
         budget: usize,
         previous: &Self,
         covered: &[bool],
@@ -1986,16 +2045,8 @@ impl PreparedLineSuppression {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                let DrawingInstruction::Line(line) = item else {
-                    return None;
-                };
-                if line.screen_ray.is_some()
-                    || line.portrayal_path.is_some()
-                    || !line.style.has_visible_stroke()
-                {
-                    return None;
-                }
-                Some((i, line, Curve::new(&line.points)?))
+                let line = item.suppression_line()?;
+                Some((i, line, Curve::new(line.points)?))
             })
             .collect();
         let segment_count: usize = selected
@@ -2029,7 +2080,7 @@ impl PreparedLineSuppression {
         let mut segments = Vec::with_capacity(segment_count);
         let mut new_segments = Vec::with_capacity(new_segment_count);
         for (i, line, curve) in &selected {
-            let priority = (line.display_plane.order().get(), line.priority.0);
+            let priority = (line.plane, line.priority);
             groups.entry(*curve).or_default().push((*i, priority));
             for pair in line.points.windows(2) {
                 if let Some(segment) = Segment::new(pair[0], pair[1]) {
@@ -2087,7 +2138,7 @@ impl PreparedLineSuppression {
                 }
             }
             let query_tree = if covered[i] { &new_tree } else { &tree };
-            let priority = (line.display_plane.order().get(), line.priority.0);
+            let priority = (line.plane, line.priority);
             let full_higher: Vec<_> = groups[&curve]
                 .iter()
                 .filter(|(_, p)| *p > priority)
@@ -2314,8 +2365,8 @@ impl PreparedLineSuppression {
         clippy::too_many_arguments,
         reason = "Keep immutable old/current coverage witnesses, private index, original budget, diagnostics, and unchanged-target policy explicit; no public source authority."
     )]
-    fn compile_growth_with_index_blocks(
-        instructions: &[DrawingInstruction],
+    fn compile_growth_with_index_blocks<S: SuppressionInput>(
+        instructions: &[S],
         budget: usize,
         previous: &Self,
         covered: &[bool],
@@ -2341,16 +2392,8 @@ impl PreparedLineSuppression {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                let DrawingInstruction::Line(line) = item else {
-                    return None;
-                };
-                if line.screen_ray.is_some()
-                    || line.portrayal_path.is_some()
-                    || !line.style.has_visible_stroke()
-                {
-                    return None;
-                }
-                Some((i, line, Curve::new(&line.points)?))
+                let line = item.suppression_line()?;
+                Some((i, line, Curve::new(line.points)?))
             })
             .collect();
         let segment_count: usize = selected
@@ -2383,7 +2426,7 @@ impl PreparedLineSuppression {
         let mut groups: CoincidentSourceGroups<'_> = HashMap::new();
 
         for (i, line, curve) in &selected {
-            let priority = (line.display_plane.order().get(), line.priority.0);
+            let priority = (line.plane, line.priority);
             groups.entry(*curve).or_default().push((*i, priority));
         }
 
@@ -2435,7 +2478,7 @@ impl PreparedLineSuppression {
                 }
             }
             let query_start = if covered[i] { new_start } else { 0 };
-            let priority = (line.display_plane.order().get(), line.priority.0);
+            let priority = (line.plane, line.priority);
             let full_higher: Vec<_> = groups[&curve]
                 .iter()
                 .filter(|(_, p)| *p > priority)

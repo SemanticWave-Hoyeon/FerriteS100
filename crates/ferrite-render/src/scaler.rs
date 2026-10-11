@@ -534,6 +534,9 @@ impl Scaler {
             .unwrap_or([f64::NAN; 2])
     }
 
+    pub fn flat_affine(&self) -> ferrite_kernel::map_camera::FlatAffine {
+        self.camera.flat_affine()
+    }
     pub fn prepare_flat_northing(
         &self,
         latitude: f64,

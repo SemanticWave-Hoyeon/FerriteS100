@@ -17,6 +17,25 @@ pub(crate) struct Plan {
     pub rasters: Vec<PathBuf>,
     pub notices: Vec<String>,
     pub routes: Vec<crate::s421_dataset_input::CapturedRouteInput>,
+    /// S-102 2.1 trial files: inspection only, never depth coverage.
+    pub trials: Vec<PathBuf>,
+    /// Filled by the discovery worker thread through the isolated inspector.
+    pub trial_inspections: Vec<(
+        PathBuf,
+        Result<ferrite_s102::trial_inspection::TrialInspection, String>,
+    )>,
+}
+impl Plan {
+    /// Run the isolated S-102 2.1 trial inspector for each discovered trial.
+    pub fn inspect_trials(&mut self) {
+        for path in std::mem::take(&mut self.trials) {
+            let result = crate::s102_trial_worker::inspect(&path).map_err(|e| format!("{e:#}"));
+            self.trial_inspections.push((path, result));
+        }
+    }
+}
+fn is_trial_product(spec: &str) -> bool {
+    matches!(spec, "INT.IHO.S-102.2.1" | "INT.IHO.S-102.2.1.0")
 }
 
 /// Exact supported S-102 reader edition. The format suffix is not a product claim.
@@ -48,7 +67,12 @@ fn hdf_product(path: &Path) -> Result<String> {
         metadata.len() <= MAX_HDF_DISCOVERY_BYTES,
         "HDF discovery file exceeds512MiB receiver limit"
     );
-    let file = File::open(path)
+    // Read-only classification of one root attribute: no lock, so a file
+    // another handle still holds (or just released) never fails discovery.
+    // Loading the dataset itself keeps HDF5's normal file locking.
+    let file = File::with_options()
+        .with_fapl(|p| p.file_locking(false))
+        .open(path)
         .with_context(|| format!("Cannot open HDF metadata: {}", path.display()))?;
     let attr = file
         .attr("productSpecification")
@@ -86,9 +110,6 @@ fn hdf_product(path: &Path) -> Result<String> {
 }
 
 fn unsupported_product_notice(spec: &str, path: &Path) -> String {
-    if matches!(spec, "INT.IHO.S-102.2.1" | "INT.IHO.S-102.2.1.0") {
-        return format!("S-102 2.1 not loaded: a compatible 2.1 reader is not available (installed reader: 3.0.0). Original data retained; no conversion performed. File: {}", path.display());
-    }
     format!("Skipped unsupported product {spec}: {}", path.display())
 }
 
@@ -96,6 +117,7 @@ fn classify_rasters(plan: &mut Plan, files: Vec<PathBuf>) {
     for path in files {
         match hdf_product(&path) {
             Ok(spec) if supported_product(&spec) => plan.rasters.push(path),
+            Ok(spec) if is_trial_product(&spec) => plan.trials.push(path),
             Ok(spec) => plan.notices.push(unsupported_product_notice(&spec, &path)),
             Err(error) => plan.notices.push(format!(
                 "Skipped HDF product with invalid metadata {}: {error:#}",
@@ -117,6 +139,7 @@ pub(crate) fn discover(root: &Path) -> Result<Plan> {
     plan.notices.extend(notices);
     if plan.charts.is_empty()
         && plan.rasters.is_empty()
+        && plan.trials.is_empty()
         && plan.routes.is_empty()
         && plan.notices.is_empty()
     {
@@ -253,7 +276,7 @@ mod tests {
         );
     }
     #[test]
-    fn ukho_21_has_explicit_reader_diagnostic_without_being_relabelled_30() {
+    fn ukho_21_is_routed_to_inspection_without_being_relabelled_30() {
         let tmp = TestDir::new();
         for (i, spec) in ["INT.IHO.S-102.2.1", "INT.IHO.S-102.2.1.0"]
             .into_iter()
@@ -269,10 +292,10 @@ mod tests {
                     .unwrap();
             }
             let plan = single_file(&path).unwrap();
+            // Inspection only: never queued as a depth raster.
             assert!(plan.rasters.is_empty());
-            assert_eq!(plan.notices.len(), 1);
-            assert!(plan.notices[0].contains("compatible 2.1 reader"));
-            assert!(plan.notices[0].contains("no conversion performed"));
+            assert_eq!(plan.trials, vec![path.clone()]);
+            assert!(plan.notices.is_empty());
             assert_eq!(hdf_product(&path).unwrap(), spec);
         }
     }

@@ -95,6 +95,19 @@ impl Server {
     pub fn approval_code(&self) -> String {
         self.shared.auth.approval_code().into()
     }
+    /// Owner-only bearer token for a local client the desktop owner launches from this
+    /// application (for example the built-in LLM chat). Bound to this process and resource,
+    /// read-only scope and one hour lifetime; stopping the service revokes it. The host
+    /// must hand it to the client per invocation and never persist it.
+    pub fn issue_owner_token(&self) -> Result<String> {
+        self.shared.auth.token(&Grant {
+            client_id: "ferrite-desktop-owner".into(),
+            redirect_uri: String::new(),
+            challenge: String::new(),
+            resource: resource(&self.shared),
+            expires: oauth::now() + 300,
+        })
+    }
     pub fn set_registry(&self, registry: Registry) {
         *self
             .shared
@@ -753,5 +766,34 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    #[test]
+    fn owner_token_authorizes_only_this_service_instance() {
+        use std::io::{Read, Write};
+        let post = |server: &Server, token: &str| {
+            let url = url::Url::parse(&server.info().url).unwrap();
+            let host = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+            let mut stream = std::net::TcpStream::connect(&host).unwrap();
+            write!(
+                stream,
+                "POST /mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let a = Server::start(false).unwrap();
+        let b = Server::start(false).unwrap();
+        let token = a.issue_owner_token().unwrap();
+        let ok = post(&a, &token);
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("datasets_list"));
+        assert!(post(&b, &token).starts_with("HTTP/1.1 401"));
     }
 }

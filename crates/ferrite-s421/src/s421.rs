@@ -98,14 +98,24 @@ fn validate_leg_curve(
     if members.next().is_some() {
         return Err("Multiple control segments not yet implemented".into());
     }
-    // Standard GML GeodesicString has geodesic interpolation. Do not invent
-    // a loxodromic GML LineStringSegment (whose interpolation is linear).
-    if geometry != LegGeometry::Orthodrome
-        || !segment.has_tag_name((GML, "GeodesicString"))
-        || segment
-            .attribute("interpolation")
-            .is_some_and(|value| value != "geodesic")
-    {
+    // Orthodrome: GML GeodesicString (geodesic interpolation). Loxodrome:
+    // LineStringSegment with linear interpolation, which S-100 Part 10b
+    // 10b-10.1.2 interprets as loxodromic in a geographic CRS.
+    let matches_declaration = match geometry {
+        LegGeometry::Orthodrome => {
+            segment.has_tag_name((GML, "GeodesicString"))
+                && segment
+                    .attribute("interpolation")
+                    .is_none_or(|value| value == "geodesic")
+        }
+        LegGeometry::Loxodrome => {
+            segment.has_tag_name((GML, "LineStringSegment"))
+                && segment
+                    .attribute("interpolation")
+                    .is_none_or(|value| value == "linear")
+        }
+    };
+    if !matches_declaration {
         return Err(
             "Explicit leg control segment unsupported or conflicts with declaration".into(),
         );
@@ -745,20 +755,12 @@ pub fn export_published(route: &Route, metadata: PublishedExport<'_>) -> Result<
         return Err("First waypoint cannot declare an incoming leg".into());
     }
     for pair in route.waypoints.windows(2) {
-        match pair[1].incoming_geometry {
-            Some(LegGeometry::Loxodrome) => {
-                return Err(
-                    "Loxodrome export unsupported; refusing to erase route geometry".into(),
-                );
-            }
-            Some(LegGeometry::Orthodrome) => {
-                crate::navigation::evaluate_leg(
-                    [pair[0].lon, pair[0].lat],
-                    [pair[1].lon, pair[1].lat],
-                    LegGeometry::Orthodrome,
-                )?;
-            }
-            None => {}
+        if let Some(geometry) = pair[1].incoming_geometry {
+            crate::navigation::evaluate_leg(
+                [pair[0].lon, pair[0].lat],
+                [pair[1].lon, pair[1].lat],
+                geometry,
+            )?;
         }
     }
     let name = route.name.as_deref().ok_or("Route name required")?;
@@ -814,12 +816,16 @@ pub fn export_published(route: &Route, metadata: PublishedExport<'_>) -> Result<
     }
     for pair in route.waypoints.windows(2) {
         let (start, end) = (&pair[0], &pair[1]);
-        if end.incoming_geometry == Some(LegGeometry::Orthodrome) {
-            // Published S-421 GM_Curve -> S100:curveProperty. EPSG:4326 axis
-            // order is latitude, longitude; shortest-decimal f64 formatting
-            // round-trips the exact waypoint values without resampling.
-            xml.push_str(&format!("<member><S421:RouteWaypointLeg gml:id=\"LEG.{}\"><geometry><S100:curveProperty><S100:Curve gml:id=\"CURVE.{}\" srsName=\"EPSG:4326\" srsDimension=\"2\"><gml:segments><gml:GeodesicString interpolation=\"geodesic\"><gml:posList>{} {} {} {}</gml:posList></gml:GeodesicString></gml:segments></S100:Curve></S100:curveProperty></geometry><routeWaypointLegGeometryType>2</routeWaypointLegGeometryType><routeWaypointLegCollection xlink:href=\"#WPT.{}\"/></S421:RouteWaypointLeg></member>",end.id,end.id,start.lat,start.lon,end.lat,end.lon,end.id));
-        }
+        // Published S-421 GM_Curve -> S100:curveProperty. EPSG:4326 axis
+        // order is latitude, longitude; shortest-decimal f64 formatting
+        // round-trips the exact waypoint values without resampling.
+        let (segment, interpolation, code) = match end.incoming_geometry {
+            Some(LegGeometry::Orthodrome) => ("GeodesicString", "geodesic", 2),
+            // S-100 Part 10b 10b-10.1.2: linear in a geographic CRS is loxodromic.
+            Some(LegGeometry::Loxodrome) => ("LineStringSegment", "linear", 1),
+            None => continue,
+        };
+        xml.push_str(&format!("<member><S421:RouteWaypointLeg gml:id=\"LEG.{}\"><geometry><S100:curveProperty><S100:Curve gml:id=\"CURVE.{}\" srsName=\"EPSG:4326\" srsDimension=\"2\"><gml:segments><gml:{segment} interpolation=\"{interpolation}\"><gml:posList>{} {} {} {}</gml:posList></gml:{segment}></gml:segments></S100:Curve></S100:curveProperty></geometry><routeWaypointLegGeometryType>{code}</routeWaypointLegGeometryType><routeWaypointLegCollection xlink:href=\"#WPT.{}\"/></S421:RouteWaypointLeg></member>",end.id,end.id,start.lat,start.lon,end.lat,end.lon,end.id));
     }
     xml.push_str("</S421:Dataset>");
     preflight(&xml)?;
@@ -1059,8 +1065,12 @@ mod tests {
         assert!(xml.contains("<gml:GeodesicString interpolation=\"geodesic\">"));
     }
     #[test]
-    fn unsupported_declared_export_never_erases_or_guesses_geometry() {
+    fn loxodrome_legs_round_trip_as_linear_geographic_segments() {
         let mut route = import_dataset(&exported()).unwrap().routes.remove(0).route;
+        // The fixture's second waypoint sits at the pole, where a rhumb line
+        // is undefined; use an ordinary leg.
+        route.waypoints[1].lat = 60.25;
+        route.waypoints[1].lon = 26.5;
         route.waypoints[1].incoming_geometry = Some(LegGeometry::Loxodrome);
         let export = |r: &Route| {
             export_published(
@@ -1072,8 +1082,37 @@ mod tests {
                 },
             )
         };
-        assert!(export(&route).unwrap_err().contains("refusing to erase"));
-        route.waypoints[1].incoming_geometry = None;
+        // S-100 Part 10b 10b-10.1.2: linear in EPSG:4326 means loxodromic.
+        let xml = export(&route).unwrap();
+        assert!(xml.contains("<gml:LineStringSegment interpolation=\"linear\">"));
+        assert!(xml.contains("<routeWaypointLegGeometryType>1</routeWaypointLegGeometryType>"));
+        let reopened = import_dataset(&xml).unwrap().routes.remove(0);
+        assert_eq!(
+            reopened.route.waypoints[1].incoming_geometry,
+            Some(LegGeometry::Loxodrome)
+        );
+        assert_eq!(route.leg_metrics(), reopened.route.leg_metrics());
+        assert_eq!(export(&reopened.route).unwrap(), xml);
+        // A declaration that contradicts its segment is refused on import.
+        assert!(import_dataset(&xml.replace(
+            "<routeWaypointLegGeometryType>1<",
+            "<routeWaypointLegGeometryType>2<"
+        ))
+        .is_err());
+    }
+    #[test]
+    fn invalid_declared_export_never_erases_or_guesses_geometry() {
+        let mut route = import_dataset(&exported()).unwrap().routes.remove(0).route;
+        let export = |r: &Route| {
+            export_published(
+                r,
+                PublishedExport {
+                    route_id: "RTE.Alpha",
+                    edition: 3,
+                    status: 11,
+                },
+            )
+        };
         route.waypoints[0].incoming_geometry = Some(LegGeometry::Orthodrome);
         assert!(export(&route).unwrap_err().contains("First waypoint"));
         route.waypoints[0].incoming_geometry = None;
@@ -1200,5 +1239,37 @@ mod tests {
             "<routeWaypointTurnRadius>0.251"
         ))
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod manual_fixtures {
+    use super::*;
+    use crate::route::{Route, Waypoint};
+    /// FERRITE_S421_FIXTURE=<file.gml>: a Solent route with loxodrome legs for
+    /// in-application checks.
+    #[test]
+    #[ignore = "Writes a manual-validation fixture"]
+    fn write_loxodrome_route_fixture() {
+        let path = std::env::var("FERRITE_S421_FIXTURE").unwrap();
+        let mut route = Route::with_name(0, "Solent Lox");
+        for (id, lon, lat) in [(1, -1.42, 50.74), (2, -1.36, 50.76), (3, -1.30, 50.79)] {
+            let mut wp = Waypoint::new(id, lon, lat);
+            wp.turn_radius = Some(0.5);
+            if id > 1 {
+                wp.incoming_geometry = Some(LegGeometry::Loxodrome);
+            }
+            route.add_waypoint(wp);
+        }
+        let xml = export_published(
+            &route,
+            PublishedExport {
+                route_id: "SOLENT.LOX",
+                edition: 1,
+                status: 1,
+            },
+        )
+        .unwrap();
+        std::fs::write(path, xml).unwrap();
     }
 }

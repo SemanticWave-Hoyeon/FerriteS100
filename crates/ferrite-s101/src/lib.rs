@@ -35,7 +35,11 @@ fn preflight_augmented_line_geometry(
             .map(|point| (point.position.x, point.position.y))
     };
     if let Some(ray) = ray {
-        let geographic = ray.direction_crs == "GeographicCRS" && ray.length_crs == "GeographicCRS";
+        let geographic = ray.length_crs == "GeographicCRS"
+            && matches!(
+                ray.direction_crs.as_str(),
+                "LocalCRS" | "PortrayalCRS" | "GeographicCRS"
+            );
         let screen_units = matches!(ray.length_crs.as_str(), "LocalCRS" | "PortrayalCRS")
             && matches!(
                 ray.direction_crs.as_str(),
@@ -86,6 +90,27 @@ fn preflight_augmented_line_geometry(
         );
         return Ok(());
     }
+    let known = |c: &str| matches!(c, "LocalCRS" | "PortrayalCRS" | "GeographicCRS");
+    anyhow::ensure!(
+        known(&crs.crs_angle) && known(&crs.crs_distance),
+        "Unsupported AugmentedPath CRS combination: {}/{}/{}",
+        crs.crs_position,
+        crs.crs_angle,
+        crs.crs_distance
+    );
+    let millimetres = matches!(crs.crs_distance.as_str(), "LocalCRS" | "PortrayalCRS");
+    if crs.crs_position == "PortrayalCRS" {
+        // Device positions with geodesic metre distances have no anchor on
+        // the earth; Part 9a does not define that combination's centre.
+        anyhow::ensure!(
+            millimetres,
+            "Unsupported AugmentedPath CRS combination: {}/{}/{}",
+            crs.crs_position,
+            crs.crs_angle,
+            crs.crs_distance
+        );
+        return Ok(());
+    }
     anyhow::ensure!(
         crs.crs_position == "GeographicCRS",
         "Unsupported AugmentedPath CRS combination: {}/{}/{}",
@@ -94,24 +119,104 @@ fn preflight_augmented_line_geometry(
         crs.crs_distance
     );
     for segment in segments {
-        match segment {
-            PathSegment::Polyline(_) => {}
-            PathSegment::Arc3Points { .. } => {
-                // Part 9 defines an arbitrary median, but the geographic
-                // interpolation model is not implemented. Do not omit this arc.
-                anyhow::bail!("Unsupported GeographicCRS Arc3Points interpolation");
-            }
-            PathSegment::ArcByRadius { .. } | PathSegment::Annulus { .. } => {
-                anyhow::ensure!(
-                    crs.crs_angle == "GeographicCRS" && crs.crs_distance == "GeographicCRS",
-                    "Unsupported mixed CRS geographic arc or annulus: {}/{}",
-                    crs.crs_angle,
-                    crs.crs_distance
-                );
-            }
+        if let PathSegment::Arc3Points { start, median, end } = segment {
+            geographic_arc3(*start, *median, *end)?;
         }
     }
     Ok(())
+}
+
+/// Millimetre (Local/Portrayal CRS) segments relative to an origin.
+fn local_portrayal_paths(
+    seg: &ferrite_lua::PathSegment,
+    geographic: bool,
+    feature_id: Option<i64>,
+) -> Vec<ferrite_render::PortrayalPath> {
+    use ferrite_lua::PathSegment as P;
+    use ferrite_render::PortrayalPath as R;
+    match seg {
+        P::Polyline(points) => vec![R::Polyline(points.clone())],
+        P::Arc3Points { start, median, end } => vec![R::Arc3 {
+            start: *start,
+            median: *median,
+            end: *end,
+        }],
+        P::ArcByRadius {
+            center,
+            radius,
+            start_angle,
+            angular_distance,
+        } => vec![R::Arc {
+            center: *center,
+            radius: *radius,
+            start: *start_angle,
+            sweep: *angular_distance,
+            geographic_angle: geographic,
+        }],
+        P::Annulus {
+            center,
+            outer_radius,
+            inner_radius,
+            start_angle,
+            angular_distance,
+        } => {
+            if !outer_radius.is_finite()
+                || !inner_radius.is_finite()
+                || *outer_radius < 0.
+                || *inner_radius < 0.
+                || inner_radius > outer_radius
+            {
+                tracing::error!("Invalid annulus radii: feature {:?}", feature_id);
+                Vec::new()
+            } else if angular_distance.abs() == 360. {
+                let mut p = vec![R::Arc {
+                    center: *center,
+                    radius: *outer_radius,
+                    start: *start_angle,
+                    sweep: *angular_distance,
+                    geographic_angle: geographic,
+                }];
+                if *inner_radius > 0. {
+                    p.push(R::Arc {
+                        center: *center,
+                        radius: *inner_radius,
+                        start: *start_angle,
+                        sweep: -*angular_distance,
+                        geographic_angle: geographic,
+                    });
+                }
+                p
+            } else {
+                vec![R::Annulus {
+                    center: *center,
+                    outer: *outer_radius,
+                    inner: *inner_radius,
+                    start: *start_angle,
+                    sweep: *angular_distance,
+                    geographic_angle: geographic,
+                }]
+            }
+        }
+    }
+}
+
+/// S-100 Part 9 9-12.2.2.13 Arc3Points in GeographicCRS (X=longitude,
+/// Y=latitude): ((centre), radius metres, start bearing, signed sweep).
+fn geographic_arc3(
+    start: (f64, f64),
+    median: (f64, f64),
+    end: (f64, f64),
+) -> anyhow::Result<((f64, f64), f64, f64, f64)> {
+    use ferrite_kernel::geodesy::{arc_through_three_points, GeographicPosition};
+    let p = |q: (f64, f64)| GeographicPosition::new(q.1, q.0);
+    let arc = arc_through_three_points(p(start)?, p(median)?, p(end)?)?;
+    let c = arc.center();
+    Ok((
+        (c.longitude_near(start.0)?, c.latitude()),
+        arc.radius_m(),
+        arc.start_azimuth_deg(),
+        arc.sweep_deg(),
+    ))
 }
 
 /// Convert Lua portrayal results to drawing instructions for a single cell
@@ -512,6 +617,24 @@ pub fn convert_lua_results_for_cell(
                             ferrite_render::PortrayalOrigin::augmented_point(crs, [*x, *y])?
                         }
                     }
+                    // An absolute Portrayal CRS path is fixed on the output device.
+                    DrawingCommand::LineInstruction {
+                        augmented_crs: Some(crs),
+                        augmented_segments,
+                        augmented_ray: None,
+                        ..
+                    }
+                    | DrawingCommand::LineInstructionUnsuppressed {
+                        augmented_crs: Some(crs),
+                        augmented_segments,
+                        augmented_ray: None,
+                        ..
+                    } if crs.crs_position == "PortrayalCRS" && !augmented_segments.is_empty() => {
+                        ferrite_render::PortrayalOrigin::augmented_point(
+                            ferrite_render::PointOriginCrs::Portrayal,
+                            [0., 0.],
+                        )?
+                    }
                     _ => feature_origin.clone(),
                 };
 
@@ -828,13 +951,21 @@ pub fn convert_lua_results_for_cell(
                                 // never with the cell compilation scale. Geographic rays
                                 // use WGS84 ellipsoidal direct geodesics, not a metres/degree
                                 // approximation. Preserve the nearby longitude copy.
+                                let screen_direction_metres = ray.length_crs == "GeographicCRS"
+                                    && matches!(
+                                        ray.direction_crs.as_str(),
+                                        "LocalCRS" | "PortrayalCRS"
+                                    );
                                 let points = if ray.length_crs == "GeographicCRS"
                                     && ray.direction_crs == "GeographicCRS"
                                 {
                                     geographic_ray_points(ox, oy, ray.direction, ray.length)?
-                                } else if ray.length_crs == "LocalCRS"
+                                } else if screen_direction_metres
+                                    || ray.length_crs == "LocalCRS"
                                     || ray.length_crs == "PortrayalCRS"
                                 {
+                                    // Resolved in the active view: screen-angled
+                                    // geodesic ray or screen-unit ray.
                                     vec![WorldPoint::new(ox, oy), WorldPoint::new(ox, oy)]
                                 } else {
                                     anyhow::bail!(
@@ -857,6 +988,19 @@ pub fn convert_lua_results_for_cell(
                                     .with_display_plane(make_display_plane(visibility))
                                     .with_feature_id(feature_id.unwrap_or(0))
                                     .with_cell_index(cell_index);
+                                if screen_direction_metres {
+                                    // Screen-axis direction, geodesic metres: the
+                                    // bearing depends on the active projection.
+                                    line_inst.portrayal_path = Some(
+                                        ferrite_render::PortrayalPath::ScreenAngled(Box::new(
+                                            ferrite_render::PortrayalPath::GeographicRay {
+                                                origin: (ox, oy),
+                                                bearing: ray.direction,
+                                                length_m: ray.length,
+                                            },
+                                        )),
+                                    );
+                                }
                                 if ray.length_crs == "LocalCRS" || ray.length_crs == "PortrayalCRS"
                                 {
                                     line_inst.screen_ray = Some(ferrite_render::ScreenRay {
@@ -886,40 +1030,172 @@ pub fn convert_lua_results_for_cell(
                                         .map(|p| WorldPoint::new(p.position.x, p.position.y))
                                 })
                             });
-                            if crs.crs_position == "LocalCRS"
-                                && matches!(crs.crs_distance.as_str(), "LocalCRS" | "PortrayalCRS")
-                                && matches!(
-                                    crs.crs_angle.as_str(),
-                                    "LocalCRS" | "PortrayalCRS" | "GeographicCRS"
-                                )
-                            {
-                                if let Some(origin) = origin {
-                                    let mut group = Vec::new();
+                            let pc_groups = pc.viewing_groups.resolve_drawing_groups(
+                                &visibility.viewing_groups,
+                                &visibility.named_viewing_groups,
+                            )?;
+                            let make_line = |points: Vec<WorldPoint>,
+                                             path: Option<ferrite_render::PortrayalPath>| {
+                                let mut line = LineInstruction::new(points)
+                                    .with_style(strokes[0].clone())
+                                    .with_priority(visibility.drawing_priority)
+                                    .with_viewing_groups(&pc_groups)
+                                    .with_scale_range(make_scale_range(visibility))
+                                    .with_display_plane(make_display_plane(visibility))
+                                    .with_feature_id(feature_id.unwrap_or(0))
+                                    .with_cell_index(cell_index);
+                                line.portrayal_path = path;
+                                if unsuppressed {
+                                    line = line.with_unsuppressed();
+                                }
+                                line
+                            };
+                            let millimetres =
+                                matches!(crs.crs_distance.as_str(), "LocalCRS" | "PortrayalCRS");
+                            let geographic_angle = crs.crs_angle == "GeographicCRS";
+                            match crs.crs_position.as_str() {
+                                // 9-11.1.13 Local CRS: millimetres from the point feature.
+                                "LocalCRS" if millimetres => {
+                                    let origin = origin.ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "AugmentedPath requires local origin: feature {:?}",
+                                            feature_id
+                                        )
+                                    })?;
+                                    let group: Vec<_> = augmented_segments
+                                        .iter()
+                                        .flat_map(|s| {
+                                            local_portrayal_paths(s, geographic_angle, feature_id)
+                                        })
+                                        .collect();
+                                    if !group.is_empty() {
+                                        geometry_instructions.push(make_line(
+                                            vec![origin, origin],
+                                            Some(ferrite_render::PortrayalPath::Group(group)),
+                                        ));
+                                    }
+                                }
+                                // 9-11.1.13 Portrayal CRS: millimetres on the output
+                                // device; the host origin is the chart's lower-left corner.
+                                "PortrayalCRS" if millimetres => {
+                                    let group: Vec<_> = augmented_segments
+                                        .iter()
+                                        .flat_map(|s| {
+                                            local_portrayal_paths(s, geographic_angle, feature_id)
+                                        })
+                                        .collect();
+                                    if !group.is_empty() {
+                                        let anchor = WorldPoint::new(0., 0.);
+                                        geometry_instructions.push(make_line(
+                                            vec![anchor, anchor],
+                                            Some(ferrite_render::PortrayalPath::Device(Box::new(
+                                                ferrite_render::PortrayalPath::Group(group),
+                                            ))),
+                                        ));
+                                    }
+                                }
+                                "GeographicCRS" => {
+                                    use ferrite_lua::PathSegment as P;
+                                    use ferrite_render::PortrayalPath as R;
                                     for seg in augmented_segments {
-                                        use ferrite_lua::PathSegment as P;
-                                        use ferrite_render::PortrayalPath as R;
-                                        let geographic = crs.crs_angle == "GeographicCRS";
-                                        let paths: Vec<R> = match seg {
+                                        match seg {
                                             P::Polyline(points) => {
-                                                vec![R::Polyline(points.clone())]
+                                                geometry_instructions.push(make_line(
+                                                    points
+                                                        .iter()
+                                                        .map(|p| WorldPoint::new(p.0, p.1))
+                                                        .collect(),
+                                                    None,
+                                                ));
                                             }
-                                            P::Arc3Points { start, median, end } => vec![R::Arc3 {
-                                                start: *start,
-                                                median: *median,
-                                                end: *end,
-                                            }],
+                                            // Points define the arc; angle and distance
+                                            // CRSs do not apply.
+                                            P::Arc3Points { start, median, end } => {
+                                                let arc = geographic_arc3(*start, *median, *end)
+                                                    .map_err(|e| {
+                                                        anyhow::anyhow!(
+                                                            "Arc3Points for feature {feature_id:?}: {e:#}"
+                                                        )
+                                                    })?;
+                                                let center = WorldPoint::new(arc.0 .0, arc.0 .1);
+                                                geometry_instructions.push(make_line(
+                                                    vec![center, center],
+                                                    Some(R::GeographicArc {
+                                                        center: arc.0,
+                                                        radius_m: arc.1,
+                                                        start: arc.2,
+                                                        sweep: arc.3,
+                                                    }),
+                                                ));
+                                            }
+                                            P::ArcByRadius { center, .. }
+                                            | P::Annulus { center, .. }
+                                                if millimetres =>
+                                            {
+                                                // Geographic centre, millimetre radii: a
+                                                // local path anchored at the centre.
+                                                let anchor = WorldPoint::new(center.0, center.1);
+                                                let local = match seg {
+                                                    P::ArcByRadius {
+                                                        radius,
+                                                        start_angle,
+                                                        angular_distance,
+                                                        ..
+                                                    } => P::ArcByRadius {
+                                                        center: (0., 0.),
+                                                        radius: *radius,
+                                                        start_angle: *start_angle,
+                                                        angular_distance: *angular_distance,
+                                                    },
+                                                    P::Annulus {
+                                                        outer_radius,
+                                                        inner_radius,
+                                                        start_angle,
+                                                        angular_distance,
+                                                        ..
+                                                    } => P::Annulus {
+                                                        center: (0., 0.),
+                                                        outer_radius: *outer_radius,
+                                                        inner_radius: *inner_radius,
+                                                        start_angle: *start_angle,
+                                                        angular_distance: *angular_distance,
+                                                    },
+                                                    _ => unreachable!(),
+                                                };
+                                                let group = local_portrayal_paths(
+                                                    &local,
+                                                    geographic_angle,
+                                                    feature_id,
+                                                );
+                                                if !group.is_empty() {
+                                                    geometry_instructions.push(make_line(
+                                                        vec![anchor, anchor],
+                                                        Some(R::Group(group)),
+                                                    ));
+                                                }
+                                            }
                                             P::ArcByRadius {
                                                 center,
                                                 radius,
                                                 start_angle,
                                                 angular_distance,
-                                            } => vec![R::Arc {
-                                                center: *center,
-                                                radius: *radius,
-                                                start: *start_angle,
-                                                sweep: *angular_distance,
-                                                geographic_angle: geographic,
-                                            }],
+                                            } => {
+                                                let path = R::GeographicArc {
+                                                    center: *center,
+                                                    radius_m: *radius,
+                                                    start: *start_angle,
+                                                    sweep: *angular_distance,
+                                                };
+                                                let point = WorldPoint::new(center.0, center.1);
+                                                geometry_instructions.push(make_line(
+                                                    vec![point, point],
+                                                    Some(if geographic_angle {
+                                                        path
+                                                    } else {
+                                                        R::ScreenAngled(Box::new(path))
+                                                    }),
+                                                ));
+                                            }
                                             P::Annulus {
                                                 center,
                                                 outer_radius,
@@ -927,192 +1203,31 @@ pub fn convert_lua_results_for_cell(
                                                 start_angle,
                                                 angular_distance,
                                             } => {
-                                                if !outer_radius.is_finite()
-                                                    || !inner_radius.is_finite()
-                                                    || *outer_radius < 0.
-                                                    || *inner_radius < 0.
-                                                    || inner_radius > outer_radius
-                                                {
-                                                    tracing::error!(
-                                                        "Invalid annulus radii: feature {:?}",
-                                                        feature_id
-                                                    );
-                                                    Vec::new()
-                                                } else if angular_distance.abs() == 360. {
-                                                    let mut p = vec![R::Arc {
-                                                        center: *center,
-                                                        radius: *outer_radius,
-                                                        start: *start_angle,
-                                                        sweep: *angular_distance,
-                                                        geographic_angle: geographic,
-                                                    }];
-                                                    if *inner_radius > 0. {
-                                                        p.push(R::Arc {
-                                                            center: *center,
-                                                            radius: *inner_radius,
-                                                            start: *start_angle,
-                                                            sweep: -*angular_distance,
-                                                            geographic_angle: geographic,
-                                                        });
-                                                    }
-                                                    p
-                                                } else {
-                                                    vec![R::Annulus {
-                                                        center: *center,
-                                                        outer: *outer_radius,
-                                                        inner: *inner_radius,
-                                                        start: *start_angle,
-                                                        sweep: *angular_distance,
-                                                        geographic_angle: geographic,
-                                                    }]
-                                                }
+                                                let path = R::GeographicAnnulus {
+                                                    center: *center,
+                                                    outer: *outer_radius,
+                                                    inner: *inner_radius,
+                                                    start: *start_angle,
+                                                    sweep: *angular_distance,
+                                                };
+                                                let point = WorldPoint::new(center.0, center.1);
+                                                geometry_instructions.push(make_line(
+                                                    vec![point, point],
+                                                    Some(if geographic_angle {
+                                                        path
+                                                    } else {
+                                                        R::ScreenAngled(Box::new(path))
+                                                    }),
+                                                ));
                                             }
-                                        };
-                                        group.extend(paths);
-                                    }
-                                    if !group.is_empty() {
-                                        let mut line = LineInstruction::new(vec![origin, origin])
-                                            .with_style(strokes[0].clone())
-                                            .with_priority(visibility.drawing_priority)
-                                            .with_viewing_groups(
-                                                &pc.viewing_groups.resolve_drawing_groups(
-                                                    &visibility.viewing_groups,
-                                                    &visibility.named_viewing_groups,
-                                                )?,
-                                            )
-                                            .with_scale_range(make_scale_range(visibility))
-                                            .with_display_plane(make_display_plane(visibility))
-                                            .with_feature_id(feature_id.unwrap_or(0))
-                                            .with_cell_index(cell_index);
-                                        line.portrayal_path =
-                                            Some(ferrite_render::PortrayalPath::Group(group));
-                                        if unsuppressed {
-                                            line = line.with_unsuppressed();
                                         }
-                                        geometry_instructions.push(line);
-                                    }
-                                } else {
-                                    anyhow::bail!(
-                                        "AugmentedPath requires local origin: feature {:?}",
-                                        feature_id
-                                    );
-                                }
-                            } else if crs.crs_position == "GeographicCRS" {
-                                for seg in augmented_segments {
-                                    if let ferrite_lua::PathSegment::Polyline(points) = seg {
-                                        let mut line = LineInstruction::new(
-                                            points
-                                                .iter()
-                                                .map(|p| WorldPoint::new(p.0, p.1))
-                                                .collect(),
-                                        )
-                                        .with_style(strokes[0].clone())
-                                        .with_priority(visibility.drawing_priority)
-                                        .with_viewing_groups(
-                                            &pc.viewing_groups.resolve_drawing_groups(
-                                                &visibility.viewing_groups,
-                                                &visibility.named_viewing_groups,
-                                            )?,
-                                        )
-                                        .with_scale_range(make_scale_range(visibility))
-                                        .with_display_plane(make_display_plane(visibility))
-                                        .with_feature_id(feature_id.unwrap_or(0))
-                                        .with_cell_index(cell_index);
-                                        if unsuppressed {
-                                            line = line.with_unsuppressed();
-                                        }
-                                        geometry_instructions.push(line);
-                                    } else if let ferrite_lua::PathSegment::ArcByRadius {
-                                        center,
-                                        radius,
-                                        start_angle,
-                                        angular_distance,
-                                    } = seg
-                                    {
-                                        if crs.crs_angle != "GeographicCRS"
-                                            || crs.crs_distance != "GeographicCRS"
-                                        {
-                                            anyhow::bail!("Unsupported mixed CRS geographic arc: feature {:?}", feature_id);
-                                        }
-                                        // Geographic X/Y follows the same chart contract as
-                                        // the adjacent existing Polyline adapter. Retain the
-                                        // metric arc for active-viewport tessellation/picking.
-                                        let center_point = WorldPoint::new(center.0, center.1);
-                                        let mut line =
-                                            LineInstruction::new(vec![center_point, center_point])
-                                                .with_style(strokes[0].clone())
-                                                .with_priority(visibility.drawing_priority)
-                                                .with_viewing_groups(
-                                                    &pc.viewing_groups.resolve_drawing_groups(
-                                                        &visibility.viewing_groups,
-                                                        &visibility.named_viewing_groups,
-                                                    )?,
-                                                )
-                                                .with_scale_range(make_scale_range(visibility))
-                                                .with_display_plane(make_display_plane(visibility))
-                                                .with_feature_id(feature_id.unwrap_or(0))
-                                                .with_cell_index(cell_index);
-                                        line.portrayal_path =
-                                            Some(ferrite_render::PortrayalPath::GeographicArc {
-                                                center: *center,
-                                                radius_m: *radius,
-                                                start: *start_angle,
-                                                sweep: *angular_distance,
-                                            });
-                                        if unsuppressed {
-                                            line = line.with_unsuppressed();
-                                        }
-                                        geometry_instructions.push(line);
-                                    } else if let ferrite_lua::PathSegment::Annulus {
-                                        center,
-                                        outer_radius,
-                                        inner_radius,
-                                        start_angle,
-                                        angular_distance,
-                                    } = seg
-                                    {
-                                        anyhow::ensure!(
-                                            crs.crs_angle == "GeographicCRS"
-                                                && crs.crs_distance == "GeographicCRS",
-                                            "Unsupported mixed CRS geographic annulus"
-                                        );
-                                        let point = WorldPoint::new(center.0, center.1);
-                                        let mut line = LineInstruction::new(vec![point, point])
-                                            .with_style(strokes[0].clone())
-                                            .with_priority(visibility.drawing_priority)
-                                            .with_viewing_groups(
-                                                &pc.viewing_groups.resolve_drawing_groups(
-                                                    &visibility.viewing_groups,
-                                                    &visibility.named_viewing_groups,
-                                                )?,
-                                            )
-                                            .with_scale_range(make_scale_range(visibility))
-                                            .with_display_plane(make_display_plane(visibility))
-                                            .with_feature_id(feature_id.unwrap_or(0))
-                                            .with_cell_index(cell_index);
-                                        line.portrayal_path = Some(
-                                            ferrite_render::PortrayalPath::GeographicAnnulus {
-                                                center: *center,
-                                                outer: *outer_radius,
-                                                inner: *inner_radius,
-                                                start: *start_angle,
-                                                sweep: *angular_distance,
-                                            },
-                                        );
-                                        if unsuppressed {
-                                            line = line.with_unsuppressed();
-                                        }
-                                        geometry_instructions.push(line);
-                                    } else {
-                                        anyhow::bail!("Unsupported GeographicCRS Arc3Points interpolation for feature {:?}", feature_id);
                                     }
                                 }
-                            } else {
-                                anyhow::bail!(
+                                _ => anyhow::bail!(
                                     "Unsupported AugmentedPath CRS {:?}: feature {:?}",
                                     crs,
                                     feature_id
-                                );
+                                ),
                             }
                         } else if let Some(feature) = feature {
                             match resolve_feature_line_geometry(cell, feature, spatial_refs) {
@@ -1813,7 +1928,8 @@ pub use line_geometry::{intersect_scale_ranges, resolve_feature_line_geometry, S
 
 mod interoperability;
 pub use interoperability::{
-    plan_interoperability, plan_interoperability_for_cells, InteroperabilityPlan,
+    plan_interoperability, plan_interoperability_for_cells, plan_interoperability_for_cells_in,
+    plan_interoperability_in, InteroperabilityPlan, ProductCoverage,
 };
 
 mod catalogue_compatibility;
@@ -2220,7 +2336,7 @@ fn resolve_strokes(
 #[cfg(test)]
 mod hatch_resource_tests {
     use super::*;
-    fn catalogue() -> PortrayalCatalogue {
+    pub(crate) fn catalogue() -> PortrayalCatalogue {
         use ferrite_portrayal_catalog::*;
         PortrayalCatalogue {
             root_path: Default::default(),
@@ -2383,24 +2499,21 @@ mod hatch_resource_tests {
         let parse = |script: &str| ferrite_lua::PortrayalResult::parse("42", script, "").unwrap();
         let valid = parse("Polyline:0,0,1,1;AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.32,CHBLK;LineInstruction:L");
         for (geometry, crs, expected) in [
+            // Points on one geodesic (the equator) are colinear (9-12.2.2.13).
             (
-                "Arc3Points:0,0,1,1,2,0",
+                "Arc3Points:0,0,1,0,2,0",
                 "GeographicCRS,GeographicCRS,GeographicCRS",
-                "Arc3Points",
+                "colinear",
             ),
+            // A device position has no earth anchor for metre distances.
             (
                 "ArcByRadius:0,0,10",
-                "GeographicCRS,LocalCRS,GeographicCRS",
-                "mixed CRS",
+                "PortrayalCRS,LocalCRS,GeographicCRS",
+                "CRS combination",
             ),
             (
                 "Annulus:0,0,10,5",
-                "GeographicCRS,GeographicCRS,LocalCRS",
-                "mixed CRS",
-            ),
-            (
-                "Polyline:0,0,1,1",
-                "PortrayalCRS,LocalCRS,LocalCRS",
+                "LocalCRS,GeographicCRS,GeographicCRS",
                 "CRS combination",
             ),
             (
@@ -2452,12 +2565,74 @@ mod hatch_resource_tests {
     }
 
     #[test]
+    fn augmented_paths_convert_every_part_9a_crs_combination_with_a_defined_anchor() {
+        use ferrite_render::PortrayalPath as R;
+        let cell = surface_text_fixture();
+        let pc = catalogue();
+        let convert = |script: &str| {
+            let result = ferrite_lua::PortrayalResult::parse(
+                "42",
+                &format!("{script};LineStyle:L,,0.32,CHBLK;LineInstruction:L"),
+                "",
+            )
+            .unwrap();
+            let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+            convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 3, "Day").unwrap();
+            context
+                .raw_instructions()
+                .iter()
+                .map(|i| match i {
+                    ferrite_render::DrawingInstruction::Line(l) => (
+                        l.portrayal_path.clone().unwrap(),
+                        l.portrayal_origin.clone(),
+                    ),
+                    _ => panic!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        // Geographic Arc3Points: a geodesic circle through the three points.
+        let lines = convert(
+            "Arc3Points:-1.36,50.75,-1.35,50.76,-1.34,50.75;AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS",
+        );
+        let R::GeographicArc {
+            radius_m, sweep, ..
+        } = lines[0].0
+        else {
+            panic!("{:?}", lines[0].0)
+        };
+        assert!(radius_m > 0. && sweep > 0. && sweep < 360.);
+        // Geographic centre, Portrayal angles, metre radius.
+        let lines = convert("ArcByRadius:-1.35,50.75,500,0,90;AugmentedPath:GeographicCRS,PortrayalCRS,GeographicCRS");
+        assert!(
+            matches!(&lines[0].0, R::ScreenAngled(inner) if matches!(**inner, R::GeographicArc { .. }))
+        );
+        let lines = convert(
+            "Annulus:-1.35,50.75,500,200,0,90;AugmentedPath:GeographicCRS,LocalCRS,GeographicCRS",
+        );
+        assert!(
+            matches!(&lines[0].0, R::ScreenAngled(inner) if matches!(**inner, R::GeographicAnnulus { .. }))
+        );
+        // Geographic centre, millimetre radius: anchored local arc.
+        let lines = convert(
+            "ArcByRadius:-1.35,50.75,5;AugmentedPath:GeographicCRS,GeographicCRS,PortrayalCRS",
+        );
+        assert!(
+            matches!(&lines[0].0, R::Group(g) if matches!(g[0], R::Arc { center: (0., 0.), geographic_angle: true, .. }))
+        );
+        // Absolute Portrayal CRS: device-fixed path and origin.
+        let lines =
+            convert("Polyline:5,5,20,5;AugmentedPath:PortrayalCRS,PortrayalCRS,PortrayalCRS");
+        assert!(matches!(&lines[0].0, R::Device(_)));
+        assert!(lines[0].1.is_device_fixed());
+    }
+
+    #[test]
     fn ray_preflight_catches_missing_origin_and_unsupported_metre_direction() {
         let cell = surface_text_fixture();
         let pc = catalogue();
         for (ray, expected) in [
             ("GeographicCRS,90,LocalCRS,10", "point origin"),
-            ("LocalCRS,90,GeographicCRS,10", "CRS combination"),
+            ("LocalCRS,90,GeographicCRS,10", "point origin"),
         ] {
             let valid = ferrite_lua::PortrayalResult::parse("42", "Polyline:0,0,1,1;AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.32,CHBLK;LineInstruction:L", "").unwrap();
             let rejected = ferrite_lua::PortrayalResult::parse(

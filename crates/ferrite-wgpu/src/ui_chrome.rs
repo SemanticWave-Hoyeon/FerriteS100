@@ -129,6 +129,7 @@ pub(crate) enum Icon {
     Route,
     Plugin,
     Mcp,
+    Chat,
 }
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     icon_toggle(ui, icon, label, false)
@@ -263,6 +264,17 @@ pub(crate) fn icon_toggle_with_badge(
             );
             p.circle_stroke(pos(-1., -6.), 2., stroke);
             p.circle_stroke(pos(6., 1.), 2., stroke);
+        }
+        Icon::Chat => {
+            // A speech bubble with a tail.
+            p.rect_stroke(
+                egui::Rect::from_min_max(pos(-7., -6.), pos(7., 3.)),
+                2.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment([pos(-3., 3.), pos(-5., 7.)], stroke);
+            p.line_segment([pos(-5., 7.), pos(1., 3.)], stroke);
         }
         Icon::Mcp => {
             // A service node linked to two clients.

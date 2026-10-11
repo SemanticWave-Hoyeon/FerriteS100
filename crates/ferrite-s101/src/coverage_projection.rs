@@ -4,9 +4,11 @@ use anyhow::{ensure, Context, Result};
 use ferrite_kernel::coverage_frame::CoverageFrame;
 use ferrite_kernel::coverage_selection::{CoverageFootprint, Region};
 use ferrite_kernel::{coverage_frame::CoverageSource, coverage_rendering::InstructionOrigin};
+#[cfg(test)]
+use ferrite_render::WorldPoint;
 use ferrite_render::{
     InstructionCoverageClass, PreparedCoverage, PreparedCoveragePass, RenderContext, RenderError,
-    Scaler, WorldPoint,
+    Scaler,
 };
 use ferrite_render::{PointOriginGeometry, PortrayalOrigin};
 use ferrite_s100_core::S101Cell;
@@ -23,6 +25,33 @@ pub struct GeographicCoverageInventory {
     binding_cache_enabled: bool,
     binding_requests: AtomicU64,
     binding_hits: AtomicU64,
+    /// Validated coverage regions in the camera-independent (longitude,
+    /// northing) plane, keyed by plane identity and wrapping.
+    plane_cache: Mutex<Option<Arc<PlaneCoverage>>>,
+}
+/// Retained region per coverage index (`coverage_loading::retention`).
+type Retention = Vec<(usize, Region)>;
+#[derive(Debug)]
+struct PlaneCoverage {
+    key: ([u64; 3], bool),
+    footprints: Vec<CoverageFootprint>,
+    /// 4.6 retention in the plane, keyed by `retention_key`.
+    retention: Mutex<Option<(usize, Arc<Retention>)>>,
+}
+impl PlaneCoverage {
+    fn retention(&self, denominator: f64) -> Arc<Retention> {
+        let key = crate::coverage_loading::retention_key(&self.footprints, denominator);
+        let mut cache = self.retention.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, value)) = cache.as_ref().filter(|(k, _)| *k == key) {
+            return value.clone();
+        }
+        let value = Arc::new(crate::coverage_loading::retention(
+            &self.footprints,
+            denominator,
+        ));
+        *cache = Some((key, value.clone()));
+        value
+    }
 }
 #[derive(Debug, Clone)]
 enum FlatBoundSource {
@@ -55,6 +84,14 @@ struct FlatSourceBinding {
     northings_enabled: bool,
     northing_requests: AtomicU64,
     northing_hits: AtomicU64,
+    planes: Mutex<Option<Arc<FlatSourcePlanes>>>,
+}
+/// Camera-independent (longitude, northing) of each geographic point source;
+/// NaN marks sources that keep the general resolver (local/portrayal CRS).
+#[derive(Debug)]
+struct FlatSourcePlanes {
+    identity: [u64; 3],
+    values: Vec<[f64; 2]>,
 }
 #[derive(Debug)]
 struct FlatAnchorNorthings {
@@ -124,6 +161,48 @@ impl FlatSourceBinding {
         *cache = Some(value.clone());
         Some(value)
     }
+    /// 16 bytes per source, bounded by the binding's own admission budget.
+    fn planes(
+        &self,
+        affine: &ferrite_kernel::map_camera::FlatAffine,
+    ) -> Option<Arc<FlatSourcePlanes>> {
+        if !self.northings_enabled {
+            return None;
+        }
+        let mut cache = self.planes.lock().ok()?;
+        if let Some(value) = cache
+            .as_ref()
+            .filter(|v| v.identity == affine.plane_identity())
+        {
+            return Some(value.clone());
+        }
+        let values = self
+            .sources
+            .iter()
+            .map(|source| {
+                let point = match source {
+                    FlatBoundSource::Point(_, p) => match p.as_ref() {
+                        PointOriginGeometry::FeaturePoint(p) => Some([p.x, p.y]),
+                        PointOriginGeometry::AugmentedPoint {
+                            crs: ferrite_render::PointOriginCrs::Geographic,
+                            coordinates,
+                        } => Some(*coordinates),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                point
+                    .and_then(|p| affine.plane(p).ok())
+                    .unwrap_or([f64::NAN; 2])
+            })
+            .collect();
+        let value = Arc::new(FlatSourcePlanes {
+            identity: affine.plane_identity(),
+            values,
+        });
+        *cache = Some(value.clone());
+        Some(value)
+    }
     fn northing_admitted(count: usize) -> bool {
         count
             .checked_mul(64)
@@ -147,6 +226,7 @@ mod tests {
             binding_cache_enabled: false,
             binding_requests: AtomicU64::new(0),
             binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
             datasets: vec![Some(vec![crate::coverage_geometry::DataCoverage {
                 feature_key: 1,
                 drawing_index: None,
@@ -390,7 +470,23 @@ impl GeographicCoverageInventory {
                 != Ok("0"),
             binding_requests: AtomicU64::new(0),
             binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
         })
+    }
+
+    /// S-101 2.0.0 4.6: the finest optimum display scale denominator among
+    /// Data Coverage areas containing `[longitude, latitude]` that is larger
+    /// scale than the mariner's selected viewing scale. Some(_) requires the
+    /// "larger scale data available" indication for own ship.
+    pub fn larger_scale_at(&self, position: [f64; 2], viewing_denominator: f64) -> Option<u32> {
+        self.datasets
+            .iter()
+            .flatten()
+            .flatten()
+            .filter(|c| (c.scales.optimum_denominator as f64) < viewing_denominator)
+            .filter(|c| c.surfaces.iter().any(|s| surface_contains(s, position)))
+            .map(|c| c.scales.optimum_denominator)
+            .min()
     }
 
     pub fn current_dataset_count(&self) -> usize {
@@ -501,6 +597,7 @@ impl GeographicCoverageInventory {
             northings_enabled: flat_source_northing_cache_enabled(),
             northing_requests: AtomicU64::new(0),
             northing_hits: AtomicU64::new(0),
+            planes: Mutex::new(None),
         })
     }
     fn flat_binding(
@@ -532,7 +629,46 @@ impl GeographicCoverageInventory {
     /// All longitude copies participate in one selection in device coordinates.
     /// A dataset retains one identity even when its footprint crosses the seam.
     pub fn project(&self, scaler: &Scaler, wrapping: bool) -> Result<Vec<CoverageFootprint>> {
-        let mut inventory = Vec::new();
+        // Validation and union are camera-independent: do them once in the
+        // (longitude, northing) plane, then apply this camera's exact affine.
+        let affine = scaler.flat_affine();
+        let plane = self.plane_coverage(&affine, wrapping)?;
+        plane
+            .footprints
+            .iter()
+            .map(|footprint| {
+                let region = footprint
+                    .region
+                    .map_affine(|p| affine.screen(p))
+                    .with_context(|| {
+                        format!(
+                            "Coverage surface projection failed: dataset={} coverage={} viewport={:?} scale_xy={:?} offset_xy={:?}",
+                            footprint.dataset_id,
+                            footprint.coverage_id,
+                            scaler.viewport,
+                            [scaler.scale_x(), scaler.scale_y()],
+                            [scaler.offset_x(), scaler.offset_y()]
+                        )
+                    })?;
+                Ok(CoverageFootprint {
+                    region,
+                    ..footprint.clone()
+                })
+            })
+            .collect()
+    }
+
+    fn plane_coverage(
+        &self,
+        affine: &ferrite_kernel::map_camera::FlatAffine,
+        wrapping: bool,
+    ) -> Result<Arc<PlaneCoverage>> {
+        let key = (affine.plane_identity(), wrapping);
+        let mut cache = self.plane_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cache.as_ref().filter(|c| c.key == key) {
+            return Ok(cached.clone());
+        }
+        let mut footprints = Vec::new();
         for (dataset_id, coverages) in self.datasets.iter().enumerate() {
             let Some(coverages) = coverages else { continue };
             for coverage in coverages {
@@ -540,19 +676,9 @@ impl GeographicCoverageInventory {
                 for (surface_index, surface) in coverage.surfaces.iter().enumerate() {
                     for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
                         let project = |ring: &[[f64; 2]]| -> Result<Vec<[f64; 2]>> {
+                            // Same longitude copy as the screen path: p[0] + shift.
                             ring.iter()
-                                .map(|p| {
-                                    // f64 throughout: a ±360° copy lies ~10^5–10^6 px away,
-                                    // where f32 rounding merges distinct boundary points and
-                                    // can turn a valid ring self-intersecting.
-                                    let p = scaler
-                                        .world_to_screen_f64(WorldPoint::new(p[0] + shift, p[1]));
-                                    ensure!(
-                                        p.iter().all(|v| v.is_finite()),
-                                        "Non-finite coverage projection"
-                                    );
-                                    Ok(p)
-                                })
+                                .map(|p| affine.plane([p[0] + shift, p[1]]))
                                 .collect()
                         };
                         let exterior = project(&surface.exterior)?;
@@ -562,17 +688,12 @@ impl GeographicCoverageInventory {
                             .map(|ring| project(ring))
                             .collect::<Result<Vec<_>>>()?;
                         let part = Region::from_rings(&exterior, &holes).with_context(|| {
-                            // Error-only bounded evidence. Preserve the original projection,
-                            // validation order, ring data and rejection; never skip a component.
-                            let consecutive = 1 + exterior.windows(2).filter(|p| p[0] != p[1]).count();
                             format!(
-                                "Coverage surface projection failed: dataset={dataset_id} coverage={} surface={surface_index} longitude_shift={shift} original_exterior_len={} projected_exterior_len={} consecutive_distinct={} holes={} original_first4={:?} projected_first4={:?} viewport={:?} scale_xy={:?} offset_xy={:?}",
-                                coverage.feature_key, surface.exterior.len(), exterior.len(),
-                                if exterior.is_empty() { 0 } else { consecutive }, holes.len(),
+                                "Coverage surface projection failed: dataset={dataset_id} coverage={} surface={surface_index} longitude_shift={shift} original_exterior_len={} holes={} original_first4={:?}",
+                                coverage.feature_key,
+                                surface.exterior.len(),
+                                holes.len(),
                                 &surface.exterior[..surface.exterior.len().min(4)],
-                                &exterior[..exterior.len().min(4)], scaler.viewport,
-                                [scaler.scale_x(), scaler.scale_y()],
-                                [scaler.offset_x(), scaler.offset_y()]
                             )
                         })?;
                         region = Some(match region {
@@ -581,7 +702,7 @@ impl GeographicCoverageInventory {
                         });
                     }
                 }
-                inventory.push(CoverageFootprint {
+                footprints.push(CoverageFootprint {
                     dataset_id,
                     coverage_id: coverage.feature_key,
                     scales: coverage.scales,
@@ -589,7 +710,13 @@ impl GeographicCoverageInventory {
                 });
             }
         }
-        Ok(inventory)
+        let plane = Arc::new(PlaneCoverage {
+            key,
+            footprints,
+            retention: Mutex::new(None),
+        });
+        *cache = Some(plane.clone());
+        Ok(plane)
     }
 
     /// The caller sorts first and explicitly identifies overlay ordinals in that
@@ -629,8 +756,21 @@ impl GeographicCoverageInventory {
             [x, y, right, bottom], [x, y, right, bottom].map(f64::to_bits),
             [scaler.scale_x(), scaler.scale_y()], [scaler.offset_x(), scaler.offset_y()]
         ))?;
-        let plan =
-            crate::coverage_loading::display_plan(&inventory, scaler.display_scale, &viewport)?;
+        // Retention differences are camera-independent; reuse them from the
+        // plane and apply only this camera's affine.
+        let affine = scaler.flat_affine();
+        let retained = self
+            .plane_coverage(&affine, wrapping)?
+            .retention(scaler.display_scale)
+            .iter()
+            .map(|(index, region)| Ok((*index, region.map_affine(|p| affine.screen(p))?)))
+            .collect::<Result<Vec<_>>>()?;
+        let plan = crate::coverage_loading::display_plan_with_retention(
+            &inventory,
+            scaler.display_scale,
+            &viewport,
+            &retained,
+        )?;
         let frame = Arc::new(CoverageFrame::new_with_scale_annotations(
             &plan.eligible_inventory,
             &plan.selection,
@@ -647,6 +787,7 @@ impl GeographicCoverageInventory {
         let northings = binding
             .as_ref()
             .and_then(|binding| binding.northings(scaler));
+        let planes = binding.as_ref().and_then(|binding| binding.planes(&affine));
         let mut passes = Vec::new();
         for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
             if let Some(binding) = binding.as_ref() {
@@ -667,6 +808,30 @@ impl GeographicCoverageInventory {
                                     false,
                                 ),
                                 FlatBoundSource::Point(dataset_id, origin) => {
+                                    // Geographic points: the same affine and f32
+                                    // rounding as the resolver below, without
+                                    // re-evaluating Mercator per point and copy.
+                                    let fast = planes.as_ref().and_then(|planes| {
+                                        let [x, northing] = planes.values[source_index];
+                                        if !x.is_finite() {
+                                            return None;
+                                        }
+                                        let p = affine.screen([x + shift, northing]);
+                                        let p = [p[0] as f32, p[1] as f32];
+                                        (p[0].is_finite() && p[1].is_finite()).then_some(p)
+                                    });
+                                    if let Some(p) = fast {
+                                        return Ok((
+                                            CoverageSource::Dataset {
+                                                dataset_id: *dataset_id,
+                                                origin: InstructionOrigin::Point([
+                                                    p[0] as f64,
+                                                    p[1] as f64,
+                                                ]),
+                                            },
+                                            false,
+                                        ));
+                                    }
                                     match PortrayalOrigin::project_flat_source_with_northing(
                                         origin,
                                         scaler,
@@ -756,6 +921,7 @@ mod anchored_local_coverage_tests {
             binding_cache_enabled: false,
             binding_requests: AtomicU64::new(0),
             binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
             datasets: vec![
                 Some(vec![crate::coverage_geometry::DataCoverage {
                     feature_key: 1,
@@ -1015,6 +1181,7 @@ mod projected_view_tests {
             binding_cache_enabled: false,
             binding_requests: AtomicU64::new(0),
             binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
             datasets: vec![Some(vec![coverage(7)]), None, Some(vec![coverage(9)])],
         };
         let result = inventory.project_with(projected).unwrap();
@@ -1035,6 +1202,129 @@ mod projected_view_tests {
             .unwrap_err();
         assert!(error.to_string().contains("horizon projection failed"));
     }
+    /// The plane cache must match validating and unioning every surface in
+    /// screen space, across projections, zooms, pans and longitude copies.
+    #[test]
+    fn plane_cache_matches_screen_space_validation_and_union() {
+        let mut touching = coverage(7);
+        touching.surfaces.push(GeographicSurface {
+            exterior: vec![[2., 0.], [3., 0.], [3., 1.], [2., 1.], [2., 0.]],
+            holes: vec![],
+        });
+        let mut antimeridian = coverage(9);
+        for p in &mut antimeridian.surfaces[0].exterior {
+            p[0] += 178.;
+        }
+        for p in &mut antimeridian.surfaces[0].holes[0] {
+            p[0] += 178.;
+        }
+        let inventory = GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
+            datasets: vec![Some(vec![touching, antimeridian])],
+        };
+        let screen_space = |scaler: &Scaler, wrapping: bool| -> Vec<Region> {
+            let mut out = Vec::new();
+            for coverage in inventory.datasets[0].as_ref().unwrap() {
+                let mut region: Option<Region> = None;
+                for surface in &coverage.surfaces {
+                    for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
+                        let p = |ring: &[[f64; 2]]| {
+                            ring.iter()
+                                .map(|p| {
+                                    scaler.world_to_screen_f64(WorldPoint::new(p[0] + shift, p[1]))
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        let holes = surface.holes.iter().map(|h| p(h)).collect::<Vec<_>>();
+                        let part = Region::from_rings(&p(&surface.exterior), &holes).unwrap();
+                        region = Some(match region {
+                            Some(r) => r.union(&part),
+                            None => part,
+                        });
+                    }
+                }
+                out.push(region.unwrap());
+            }
+            out
+        };
+        for projection in [
+            ferrite_render::FlatProjection::LocalGeographic,
+            ferrite_render::FlatProjection::EllipsoidalMercator,
+        ] {
+            for (bounds, wrapping) in [
+                (GeoBounds::new(0., 0., 3., 2.), false),
+                (GeoBounds::new(-1.5, -0.5, 0.75, 1.25), true),
+                (GeoBounds::new(179., 0.5, 181., 1.5), true),
+            ] {
+                let mut c = RenderContext::new(Viewport::new(800., 600.));
+                c.scaler.set_projection(projection);
+                c.set_bounds(bounds);
+                let cached = inventory.project(&c.scaler, wrapping).unwrap();
+                let expected = screen_space(&c.scaler, wrapping);
+                assert_eq!(cached.len(), expected.len());
+                let copies = if wrapping { 3. } else { 1. };
+                for ((got, want), coverage) in cached
+                    .iter()
+                    .zip(&expected)
+                    .zip(inventory.datasets[0].as_ref().unwrap())
+                {
+                    // Surfaces only touch, so the exact union area is the sum of
+                    // the projected ring areas. Overlay snaps to a grid relative
+                    // to the region extent in either space; the plane result must
+                    // be as close to that exact area as the screen-space result.
+                    let ring = |r: &[[f64; 2]]| {
+                        let p: Vec<_> = r
+                            .iter()
+                            .map(|p| c.scaler.world_to_screen_f64(WorldPoint::new(p[0], p[1])))
+                            .collect();
+                        p.windows(2)
+                            .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
+                            .sum::<f64>()
+                            .abs()
+                            / 2.
+                    };
+                    let exact = copies
+                        * coverage
+                            .surfaces
+                            .iter()
+                            .map(|s| {
+                                ring(&s.exterior) - s.holes.iter().map(|h| ring(h)).sum::<f64>()
+                            })
+                            .sum::<f64>();
+                    let got_error = (got.region.area() - exact).abs();
+                    let want_error = (want.area() - exact).abs();
+                    let difference =
+                        got.region.difference(want).area() + want.difference(&got.region).area();
+                    assert!(
+                        got_error <= (2. * want_error).max(exact * 1e-9),
+                        "{projection:?} {bounds:?}: plane error {got_error} vs screen error {want_error}"
+                    );
+                    assert!(
+                        difference <= exact * 1e-6,
+                        "{projection:?} {bounds:?}: {difference}"
+                    );
+                    // Screen-space snapping can leave touching surfaces of a far
+                    // longitude copy unmerged; the plane union never splits more.
+                    assert!(got.region.polygons().len() <= want.polygons().len());
+                }
+            }
+        }
+        // One plane build serves every camera of the same projection.
+        let mut c = RenderContext::new(Viewport::new(800., 600.));
+        c.set_bounds(GeoBounds::new(0., 0., 3., 2.));
+        let first = inventory
+            .plane_coverage(&c.scaler.flat_affine(), true)
+            .unwrap();
+        c.set_bounds(GeoBounds::new(1., 0.5, 2., 1.5));
+        let second = inventory
+            .plane_coverage(&c.scaler.flat_affine(), true)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
     #[test]
     fn invisible_origin_is_hidden_and_camera_revision_rejects_old_binding() {
         let source = GeographicCoverageInventory {
@@ -1042,6 +1332,7 @@ mod projected_view_tests {
             binding_cache_enabled: false,
             binding_requests: AtomicU64::new(0),
             binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
             datasets: vec![Some(vec![coverage(7)])],
         };
         let mut c = context(0);
@@ -1078,6 +1369,7 @@ mod projected_view_tests {
             binding_cache_enabled: false,
             binding_requests: AtomicU64::new(0),
             binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
             datasets: vec![Some(vec![coverage(7)])],
         };
         let v = viewport();
@@ -1159,6 +1451,46 @@ mod northing_cache_contract_tests {
             northings_enabled: true,
             northing_requests: AtomicU64::new(0),
             northing_hits: AtomicU64::new(0),
+            planes: Mutex::new(None),
+        }
+    }
+    /// The plane fast path must produce the resolver's exact f32 screen bits.
+    #[test]
+    fn plane_fast_path_matches_resolver_bits() {
+        use ferrite_render::{GeoBounds, Viewport};
+        let binding = binding(48.65, 0);
+        for projection in [
+            ferrite_render::FlatProjection::LocalGeographic,
+            ferrite_render::FlatProjection::EllipsoidalMercator,
+        ] {
+            for bounds in [
+                GeoBounds::new(178.5, 48., 179.5, 49.),
+                GeoBounds::new(-181.2, 48.6, -180.9, 48.7),
+                GeoBounds::new(170., 40., 190., 55.),
+            ] {
+                let mut c = RenderContext::new(Viewport::new(1280., 720.));
+                c.scaler.set_projection(projection);
+                c.set_bounds(bounds);
+                let affine = c.scaler.flat_affine();
+                let planes = binding.planes(&affine).unwrap();
+                let FlatBoundSource::Point(_, origin) = &binding.sources[0] else {
+                    unreachable!()
+                };
+                for shift in [0., -360., 360.] {
+                    let want = PortrayalOrigin::project_flat_source_with_northing(
+                        origin, &c.scaler, shift, None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let [x, northing] = planes.values[0];
+                    let got = affine.screen([x + shift, northing]);
+                    assert_eq!(
+                        [got[0] as f32, got[1] as f32].map(f32::to_bits),
+                        [want.x, want.y].map(f32::to_bits),
+                        "{projection:?} {bounds:?} {shift}"
+                    );
+                }
+            }
         }
     }
     #[test]
@@ -1219,5 +1551,73 @@ mod northing_cache_contract_tests {
         assert!(FlatSourceBinding::northing_admitted(16384));
         assert!(!FlatSourceBinding::northing_admitted(16385));
         assert!(!FlatSourceBinding::northing_admitted(usize::MAX));
+    }
+}
+
+fn ring_contains(ring: &[[f64; 2]], [x, y]: [f64; 2]) -> bool {
+    let mut inside = false;
+    for edge in ring.windows(2) {
+        let ([x0, y0], [x1, y1]) = (edge[0], edge[1]);
+        if (y0 > y) != (y1 > y) && x < x0 + (y - y0) * (x1 - x0) / (y1 - y0) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+/// Rings are closed WGS84 longitude/latitude polygons; holes exclude.
+fn surface_contains(s: &crate::coverage_geometry::GeographicSurface, p: [f64; 2]) -> bool {
+    ring_contains(&s.exterior, p) && !s.holes.iter().any(|h| ring_contains(h, p))
+}
+#[cfg(test)]
+mod larger_scale_tests {
+    use super::*;
+    use crate::coverage_geometry::{DataCoverage, GeographicSurface};
+    use ferrite_kernel::scale_policy::CoverageScaleRange;
+    fn square(x: f64, size: f64) -> Vec<[f64; 2]> {
+        vec![
+            [x, 0.],
+            [x + size, 0.],
+            [x + size, size],
+            [x, size],
+            [x, 0.],
+        ]
+    }
+    fn coverage(optimum: u32, exterior: Vec<[f64; 2]>, holes: Vec<Vec<[f64; 2]>>) -> DataCoverage {
+        DataCoverage {
+            feature_key: optimum as i64,
+            scales: CoverageScaleRange {
+                minimum_denominator: None,
+                optimum_denominator: optimum,
+                maximum_denominator: optimum / 2,
+            },
+            drawing_index: None,
+            surfaces: vec![GeographicSurface { exterior, holes }],
+        }
+    }
+    #[test]
+    fn own_ship_indication_reports_the_finest_larger_scale_coverage_at_the_position() {
+        let inventory = GeographicCoverageInventory {
+            datasets: vec![
+                Some(vec![coverage(90_000, square(0., 10.), vec![])]),
+                Some(vec![coverage(22_000, square(0., 4.), vec![square(1., 1.)])]),
+                None,
+            ],
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
+        };
+        assert_eq!(inventory.larger_scale_at([3., 3.], 180_000.), Some(22_000));
+        // The MSVS already shows the finer data: no indication.
+        assert_eq!(inventory.larger_scale_at([3., 3.], 22_000.), None);
+        assert_eq!(inventory.larger_scale_at([3., 3.], 50_000.), Some(22_000));
+        // Inside the hole only the coarser coverage applies.
+        assert_eq!(
+            inventory.larger_scale_at([1.5, 0.5], 180_000.),
+            Some(90_000)
+        );
+        assert_eq!(inventory.larger_scale_at([8., 8.], 90_000.), None);
+        assert_eq!(inventory.larger_scale_at([20., 8.], 1e9), None);
     }
 }

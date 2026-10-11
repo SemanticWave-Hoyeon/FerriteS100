@@ -740,6 +740,9 @@ impl NativeS421 {
                         .is_some_and(|route| self.controller.editing() && route.len() >= 2)
                         .into();
                 }
+                if action["id"] == "copy" {
+                    action["enabled"] = (imported && !self.controller.editing()).into();
+                }
                 if action["id"] == "export" {
                     action["label"] = if imported {
                         "Save original"
@@ -788,6 +791,72 @@ mod tests {
         let path = dir.join("input.gml");
         std::fs::write(&path, xml).unwrap();
         path
+    }
+    #[test]
+    fn imported_loxodrome_route_edits_through_an_authored_copy_and_reloads() {
+        use ferrite_s421::s421::LegGeometry;
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = Route::with_name(0, "Lox route");
+        for (id, lon, lat) in [(1, -2.5, 50.), (2, -2.3, 50.1), (3, -2.1, 50.15)] {
+            let mut wp = Waypoint::new(id, lon, lat);
+            wp.turn_radius = Some(0.5);
+            if id > 1 {
+                wp.incoming_geometry = Some(LegGeometry::Loxodrome);
+            }
+            route.add_waypoint(wp);
+        }
+        let xml = export_published(
+            &route,
+            PublishedExport {
+                route_id: "LOX.ROUTE",
+                edition: 1,
+                status: 1,
+            },
+        )
+        .unwrap();
+        let input = dir.path().join("lox.gml");
+        std::fs::write(&input, &xml).unwrap();
+        let mut host = NativeS421::new(dir.path().join("Catalogues"));
+        let imported = host.import_path(&input, false).unwrap();
+        // The original saves byte-for-byte; its content stays read-only.
+        let original = dir.path().join("original.gml");
+        host.export_path(&original).unwrap();
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), xml);
+        let ui: serde_json::Value = serde_json::from_str(&host.ui_json).unwrap();
+        let copy = ui["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "copy")
+            .unwrap();
+        assert_eq!(copy["enabled"], true);
+        host.handle_event(r#"{"type":"CopyAsAuthored"}"#, false)
+            .unwrap();
+        let active = host.controller.active_route().unwrap().id;
+        assert_ne!(active, imported);
+        assert!(host.controller.source_for_route(active).is_none());
+        // The copy is editable and keeps the declared loxodromes.
+        let event =
+            serde_json::json!({"type":"SetTurnRadius","id":2,"radius_nm":"0.25"}).to_string();
+        host.handle_event(&event, false).unwrap();
+        let edited = dir.path().join("edited.gml");
+        host.export_path(&edited).unwrap();
+        let saved = std::fs::read_to_string(&edited).unwrap();
+        assert!(saved.contains("<gml:LineStringSegment interpolation=\"linear\">"));
+        let reloaded = host.import_path(&edited, false).unwrap();
+        let route = host
+            .controller
+            .routes()
+            .iter()
+            .find(|r| r.id == reloaded)
+            .unwrap();
+        assert_eq!(route.waypoints[1].turn_radius, Some(0.25));
+        assert!(route.waypoints[1..]
+            .iter()
+            .all(|w| w.incoming_geometry == Some(LegGeometry::Loxodrome)));
+        // The imported original is unchanged.
+        let source = host.controller.source_for_route(imported).unwrap();
+        assert_eq!(&*source.original_xml, xml.as_str());
     }
     #[test]
     fn original_save_and_explicit_radius_events_preserve_source_and_failed_state() {

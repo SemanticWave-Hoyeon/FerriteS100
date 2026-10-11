@@ -5,6 +5,8 @@ use std::{io::Read, path::Path};
 pub struct AuthenticatedCatalogue {
     pub catalogue: super::Catalogue,
     pub authorization: AuthorizedCatalogue,
+    /// Non-fatal S-98 profile findings (for example a dictionary MRN discrepancy).
+    pub profile_findings: Vec<String>,
 }
 impl AuthenticatedCatalogue {
     /// Authentication precedes XML interpretation. This is a supported Part 16 subset,
@@ -48,9 +50,12 @@ impl AuthenticatedCatalogue {
             date <= issued,
             "IC versionDate is later than authenticated issueDate"
         );
+        // The discovery metadata identified S-98, so its profile applies too.
+        let profile_findings = catalogue.validate_s98_profile()?;
         Ok(Self {
             catalogue,
             authorization,
+            profile_findings,
         })
     }
 }

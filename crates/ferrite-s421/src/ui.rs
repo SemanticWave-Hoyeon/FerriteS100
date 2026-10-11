@@ -141,6 +141,8 @@ pub enum UiEvent {
         id: u32,
         geometry: crate::s421::LegGeometry,
     },
+    /// Editable copy of the active imported route (its original stays retained).
+    CopyAsAuthored,
 }
 
 /// Build UI data from route state
@@ -270,6 +272,12 @@ pub fn build_ui_data(
         id: "export".to_string(),
         label: "Export".to_string(),
         enabled: active_route.is_some_and(|r| r.waypoints.len() >= 2),
+    });
+    actions.push(ActionButton {
+        id: "copy".to_string(),
+        label: "Edit Copy".to_string(),
+        // The host enables it for imported routes only.
+        enabled: false,
     });
     actions.push(ActionButton {
         id: "import".to_string(),

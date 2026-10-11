@@ -108,6 +108,33 @@ impl Region {
             holes.iter().map(|h| line(h)).collect(),
         )])
     }
+    /// Map an already validated region through a non-degenerate affine map.
+    /// Validity is affine-invariant, so only finiteness, area and ring
+    /// orientation are rechecked (O(n)) instead of repeating the O(n²)
+    /// self-intersection validation.
+    pub fn map_affine(&self, map: impl Fn([f64; 2]) -> [f64; 2]) -> Result<Self> {
+        use geo::{algorithm::orient::Direction, MapCoords, Orient};
+        let mut polygons = Vec::with_capacity(self.0 .0.len());
+        for polygon in &self.0 .0 {
+            let mapped = polygon.map_coords(|c| {
+                let [x, y] = map([c.x, c.y]);
+                geo::Coord { x, y }
+            });
+            ensure!(
+                mapped
+                    .coords_iter()
+                    .all(|p| p.x.is_finite() && p.y.is_finite()),
+                "Non-finite projected coverage"
+            );
+            let area = mapped.unsigned_area();
+            ensure!(
+                area.is_finite() && area > 0.,
+                "Invalid projected coverage area"
+            );
+            polygons.push(mapped.orient(Direction::Default));
+        }
+        Ok(Self(Arc::new(MultiPolygon(polygons))))
+    }
     pub fn polygons(&self) -> &[Polygon<f64>] {
         &self.0 .0
     }
