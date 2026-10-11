@@ -1946,10 +1946,13 @@ impl EguiIntegration {
             .fixed_pos(egui::pos2(chart_x + 10.0, chart_y + 10.0))
             // Chart HUD cannot cover floating windows or menu popups.
             .order(egui::Order::Background)
+            // The area senses before its contents, so it blocks chart
+            // dragging underneath while headers inside still get clicks.
+            .sense(egui::Sense::click_and_drag())
             .show(ctx, |ui| {
                 ui.style_mut().visuals.override_text_color = Some(theme.success);
 
-                let frame_response = egui::Frame::new()
+                egui::Frame::new()
                     .fill(theme.panel)
                     .inner_margin(egui::Margin::same(8))
                     .corner_radius(4.0)
@@ -2030,12 +2033,6 @@ impl EguiIntegration {
                             ui.label("Pos: (no chart)");
                         }
                     });
-                // Consume mouse events on the frame area to prevent chart from moving when dragging on overlay
-                ui.interact(
-                    frame_response.response.rect,
-                    egui::Id::new("debug_overlay_blocker"),
-                    egui::Sense::click_and_drag(),
-                );
             });
     }
 
@@ -3631,5 +3628,81 @@ mod debug_history_tests {
         assert_eq!(h.sample(119, 0), Some(124.0));
         assert_eq!(h.sample(119, 1), None);
         assert_eq!(h.sample(119, 2), None);
+    }
+}
+
+#[cfg(test)]
+mod debug_overlay_tests {
+    use super::*;
+    fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_owned(), text.pos)),
+                _ => None,
+            })
+            .collect()
+    }
+    fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+    /// Sections fold open on click and the overlay keeps the pointer from
+    /// the chart underneath.
+    #[test]
+    fn collapsed_sections_open_on_click_and_overlay_owns_the_pointer() {
+        let context = egui::Context::default();
+        let state = AppUiState::default();
+        let frame = |events: Vec<egui::Event>| {
+            context.run(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 900.),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| EguiIntegration::draw_debug_overlay(ctx, &state, 0., 0.),
+            )
+        };
+        frame(Vec::new());
+        let shown = texts(&frame(Vec::new()));
+        let header = shown
+            .iter()
+            .find(|(text, _)| text == "Frame timing and reuse")
+            .expect("section header drawn")
+            .1
+            + egui::vec2(4., 4.);
+        assert!(!shown
+            .iter()
+            .any(|(t, _)| t.starts_with("Navigation redraw wall")));
+        frame(vec![egui::Event::PointerMoved(header), press(header, true)]);
+        frame(vec![press(header, false)]);
+        let mut opened = Vec::new();
+        for _ in 0..30 {
+            opened = texts(&frame(Vec::new()));
+        }
+        assert!(
+            opened
+                .iter()
+                .any(|(t, _)| t.starts_with("Navigation redraw wall")),
+            "section did not open"
+        );
+        // A press on a plain label belongs to egui, not to chart dragging.
+        let label = opened
+            .iter()
+            .find(|(text, _)| text.starts_with("Zoom:"))
+            .expect("zoom label")
+            .1
+            + egui::vec2(2., 2.);
+        frame(vec![egui::Event::PointerMoved(label), press(label, true)]);
+        assert!(context.wants_pointer_input());
+        frame(vec![press(label, false)]);
     }
 }
