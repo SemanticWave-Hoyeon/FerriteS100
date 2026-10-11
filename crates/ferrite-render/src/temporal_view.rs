@@ -110,9 +110,11 @@ mod tests {
     use super::*;
     #[test]
     fn invalid_edits_preserve_every_active_temporal_setting() {
-        let mut settings = DisplaySettings::default();
-        settings.current_datetime = Some("20261004T010000Z".into());
-        settings.local_time_offset_seconds = 32400;
+        let mut settings = DisplaySettings {
+            current_datetime: Some("20261004T010000Z".into()),
+            local_time_offset_seconds: 32400,
+            ..Default::default()
+        };
         let old = TemporalView::from_settings(&settings);
         let mut draft = old.clone();
         draft.instant = "2026-10-04T12:00:00".into();
@@ -151,9 +153,11 @@ mod tests {
     }
     #[test]
     fn cli_selectors_round_trip_without_implicit_timezone_changes() {
-        let mut settings = DisplaySettings::default();
-        settings.current_date = Some("2026-10-04".into());
-        settings.local_time_offset_seconds = -12600;
+        let settings = DisplaySettings {
+            current_date: Some("2026-10-04".into()),
+            local_time_offset_seconds: -12600,
+            ..Default::default()
+        };
         let view = TemporalView::from_settings(&settings);
         assert_eq!(view.source_offset, "-03:30");
         assert_eq!(view.mode, TemporalViewMode::Date);

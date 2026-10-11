@@ -1,0 +1,573 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<S100XC:S100_ExchangeCatalogue xmlns:S100XC="http://www.iho.int/s100/xc/5.2" xmlns:S100SE="http://www.iho.int/s100/se/5.2" xmlns:cit="http://standards.iso.org/iso/19115/-3/cit/2.0" xmlns:gco="http://standards.iso.org/iso/19115/-3/gco/1.0" xmlns:gex="http://standards.iso.org/iso/19115/-3/gex/1.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:lan="http://standards.iso.org/iso/19115/-3/lan/1.0" xmlns:mcc="http://standards.iso.org/iso/19115/-3/mcc/1.0" xmlns:mco="http://standards.iso.org/iso/19115/-3/mco/1.0" xmlns:mmi="http://standards.iso.org/iso/19115/-3/mmi/1.0" xmlns:mri="http://standards.iso.org/iso/19115/-3/mri/1.0" xmlns:mrs="http://standards.iso.org/iso/19115/-3/mrs/1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://standards.iso.org/iso/19115/-3/mrs/1.0 http://standards.iso.org/iso/19115/-3/mrs/1.0/mrs.xsd">
+
+  <S100XC:identifier>
+    <S100XC:identifier>S100_ENC_ROOT_SAINTMALO_5m_2026-05-26</S100XC:identifier>
+    <S100XC:dateTime>2026-05-26T06:49:20</S100XC:dateTime>
+  </S100XC:identifier>
+
+  <S100XC:contact>
+    <S100XC:organization>
+      <gco:CharacterString>Shom</gco:CharacterString>
+    </S100XC:organization>
+    <S100XC:phone>
+      <cit:number>
+        <gco:CharacterString>+330000000</gco:CharacterString>
+      </cit:number>
+    </S100XC:phone>
+    <S100XC:address>
+      <cit:city>
+        <gco:CharacterString>Brest</gco:CharacterString>
+      </cit:city>
+      <cit:administrativeArea>
+        <gco:CharacterString>FRANCE</gco:CharacterString>
+      </cit:administrativeArea>
+      <cit:postalCode>
+        <gco:CharacterString>29200</gco:CharacterString>
+      </cit:postalCode>
+      <cit:country>
+        <gco:CharacterString>FRANCE</gco:CharacterString>
+      </cit:country>
+      <cit:electronicMailAddress>
+        <gco:CharacterString>retours-s100@shom.fr</gco:CharacterString>
+      </cit:electronicMailAddress>
+    </S100XC:address>
+  </S100XC:contact>
+
+  <S100XC:productSpecification>
+    <S100XC:name>Bathymetric Surface</S100XC:name>
+    <S100XC:version>3.0</S100XC:version>
+    <S100XC:date>2024-12-27</S100XC:date>
+    <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+    <S100XC:number>215</S100XC:number>
+    <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+  </S100XC:productSpecification>
+
+  <S100XC:exchangeCatalogueDescription>
+    <gco:CharacterString>S-102 test dataset</gco:CharacterString>
+  </S100XC:exchangeCatalogueDescription>
+
+  <S100XC:certificates>
+    <S100SE:schemeAdministrator id="IHO"/>
+    <S100SE:certificate id="823872f9-0694-41a0-8c68-c5a9b6ddd386" issuer="IHO">MIIDcjCCAvegAwIBAgIVAJo0gjEy8fIm4zfs1glHOzrb+UidMAoGCCqGSM49BAMDMIHYMQswCQYDVQQGEwJNQzEdMBsGA1UECAwUU0NIRU1FX0FETUlOSVNUUkFUT1IxDzANBgNVBAcMBk1vbmFjbzEwMC4GA1UECgwnSW50ZXJuYXRpb25hbCBIeWRyb2dyYXBoaWMgT3JnYW5pemF0aW9uMSkwJwYDVQQLDCBJSE8gUy0xMDBlNS4yLjAgUk9PVCBjZXJ0aWZpY2F0ZTEfMB0GA1UEAwwWdXJuOm1ybjppaG86MDBBQTowMTgxMDEbMBkGCSqGSIb3DQEJARYMaW5mb0BpaG8uaW50MB4XDTI1MTExMzE0NDgyMloXDTI2MTExMzE0NDgyMlowgZMxHzAdBgNVBAMTFnVybjptcm46aWhvOkZSMDA6MDAxNzAxRzBFBgNVBAoMPlNlcnZpY2UgSHlkcm9ncmFwaGlxdWUgZXQgT2PDqWFub2dyYXBoaXF1ZSBkZSBsYSBNYXJpbmUgKFNIT00pMRYwFAYDVQQIDA1EQVRBX1BST0RVQ0VSMQ8wDQYDVQQGEwZGcmFuY2UwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAASV6zqEaNHh/lO1RPYmVPnUJu1YnyKoMdyTAaPYioxKtVQT8U3tzFtswhEMPH46VzuTKuDMy3l7LT1Nvxl6Ot2jBq8wixwn++c7EC35FXCtllxoNEK22RmS7vWeU5bh2tKjgcMwgcAwCQYDVR0TBAIwADCBgQYDVR0OBHoEeDB2MBAGByqGSM49AgEGBSuBBAAiA2IABJXrOoRo0eH+U7VE9iZU+dQm7VifIqgx3JMBo9iKjEq1VBPxTe3MW2zCEQw8fjpXO5Mq4MzLeXstPU2/GXo63aMGrzCLHCf75zsQLfkVcK2WXGg0QrbZGZLu9Z5TluHa0jAfBgNVHSMEGDAWgBT7pbB3RsgTsVXJ5QN67+dkgVqpkzAOBgNVHQ8BAf8EBAMCA/gwCgYIKoZIzj0EAwMDaQAwZgIxAPLqCrfCTRylCir6D526BtJz74XrD88WnAeEBORvSkTuiYbbi4ZSou+pUc3fZFbGcAIxAM6E++Q++7U4cHy7XitjTqN+BJU6w7uoBTA90YiHYL4n1CbiBRq8gSvBmqk4KBqbWA==</S100SE:certificate>
+  </S100XC:certificates>
+
+  <S100XC:datasetDiscoveryMetadata>
+    <S100XC:S100_DatasetDiscoveryMetadata>
+      <S100XC:fileName>file:/S-102/DATASET_FILES/102FR00SMALOG000001/102FR00SMALOG000001.H5</S100XC:fileName>
+      <S100XC:compressionFlag>false</S100XC:compressionFlag>
+      <S100XC:dataProtection>false</S100XC:dataProtection>
+      <S100XC:digitalSignatureReference>ECDSA-384-SHA2</S100XC:digitalSignatureReference>
+      <S100XC:digitalSignatureValue>
+        <S100SE:S100_SE_SignatureOnData certificateRef="823872f9-0694-41a0-8c68-c5a9b6ddd386" dataStatus="unencrypted" id="4ace5940-2b9f-49e2-9146-48d4b42ef303">MGUCMQC/Kro1Hq6Y2pdm5GwMqm1ChZpsUL9UJY6xlKm0MtrG23Qc3mMJ5LQzMJ5moikyaa8CMDW6QVcMbXN2P24nvZ2zarM/viGiQWWFVkR63crc0KSmsCELy5wAVW9exdIjlUAqcw==</S100SE:S100_SE_SignatureOnData>
+      </S100XC:digitalSignatureValue>
+      <S100XC:copyright>true</S100XC:copyright>
+      <S100XC:classification>
+        <mco:MD_ClassificationCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#MD_ClassificationCode" codeListValue="unclassified" codeSpace="http://standards.iso.org/iso/19115/-3/mco/1.0">unclassified</mco:MD_ClassificationCode>
+      </S100XC:classification>
+      <S100XC:purpose>newDataset</S100XC:purpose>
+      <S100XC:notForNavigation>true</S100XC:notForNavigation>
+      <S100XC:editionNumber>1</S100XC:editionNumber>
+      <S100XC:issueDate>2026-05-26</S100XC:issueDate>
+      <S100XC:boundingBox>
+        <gex:westBoundLongitude>
+          <gco:Decimal>-2.13</gco:Decimal>
+        </gex:westBoundLongitude>
+        <gex:eastBoundLongitude>
+          <gco:Decimal>-2.08</gco:Decimal>
+        </gex:eastBoundLongitude>
+        <gex:southBoundLatitude>
+          <gco:Decimal>48.62</gco:Decimal>
+        </gex:southBoundLatitude>
+        <gex:northBoundLatitude>
+          <gco:Decimal>48.67</gco:Decimal>
+        </gex:northBoundLatitude>
+      </S100XC:boundingBox>
+      <S100XC:productSpecification>
+        <S100XC:name>Bathymetric Surface</S100XC:name>
+        <S100XC:version>3.0</S100XC:version>
+        <S100XC:date>2024-12-27</S100XC:date>
+        <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+        <S100XC:number>215</S100XC:number>
+        <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+      </S100XC:productSpecification>
+      <S100XC:producingAgency>
+        <cit:CI_Responsibility>
+          <cit:role>
+            <cit:CI_RoleCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#CI_RoleCode" codeListValue="publisher" codeSpace="http://standards.iso.org/iso/19115/-3/cit/1.0">publisher</cit:CI_RoleCode>
+          </cit:role>
+          <cit:party>
+            <cit:CI_Organisation>
+              <cit:name>
+                <gco:CharacterString>FR</gco:CharacterString>
+              </cit:name>
+            </cit:CI_Organisation>
+          </cit:party>
+        </cit:CI_Responsibility>
+      </S100XC:producingAgency>
+      <S100XC:producerCode>FR</S100XC:producerCode>
+      <S100XC:encodingFormat>HDF5</S100XC:encodingFormat>
+      <S100XC:dataCoverage>
+        <S100XC:boundingPolygon>
+          <gex:polygon>
+            <gml:Polygon gml:id="_68054eec-d6dd-489d-954d-97d09227da38" srsName="urn:ogc:def:crs:EPSG::4326">
+              <gml:exterior>
+                <gml:LinearRing>
+                  <gml:posList>48.62 -2.13 48.62 -2.08 48.67 -2.08 48.67 -2.13 48.62 -2.13</gml:posList>
+                </gml:LinearRing>
+              </gml:exterior>
+            </gml:Polygon>
+          </gex:polygon>
+        </S100XC:boundingPolygon>
+        <S100XC:optimumDisplayScale>12000</S100XC:optimumDisplayScale>
+        <S100XC:maximumDisplayScale>6000</S100XC:maximumDisplayScale>
+        <S100XC:minimumDisplayScale>45000</S100XC:minimumDisplayScale>
+        <S100XC:approximateGridResolution>5</S100XC:approximateGridResolution>
+      </S100XC:dataCoverage>
+      <S100XC:navigationPurpose>port</S100XC:navigationPurpose>
+    </S100XC:S100_DatasetDiscoveryMetadata>
+    <S100XC:S100_DatasetDiscoveryMetadata>
+      <S100XC:fileName>file:/S-102/DATASET_FILES/102FR00SMALOG000002/102FR00SMALOG000002.H5</S100XC:fileName>
+      <S100XC:compressionFlag>false</S100XC:compressionFlag>
+      <S100XC:dataProtection>false</S100XC:dataProtection>
+      <S100XC:digitalSignatureReference>ECDSA-384-SHA2</S100XC:digitalSignatureReference>
+      <S100XC:digitalSignatureValue>
+        <S100SE:S100_SE_SignatureOnData certificateRef="823872f9-0694-41a0-8c68-c5a9b6ddd386" dataStatus="unencrypted" id="c173542b-a69f-4d8e-8c8a-4f3ebd8f9fd2">MGQCMExTB8DUa3UEplT79EHYwPH2FkmimXnYA+vHDXt0Ptq8UfvUixcVGDVzmQPIbuHk8wIwEry5ZF8b+hGpxkwfsuvMeEVwWUXMjXtmZuOcK8Is7vDJPQQrm3o1rNk1S+xsnhxt</S100SE:S100_SE_SignatureOnData>
+      </S100XC:digitalSignatureValue>
+      <S100XC:copyright>true</S100XC:copyright>
+      <S100XC:classification>
+        <mco:MD_ClassificationCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#MD_ClassificationCode" codeListValue="unclassified" codeSpace="http://standards.iso.org/iso/19115/-3/mco/1.0">unclassified</mco:MD_ClassificationCode>
+      </S100XC:classification>
+      <S100XC:purpose>newDataset</S100XC:purpose>
+      <S100XC:notForNavigation>true</S100XC:notForNavigation>
+      <S100XC:editionNumber>1</S100XC:editionNumber>
+      <S100XC:issueDate>2026-05-26</S100XC:issueDate>
+      <S100XC:boundingBox>
+        <gex:westBoundLongitude>
+          <gco:Decimal>-2.08</gco:Decimal>
+        </gex:westBoundLongitude>
+        <gex:eastBoundLongitude>
+          <gco:Decimal>-2.03</gco:Decimal>
+        </gex:eastBoundLongitude>
+        <gex:southBoundLatitude>
+          <gco:Decimal>48.62</gco:Decimal>
+        </gex:southBoundLatitude>
+        <gex:northBoundLatitude>
+          <gco:Decimal>48.67</gco:Decimal>
+        </gex:northBoundLatitude>
+      </S100XC:boundingBox>
+      <S100XC:productSpecification>
+        <S100XC:name>Bathymetric Surface</S100XC:name>
+        <S100XC:version>3.0</S100XC:version>
+        <S100XC:date>2024-12-27</S100XC:date>
+        <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+        <S100XC:number>215</S100XC:number>
+        <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+      </S100XC:productSpecification>
+      <S100XC:producingAgency>
+        <cit:CI_Responsibility>
+          <cit:role>
+            <cit:CI_RoleCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#CI_RoleCode" codeListValue="publisher" codeSpace="http://standards.iso.org/iso/19115/-3/cit/1.0">publisher</cit:CI_RoleCode>
+          </cit:role>
+          <cit:party>
+            <cit:CI_Organisation>
+              <cit:name>
+                <gco:CharacterString>FR</gco:CharacterString>
+              </cit:name>
+            </cit:CI_Organisation>
+          </cit:party>
+        </cit:CI_Responsibility>
+      </S100XC:producingAgency>
+      <S100XC:producerCode>FR</S100XC:producerCode>
+      <S100XC:encodingFormat>HDF5</S100XC:encodingFormat>
+      <S100XC:dataCoverage>
+        <S100XC:boundingPolygon>
+          <gex:polygon>
+            <gml:Polygon gml:id="_03150ed2-53a3-4963-88a2-dc172ebbdbc2" srsName="urn:ogc:def:crs:EPSG::4326">
+              <gml:exterior>
+                <gml:LinearRing>
+                  <gml:posList>48.62 -2.08 48.62 -2.03 48.67 -2.03 48.67 -2.08 48.62 -2.08</gml:posList>
+                </gml:LinearRing>
+              </gml:exterior>
+            </gml:Polygon>
+          </gex:polygon>
+        </S100XC:boundingPolygon>
+        <S100XC:optimumDisplayScale>12000</S100XC:optimumDisplayScale>
+        <S100XC:maximumDisplayScale>6000</S100XC:maximumDisplayScale>
+        <S100XC:minimumDisplayScale>45000</S100XC:minimumDisplayScale>
+        <S100XC:approximateGridResolution>5</S100XC:approximateGridResolution>
+      </S100XC:dataCoverage>
+      <S100XC:navigationPurpose>port</S100XC:navigationPurpose>
+    </S100XC:S100_DatasetDiscoveryMetadata>
+    <S100XC:S100_DatasetDiscoveryMetadata>
+      <S100XC:fileName>file:/S-102/DATASET_FILES/102FR00SMALOG000003/102FR00SMALOG000003.H5</S100XC:fileName>
+      <S100XC:compressionFlag>false</S100XC:compressionFlag>
+      <S100XC:dataProtection>false</S100XC:dataProtection>
+      <S100XC:digitalSignatureReference>ECDSA-384-SHA2</S100XC:digitalSignatureReference>
+      <S100XC:digitalSignatureValue>
+        <S100SE:S100_SE_SignatureOnData certificateRef="823872f9-0694-41a0-8c68-c5a9b6ddd386" dataStatus="unencrypted" id="6ee48bc7-cd3f-4de0-82a1-75ab7ef2e9eb">MGYCMQC0g3a3TYtxWVXrNp/+Q6MjoE6Z+o6twvxV6IxwST7XuHZPwZb14nwwS1aoYP5m+EUCMQDmt3TOdfMbeoP28WK9XPIt4EhEjxmcU1SIOf1pVYQI4baEEubQZT78W5q1Hfbd/44=</S100SE:S100_SE_SignatureOnData>
+      </S100XC:digitalSignatureValue>
+      <S100XC:copyright>true</S100XC:copyright>
+      <S100XC:classification>
+        <mco:MD_ClassificationCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#MD_ClassificationCode" codeListValue="unclassified" codeSpace="http://standards.iso.org/iso/19115/-3/mco/1.0">unclassified</mco:MD_ClassificationCode>
+      </S100XC:classification>
+      <S100XC:purpose>newDataset</S100XC:purpose>
+      <S100XC:notForNavigation>true</S100XC:notForNavigation>
+      <S100XC:editionNumber>1</S100XC:editionNumber>
+      <S100XC:issueDate>2026-05-26</S100XC:issueDate>
+      <S100XC:boundingBox>
+        <gex:westBoundLongitude>
+          <gco:Decimal>-2.03</gco:Decimal>
+        </gex:westBoundLongitude>
+        <gex:eastBoundLongitude>
+          <gco:Decimal>-1.98</gco:Decimal>
+        </gex:eastBoundLongitude>
+        <gex:southBoundLatitude>
+          <gco:Decimal>48.62</gco:Decimal>
+        </gex:southBoundLatitude>
+        <gex:northBoundLatitude>
+          <gco:Decimal>48.67</gco:Decimal>
+        </gex:northBoundLatitude>
+      </S100XC:boundingBox>
+      <S100XC:productSpecification>
+        <S100XC:name>Bathymetric Surface</S100XC:name>
+        <S100XC:version>3.0</S100XC:version>
+        <S100XC:date>2024-12-27</S100XC:date>
+        <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+        <S100XC:number>215</S100XC:number>
+        <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+      </S100XC:productSpecification>
+      <S100XC:producingAgency>
+        <cit:CI_Responsibility>
+          <cit:role>
+            <cit:CI_RoleCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#CI_RoleCode" codeListValue="publisher" codeSpace="http://standards.iso.org/iso/19115/-3/cit/1.0">publisher</cit:CI_RoleCode>
+          </cit:role>
+          <cit:party>
+            <cit:CI_Organisation>
+              <cit:name>
+                <gco:CharacterString>FR</gco:CharacterString>
+              </cit:name>
+            </cit:CI_Organisation>
+          </cit:party>
+        </cit:CI_Responsibility>
+      </S100XC:producingAgency>
+      <S100XC:producerCode>FR</S100XC:producerCode>
+      <S100XC:encodingFormat>HDF5</S100XC:encodingFormat>
+      <S100XC:dataCoverage>
+        <S100XC:boundingPolygon>
+          <gex:polygon>
+            <gml:Polygon gml:id="_7163b289-1a63-4898-a20a-c1ba880ea5e6" srsName="urn:ogc:def:crs:EPSG::4326">
+              <gml:exterior>
+                <gml:LinearRing>
+                  <gml:posList>48.62 -2.03 48.62 -1.98 48.67 -1.98 48.67 -2.03 48.62 -2.03</gml:posList>
+                </gml:LinearRing>
+              </gml:exterior>
+            </gml:Polygon>
+          </gex:polygon>
+        </S100XC:boundingPolygon>
+        <S100XC:optimumDisplayScale>12000</S100XC:optimumDisplayScale>
+        <S100XC:maximumDisplayScale>6000</S100XC:maximumDisplayScale>
+        <S100XC:minimumDisplayScale>45000</S100XC:minimumDisplayScale>
+        <S100XC:approximateGridResolution>5</S100XC:approximateGridResolution>
+      </S100XC:dataCoverage>
+      <S100XC:navigationPurpose>port</S100XC:navigationPurpose>
+    </S100XC:S100_DatasetDiscoveryMetadata>
+    <S100XC:S100_DatasetDiscoveryMetadata>
+      <S100XC:fileName>file:/S-102/DATASET_FILES/102FR00SMALOG000004/102FR00SMALOG000004.H5</S100XC:fileName>
+      <S100XC:compressionFlag>false</S100XC:compressionFlag>
+      <S100XC:dataProtection>false</S100XC:dataProtection>
+      <S100XC:digitalSignatureReference>ECDSA-384-SHA2</S100XC:digitalSignatureReference>
+      <S100XC:digitalSignatureValue>
+        <S100SE:S100_SE_SignatureOnData certificateRef="823872f9-0694-41a0-8c68-c5a9b6ddd386" dataStatus="unencrypted" id="344627ec-3eae-4b83-a83c-509f1f10f9fe">MGYCMQDIlp1V8+b03DJhUEWyXFRn53k22WrVQhuLvIY6ItmCXJR5uFy7azIz5KBQnpg1fzsCMQCHeFX0R371OWc+8Zlu2Iy6aB08Gl/xU4KAIA+hN10yzBAv28zodMA5IbSkw8l6ytw=</S100SE:S100_SE_SignatureOnData>
+      </S100XC:digitalSignatureValue>
+      <S100XC:copyright>true</S100XC:copyright>
+      <S100XC:classification>
+        <mco:MD_ClassificationCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#MD_ClassificationCode" codeListValue="unclassified" codeSpace="http://standards.iso.org/iso/19115/-3/mco/1.0">unclassified</mco:MD_ClassificationCode>
+      </S100XC:classification>
+      <S100XC:purpose>newDataset</S100XC:purpose>
+      <S100XC:notForNavigation>true</S100XC:notForNavigation>
+      <S100XC:editionNumber>1</S100XC:editionNumber>
+      <S100XC:issueDate>2026-05-26</S100XC:issueDate>
+      <S100XC:boundingBox>
+        <gex:westBoundLongitude>
+          <gco:Decimal>-2.18</gco:Decimal>
+        </gex:westBoundLongitude>
+        <gex:eastBoundLongitude>
+          <gco:Decimal>-2.13</gco:Decimal>
+        </gex:eastBoundLongitude>
+        <gex:southBoundLatitude>
+          <gco:Decimal>48.67</gco:Decimal>
+        </gex:southBoundLatitude>
+        <gex:northBoundLatitude>
+          <gco:Decimal>48.72</gco:Decimal>
+        </gex:northBoundLatitude>
+      </S100XC:boundingBox>
+      <S100XC:productSpecification>
+        <S100XC:name>Bathymetric Surface</S100XC:name>
+        <S100XC:version>3.0</S100XC:version>
+        <S100XC:date>2024-12-27</S100XC:date>
+        <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+        <S100XC:number>215</S100XC:number>
+        <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+      </S100XC:productSpecification>
+      <S100XC:producingAgency>
+        <cit:CI_Responsibility>
+          <cit:role>
+            <cit:CI_RoleCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#CI_RoleCode" codeListValue="publisher" codeSpace="http://standards.iso.org/iso/19115/-3/cit/1.0">publisher</cit:CI_RoleCode>
+          </cit:role>
+          <cit:party>
+            <cit:CI_Organisation>
+              <cit:name>
+                <gco:CharacterString>FR</gco:CharacterString>
+              </cit:name>
+            </cit:CI_Organisation>
+          </cit:party>
+        </cit:CI_Responsibility>
+      </S100XC:producingAgency>
+      <S100XC:producerCode>FR</S100XC:producerCode>
+      <S100XC:encodingFormat>HDF5</S100XC:encodingFormat>
+      <S100XC:dataCoverage>
+        <S100XC:boundingPolygon>
+          <gex:polygon>
+            <gml:Polygon gml:id="_0dacb664-8902-4a6b-974c-71a59762a782" srsName="urn:ogc:def:crs:EPSG::4326">
+              <gml:exterior>
+                <gml:LinearRing>
+                  <gml:posList>48.67 -2.18 48.67 -2.13 48.72 -2.13 48.72 -2.18 48.67 -2.18</gml:posList>
+                </gml:LinearRing>
+              </gml:exterior>
+            </gml:Polygon>
+          </gex:polygon>
+        </S100XC:boundingPolygon>
+        <S100XC:optimumDisplayScale>12000</S100XC:optimumDisplayScale>
+        <S100XC:maximumDisplayScale>6000</S100XC:maximumDisplayScale>
+        <S100XC:minimumDisplayScale>45000</S100XC:minimumDisplayScale>
+        <S100XC:approximateGridResolution>5</S100XC:approximateGridResolution>
+      </S100XC:dataCoverage>
+      <S100XC:navigationPurpose>port</S100XC:navigationPurpose>
+    </S100XC:S100_DatasetDiscoveryMetadata>
+    <S100XC:S100_DatasetDiscoveryMetadata>
+      <S100XC:fileName>file:/S-102/DATASET_FILES/102FR00SMALOG000005/102FR00SMALOG000005.H5</S100XC:fileName>
+      <S100XC:compressionFlag>false</S100XC:compressionFlag>
+      <S100XC:dataProtection>false</S100XC:dataProtection>
+      <S100XC:digitalSignatureReference>ECDSA-384-SHA2</S100XC:digitalSignatureReference>
+      <S100XC:digitalSignatureValue>
+        <S100SE:S100_SE_SignatureOnData certificateRef="823872f9-0694-41a0-8c68-c5a9b6ddd386" dataStatus="unencrypted" id="f76a55fe-79c3-4da4-b0bf-8d3b2bdf1da3">MGQCMBpWQW5WL/G/SeUCQWLq0qWz3ggT+DKNYxBKgZdkMuZ4oXnQ81MC/QhnDEqjtAc9wgIwS7pk0YFhERZq0SbpSDrRy79CxJNmW91dvAtXnEtTnw9+dMVPqm0f/40AiFxzQRf1</S100SE:S100_SE_SignatureOnData>
+      </S100XC:digitalSignatureValue>
+      <S100XC:copyright>true</S100XC:copyright>
+      <S100XC:classification>
+        <mco:MD_ClassificationCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#MD_ClassificationCode" codeListValue="unclassified" codeSpace="http://standards.iso.org/iso/19115/-3/mco/1.0">unclassified</mco:MD_ClassificationCode>
+      </S100XC:classification>
+      <S100XC:purpose>newDataset</S100XC:purpose>
+      <S100XC:notForNavigation>true</S100XC:notForNavigation>
+      <S100XC:editionNumber>1</S100XC:editionNumber>
+      <S100XC:issueDate>2026-05-26</S100XC:issueDate>
+      <S100XC:boundingBox>
+        <gex:westBoundLongitude>
+          <gco:Decimal>-2.13</gco:Decimal>
+        </gex:westBoundLongitude>
+        <gex:eastBoundLongitude>
+          <gco:Decimal>-2.08</gco:Decimal>
+        </gex:eastBoundLongitude>
+        <gex:southBoundLatitude>
+          <gco:Decimal>48.67</gco:Decimal>
+        </gex:southBoundLatitude>
+        <gex:northBoundLatitude>
+          <gco:Decimal>48.72</gco:Decimal>
+        </gex:northBoundLatitude>
+      </S100XC:boundingBox>
+      <S100XC:productSpecification>
+        <S100XC:name>Bathymetric Surface</S100XC:name>
+        <S100XC:version>3.0</S100XC:version>
+        <S100XC:date>2024-12-27</S100XC:date>
+        <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+        <S100XC:number>215</S100XC:number>
+        <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+      </S100XC:productSpecification>
+      <S100XC:producingAgency>
+        <cit:CI_Responsibility>
+          <cit:role>
+            <cit:CI_RoleCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#CI_RoleCode" codeListValue="publisher" codeSpace="http://standards.iso.org/iso/19115/-3/cit/1.0">publisher</cit:CI_RoleCode>
+          </cit:role>
+          <cit:party>
+            <cit:CI_Organisation>
+              <cit:name>
+                <gco:CharacterString>FR</gco:CharacterString>
+              </cit:name>
+            </cit:CI_Organisation>
+          </cit:party>
+        </cit:CI_Responsibility>
+      </S100XC:producingAgency>
+      <S100XC:producerCode>FR</S100XC:producerCode>
+      <S100XC:encodingFormat>HDF5</S100XC:encodingFormat>
+      <S100XC:dataCoverage>
+        <S100XC:boundingPolygon>
+          <gex:polygon>
+            <gml:Polygon gml:id="_840e7c84-b7f6-41b6-b4fe-54e79ad169c5" srsName="urn:ogc:def:crs:EPSG::4326">
+              <gml:exterior>
+                <gml:LinearRing>
+                  <gml:posList>48.67 -2.13 48.67 -2.08 48.72 -2.08 48.72 -2.13 48.67 -2.13</gml:posList>
+                </gml:LinearRing>
+              </gml:exterior>
+            </gml:Polygon>
+          </gex:polygon>
+        </S100XC:boundingPolygon>
+        <S100XC:optimumDisplayScale>12000</S100XC:optimumDisplayScale>
+        <S100XC:maximumDisplayScale>6000</S100XC:maximumDisplayScale>
+        <S100XC:minimumDisplayScale>45000</S100XC:minimumDisplayScale>
+        <S100XC:approximateGridResolution>5</S100XC:approximateGridResolution>
+      </S100XC:dataCoverage>
+      <S100XC:navigationPurpose>port</S100XC:navigationPurpose>
+    </S100XC:S100_DatasetDiscoveryMetadata>
+    <S100XC:S100_DatasetDiscoveryMetadata>
+      <S100XC:fileName>file:/S-102/DATASET_FILES/102FR00SMALOG000006/102FR00SMALOG000006.H5</S100XC:fileName>
+      <S100XC:compressionFlag>false</S100XC:compressionFlag>
+      <S100XC:dataProtection>false</S100XC:dataProtection>
+      <S100XC:digitalSignatureReference>ECDSA-384-SHA2</S100XC:digitalSignatureReference>
+      <S100XC:digitalSignatureValue>
+        <S100SE:S100_SE_SignatureOnData certificateRef="823872f9-0694-41a0-8c68-c5a9b6ddd386" dataStatus="unencrypted" id="0479da03-b60e-432e-b5cf-d30cba299845">MGUCMQCig7kQQLPbY2v48+3ZMOCfeN+azKjuB9AzT5aQafST2Ck+iWYSBR1DfBDoidlE9jECMHl5nisFIqdHHyYtcvSX8BbUC93CVUKQkjyp21uAgmbAnqlDMo7T51Ls1JmVEkSXcQ==</S100SE:S100_SE_SignatureOnData>
+      </S100XC:digitalSignatureValue>
+      <S100XC:copyright>true</S100XC:copyright>
+      <S100XC:classification>
+        <mco:MD_ClassificationCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#MD_ClassificationCode" codeListValue="unclassified" codeSpace="http://standards.iso.org/iso/19115/-3/mco/1.0">unclassified</mco:MD_ClassificationCode>
+      </S100XC:classification>
+      <S100XC:purpose>newDataset</S100XC:purpose>
+      <S100XC:notForNavigation>true</S100XC:notForNavigation>
+      <S100XC:editionNumber>1</S100XC:editionNumber>
+      <S100XC:issueDate>2026-05-26</S100XC:issueDate>
+      <S100XC:boundingBox>
+        <gex:westBoundLongitude>
+          <gco:Decimal>-2.08</gco:Decimal>
+        </gex:westBoundLongitude>
+        <gex:eastBoundLongitude>
+          <gco:Decimal>-2.03</gco:Decimal>
+        </gex:eastBoundLongitude>
+        <gex:southBoundLatitude>
+          <gco:Decimal>48.67</gco:Decimal>
+        </gex:southBoundLatitude>
+        <gex:northBoundLatitude>
+          <gco:Decimal>48.72</gco:Decimal>
+        </gex:northBoundLatitude>
+      </S100XC:boundingBox>
+      <S100XC:productSpecification>
+        <S100XC:name>Bathymetric Surface</S100XC:name>
+        <S100XC:version>3.0</S100XC:version>
+        <S100XC:date>2024-12-27</S100XC:date>
+        <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+        <S100XC:number>215</S100XC:number>
+        <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+      </S100XC:productSpecification>
+      <S100XC:producingAgency>
+        <cit:CI_Responsibility>
+          <cit:role>
+            <cit:CI_RoleCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#CI_RoleCode" codeListValue="publisher" codeSpace="http://standards.iso.org/iso/19115/-3/cit/1.0">publisher</cit:CI_RoleCode>
+          </cit:role>
+          <cit:party>
+            <cit:CI_Organisation>
+              <cit:name>
+                <gco:CharacterString>FR</gco:CharacterString>
+              </cit:name>
+            </cit:CI_Organisation>
+          </cit:party>
+        </cit:CI_Responsibility>
+      </S100XC:producingAgency>
+      <S100XC:producerCode>FR</S100XC:producerCode>
+      <S100XC:encodingFormat>HDF5</S100XC:encodingFormat>
+      <S100XC:dataCoverage>
+        <S100XC:boundingPolygon>
+          <gex:polygon>
+            <gml:Polygon gml:id="_ccc04a1d-809e-4908-8fd3-095a722b732f" srsName="urn:ogc:def:crs:EPSG::4326">
+              <gml:exterior>
+                <gml:LinearRing>
+                  <gml:posList>48.67 -2.08 48.67 -2.03 48.72 -2.03 48.72 -2.08 48.67 -2.08</gml:posList>
+                </gml:LinearRing>
+              </gml:exterior>
+            </gml:Polygon>
+          </gex:polygon>
+        </S100XC:boundingPolygon>
+        <S100XC:optimumDisplayScale>12000</S100XC:optimumDisplayScale>
+        <S100XC:maximumDisplayScale>6000</S100XC:maximumDisplayScale>
+        <S100XC:minimumDisplayScale>45000</S100XC:minimumDisplayScale>
+        <S100XC:approximateGridResolution>5</S100XC:approximateGridResolution>
+      </S100XC:dataCoverage>
+      <S100XC:navigationPurpose>port</S100XC:navigationPurpose>
+    </S100XC:S100_DatasetDiscoveryMetadata>
+    <S100XC:S100_DatasetDiscoveryMetadata>
+      <S100XC:fileName>file:/S-102/DATASET_FILES/102FR00SMALOG000007/102FR00SMALOG000007.H5</S100XC:fileName>
+      <S100XC:compressionFlag>false</S100XC:compressionFlag>
+      <S100XC:dataProtection>false</S100XC:dataProtection>
+      <S100XC:digitalSignatureReference>ECDSA-384-SHA2</S100XC:digitalSignatureReference>
+      <S100XC:digitalSignatureValue>
+        <S100SE:S100_SE_SignatureOnData certificateRef="823872f9-0694-41a0-8c68-c5a9b6ddd386" dataStatus="unencrypted" id="1aa13070-3372-42cc-b19c-330c83e726cc">MGQCLx9OVJlePd6ON54SaEuGkm18JeRfofvb0K0ktSogoWoBSIhZA3rVHQeaa3ZBGWS1AjEAvEwgeetM/87al8EJFKwx7XGT75QBaK+B/UcTNAHvwjfhfAvugdTMzvQDuZlr6RS6</S100SE:S100_SE_SignatureOnData>
+      </S100XC:digitalSignatureValue>
+      <S100XC:copyright>true</S100XC:copyright>
+      <S100XC:classification>
+        <mco:MD_ClassificationCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#MD_ClassificationCode" codeListValue="unclassified" codeSpace="http://standards.iso.org/iso/19115/-3/mco/1.0">unclassified</mco:MD_ClassificationCode>
+      </S100XC:classification>
+      <S100XC:purpose>newDataset</S100XC:purpose>
+      <S100XC:notForNavigation>true</S100XC:notForNavigation>
+      <S100XC:editionNumber>1</S100XC:editionNumber>
+      <S100XC:issueDate>2026-05-26</S100XC:issueDate>
+      <S100XC:boundingBox>
+        <gex:westBoundLongitude>
+          <gco:Decimal>-2.03</gco:Decimal>
+        </gex:westBoundLongitude>
+        <gex:eastBoundLongitude>
+          <gco:Decimal>-1.98</gco:Decimal>
+        </gex:eastBoundLongitude>
+        <gex:southBoundLatitude>
+          <gco:Decimal>48.67</gco:Decimal>
+        </gex:southBoundLatitude>
+        <gex:northBoundLatitude>
+          <gco:Decimal>48.72</gco:Decimal>
+        </gex:northBoundLatitude>
+      </S100XC:boundingBox>
+      <S100XC:productSpecification>
+        <S100XC:name>Bathymetric Surface</S100XC:name>
+        <S100XC:version>3.0</S100XC:version>
+        <S100XC:date>2024-12-27</S100XC:date>
+        <S100XC:productIdentifier>S-102</S100XC:productIdentifier>
+        <S100XC:number>215</S100XC:number>
+        <S100XC:compliancyCategory>category4</S100XC:compliancyCategory>
+      </S100XC:productSpecification>
+      <S100XC:producingAgency>
+        <cit:CI_Responsibility>
+          <cit:role>
+            <cit:CI_RoleCode codeList="https://standards.iso.org/iso/19115/resources/Codelists/cat/codelists.xml#CI_RoleCode" codeListValue="publisher" codeSpace="http://standards.iso.org/iso/19115/-3/cit/1.0">publisher</cit:CI_RoleCode>
+          </cit:role>
+          <cit:party>
+            <cit:CI_Organisation>
+              <cit:name>
+                <gco:CharacterString>FR</gco:CharacterString>
+              </cit:name>
+            </cit:CI_Organisation>
+          </cit:party>
+        </cit:CI_Responsibility>
+      </S100XC:producingAgency>
+      <S100XC:producerCode>FR</S100XC:producerCode>
+      <S100XC:encodingFormat>HDF5</S100XC:encodingFormat>
+      <S100XC:dataCoverage>
+        <S100XC:boundingPolygon>
+          <gex:polygon>
+            <gml:Polygon gml:id="_c4e4fbb9-df4f-4a2a-9a77-ba80fe93372a" srsName="urn:ogc:def:crs:EPSG::4326">
+              <gml:exterior>
+                <gml:LinearRing>
+                  <gml:posList>48.67 -2.03 48.67 -1.98 48.72 -1.98 48.72 -2.03 48.67 -2.03</gml:posList>
+                </gml:LinearRing>
+              </gml:exterior>
+            </gml:Polygon>
+          </gex:polygon>
+        </S100XC:boundingPolygon>
+        <S100XC:optimumDisplayScale>12000</S100XC:optimumDisplayScale>
+        <S100XC:maximumDisplayScale>6000</S100XC:maximumDisplayScale>
+        <S100XC:minimumDisplayScale>45000</S100XC:minimumDisplayScale>
+        <S100XC:approximateGridResolution>5</S100XC:approximateGridResolution>
+      </S100XC:dataCoverage>
+      <S100XC:navigationPurpose>port</S100XC:navigationPurpose>
+    </S100XC:S100_DatasetDiscoveryMetadata>
+  </S100XC:datasetDiscoveryMetadata>
+
+  <S100XC:supportFileDiscoveryMetadata/>
+
+  <S100XC:catalogueDiscoveryMetadata/>
+
+</S100XC:S100_ExchangeCatalogue>

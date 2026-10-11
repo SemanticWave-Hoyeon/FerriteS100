@@ -2,7 +2,7 @@
 //!
 //! Supports two parsing modes:
 //! 1. `Iso8211Parser` - Traditional in-memory parsing (Vec<u8>)
-//! 2. `MmapIso8211Parser` - Zero-copy memory-mapped parsing (3-10x faster for large files)
+//! 2. `MmapIso8211Parser` - Explicit unsafe mapping for caller-guaranteed immutable files
 
 use std::fs::File;
 use std::io::Read;
@@ -19,13 +19,51 @@ pub struct Iso8211Parser {
 }
 
 impl Iso8211Parser {
-    /// Create parser from file path (reads entire file into memory)
+    /// Capture externally mutable input into bounded owned bytes.
+    /// This is not an atomic read or an authentication guarantee.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
+        Self::from_file_bounded(path, 512 * 1024 * 1024)
+    }
 
-        Ok(Iso8211Parser { data, position: 0 })
+    /// Capture at most `max_bytes`; probe one extra byte on the stack, never
+    /// append it or trust metadata alone. Uses the current S-101 512 MiB default.
+    pub fn from_file_bounded<P: AsRef<Path>>(path: P, max_bytes: usize) -> Result<Self> {
+        let file = File::open(path)?;
+        let hint = file.metadata()?.len();
+        if hint > max_bytes as u64 {
+            return Err(Iso8211Error::Parse(
+                "ISO 8211 input byte budget exceeded".into(),
+            ));
+        }
+        Self::capture_bounded(file, max_bytes, hint as usize)
+    }
+
+    fn capture_bounded(mut file: impl Read, max_bytes: usize, hint: usize) -> Result<Self> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(hint)
+            .map_err(|_| Iso8211Error::Parse("ISO 8211 owned input allocation failed".into()))?;
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let remaining = max_bytes - data.len();
+            if remaining == 0 {
+                let mut extra = [0u8; 1];
+                if file.read(&mut extra)? != 0 {
+                    return Err(Iso8211Error::Parse(
+                        "ISO 8211 input byte budget exceeded".into(),
+                    ));
+                }
+                break;
+            }
+            let count = file.read(&mut chunk[..remaining.min(64 * 1024)])?;
+            if count == 0 {
+                break;
+            }
+            data.try_reserve_exact(count).map_err(|_| {
+                Iso8211Error::Parse("ISO 8211 owned input allocation failed".into())
+            })?;
+            data.extend_from_slice(&chunk[..count]);
+        }
+        Ok(Self { data, position: 0 })
     }
 
     /// Create parser from bytes
@@ -152,11 +190,13 @@ pub struct MmapIso8211Parser {
 // - Mmap is Send (OS guarantees thread-safe memory mapping)
 // - We only read from the mapped memory, never write
 // - The data pointer is derived from the Mmap and valid for its lifetime
+// - The unsafe constructor requires external file immutability for that lifetime
 unsafe impl Send for MmapIso8211Parser {}
 
 // Safety: MmapIso8211Parser is Sync because:
 // - All access is read-only
 // - Multiple readers can safely access mmap concurrently
+// - The unsafe constructor requires external file immutability for that lifetime
 unsafe impl Sync for MmapIso8211Parser {}
 
 impl MmapIso8211Parser {
@@ -168,12 +208,15 @@ impl MmapIso8211Parser {
     /// - 3-10x faster than `Iso8211Parser::from_file()` for large files
     ///
     /// # Safety
-    /// The file should not be modified while the parser exists.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+    /// Caller must guarantee that the mapped file is not modified, truncated,
+    /// or otherwise invalidated by any thread/process for the entire parser
+    /// lifetime (including every borrowed slice). An open file descriptor alone
+    /// does not provide that guarantee. Use `Iso8211Parser::from_file` for untrusted input.
+    pub unsafe fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
 
-        // Safety: We're only reading the file, and it's kept open
-        // for the lifetime of the Mmap
+        // Safety: upheld by this unsafe constructor's caller contract;
+        // read-only access and an open descriptor alone are insufficient.
         let mmap = unsafe { Mmap::map(&file)? };
 
         let data = mmap.as_ptr();
@@ -303,5 +346,61 @@ mod tests {
         let parser = Iso8211Parser::from_bytes(vec![]);
         assert!(parser.is_empty());
         assert!(parser.is_eof());
+    }
+}
+
+#[cfg(test)]
+mod owned_input_controls {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferrite-owned-{}-{}.bin",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+    #[test]
+    fn overwrite_and_truncate_after_construction_preserve_owned_bytes() {
+        let path = path();
+        let original = vec![b'x'; 128];
+        std::fs::write(&path, &original).unwrap();
+        let parser = Iso8211Parser::from_file(&path).unwrap();
+        std::fs::write(&path, b"changed").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_eq!(parser.remaining(), original.as_slice());
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn exact_limit_and_one_extra_byte_admission() {
+        let path = path();
+        std::fs::write(&path, [1u8; 8]).unwrap();
+        assert_eq!(Iso8211Parser::from_file_bounded(&path, 8).unwrap().len(), 8);
+        assert!(Iso8211Parser::from_file_bounded(&path, 7).is_err());
+        std::fs::write(&path, []).unwrap();
+        assert!(Iso8211Parser::from_file_bounded(&path, 0)
+            .unwrap()
+            .is_empty());
+        std::fs::write(&path, [1]).unwrap();
+        assert!(Iso8211Parser::from_file_bounded(&path, 0).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn stale_metadata_hint_cannot_allow_read_beyond_limit() {
+        let bytes = std::io::Cursor::new(vec![9u8; 9]);
+        assert!(Iso8211Parser::capture_bounded(bytes, 8, 0).is_err());
+        let bytes = std::io::Cursor::new(vec![9u8; 8]);
+        assert_eq!(
+            Iso8211Parser::capture_bounded(bytes, 8, 0)
+                .unwrap()
+                .remaining(),
+            &[9u8; 8]
+        );
     }
 }

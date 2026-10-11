@@ -11,6 +11,8 @@ mod color;
 mod context;
 mod error;
 mod instruction;
+mod retained_path_cache;
+pub use retained_path_cache::RetainedPathCacheStats;
 mod intern;
 mod scaler;
 
@@ -26,8 +28,8 @@ pub use raster::*;
 
 mod selection;
 pub use selection::{
-    hit_geometry, hit_geometry_visible, hit_geometry_wrapped_visible, GeometryHit,
-    WrappedGeometryHit,
+    hit_geometry, hit_geometry_visible, hit_geometry_wrapped_visible,
+    hit_geometry_wrapped_visible_in_context, GeometryHit, WrappedGeometryHit,
 };
 
 mod area_relation_identity;
@@ -36,7 +38,7 @@ mod line_relation_identity;
 pub use line_relation_identity::StaticLineRelationEpoch;
 mod suppression;
 pub use suppression::{
-    instruction_visible, LineSpan, LineSuppressionCache, LineSuppressionPlan,
+    instruction_visible, LineEligibilityWork, LineSpan, LineSuppressionCache, LineSuppressionPlan,
     PreparedLineSuppression,
 };
 

@@ -15,6 +15,22 @@ pub struct ShallowPatternContract {
     plane: DisplayPlane,
 }
 impl ShallowPatternContract {
+    /// Exact independent selector contract identity; sharing a resource cache
+    /// must not merge different optionality/provenance permissions.
+    pub fn same_bound_contract(&self, other: &Self) -> bool {
+        self.digest == other.digest
+            && self.group == other.group
+            && self.fill_reference == other.fill_reference
+            && self.symbol == other.symbol
+            && self.crs == other.crs
+            && self.priority == other.priority
+            && self.plane == other.plane
+            && self.v1.0.to_bits() == other.v1.0.to_bits()
+            && self.v1.1.to_bits() == other.v1.1.to_bits()
+            && self.v2.0.to_bits() == other.v2.0.to_bits()
+            && self.v2.1.to_bits() == other.v2.1.to_bits()
+    }
+
     /// Bind a product adapter's independently audited selector profile to exact
     /// immutable PC rules, selector group and resolved SymbolFill resource.
     /// This checks provenance/shape; the adapter owns product optionality semantics.
@@ -116,6 +132,20 @@ mod tests {
             priority: 9,
             plane: DisplayPlane::UnderRadar,
         }
+    }
+    #[test]
+    fn sharing_requires_complete_exact_selector_permission() {
+        let a = contract();
+        assert!(a.same_bound_contract(&a.clone()));
+        let mut b = a.clone();
+        b.v1.1 = -0.;
+        assert!(!a.same_bound_contract(&b));
+        let mut b = a.clone();
+        b.digest[0] ^= 1;
+        assert!(!a.same_bound_contract(&b));
+        let mut b = a.clone();
+        b.group += 1;
+        assert!(!a.same_bound_contract(&b));
     }
     fn area(fill: &str, symbol: &str, group: u32) -> DrawingInstruction {
         let mut area = AreaInstruction::new(vec![

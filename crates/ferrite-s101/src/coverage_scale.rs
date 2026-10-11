@@ -1,10 +1,10 @@
 //! S-101 DataCoverage scale attributes, preserving each coverage feature.
 //! Dataset polygon selection and obscuring masks are a separate operation.
 use anyhow::{ensure, Context, Result};
-use ferrite_kernel::scale_policy::CoverageScaleRange;
+use ferrite_kernel::scale_policy::{CoverageScaleRange, SCALE_BAND_OPTIMUM_DENOMINATORS};
 use ferrite_s100_core::{Attribute, FeatureRecord, S101Cell};
 
-fn denominator(attributes: &[Attribute], code: &str) -> Result<u32> {
+fn required_attribute<'a>(attributes: &'a [Attribute], code: &str) -> Result<&'a Attribute> {
     let mut found = attributes
         .iter()
         .filter(|a| a.code.as_deref() == Some(code));
@@ -13,6 +13,21 @@ fn denominator(attributes: &[Attribute], code: &str) -> Result<u32> {
         .with_context(|| format!("Missing DataCoverage {code}"))?;
     ensure!(found.next().is_none(), "Repeated DataCoverage {code}");
     ensure!(attribute.paix == 0, "Nested DataCoverage {code}");
+    Ok(attribute)
+}
+
+fn denominator(attributes: &[Attribute], code: &str) -> Result<u32> {
+    let attribute = required_attribute(attributes, code)?;
+    // S-100 Part 10a, 10a-5.1.4: ATVL integers use decimal digits without
+    // a positive sign or non-significant zeros. A scale denominator is positive.
+    let bytes = attribute.atvl.as_bytes();
+    ensure!(
+        !bytes.is_empty()
+            && bytes.iter().all(u8::is_ascii_digit)
+            && (bytes.len() == 1 || bytes[0] != b'0'),
+        "Invalid DataCoverage {code} integer encoding: {:?}",
+        attribute.atvl
+    );
     let value: u32 = attribute
         .atvl
         .parse()
@@ -26,12 +41,36 @@ pub fn feature_scale(feature: &FeatureRecord) -> Result<Option<CoverageScaleRang
     if feature.feature_code.as_deref() != Some("DataCoverage") {
         return Ok(None);
     }
+    // S-101 DCEG 3.5.1 Table 3-2: the mandatory minimum field may contain
+    // an empty (null) value. Absence, whitespace and a numeric zero are not null.
+    let minimum = required_attribute(&feature.attributes, "minimumDisplayScale")?;
+    let minimum_denominator = if minimum.atvl.is_empty() {
+        None
+    } else {
+        Some(denominator(&feature.attributes, "minimumDisplayScale")?)
+    };
     let scales = CoverageScaleRange {
-        minimum_denominator: Some(denominator(&feature.attributes, "minimumDisplayScale")?),
+        minimum_denominator,
         optimum_denominator: denominator(&feature.attributes, "optimumDisplayScale")?,
         maximum_denominator: denominator(&feature.attributes, "maximumDisplayScale")?,
     };
     scales.validate()?;
+    ensure!(
+        SCALE_BAND_OPTIMUM_DENOMINATORS.contains(&scales.optimum_denominator),
+        "Non-standard DataCoverage optimumDisplayScale {}",
+        scales.optimum_denominator
+    );
+    if let Some(minimum) = scales.minimum_denominator {
+        ensure!(
+            SCALE_BAND_OPTIMUM_DENOMINATORS[..14].contains(&minimum),
+            "Non-standard DataCoverage minimumDisplayScale {minimum}"
+        );
+        // The DCEG permits maximum <= optimum, but requires optimum < minimum.
+        ensure!(
+            minimum > scales.optimum_denominator,
+            "DataCoverage minimum display scale must be smaller than optimum display scale"
+        );
+    }
     Ok(Some(scales))
 }
 
@@ -140,6 +179,41 @@ mod tests {
         assert!(reference_scale(&[(1, a), (2, wrong)]).is_err());
     }
     #[test]
+    fn scale_integer_encoding_is_canonical_for_each_attribute() {
+        for index in 0..3 {
+            for value in [
+                "+90000",
+                "090000",
+                "00",
+                " 90000",
+                "90000 ",
+                "9e4",
+                "９００００",
+            ] {
+                let mut f = feature();
+                f.attributes[index].atvl = value.into();
+                let error = feature_scale(&f).unwrap_err().to_string();
+                assert!(
+                    error.contains("integer encoding"),
+                    "attribute {index}: {value:?}: {error}"
+                );
+            }
+            let mut f = feature();
+            f.attributes[index].atvl = "0".into();
+            assert!(feature_scale(&f).unwrap_err().to_string().contains("Zero"));
+            f.attributes[index].atvl = "4294967296".into();
+            assert!(feature_scale(&f).is_err());
+        }
+        assert!(feature_scale(&feature()).unwrap().is_some());
+        let mut f = feature();
+        f.attributes[0].atvl.clear();
+        assert_eq!(
+            feature_scale(&f).unwrap().unwrap().minimum_denominator,
+            None
+        );
+    }
+
+    #[test]
     fn coverage_ranges_do_not_become_instruction_visibility_limits() {
         let range = feature_scale(&feature()).unwrap().unwrap();
         assert!(range.within_minimum(90000.).unwrap());
@@ -147,6 +221,80 @@ mod tests {
         let overscale = range.overscale(11999., true).unwrap();
         assert!(overscale.indicator_required && overscale.pattern_required);
         assert!(!range.overscale(12000., true).unwrap().pattern_required);
+    }
+    #[test]
+    fn mandatory_empty_minimum_preserves_global_coverage_at_small_scales() {
+        let mut f = feature();
+        f.attributes[0].atvl.clear();
+        f.attributes[1].atvl = "10000000".into();
+        f.attributes[2].atvl = "5000000".into();
+        let global = feature_scale(&f).unwrap().unwrap();
+        assert_eq!(global.minimum_denominator, None);
+        assert!(global.within_minimum(20_000_000.).unwrap());
+        assert_eq!(global.scale_bands().unwrap(), 1);
+        assert_eq!(reference_scale(&[(1, global)]).unwrap(), Some(10000000));
+        let regional = CoverageScaleRange {
+            optimum_denominator: 3500000,
+            maximum_denominator: 1750000,
+            ..global
+        };
+        assert_eq!(
+            reference_scale(&[(1, global), (2, regional)]).unwrap(),
+            Some(3500000)
+        );
+        let non_null = CoverageScaleRange {
+            minimum_denominator: Some(10000000),
+            ..regional
+        };
+        assert!(reference_scale(&[(1, global), (2, non_null)]).is_err());
+    }
+    #[test]
+    fn null_is_not_missing_zero_whitespace_or_textual_null() {
+        for value in ["0", " ", "NULL", "-1"] {
+            let mut f = feature();
+            f.attributes[0].atvl = value.into();
+            assert!(feature_scale(&f).is_err(), "{value:?}");
+        }
+        let mut f = feature();
+        f.attributes.remove(0);
+        assert!(feature_scale(&f)
+            .unwrap_err()
+            .to_string()
+            .contains("Missing"));
+        let mut f = feature();
+        f.attributes[0].atvl.clear();
+        f.attributes[0].paix = 1;
+        assert!(feature_scale(&f).is_err());
+        let mut f = feature();
+        f.attributes[0].atvl.clear();
+        f.attributes.push(f.attributes[0].clone());
+        assert!(feature_scale(&f).is_err());
+        for index in [1, 2] {
+            let mut f = feature();
+            f.attributes[index].atvl.clear();
+            assert!(feature_scale(&f).is_err());
+        }
+    }
+    #[test]
+    fn prescribed_denominators_and_strict_minimum_order_are_product_rules() {
+        for (minimum, optimum, maximum, accepted) in [
+            ("2000", "1000", "799", true),
+            ("90000", "45000", "45000", true),
+            ("1000", "1000", "799", false),
+            ("5000", "4000", "2000", false),
+            ("90000", "5000", "2000", false),
+            ("45000", "45000", "22000", false),
+        ] {
+            let mut f = feature();
+            for (attribute, value) in f.attributes.iter_mut().zip([minimum, optimum, maximum]) {
+                attribute.atvl = value.into();
+            }
+            assert_eq!(
+                feature_scale(&f).is_ok(),
+                accepted,
+                "{minimum}/{optimum}/{maximum}"
+            );
+        }
     }
     #[test]
     fn missing_nested_duplicate_unknown_and_inverted_ranges_are_rejected() {
@@ -164,7 +312,7 @@ mod tests {
                     f.attributes.push(f.attributes[0].clone());
                 }
                 3 => {
-                    f.attributes[0].atvl.clear();
+                    f.attributes[1].atvl.clear();
                 }
                 4 => {
                     f.attributes[2].atvl = "50000".into();

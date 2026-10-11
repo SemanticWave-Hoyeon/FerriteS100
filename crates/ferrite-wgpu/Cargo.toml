@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 description = "wgpu-based renderer for S-100 charts"
 
+[features]
+s102-portrayal = ["dep:ferrite-s102"]
+lua54 = ["ferrite-s102?/lua54"]
+lua55 = ["ferrite-s102?/lua55"]
+
 [dependencies]
 ferrite-kernel.workspace = true
 thiserror.workspace = true
@@ -25,11 +30,18 @@ earcutr.workspace = true  # Polygon triangulation
 resvg.workspace = true  # SVG rendering
 
 # GUI
+ab_glyph = "=0.2.32"
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 # Internal crates
 ferrite-render = { workspace = true }
 ferrite-portrayal-catalog = { workspace = true }
+ferrite-s421 = { path = "../ferrite-s421" }
+serde.workspace = true
+
+# Typed S102 material owner; preserve workspace-selected Lua backend.
+ferrite-s102 = { path = "../ferrite-s102", default-features = false, optional = true }

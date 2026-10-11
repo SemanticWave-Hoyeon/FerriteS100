@@ -5,9 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ferrite_iso8211::{
-    read_string, tags, Iso8211Parser, MmapIso8211Parser, RawField, DR, FIELD_TERMINATOR,
-};
+use ferrite_iso8211::{read_string, tags, Iso8211Parser, RawField, DR, FIELD_TERMINATOR};
 
 use crate::{
     Attribute, CodeMapping, CompositeCurveRecord, Coordinate, CurveRecord, CurveSegment,
@@ -166,6 +164,18 @@ impl S101Cell {
             .collect();
         validate_update_metadata(&base_metadata, &base_metadata)?;
         let mut store = S100RecordStore::from_base(base_records, limits)?;
+        let mut feature_types = CodeMapping::default();
+        for field in base_metadata
+            .iter()
+            .flat_map(|r| &r.fields)
+            .filter(|f| f.tag == "FTCS")
+        {
+            strict_update_code_field(&field.data, &mut feature_types)?;
+        }
+        let mut coverage_guard = crate::coverage_update::CoverageUpdateGuard::capture(
+            &store,
+            feature_types.str_to_num.get("DataCoverage").copied(),
+        )?;
         for (index, path) in updates.iter().enumerate() {
             let mut parser = bounded_update_parser(path, limits.max_dataset_bytes)?;
             hash_chain_input(
@@ -206,6 +216,7 @@ impl S101Cell {
                 }
             }
             store.apply_records(&data)?;
+            coverage_guard.verify_after(&store, &data)?;
             number = next_number;
         }
         store.validate_references()?;
@@ -220,14 +231,14 @@ impl S101Cell {
             },
         ))
     }
-    /// Load cell from file using memory-mapped I/O (zero-copy, 3-10x faster)
+    /// Load cell from bounded owned bytes, safe against later file changes.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::load_from(path.as_ref(), path.as_ref())
     }
 
     /// Parse a retained private snapshot while preserving the original dataset identity.
     pub fn load_from(source: &Path, data_path: &Path) -> Result<Self> {
-        Self::parse_mapped(source, MmapIso8211Parser::from_file(data_path)?)
+        Self::load_from_with_identity(source, data_path).map(|(cell, _)| cell)
     }
 
     /// Capture a cell's input once, then hash and parse the same owned bytes.
@@ -238,7 +249,13 @@ impl S101Cell {
         source: &Path,
         data_path: &Path,
     ) -> Result<(Self, CellSourceIdentity)> {
-        Self::parse_owned_with_identity(source, Iso8211Parser::from_file(data_path)?)
+        Self::parse_owned_with_identity(
+            source,
+            Iso8211Parser::from_file_bounded(
+                data_path,
+                crate::updates::UpdateLimits::default().max_dataset_bytes,
+            )?,
+        )
     }
 
     fn parse_owned_with_identity(
@@ -254,13 +271,6 @@ impl S101Cell {
         drop(parser);
         let cell = Self::parse_records(source, records)?;
         Ok((cell, identity))
-    }
-
-    fn parse_mapped(source: &Path, mut parser: MmapIso8211Parser) -> Result<Self> {
-        let path = source;
-        tracing::info!("Loading S-101 cell (mmap): {}", path.display());
-        let (_ddr, records) = parser.read_all()?;
-        Self::parse_records(source, records)
     }
 
     fn parse_records(source: &Path, records: Vec<DR>) -> Result<Self> {
@@ -859,11 +869,7 @@ impl S101Cell {
 
         for cuco_field in dr.find_fields(tags::CUCO) {
             let cuco_data = cuco_field.data_trimmed();
-            if !cuco_data.len().is_multiple_of(6) {
-                return Err(S100Error::InvalidFieldData(
-                    "Truncated curve component".into(),
-                ));
-            }
+            validate_curve_association_field(cuco_data, false)?;
             let mut offset = 0;
 
             // CUCO format (6 bytes per entry):
@@ -920,11 +926,7 @@ impl S101Cell {
 
         for rias_field in dr.find_fields(tags::RIAS) {
             let rias_data = rias_field.data_trimmed();
-            if !rias_data.len().is_multiple_of(8) {
-                return Err(S100Error::InvalidFieldData(
-                    "Truncated ring association".into(),
-                ));
-            }
+            validate_curve_association_field(rias_data, true)?;
             let mut offset = 0;
 
             // RIAS format (8 bytes per entry):
@@ -1740,17 +1742,7 @@ fn hash_chain_input(
 }
 
 fn bounded_update_parser(path: &Path, max: usize) -> Result<Iso8211Parser> {
-    use std::io::Read;
-    let mut data = Vec::new();
-    std::fs::File::open(path)?
-        .take((max as u64).saturating_add(1))
-        .read_to_end(&mut data)?;
-    if data.len() > max {
-        return Err(S100Error::InvalidRecord(
-            "Update-chain input byte budget exceeded".into(),
-        ));
-    }
-    Ok(Iso8211Parser::from_bytes(data))
+    Ok(Iso8211Parser::from_file_bounded(path, max)?)
 }
 fn parse_edition(s: &str) -> Result<(u16, u16)> {
     let parts: Vec<_> = s.split('.').collect();
@@ -2231,6 +2223,71 @@ mod update_materialization_tests {
         assert_eq!(associations[0].attributes[0].atvl, "good");
     }
     #[test]
+    fn invalid_curve_direction_or_target_is_not_interpreted_as_reverse() {
+        for (name, id_value, orientation) in [
+            (120, 1u32, 0),
+            (125, 1, 255),
+            (130, 1, 1),
+            (120, 0, 1),
+            (120, u32::MAX, 1),
+        ] {
+            let mut tuple = vec![name];
+            tuple.extend(id_value.to_le_bytes());
+            tuple.push(orientation);
+            let record = dr(vec![id("CCID", 125, 2), field("CUCO", tuple)]);
+            assert!(S101Cell::parse_records(Path::new("fixture.000"), vec![record]).is_err());
+        }
+    }
+    #[test]
+    fn invalid_ring_usage_or_delete_cannot_disappear_from_a_base_surface() {
+        for (orientation, usage, instruction) in [
+            (0, 1, 1),
+            (255, 1, 1),
+            (1, 0, 1),
+            (1, 3, 1),
+            (1, 1, 0),
+            (1, 1, 2),
+        ] {
+            let record = dr(vec![
+                id("SRID", 130, 2),
+                field(
+                    "RIAS",
+                    vec![120, 1, 0, 0, 0, orientation, usage, instruction],
+                ),
+            ]);
+            assert!(S101Cell::parse_records(Path::new("fixture.000"), vec![record]).is_err());
+        }
+    }
+    #[test]
+    fn valid_curve_and_ring_directions_and_usages_are_preserved() {
+        for orientation in [1, 2] {
+            let composite = dr(vec![
+                id("CCID", 125, 2),
+                field("CUCO", vec![120, 1, 0, 0, 0, orientation]),
+            ]);
+            let cell = S101Cell::parse_records(Path::new("fixture.000"), vec![composite]).unwrap();
+            assert_eq!(
+                cell.composite_curves[&RecordId::new(125, 2).key()].curves[0].orientation,
+                orientation == 1
+            );
+            for usage in [1, 2] {
+                let surface = dr(vec![
+                    id("SRID", 130, 3),
+                    field("RIAS", vec![120, 1, 0, 0, 0, orientation, usage, 1]),
+                ]);
+                let cell =
+                    S101Cell::parse_records(Path::new("fixture.000"), vec![surface]).unwrap();
+                let surface = &cell.surfaces[&RecordId::new(130, 3).key()];
+                let curves = if usage == 1 {
+                    &surface.exterior_ring
+                } else {
+                    &surface.interior_rings[0]
+                };
+                assert_eq!(curves[0].orientation, orientation == 1);
+            }
+        }
+    }
+    #[test]
     fn complete_materialization_preserves_segment_and_component_streams() {
         let curve = dr(vec![
             id("CRID", 120, 1),
@@ -2437,6 +2494,61 @@ fn parse_typed_identifier(data: &[u8], expected_type: u8) -> Result<(u32, u16, u
         data[9],
     ))
 }
+// Validate before interpreting orientation or dropping unknown ring usages.
+// Part 10a 7.2.5.2.3 / 7.2.6.2.2 / 7.3.2.3. Update commands must first
+// pass through the record store; a materialized cell contains insert tuples.
+fn validate_materialized_spatial_reference(d: &[u8], curve: bool) -> Result<()> {
+    let id = u32::from_le_bytes(d[1..5].try_into().unwrap());
+    if id == 0
+        || id == u32::MAX
+        || if curve {
+            !matches!(d[0], 120 | 125)
+        } else {
+            !matches!(d[0], 110 | 115 | 120 | 125 | 130)
+        }
+    {
+        return Err(S100Error::InvalidFieldData(
+            "Invalid spatial association target".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_curve_association_field(data: &[u8], ring: bool) -> Result<()> {
+    let width = if ring { 8 } else { 6 };
+    if !data.len().is_multiple_of(width) {
+        return Err(S100Error::InvalidFieldData(
+            "Truncated curve/ring association".into(),
+        ));
+    }
+    for d in data.chunks_exact(width) {
+        validate_materialized_spatial_reference(d, true)?;
+        if !matches!(d[5], 1 | 2) || (ring && (!matches!(d[6], 1 | 2) || d[7] != 1)) {
+            return Err(S100Error::InvalidFieldData(
+                "Invalid or unmaterialized curve/ring association".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_materialized_spas(data: &[u8]) -> Result<()> {
+    if !data.len().is_multiple_of(15) {
+        return Err(S100Error::InvalidFieldData(
+            "Truncated spatial association".into(),
+        ));
+    }
+    for d in data.as_chunks::<15>().0 {
+        validate_materialized_spatial_reference(d, false)?;
+        if !matches!(d[5], 1 | 2 | 255) || d[14] != 1 {
+            return Err(S100Error::InvalidFieldData(
+                "Invalid or unmaterialized spatial association".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_spas(data: &[u8]) -> Result<Vec<SpatialAssociation>> {
     let data = data.strip_suffix(&[FIELD_TERMINATOR]).unwrap_or(data);
     if !data.len().is_multiple_of(15) {
@@ -2444,6 +2556,7 @@ fn parse_spas(data: &[u8]) -> Result<Vec<SpatialAssociation>> {
             "SPAS length is not a multiple of 15".into(),
         ));
     }
+    validate_materialized_spas(data)?;
     let nullable_scale = |v: u32| {
         if v == 0 || v == u32::MAX {
             None
@@ -2498,6 +2611,29 @@ mod identifier_tests {
             assert_eq!(associations[0].spatial_id, RecordId::new(120, 7));
             assert_eq!(associations[0].ornt, 2);
             assert_eq!(associations[0].update_instruction, 1);
+        }
+    }
+    #[test]
+    fn spatial_association_rejects_invalid_target_orientation_and_unapplied_delete() {
+        let valid = [120, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        for (offset, value) in [
+            (0, 100),
+            (1, 0),
+            (5, 0),
+            (5, 3),
+            (5, 254),
+            (14, 0),
+            (14, 2),
+            (14, 3),
+        ] {
+            let mut tuple = valid;
+            tuple[offset] = value;
+            assert!(parse_spas(&tuple).is_err());
+        }
+        for orientation in [1, 2, 255] {
+            let mut tuple = valid;
+            tuple[5] = orientation;
+            assert_eq!(parse_spas(&tuple).unwrap()[0].ornt, orientation as i8);
         }
     }
     #[test]
@@ -2685,6 +2821,14 @@ mod owned_source_identity_tests {
         let b = dataset("Replacement B with a different length");
         std::fs::write(&path, &a).unwrap();
         let captured = Iso8211Parser::from_file(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_eq!(captured.remaining(), a.as_slice());
+
         std::fs::write(&path, &b).unwrap();
         let (later, later_identity) = S101Cell::load_from_with_identity(&path, &path).unwrap();
         assert_eq!(
@@ -2846,7 +2990,11 @@ mod owned_source_identity_tests {
         let a = temp.0.join("private.001");
         let b = temp.0.join("private.002");
         let source = temp.0.join("original.000");
-        std::fs::write(&base, input_dataset("Base", 1, 0)).unwrap();
+        std::fs::write(
+            &base,
+            crate::coverage_update::tests::identity_base_dataset(),
+        )
+        .unwrap();
         std::fs::write(&a, input_dataset("First", 2, 1)).unwrap();
         std::fs::write(&b, input_dataset("Second", 2, 2)).unwrap();
         let (cell, identity) =

@@ -1,6 +1,9 @@
 //! S-102 HDF5 adapter with bounded window reads; no application or GPU dependency.
 #![allow(non_local_definitions)]
+pub mod legacy_trial;
 mod scalar;
+pub mod singleton;
+pub mod trial_inspection;
 use anyhow::{ensure, Context, Result};
 use ferrite_kernel::{CoverageSample, CoverageSource, CoverageTile, GridGeometry, GridWindow};
 pub use hdf5;
@@ -118,6 +121,9 @@ pub struct BathymetryCoverage {
     pub instance_name: String,
     pub product_specification: String,
     pub vertical_crs: u32,
+    /// The declared `vertical_crs` (6499) was read as depth-down by explicit
+    /// opt-in; consumers must disclose this alongside any depth.
+    pub vertical_cs_reinterpreted_as_depth: bool,
     pub vertical_datum: u32,
     pub vertical_datum_reference: u8,
     pub depth_fill: f32,
@@ -148,14 +154,17 @@ fn checked_metadata_text(bytes: &[u8], ascii: bool, name: &str) -> Result<String
 fn string_attr(g: &hdf5::Group, name: &str) -> Result<String> {
     use hdf5::types::{FixedAscii, FixedUnicode, TypeDescriptor};
     let a = g.attr(name)?;
-    ensure!(a.is_scalar(), "S102 {name} must be scalar");
+    ensure!(
+        crate::singleton::admitted(&a),
+        "S102 {name} must be scalar or a single element"
+    );
     match a.dtype()?.to_descriptor()? {
         TypeDescriptor::VarLenUnicode => {
-            let v = a.read_scalar::<VarLenUnicode>()?;
+            let v = crate::singleton::read::<VarLenUnicode>(&a)?;
             checked_metadata_text(v.as_bytes(), false, name)
         }
         TypeDescriptor::VarLenAscii => {
-            let v = a.read_scalar::<VarLenAscii>()?;
+            let v = crate::singleton::read::<VarLenAscii>(&a)?;
             checked_metadata_text(v.as_bytes(), true, name)
         }
         TypeDescriptor::FixedUnicode(n) => {
@@ -163,7 +172,7 @@ fn string_attr(g: &hdf5::Group, name: &str) -> Result<String> {
                 n <= 4096,
                 "Fixed metadata string exceeds supported4096 bytes"
             );
-            let v = a.read_scalar::<FixedUnicode<4096>>()?;
+            let v = crate::singleton::read::<FixedUnicode<4096>>(&a)?;
             checked_metadata_text(v.as_bytes(), false, name)
         }
         TypeDescriptor::FixedAscii(n) => {
@@ -171,7 +180,7 @@ fn string_attr(g: &hdf5::Group, name: &str) -> Result<String> {
                 n <= 4096,
                 "Fixed metadata string exceeds supported4096 bytes"
             );
-            let v = a.read_scalar::<FixedAscii<4096>>()?;
+            let v = crate::singleton::read::<FixedAscii<4096>>(&a)?;
             checked_metadata_text(v.as_bytes(), true, name)
         }
         _ => anyhow::bail!("S102 {name} must be a string attribute"),
@@ -229,10 +238,11 @@ fn position_uncertainties(container: &hdf5::Group) -> Result<[f32; 2]> {
             .attr(name)
             .with_context(|| format!("Missing S-102 {name}"))?;
         ensure!(
-            a.is_scalar() && a.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U4),
+            crate::singleton::admitted(&a)
+                && a.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U4),
             "S-102 {name} must be scalar float32"
         );
-        let v = a.read_scalar::<f32>()?;
+        let v = crate::singleton::read::<f32>(&a)?;
         ensure!(
             v.is_finite() && (v == -1. || v >= 0.),
             "Invalid S-102 {name}: expected -1 unknown or nonnegative metres"
@@ -248,16 +258,32 @@ fn validate_datum(datum: u32) -> Result<()> {
     );
     Ok(())
 }
-fn validate_vertical_root(file: &hdf5::Group) -> Result<()> {
-    ensure!(
-        crate::scalar::u32(file, "verticalCS")? == 6498,
-        "S-102 requires verticalCS=6498 (depth metres down)"
-    );
+/// Opt-in receiver compatibility (`FERRITE_S102_VERTICAL_CS_6499_AS_DEPTH=1`):
+/// UKHO's April 2026 S-102 3.0 set declares verticalCS 6499 (height, up) while
+/// its values follow the depth-down convention. Off by default; the declared
+/// code is never rewritten and every admitted coverage is marked.
+pub const VERTICAL_CS_6499_AS_DEPTH_ENV: &str = "FERRITE_S102_VERTICAL_CS_6499_AS_DEPTH";
+pub fn vertical_cs_6499_as_depth_enabled() -> bool {
+    std::env::var_os(VERTICAL_CS_6499_AS_DEPTH_ENV).is_some_and(|v| v == "1")
+}
+/// Ok(true) when a 6499 declaration was admitted as depth-down by opt-in.
+fn validate_vertical_root(file: &hdf5::Group, admit_6499_as_depth: bool) -> Result<bool> {
+    let vertical_cs = crate::scalar::u32(file, "verticalCS")?;
+    let reinterpreted = match vertical_cs {
+        6498 => false,
+        6499 if admit_6499_as_depth => true,
+        6499 => anyhow::bail!(
+            "S-102 requires verticalCS=6498 (depth metres down); found 6499 (height up). \
+             Set {VERTICAL_CS_6499_AS_DEPTH_ENV}=1 to read such data as depth-down \
+             (UKHO 2026 compatibility)"
+        ),
+        _ => anyhow::bail!("S-102 requires verticalCS=6498 (depth metres down)"),
+    };
     ensure!(
         crate::scalar::u8(file, "verticalCoordinateBase")? == 2,
         "S-102 requires verticalCoordinateBase=2 (verticalDatum)"
     );
-    Ok(())
+    Ok(reinterpreted)
 }
 // Exact decoded-dyadic cell-boundary comparison, with explicit admission for
 // coordinates too coarse to represent distinct grid cells. No tolerance snaps
@@ -383,7 +409,7 @@ fn validate_instance_domains(items: &[(u32, GridGeometry)]) -> Result<()> {
 fn instance_vertical_datum(group: &hdf5::Group, root_datum: u32) -> Result<u32> {
     let attributes = group.attr_names()?;
     let datum = if attributes.iter().any(|n| n == "verticalDatum") {
-        let datum = crate::scalar::unsigned_u32(group, "verticalDatum")?;
+        let datum = crate::scalar::unsigned_or_enum_u32(group, "verticalDatum")?;
         validate_datum(datum)?;
         ensure!(
             datum != root_datum,
@@ -587,19 +613,37 @@ impl BathymetryCoverage {
     }
     /// Read only structure and metadata. Values stay in HDF5 until a window is requested.
     pub fn open(path: impl AsRef<Path>) -> Result<Vec<Self>> {
+        Self::open_impl(path, None)
+    }
+
+    /// Open a captured S-102 input with quality attributes decoded in an isolated worker.
+    /// The outer call always supplies a result; None means the worker found no quality coverage.
+    pub fn open_with_quality_records(
+        path: impl AsRef<Path>,
+        quality_records: Option<Vec<quality::QualityRecord>>,
+    ) -> Result<Vec<Self>> {
+        Self::open_impl(path, Some(quality_records))
+    }
+
+    fn open_impl(
+        path: impl AsRef<Path>,
+        quality_records: Option<Option<Vec<quality::QualityRecord>>>,
+    ) -> Result<Vec<Self>> {
         let file = hdf5::File::open(path)?;
-        domain::preflight_work(&file)?;
-        let root_bounds = RootBounds::read(&file)?;
-        let issue = IssueMetadata::read(&file)?;
+        // Dispatch edition before applying any edition-specific metadata contracts.
         let spec = string_attr(&file, "productSpecification")?;
         ensure!(
             spec == "INT.IHO.S-102.3.0.0",
-            "Unsupported S-102 product edition: {spec}"
+            "Unsupported S-102 product edition: {spec}; this reader supports 3.0.0. A matching edition reader is required; the source was not converted."
         );
+        domain::preflight_work(&file)?;
+        let root_bounds = RootBounds::read(&file)?;
+        let issue = IssueMetadata::read(&file)?;
         let crs = crate::scalar::u32(&file, "horizontalCRS")?;
-        validate_vertical_root(&file)?;
+        let vertical_cs_reinterpreted_as_depth =
+            validate_vertical_root(&file, vertical_cs_6499_as_depth_enabled())?;
         let vertical_crs = crate::scalar::u32(&file, "verticalCS")?;
-        let vertical_datum = crate::scalar::unsigned_u32(&file, "verticalDatum")?;
+        let vertical_datum = crate::scalar::unsigned_or_enum_u32(&file, "verticalDatum")?;
         validate_datum(vertical_datum)?;
         let vertical_datum_reference = crate::scalar::u8(&file, "verticalDatumReference")?;
         ensure!(
@@ -730,6 +774,7 @@ impl BathymetryCoverage {
                 instance_name: name,
                 product_specification: spec.clone(),
                 vertical_crs,
+                vertical_cs_reinterpreted_as_depth,
                 vertical_datum: instance_datum,
                 vertical_datum_reference,
                 depth_fill,
@@ -758,9 +803,10 @@ impl BathymetryCoverage {
                 .map(|c| (c.vertical_datum, c.geometry))
                 .collect::<Vec<_>>(),
         )?;
-        let quality = QualityCoverage::open_optional(
+        let quality = QualityCoverage::open_optional_with_records(
             &file,
             &coverages.iter().map(|c| c.geometry).collect::<Vec<_>>(),
+            quality_records,
         )?;
         for coverage in &mut coverages {
             coverage.quality = quality.clone();
@@ -849,6 +895,23 @@ mod tests {
     }
     fn text(g: &hdf5::Group, name: &str, value: &str) {
         attr(g, name, VarLenAscii::from_ascii(value).unwrap());
+    }
+    #[test]
+    fn older_edition_dispatch_precedes_30_metadata_validation() {
+        let path = std::env::temp_dir().join(format!(
+            "ferrite-s102-edition-dispatch-{}.h5",
+            std::process::id()
+        ));
+        for spec in ["INT.IHO.S-102.2.1", "INT.IHO.S-102.2.1.0"] {
+            {
+                let f = hdf5::File::create(&path).unwrap();
+                text(&f, "productSpecification", spec);
+            }
+            let error = BathymetryCoverage::open(&path).unwrap_err().to_string();
+            assert!(error.contains(spec));
+            assert!(error.contains("matching edition reader is required"));
+        }
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn window_orientation_and_missing_uncertainty() {
@@ -1205,18 +1268,27 @@ mod vertical_contract_tests {
                 .unwrap()
                 .write_scalar(&6498u32)
                 .unwrap();
-            assert!(validate_vertical_root(&file).is_err());
+            assert!(validate_vertical_root(&file, false).is_err());
             file.new_attr::<u8>()
                 .create("verticalCoordinateBase")
                 .unwrap()
                 .write_scalar(&2u8)
                 .unwrap();
-            assert!(validate_vertical_root(&file).is_ok());
+            assert!(!validate_vertical_root(&file, false).unwrap());
+            assert!(!validate_vertical_root(&file, true).unwrap());
             file.attr("verticalCS")
                 .unwrap()
                 .write_scalar(&6499u32)
                 .unwrap();
-            assert!(validate_vertical_root(&file).is_err());
+            let refused = validate_vertical_root(&file, false).unwrap_err();
+            assert!(refused.to_string().contains(VERTICAL_CS_6499_AS_DEPTH_ENV));
+            // Opt-in admits only 6499, and reports the reinterpretation.
+            assert!(validate_vertical_root(&file, true).unwrap());
+            file.attr("verticalCS")
+                .unwrap()
+                .write_scalar(&5714u32)
+                .unwrap();
+            assert!(validate_vertical_root(&file, true).is_err());
             file.attr("verticalCS")
                 .unwrap()
                 .write_scalar(&6498u32)
@@ -1225,7 +1297,7 @@ mod vertical_contract_tests {
                 .unwrap()
                 .write_scalar(&1u8)
                 .unwrap();
-            assert!(validate_vertical_root(&file).is_err());
+            assert!(validate_vertical_root(&file, true).is_err());
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -1423,10 +1495,7 @@ mod values_contract_tests {
         } else {
             vec!["depth"]
         };
-        let rows: Vec<_> = codes
-            .into_iter()
-            .map(|code| Definition::for_code(code))
-            .collect();
+        let rows: Vec<_> = codes.into_iter().map(Definition::for_code).collect();
         info.new_dataset::<Definition>()
             .shape(rows.len())
             .create("BathymetryCoverage")
@@ -1440,6 +1509,101 @@ mod values_contract_tests {
     struct Vertex {
         longitude: f64,
         latitude: f64,
+    }
+
+    #[test]
+    fn isolated_quality_records_match_normal_hdf5_product() {
+        use std::str::FromStr;
+        #[allow(non_snake_case)]
+        #[derive(H5Type, Clone)]
+        #[repr(C)]
+        struct QualityRow {
+            id: u32,
+            sourceSurveyID: VarLenAscii,
+            surveyAuthority: VarLenUnicode,
+        }
+        let f = fixture(true, true, 0.5, 0.5);
+        {
+            let file = hdf5::File::open_rw(&f.0).unwrap();
+            let q = file.create_group("QualityOfBathymetryCoverage").unwrap();
+            for (name, value) in [
+                ("dimension", 2u8),
+                ("commonPointRule", 2),
+                ("interpolationType", 1),
+                ("numInstances", 1),
+            ] {
+                attr(&q, name, value);
+            }
+            attr(&q, "horizontalPositionUncertainty", -1f32);
+            attr(&q, "verticalUncertainty", -1f32);
+            write_test_axes(&q, 4326);
+            attr(&q, "dataCodingFormat", 9u8);
+            attr(&q, "dataOffsetCode", 5u8);
+            attr(&q, "sequencingRule.type", 1u8);
+            text(&q, "sequencingRule.scanDirection", "Longitude, Latitude");
+            let g = q.create_group("QualityOfBathymetryCoverage.01").unwrap();
+            attr(&g, "numGRP", 1u32);
+            text(&g, "startSequence", "0,0");
+            attr(&g, "numPointsLongitudinal", 3u32);
+            attr(&g, "numPointsLatitudinal", 2u32);
+            for (name, value) in [
+                ("gridOriginLongitude", 1f64),
+                ("gridOriginLatitude", 2f64),
+                ("gridSpacingLongitudinal", 1f64),
+                ("gridSpacingLatitudinal", 1f64),
+            ] {
+                attr(&g, name, value);
+            }
+            for (name, value) in [
+                ("westBoundLongitude", 0.5f32),
+                ("eastBoundLongitude", 3.5),
+                ("southBoundLatitude", 1.5),
+                ("northBoundLatitude", 3.5),
+            ] {
+                attr(&g, name, value);
+            }
+            g.create_group("Group_001")
+                .unwrap()
+                .new_dataset::<u32>()
+                .shape([2, 3])
+                .create("values")
+                .unwrap()
+                .write_raw(&[1u32; 6])
+                .unwrap();
+            q.new_dataset_builder()
+                .with_data(&[QualityRow {
+                    id: 1,
+                    sourceSurveyID: VarLenAscii::from_ascii("FR-SURVEY-1").unwrap(),
+                    surveyAuthority: VarLenUnicode::from_str("Shom – 조사").unwrap(),
+                }])
+                .create("featureAttributeTable")
+                .unwrap();
+        }
+        let legacy = BathymetryCoverage::open(&f.0).unwrap();
+        let records: Vec<_> = legacy[0]
+            .quality
+            .as_ref()
+            .unwrap()
+            .records()
+            .cloned()
+            .collect();
+        let injected = BathymetryCoverage::open_with_quality_records(&f.0, Some(records)).unwrap();
+        let old: Vec<_> = legacy[0]
+            .quality
+            .as_ref()
+            .unwrap()
+            .records()
+            .map(QualityRecord::description)
+            .collect();
+        let new: Vec<_> = injected[0]
+            .quality
+            .as_ref()
+            .unwrap()
+            .records()
+            .map(QualityRecord::description)
+            .collect();
+        assert_eq!(old, new);
+        assert_eq!(injected[0].quality.as_ref().unwrap().record_count(), 1);
     }
 
     #[test]
@@ -1503,10 +1667,10 @@ mod values_contract_tests {
                         1 => attr(&b, name, 1u32),
                         _ => {
                             b.new_attr::<f32>()
-                                .shape(1)
+                                .shape(2)
                                 .create(name)
                                 .unwrap()
-                                .write_raw(&[1.])
+                                .write_raw(&[1., 1.])
                                 .unwrap();
                         }
                     }
@@ -2395,7 +2559,7 @@ mod values_contract_tests {
                 g.unlink("BathymetryCoverage").unwrap();
                 let rows: Vec<_> = ["depth", code]
                     .into_iter()
-                    .map(|code| Definition::for_code(code))
+                    .map(Definition::for_code)
                     .collect();
                 g.new_dataset::<Definition>()
                     .shape(2)
@@ -2615,3 +2779,10 @@ pub use feature_metadata::{
     DefinitionInterval, FeatureDefinition, FeatureMetadata, FeatureMetadataDiagnostic,
     IntervalClosure,
 };
+
+/// Signed discovery metadata gates for S-102 fileless cancellations.
+/// Product publication/removal is a separate transaction.
+pub mod discovery;
+
+/// Bounded historical receipt codec; not cancellation/removal permission.
+pub mod cancellation_journal;

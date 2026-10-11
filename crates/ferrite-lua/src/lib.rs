@@ -39,7 +39,9 @@ mod context;
 mod error;
 mod host;
 mod instruction;
+mod resource_limits;
 mod session;
+pub use resource_limits::LuaResourceLimits;
 
 pub use context::*;
 pub use error::*;

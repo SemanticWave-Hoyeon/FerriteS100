@@ -505,7 +505,7 @@ mod tests {
         v.insert("FourShades".into(), "false".into());
         let report = validate_context_values(&p, &v).unwrap();
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.enabled["Shallow"], false);
+        assert!(!report.enabled["Shallow"]);
         v.insert("Deep".into(), "10".into());
         assert!(validate_context_values(&p, &v)
             .unwrap()

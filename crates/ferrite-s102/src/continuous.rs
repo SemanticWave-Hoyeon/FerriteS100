@@ -686,8 +686,10 @@ mod tests {
         assert_eq!(atlas.domain_vertices, 4);
         let words: Vec<_> = atlas
             .bytes
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect();
         assert_eq!(words[0], SELECTOR_MAGIC);
         assert_eq!(words[2], 2);

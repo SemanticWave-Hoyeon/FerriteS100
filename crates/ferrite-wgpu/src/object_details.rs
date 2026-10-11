@@ -7,6 +7,7 @@ use crate::{ui_chrome::Theme, SelectedFeature};
 pub struct ObjectDetailSections {
     pub definition: bool,
     pub source: bool,
+    pub catalogues: bool,
     pub position: bool,
     pub attributes: bool,
     pub portrayal: bool,
@@ -19,6 +20,7 @@ impl Default for ObjectDetailSections {
         Self {
             definition: false,
             source: false,
+            catalogues: false,
             position: true,
             attributes: true,
             portrayal: false,
@@ -33,6 +35,7 @@ impl ObjectDetailSections {
         *self = Self {
             definition: open,
             source: open,
+            catalogues: open,
             position: open,
             attributes: open,
             portrayal: open,
@@ -62,14 +65,104 @@ pub(crate) fn detail_section<R>(
 fn value(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
     ui.add(egui::Label::new(text).wrap().selectable(true));
 }
-fn row(ui: &mut egui::Ui, name: &str, text: &str) {
-    ui.label(
-        egui::RichText::new(name)
-            .small()
-            .color(Theme::current(ui.ctx()).muted),
-    );
-    value(ui, text);
-    ui.add_space(3.);
+/// Keep full original values selectable/copyable, independent of display layout.
+fn copy_menu(response: egui::Response, name: &str, text: &str, original: Option<&str>) {
+    response.context_menu(|ui| {
+        if ui.button("Copy value").clicked() {
+            ui.ctx().copy_text(text.to_owned());
+            ui.close_menu();
+        }
+        if ui.button("Copy field").clicked() {
+            ui.ctx().copy_text(
+                original
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{name}: {text}")),
+            );
+            ui.close_menu();
+        }
+    });
+}
+
+/// Narrow inspectors stack labels above values; wider inspectors reserve most
+/// of the row for values. This never rewrites chart attributes or source text.
+fn field_widths(width: f32) -> Option<(f32, f32)> {
+    if width < 340. {
+        return None;
+    }
+    let name = (width * 0.30).min(120.);
+    Some((name, (width - name - 10.).max(1.)))
+}
+fn field(ui: &mut egui::Ui, name: &str, text: &str, original: Option<&str>) {
+    let name_text = egui::RichText::new(name)
+        .small()
+        .strong()
+        .color(Theme::current(ui.ctx()).muted);
+    let width = ui.available_width();
+    if name.is_empty() {
+        copy_menu(
+            ui.add(egui::Label::new(text).wrap().selectable(true)),
+            name,
+            text,
+            original,
+        );
+    } else if let Some((name_width, value_width)) = field_widths(width) {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.;
+            ui.allocate_ui_with_layout(
+                egui::vec2(name_width, 0.),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(name_width);
+                    ui.add(egui::Label::new(name_text).wrap().selectable(true));
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(value_width, 0.),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(value_width);
+                    copy_menu(
+                        ui.add(egui::Label::new(text).wrap().selectable(true)),
+                        name,
+                        text,
+                        original,
+                    );
+                },
+            );
+        });
+    } else {
+        ui.add(egui::Label::new(name_text).wrap().selectable(true));
+        copy_menu(
+            ui.add(egui::Label::new(text).wrap().selectable(true)),
+            name,
+            text,
+            original,
+        );
+    }
+    ui.add_space(4.);
+}
+pub(crate) fn row(ui: &mut egui::Ui, name: &str, text: &str) {
+    ui.push_id(("detail-row", name), |ui| field(ui, name, text, None));
+}
+
+/// Preserve each original report line for copying. Only the display separates
+/// its first colon into label/value; colons inside the value remain unchanged.
+pub(crate) fn draw_report_fields(ui: &mut egui::Ui, text: &str) {
+    ui.push_id(text, |ui| {
+        for (index, line) in text.lines().enumerate() {
+            let (name, text) = line.split_once(':').unwrap_or(("", line));
+            ui.push_id(index, |ui| field(ui, name.trim(), text.trim(), Some(line)));
+        }
+    });
+}
+
+fn copied_attributes(feature: &SelectedFeature) -> String {
+    feature
+        .attributes
+        .iter()
+        .map(|(name, text)| format!("{name}: {text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The same body is used by the application and native UI regression fixtures.
@@ -88,6 +181,12 @@ pub fn draw_selected_object_details(
             .strong()
             .color(theme.accent),
     );
+    if let Some((_, name)) = feature.attributes.iter().find(|(key, _)| {
+        key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("featureName")
+    }) {
+        value(ui, name);
+    }
+    ui.small(format!("Object ID {}", feature.feature_id));
     ui.horizontal_wrapped(|ui| {
         ui.weak(&feature.primitive_type);
         if let Some(source) = &feature.source {
@@ -141,30 +240,35 @@ pub fn draw_selected_object_details(
                 ui.weak("No public pick-report attributes.");
                 return;
             }
-            ui.horizontal(|ui| {
-                let width = (ui.available_width() - 48.).max(60.);
-                ui.add(
-                    egui::TextEdit::singleline(query)
-                        .hint_text("Filter attributes")
-                        .desired_width(width),
-                );
-                if !query.is_empty() && ui.small_button("Clear").clicked() {
+            ui.add(
+                egui::TextEdit::singleline(query)
+                    .hint_text("Find a name or value")
+                    .desired_width(ui.available_width()),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button("Copy all")
+                    .on_hover_text("Copy all original attributes, including filtered values")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(copied_attributes(feature));
+                }
+                if !query.is_empty() && ui.small_button("Clear filter").clicked() {
                     query.clear();
                 }
             });
+            ui.add_space(4.);
             let needle = query.trim().to_lowercase();
             let mut matches = 0;
-            for (key, text) in &feature.attributes {
+            for (index, (key, text)) in feature.attributes.iter().enumerate() {
                 if !needle.is_empty()
                     && !key.to_lowercase().contains(&needle)
                     && !text.to_lowercase().contains(&needle)
                 {
                     continue;
                 }
-                if matches > 0 {
-                    ui.separator();
-                }
-                row(ui, key, text);
+                ui.push_id(("object_attribute", index), |ui| field(ui, key, text, None));
+                ui.separator();
                 matches += 1;
             }
             if !needle.is_empty() {
@@ -320,6 +424,81 @@ mod tests {
         assert!(!v.iter().any(|t| t.contains("ATTRIBUTE_SENTINEL")));
         assert!(v.iter().any(|t| t == "1 of 2 attributes"));
         assert_eq!(f.attributes, original);
+    }
+    #[test]
+    fn responsive_fields_preserve_full_values_and_clip_to_inspector_width() {
+        for width in [220., 280., 360., 520.] {
+            let ctx = egui::Context::default();
+            let long_value = format!(
+                "https://example.test/{}: original suffix",
+                "LONG_SOURCE_".repeat(32)
+            );
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 2400.),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        row(ui, "Original source path and identifier", &long_value);
+                    });
+                },
+            );
+            let mut strings = Vec::new();
+            for shape in &out.shapes {
+                texts(&shape.shape, &mut strings);
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    let right = text.pos.x + text.galley.size().x;
+                    assert!(right <= width + 1., "width={width}, right={right}");
+                }
+            }
+            assert!(strings.iter().any(|s| s == &long_value));
+        }
+    }
+    #[test]
+    fn copy_all_retains_original_whitespace_unicode_and_value_colons() {
+        let mut f = fixture();
+        f.attributes = vec![
+            ("name".into(), "  항로 : 原文  ".into()),
+            ("link".into(), "https://example.test/a:b".into()),
+        ];
+        assert_eq!(
+            copied_attributes(&f),
+            "name:   항로 : 原文  \nlink: https://example.test/a:b"
+        );
+        assert_eq!(f.attributes[0].1, "  항로 : 原文  ");
+    }
+    #[test]
+    fn report_colons_stay_in_values_and_unlabelled_lines_remain_readable() {
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240., 1200.),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_report_fields(
+                        ui,
+                        "Source: https://example.test/a:b\nOriginal report without a colon",
+                    );
+                });
+            },
+        );
+        let mut rendered = Vec::new();
+        for shape in &out.shapes {
+            texts(&shape.shape, &mut rendered);
+        }
+        assert!(rendered.iter().any(|s| s == "https://example.test/a:b"));
+        assert!(rendered
+            .iter()
+            .any(|s| s == "Original report without a colon"));
     }
     #[test]
     fn pointer_click_toggles_only_the_requested_section() {

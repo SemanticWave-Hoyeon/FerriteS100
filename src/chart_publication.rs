@@ -212,7 +212,6 @@ impl CancellationHistory {
         Ok(history)
     }
     fn write_atomic(&self, path: &std::path::Path) -> Result<()> {
-        use std::io::Write;
         ensure!(
             self.by_dataset.len() <= MAX_HISTORY_RECORDS,
             "Cancellation history record budget exceeded"
@@ -233,22 +232,33 @@ impl CancellationHistory {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let temporary = parent.join(format!(".s101-history-{}-{nonce}.tmp", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temporary, path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
+        replace_history_file(path, &temporary, &bytes)
     }
+}
+
+fn replace_history_file(
+    path: &std::path::Path,
+    temporary: &std::path::Path,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::io::Write;
+    // A failed create_new gives us no ownership of this name. In particular,
+    // never remove an existing file or symlink that caused a collision.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)?;
+    let result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 /// Hold an OS file lock across fresh history validation, atomic file replacement
 /// and the synchronous visible publication. No network or chart file is deleted.
@@ -281,8 +291,14 @@ impl HistoryStore {
         if records.is_empty() {
             return Ok(());
         }
-        self.history.record(records);
-        self.history.write_atomic(&self.path)
+        // Keep the in-memory authority aligned with the file when a known
+        // pre-replacement write failure rejects this candidate. This does not
+        // provide crash durability or atomicity with the visible GPU scene.
+        let mut next = self.history.clone();
+        next.record(records);
+        next.write_atomic(&self.path)?;
+        self.history = next;
+        Ok(())
     }
 }
 pub(crate) fn default_history_path() -> PathBuf {
@@ -1015,6 +1031,80 @@ pub(crate) mod tests {
         assert_eq!(cells[2].dsid.update_number, 0);
         assert_eq!(paths, old_paths);
         assert_eq!(digest(&ids), before);
+    }
+    #[test]
+    fn history_temporary_collision_never_removes_foreign_file() {
+        let folder = std::env::temp_dir().join(format!(
+            "ferrite-history-collision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("history.json");
+        let temporary = folder.join("foreign.tmp");
+        std::fs::write(&path, b"previous committed history").unwrap();
+        std::fs::write(&temporary, b"foreign contents").unwrap();
+        assert!(replace_history_file(&path, &temporary, b"candidate").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous committed history");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"foreign contents");
+        std::fs::remove_file(&temporary).unwrap();
+        replace_history_file(&path, &temporary, b"candidate").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"candidate");
+        assert!(!temporary.exists());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn history_store_failed_replacement_preserves_authority_and_retry_commits() {
+        let folder = std::env::temp_dir().join(format!(
+            "ferrite-history-store-retry-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("history.json");
+        let original = CancellationRecord {
+            key: ("INT.IHO.S-101.2.0".into(), "101AA00TEST".into()),
+            cancelled_edition: 4,
+            cancellation_update: 3,
+            issue_date: chrono::NaiveDate::from_ymd_opt(2024, 10, 17).unwrap(),
+        };
+        let mut store = HistoryStore::begin(&path).unwrap();
+        store.persist(vec![original.clone()]).unwrap();
+        let original_file = std::fs::read(&path).unwrap();
+        let candidate = CancellationRecord {
+            issue_date: original.issue_date.succ_opt().unwrap(),
+            cancellation_update: 4,
+            ..original.clone()
+        };
+        // Force a real rename failure after the temporary file was written.
+        // Keep the existing committed file available for independent checking.
+        let blocked = folder.join("destination-directory");
+        std::fs::create_dir(&blocked).unwrap();
+        store.path = blocked;
+        assert!(store.persist(vec![candidate.clone()]).is_err());
+        assert_eq!(store.history.by_dataset.get(&original.key), Some(&original));
+        assert_eq!(std::fs::read(&path).unwrap(), original_file);
+        assert!(std::fs::read_dir(&folder).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".s101-history-")));
+        store.path = path.clone();
+        store.persist(vec![candidate.clone()]).unwrap();
+        assert_eq!(
+            store.history.by_dataset.get(&candidate.key),
+            Some(&candidate)
+        );
+        drop(store);
+        let reopened = HistoryStore::begin(&path).unwrap();
+        assert_eq!(
+            reopened.history.by_dataset.get(&candidate.key),
+            Some(&candidate)
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
     fn persistent_history_survives_reopen_and_refuses_corrupt_or_duplicate_records() {

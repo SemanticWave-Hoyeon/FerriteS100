@@ -10,21 +10,24 @@ fn attribute(g: &Group, name: &str) -> Result<Attribute> {
     let a = g
         .attr(name)
         .with_context(|| format!("Missing S-102 {name}"))?;
-    ensure!(a.is_scalar(), "S-102 {name} must be scalar");
+    ensure!(
+        crate::singleton::admitted(&a),
+        "S-102 {name} must be scalar or a single element"
+    );
     Ok(a)
 }
 fn nonnegative(g: &Group, name: &str) -> Result<u64> {
     let a = attribute(g, name)?;
     match a.dtype()?.to_descriptor()? {
-        TypeDescriptor::Unsigned(_) => Ok(a.read_scalar::<u64>()?),
+        TypeDescriptor::Unsigned(_) => Ok(crate::singleton::read::<u64>(&a)?),
         TypeDescriptor::Integer(_) => {
-            let v = a.read_scalar::<i64>()?;
+            let v = crate::singleton::read::<i64>(&a)?;
             ensure!(v >= 0, "S-102 {name} integer must be nonnegative");
             Ok(v as u64)
         }
-        TypeDescriptor::Enum(e) if !e.signed => Ok(a.read_scalar::<u64>()?),
+        TypeDescriptor::Enum(e) if !e.signed => Ok(crate::singleton::read::<u64>(&a)?),
         TypeDescriptor::Enum(_) => {
-            let v = a.read_scalar::<i64>()?;
+            let v = crate::singleton::read::<i64>(&a)?;
             ensure!(v >= 0, "S-102 {name} enumeration must be nonnegative");
             Ok(v as u64)
         }
@@ -50,6 +53,20 @@ fn require_unsigned(g: &Group, name: &str) -> Result<()> {
     );
     Ok(())
 }
+/// An unsigned integer, or an explicit HDF5 enumeration with a nonnegative
+/// value (UKHO 2026 encodes S-100 vertical datum codes as a signed-base enum).
+/// Plain signed integers remain refused.
+pub(crate) fn unsigned_or_enum_u32(g: &Group, name: &str) -> Result<u32> {
+    let a = attribute(g, name)?;
+    ensure!(
+        matches!(
+            a.dtype()?.to_descriptor()?,
+            TypeDescriptor::Unsigned(_) | TypeDescriptor::Enum(_)
+        ),
+        "S-102 {name} must be an unsigned integer or explicit enumeration"
+    );
+    u32(g, name)
+}
 pub(crate) fn unsigned_u8(g: &Group, name: &str) -> Result<u8> {
     require_unsigned(g, name)?;
     u8(g, name)
@@ -64,7 +81,7 @@ pub(crate) fn f32(g: &Group, name: &str) -> Result<f32> {
         a.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U4),
         "S-102 {name} must be scalar float32"
     );
-    Ok(a.read_scalar::<f32>()?)
+    crate::singleton::read::<f32>(&a)
 }
 pub(crate) fn f64(g: &Group, name: &str) -> Result<f64> {
     let a = attribute(g, name)?;
@@ -72,7 +89,7 @@ pub(crate) fn f64(g: &Group, name: &str) -> Result<f64> {
         a.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U8),
         "S-102 {name} must be scalar float64"
     );
-    Ok(a.read_scalar::<f64>()?)
+    crate::singleton::read::<f64>(&a)
 }
 #[cfg(test)]
 mod tests {
@@ -104,11 +121,53 @@ mod tests {
             assert_eq!(u32(&f, "u32max").unwrap(), u32::MAX);
             f.new_attr::<u8>()
                 .shape(1)
-                .create("vector")
+                .create("singleton")
                 .unwrap()
                 .write_raw(&[2])
                 .unwrap();
+            assert_eq!(u8(&f, "singleton").unwrap(), 2);
+            f.new_attr::<u8>()
+                .shape(2)
+                .create("vector")
+                .unwrap()
+                .write_raw(&[2, 3])
+                .unwrap();
             assert!(u8(&f, "vector").is_err());
+        }
+        std::fs::remove_file(p).unwrap();
+    }
+    #[test]
+    fn vertical_datum_admits_unsigned_or_nonnegative_enum_but_not_signed_integer() {
+        let p = std::env::temp_dir().join(format!(
+            "ferrite-scalar-datum-enum-{}.h5",
+            std::process::id()
+        ));
+        {
+            let f = hdf5::File::create(&p).unwrap();
+            attr(&f, "unsigned", 10u32);
+            attr(&f, "signed", 10i32);
+            #[derive(hdf5::H5Type, Clone, Copy)]
+            #[repr(i8)]
+            enum Datum {
+                Approximate = 10,
+                Negative = -1,
+            }
+            f.new_attr::<Datum>()
+                .shape(1)
+                .create("enum")
+                .unwrap()
+                .write_raw(&[Datum::Approximate])
+                .unwrap();
+            f.new_attr::<Datum>()
+                .create("negative_enum")
+                .unwrap()
+                .write_scalar(&Datum::Negative)
+                .unwrap();
+            assert_eq!(unsigned_or_enum_u32(&f, "unsigned").unwrap(), 10);
+            assert_eq!(unsigned_or_enum_u32(&f, "enum").unwrap(), 10);
+            assert!(unsigned_or_enum_u32(&f, "signed").is_err());
+            assert!(unsigned_or_enum_u32(&f, "negative_enum").is_err());
+            assert!(unsigned_u32(&f, "enum").is_err());
         }
         std::fs::remove_file(p).unwrap();
     }

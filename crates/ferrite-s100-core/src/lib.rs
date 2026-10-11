@@ -6,6 +6,7 @@
 mod attribute_updates;
 mod cell;
 mod code_mapping;
+mod coverage_update;
 mod error;
 mod feature;
 mod information;
@@ -19,3 +20,5 @@ pub use information::*;
 pub use spatial::*;
 
 pub mod updates;
+
+mod retained_payload;

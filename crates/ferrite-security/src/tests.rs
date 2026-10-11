@@ -944,3 +944,454 @@ fn signed_catalogue_and_resource_receiver_budget_is_checked_before_streaming() {
     std::fs::write(f.dir.path().join("CATALOG.XML"), excessive).unwrap();
     assert!(verify_exchange_catalogue(f.dir.path(), &f.anchors, NOW).is_err());
 }
+
+fn copied_signature_notice(
+    f: &Fixture,
+    xml: &str,
+) -> (tempfile::TempDir, AuthenticatedExchangeCatalogue) {
+    f.catalogue(xml.as_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["CATALOG.XML", "CATALOG.SIGN"] {
+        std::fs::copy(f.dir.path().join(name), dir.path().join(name)).unwrap();
+    }
+    let catalogue = verify_exchange_catalogue(dir.path(), &f.anchors, NOW).unwrap();
+    (dir, catalogue)
+}
+
+#[test]
+fn copied_original_signatures_pin_original_bytes_and_incoming_catalogue() {
+    let f = Fixture::new(true, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", true, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML"))
+        .unwrap()
+        .replace("newDataset", "cancellation");
+    let (dir, incoming) = copied_signature_notice(&f, &xml);
+    assert!(!dir.path().join("DATA.H5").exists());
+    let binding = original.bind_copied_signatures(&incoming).unwrap();
+    assert_eq!(
+        binding.original().resource_sha384(),
+        original.resource_sha384()
+    );
+    assert_eq!(
+        binding.incoming_catalogue().catalogue_sha384(),
+        incoming.catalogue_sha384()
+    );
+    assert_eq!(binding.original().signatures().len(), 2);
+    std::fs::write(f.dir.path().join("DATA.H5"), b"replacement").unwrap();
+    assert_eq!(
+        std::fs::read(binding.resource_snapshot().path()).unwrap(),
+        b"authentic bathymetry bytes\x00\xff"
+    );
+    assert!(original.bind_copied_signatures(&incoming).is_err());
+}
+
+#[test]
+fn trusted_notice_with_same_signature_ids_cannot_replace_original_der() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", true, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let old_der = STANDARD.encode(original.signatures()[0].der());
+    let other_der = STANDARD.encode(signature(&f.key, b"different resource"));
+    let bad = xml.replace(&old_der, &other_der);
+    let (_dir, incoming) = copied_signature_notice(&f, &bad);
+    assert!(original
+        .bind_copied_signatures(&incoming)
+        .unwrap_err()
+        .to_string()
+        .contains("Copied signature value"));
+}
+
+#[test]
+fn copied_original_graph_status_algorithm_and_exact_uri_are_bound() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", true, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    for bad in [
+        xml.replace("signatureRef=\"DATA\"", "signatureRef=\"CHAIN\""),
+        xml.replace("dataStatus=\"unencrypted\"", "dataStatus=\"encrypted\""),
+        xml.replace("ECDSA-384-SHA2", "8"),
+        xml.replace("file:/DATA.H5", "file:/OTHER.H5"),
+        xml.replace("id=\"CHAIN\"", "id=\"DATA\""),
+    ] {
+        let (_dir, incoming) = copied_signature_notice(&f, &bad);
+        assert!(original.bind_copied_signatures(&incoming).is_err());
+    }
+}
+
+#[test]
+fn copied_certificate_must_match_original_der_not_only_id_or_public_key() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let cert_der = original.signatures()[0].signer_certificate_der();
+    // Same signing key, different certificate subject: identity must reject.
+    let another = certificate("ANOTHER IDENTITY", &f.key, None, false, true)
+        .to_der()
+        .unwrap();
+    for der in [another, [cert_der, &[0u8][..]].concat()] {
+        let bad = xml.replace(&STANDARD.encode(cert_der), &STANDARD.encode(der));
+        let (_dir, incoming) = copied_signature_notice(&f, &bad);
+        assert!(original.bind_copied_signatures(&incoming).is_err());
+    }
+}
+
+#[test]
+fn copied_signature_envelopes_keep_expanded_names_but_ignore_base64_whitespace() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let encoded = STANDARD.encode(original.signatures()[0].der());
+    let whitespace = encoded
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(12)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n ");
+    let (_dir, incoming) = copied_signature_notice(&f, &xml.replace(&encoded, &whitespace));
+    original.bind_copied_signatures(&incoming).unwrap();
+    let bad = xml.replace(SE, "urn:spoof");
+    let (_dir, incoming) = copied_signature_notice(&f, &bad);
+    assert!(original.bind_copied_signatures(&incoming).is_err());
+}
+
+#[test]
+fn copied_signatures_reuse_parser_snapshot_after_live_original_is_removed() {
+    let f = Fixture::new(true, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", true, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let snapshot = std::sync::Arc::new(original.capture_resource().unwrap());
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let (_dir, incoming) = copied_signature_notice(&f, &xml.replace("newDataset", "cancellation"));
+    std::fs::remove_file(original.resource_path()).unwrap();
+    assert!(original.bind_copied_signatures(&incoming).is_err());
+    let binding = original
+        .bind_copied_signatures_from_snapshot(&incoming, snapshot.clone())
+        .unwrap();
+    assert!(std::ptr::eq(binding.resource_snapshot(), snapshot.as_ref()));
+    assert_eq!(std::sync::Arc::strong_count(&snapshot), 2);
+    drop(snapshot);
+    assert_eq!(
+        std::fs::read(binding.resource_snapshot().path()).unwrap(),
+        b"authentic bathymetry bytes\x00\xff"
+    );
+}
+
+#[test]
+fn copied_snapshot_binding_rehashes_same_size_mutation_truncation_and_growth() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let (_dir, incoming) = copied_signature_notice(&f, &xml);
+    for bytes in [
+        vec![b'x'; original.resource_size() as usize],
+        vec![b'x'; 1],
+        vec![b'x'; original.resource_size() as usize + 1],
+    ] {
+        let snapshot = std::sync::Arc::new(original.capture_resource().unwrap());
+        std::fs::write(snapshot.path(), bytes).unwrap();
+        assert!(original
+            .bind_copied_signatures_from_snapshot(&incoming, snapshot)
+            .is_err());
+    }
+}
+
+#[test]
+fn copied_snapshot_source_label_cannot_redirect_authentication_and_der_still_binds() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    let original = report
+        .dataset_discovery
+        .values()
+        .next()
+        .unwrap()
+        .original_authentication();
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let mut snapshot = original.capture_resource().unwrap();
+    snapshot.source = f.dir.path().join("NONEXISTENT_DECOY.H5");
+    let snapshot = std::sync::Arc::new(snapshot);
+    let (_dir, incoming) = copied_signature_notice(&f, &xml);
+    original
+        .bind_copied_signatures_from_snapshot(&incoming, snapshot.clone())
+        .unwrap();
+    let old_der = STANDARD.encode(original.signatures()[0].der());
+    let bad = xml.replace(
+        &old_der,
+        &STANDARD.encode(signature(&f.key, b"another payload")),
+    );
+    let (_otherdir, changed) = copied_signature_notice(&f, &bad);
+    assert!(original
+        .bind_copied_signatures_from_snapshot(&changed, snapshot)
+        .is_err());
+}
+
+#[test]
+fn captured_incoming_namespace_survives_source_deletion_without_authenticating_payloads() {
+    let owned = {
+        let f = Fixture::new(true, true, Nid::SECP384R1);
+        f.write("file:/DATA.H5", true, "LEAF", "unencrypted");
+        let owned = capture_catalogue_authenticated_incoming_exchange(
+            f.dir.path(),
+            &f.anchors,
+            NOW,
+            IncomingExchangeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(owned.file_count(), 3);
+        let original = owned
+            .resource_bytes("file:/DATA.H5")
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        assert_eq!(original, b"authentic bathymetry bytes\x00\xff");
+        assert!(owned.prove_ascii_resource_absent("DATA.H5").is_err());
+        std::fs::write(f.dir.path().join("DATA.H5"), b"tampered source").unwrap();
+        std::fs::write(f.dir.path().join("LATER.H5"), b"later arrival").unwrap();
+        assert_eq!(owned.resource_bytes("DATA.H5").unwrap().unwrap(), original);
+        assert!(owned.prove_ascii_resource_absent("LATER.H5").is_ok());
+        owned
+    }; // Entire original namespace, signing keys and fixture files are deleted.
+    assert_eq!(
+        owned.resource_bytes("DATA.H5").unwrap().unwrap(),
+        b"authentic bathymetry bytes\x00\xff"
+    );
+    assert!(owned
+        .catalogue()
+        .discovery_view()
+        .unwrap()
+        .dataset_entries()
+        .next()
+        .is_some());
+    assert_eq!(owned.namespace_sha384().len(), 96);
+    assert!(!format!("{owned:?}").contains("bathymetry bytes"));
+}
+
+#[test]
+fn captured_catalogue_only_missing_file_is_absence_not_resource_authentication() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    assert!(f.verify(NOW).is_ok());
+    std::fs::remove_file(f.dir.path().join("DATA.H5")).unwrap();
+    let owned = capture_catalogue_authenticated_incoming_exchange(
+        f.dir.path(),
+        &f.anchors,
+        NOW,
+        IncomingExchangeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(owned.file_count(), 2);
+    assert!(owned.resource_bytes("DATA.H5").unwrap().is_none());
+    let absent = owned.prove_ascii_resource_absent("file:/DATA.H5").unwrap();
+    assert_eq!(absent.relative_name(), "DATA.H5");
+    assert!(std::ptr::eq(absent.incoming_exchange(), &owned));
+    // The captured announcement is not a VerifiedResource or a cancellation.
+    assert!(f.verify(NOW).is_err());
+    let bytes = std::fs::read(f.dir.path().join("CATALOG.XML")).unwrap();
+    std::fs::write(
+        f.dir.path().join("CATALOG.XML"),
+        [bytes, b" ".to_vec()].concat(),
+    )
+    .unwrap();
+    assert!(capture_catalogue_authenticated_incoming_exchange(
+        f.dir.path(),
+        &f.anchors,
+        NOW,
+        IncomingExchangeLimits::default()
+    )
+    .is_err());
+}
+
+#[test]
+fn incoming_receiver_limits_are_enforced_before_admission() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("DATA.H5", false, "LEAF", "unencrypted");
+    let cap = IncomingExchangeLimits::default();
+    for limits in [
+        IncomingExchangeLimits {
+            file_bytes: 1,
+            ..cap
+        },
+        IncomingExchangeLimits {
+            total_bytes: 1,
+            ..cap
+        },
+        IncomingExchangeLimits { nodes: 1, ..cap },
+        IncomingExchangeLimits {
+            path_bytes: 1,
+            ..cap
+        },
+        IncomingExchangeLimits {
+            file_bytes: cap.file_bytes + 1,
+            ..cap
+        },
+        IncomingExchangeLimits { nodes: 0, ..cap },
+    ] {
+        assert!(capture_catalogue_authenticated_incoming_exchange(
+            f.dir.path(),
+            &f.anchors,
+            NOW,
+            limits
+        )
+        .is_err());
+    }
+    // Sparse oversized file: decline by metadata before reading/allocating it.
+    std::fs::File::create(f.dir.path().join("OVERSIZED.H5"))
+        .unwrap()
+        .set_len(cap.file_bytes + 1)
+        .unwrap();
+    assert!(
+        capture_catalogue_authenticated_incoming_exchange(f.dir.path(), &f.anchors, NOW, cap)
+            .is_err()
+    );
+}
+
+#[test]
+fn incoming_absence_rejects_case_percent_directory_and_portable_aliases() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("DATA.H5", false, "LEAF", "unencrypted");
+    std::fs::write(f.dir.path().join("Other.H5."), b"alias").unwrap();
+    std::fs::create_dir(f.dir.path().join("DIRECTORY.H5")).unwrap();
+    let owned = capture_catalogue_authenticated_incoming_exchange(
+        f.dir.path(),
+        &f.anchors,
+        NOW,
+        IncomingExchangeLimits::default(),
+    )
+    .unwrap();
+    for uri in [
+        "data.h5",
+        "%44ATA.H5",
+        "OTHER.H5",
+        "directory.h5",
+        "file:/DATA.H5",
+    ] {
+        assert!(owned.prove_ascii_resource_absent(uri).is_err(), "{uri}");
+    }
+    for uri in [
+        "../NONE.H5",
+        "file://NONE.H5",
+        "https://example.com/NONE.H5",
+        "NONE/../DATA.H5",
+    ] {
+        assert!(owned.prove_ascii_resource_absent(uri).is_err(), "{uri}");
+    }
+}
+
+#[test]
+fn incoming_preserves_utf8_resources_without_general_unicode_absence_claim() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("DATA.H5", false, "LEAF", "unencrypted");
+    std::fs::create_dir(f.dir.path().join("설명")).unwrap();
+    std::fs::write(f.dir.path().join("설명/항만.txt"), "원본".as_bytes()).unwrap();
+    let owned = capture_catalogue_authenticated_incoming_exchange(
+        f.dir.path(),
+        &f.anchors,
+        NOW,
+        IncomingExchangeLimits::default(),
+    )
+    .unwrap();
+    // Use the actual platform spelling; APFS may return decomposed Unicode names.
+    let entry = std::fs::read_dir(f.dir.path())
+        .unwrap()
+        .map(|e| e.unwrap())
+        .find(|e| e.file_type().unwrap().is_dir())
+        .unwrap();
+    let file = std::fs::read_dir(entry.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let rel = file.strip_prefix(f.dir.path()).unwrap().to_str().unwrap();
+    assert_eq!(
+        owned.resource_bytes(rel).unwrap().unwrap(),
+        "원본".as_bytes()
+    );
+    assert!(owned.prove_ascii_resource_absent("다른파일.H5").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn incoming_rejects_symlink_files_directories_and_roots() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("DATA.H5", false, "LEAF", "unencrypted");
+    std::os::unix::fs::symlink("DATA.H5", f.dir.path().join("LINK.H5")).unwrap();
+    assert!(capture_catalogue_authenticated_incoming_exchange(
+        f.dir.path(),
+        &f.anchors,
+        NOW,
+        IncomingExchangeLimits::default()
+    )
+    .is_err());
+    std::fs::remove_file(f.dir.path().join("LINK.H5")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), f.dir.path().join("LINKDIR")).unwrap();
+    assert!(capture_catalogue_authenticated_incoming_exchange(
+        f.dir.path(),
+        &f.anchors,
+        NOW,
+        IncomingExchangeLimits::default()
+    )
+    .is_err());
+    std::fs::remove_file(f.dir.path().join("LINKDIR")).unwrap();
+    std::os::unix::fs::symlink(f.dir.path(), outside.path().join("ROOTLINK")).unwrap();
+    assert!(capture_catalogue_authenticated_incoming_exchange(
+        outside.path().join("ROOTLINK"),
+        &f.anchors,
+        NOW,
+        IncomingExchangeLimits::default()
+    )
+    .is_err());
+}
+
+#[path = "trusted_cancellation_authority_tests.rs"]
+mod trusted_cancellation_authority_tests;

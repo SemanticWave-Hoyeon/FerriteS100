@@ -175,6 +175,27 @@ mod tests {
         context.get_sorted_instructions();
         context
     }
+    /// A valid ring whose two long edges are 1e-6 degree apart: at high zoom
+    /// the -360 degree copy lies millions of pixels away, where f32 merges the
+    /// edges into a self-intersection (UKHO 101GB005DEVQH, April 2026).
+    #[test]
+    fn wrapped_copies_far_from_the_view_keep_full_precision() {
+        let mut sliver = inventory();
+        let (x, x2) = (-0.9, -0.9 + 1e-6);
+        let mut exterior: Vec<[f64; 2]> = (0..=40).map(|i| [x, 50.78 - i as f64 * 5e-4]).collect();
+        exterior.extend((0..=40).rev().map(|i| [x2, 50.78 - i as f64 * 5e-4]));
+        exterior.push(exterior[0]);
+        sliver.datasets[0].as_mut().unwrap()[0].surfaces[0].exterior = exterior;
+        let scaler = Scaler::new(
+            ferrite_render::GeoBounds::new(-0.95, 50.75, -0.85, 50.79),
+            Viewport::new(1420., 862.),
+        );
+        assert!(scaler.scale_x() > 10_000.);
+        let projected = sliver.project(&scaler, true).unwrap();
+        // One footprint per coverage: the union of the central and both copies.
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].region.polygons().len(), 3);
+    }
     #[test]
     fn cached_slots_preserve_current_view_decisions_and_fragment_rights() {
         let cold = inventory();
@@ -335,7 +356,8 @@ mod tests {
     #[test]
     fn physical_crs_must_not_be_interpreted_as_geographic_degrees() {
         let source = inventory();
-        for crs in [PointOriginCrs::Local] {
+        {
+            let crs = PointOriginCrs::Local;
             let context = context(
                 Some(0),
                 PortrayalOrigin::augmented_point(crs, [0.5, 0.5]).unwrap(),
@@ -515,14 +537,16 @@ impl GeographicCoverageInventory {
             let Some(coverages) = coverages else { continue };
             for coverage in coverages {
                 let mut region: Option<Region> = None;
-                for surface in &coverage.surfaces {
+                for (surface_index, surface) in coverage.surfaces.iter().enumerate() {
                     for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
                         let project = |ring: &[[f64; 2]]| -> Result<Vec<[f64; 2]>> {
                             ring.iter()
                                 .map(|p| {
-                                    let p =
-                                        scaler.world_to_screen(WorldPoint::new(p[0] + shift, p[1]));
-                                    let p = [f64::from(p.x), f64::from(p.y)];
+                                    // f64 throughout: a ±360° copy lies ~10^5–10^6 px away,
+                                    // where f32 rounding merges distinct boundary points and
+                                    // can turn a valid ring self-intersecting.
+                                    let p = scaler
+                                        .world_to_screen_f64(WorldPoint::new(p[0] + shift, p[1]));
                                     ensure!(
                                         p.iter().all(|v| v.is_finite()),
                                         "Non-finite coverage projection"
@@ -537,7 +561,20 @@ impl GeographicCoverageInventory {
                             .iter()
                             .map(|ring| project(ring))
                             .collect::<Result<Vec<_>>>()?;
-                        let part = Region::from_rings(&exterior, &holes)?;
+                        let part = Region::from_rings(&exterior, &holes).with_context(|| {
+                            // Error-only bounded evidence. Preserve the original projection,
+                            // validation order, ring data and rejection; never skip a component.
+                            let consecutive = 1 + exterior.windows(2).filter(|p| p[0] != p[1]).count();
+                            format!(
+                                "Coverage surface projection failed: dataset={dataset_id} coverage={} surface={surface_index} longitude_shift={shift} original_exterior_len={} projected_exterior_len={} consecutive_distinct={} holes={} original_first4={:?} projected_first4={:?} viewport={:?} scale_xy={:?} offset_xy={:?}",
+                                coverage.feature_key, surface.exterior.len(), exterior.len(),
+                                if exterior.is_empty() { 0 } else { consecutive }, holes.len(),
+                                &surface.exterior[..surface.exterior.len().min(4)],
+                                &exterior[..exterior.len().min(4)], scaler.viewport,
+                                [scaler.scale_x(), scaler.scale_y()],
+                                [scaler.offset_x(), scaler.offset_y()]
+                            )
+                        })?;
                         region = Some(match region {
                             Some(r) => r.union(&part),
                             None => part,
@@ -587,15 +624,24 @@ impl GeographicCoverageInventory {
         let viewport = Region::from_rings(
             &[[x, y], [right, y], [right, bottom], [x, bottom], [x, y]],
             &[],
-        )?;
+        ).with_context(|| format!(
+            "Coverage viewport projection failed: viewport={v:?} rounded_edges={:?} edge_bits={:?} physical_extent={extent:?} scale_xy={:?} offset_xy={:?}",
+            [x, y, right, bottom], [x, y, right, bottom].map(f64::to_bits),
+            [scaler.scale_x(), scaler.scale_y()], [scaler.offset_x(), scaler.offset_y()]
+        ))?;
         let plan =
             crate::coverage_loading::display_plan(&inventory, scaler.display_scale, &viewport)?;
-        let frame = Arc::new(CoverageFrame::new(
+        let frame = Arc::new(CoverageFrame::new_with_scale_annotations(
             &plan.eligible_inventory,
             &plan.selection,
             &viewport,
             extent,
             pixel_budget,
+            scaler.display_scale,
+            [
+                v.x as f64 + v.width as f64 * 0.5,
+                v.y as f64 + v.height as f64 * 0.5,
+            ],
         )?);
         // PreparedCoverage and its caller share the already-sorted raw order.
         let northings = binding

@@ -513,8 +513,10 @@ mod projected_dash_tests {
     use super::*;
     #[test]
     fn dash_crossing_vertex_has_exact_segment_endpoints() {
-        let mut style = LineStyle::default();
-        style.dash_cycle = Some(DashCycle::new(100., [(0., 90.)]).unwrap());
+        let style = LineStyle {
+            dash_cycle: Some(DashCycle::new(100., [(0., 90.)]).unwrap()),
+            ..Default::default()
+        };
         // A short vertical segment after a long segment loses low bits if
         // its endpoint is computed by adding then subtracting the phase.
         let spans = dash_projected_line_spans(
@@ -536,8 +538,10 @@ mod projected_dash_tests {
     }
     #[test]
     fn calibrated_phase_survives_subdivision_and_empty_cycle_is_valid() {
-        let mut style = LineStyle::default();
-        style.dash_cycle = Some(DashCycle::new(10., [(2., 3.)]).unwrap());
+        let mut style = LineStyle {
+            dash_cycle: Some(DashCycle::new(10., [(2., 3.)]).unwrap()),
+            ..Default::default()
+        };
         let spans = dash_projected_line_spans(&[[0., 0.], [12., 0.], [40., 0.]], 2., &style, None)
             .unwrap()
             .unwrap();
@@ -579,9 +583,11 @@ mod clipped_tests {
     #[test]
     fn clipped_dash_advances_hidden_billion_pixels_without_allocating_hidden_cycles() {
         let points = [[0., 0.], [1e9 + 3., 0.], [1e9 + 3., 123.]];
-        let mut style = LineStyle::default();
-        style.dash_pattern = vec![10., 10.];
-        style.width_unit = StrokeUnit::PhysicalPixels;
+        let style = LineStyle {
+            dash_pattern: vec![10., 10.],
+            width_unit: StrokeUnit::PhysicalPixels,
+            ..Default::default()
+        };
         let roi = [
             LineSpan {
                 segment: 0,
@@ -610,8 +616,10 @@ mod clipped_tests {
     #[test]
     fn clipped_and_full_dash_agree_on_masked_intervals_and_phase_shift() {
         let points = [[0., 0.], [47., 0.], [47., 91.]];
-        let mut style = LineStyle::default();
-        style.dash_cycle = Some(DashCycle::new(11., [(2., 4.)]).unwrap());
+        let style = LineStyle {
+            dash_cycle: Some(DashCycle::new(11., [(2., 4.)]).unwrap()),
+            ..Default::default()
+        };
         let roi = [
             LineSpan {
                 segment: 0,

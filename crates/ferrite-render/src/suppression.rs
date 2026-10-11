@@ -1,5 +1,11 @@
 //! Product-neutral visibility-aware suppression of coincident line segments.
+#[path = "suppression_eligibility.rs"]
+mod eligibility_program;
+#[path = "suppression_owned_overlap.rs"]
+mod owned_overlap_block;
 use crate::{DrawingInstruction, FlatProjection, Scaler, ScreenPoint, WorldPoint};
+pub use eligibility_program::Work as LineEligibilityWork;
+use owned_overlap_block::{Bounds as OwnedBounds, Entry as OwnedEntry, OwnedOverlapBlock};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::{
@@ -7,6 +13,14 @@ use std::{
     hash::{Hash, Hasher},
     sync::Arc,
 };
+
+// Exact bounded growth compilation is the default. Explicit values other than
+// "1" retain the reference compiler; policy is sampled once per cache lifetime.
+fn retained_growth_enabled(name: &str) -> bool {
+    std::env::var_os(name)
+        .as_deref()
+        .is_none_or(|value| value == std::ffi::OsStr::new("1"))
+}
 
 pub fn instruction_visible(
     instruction: &DrawingInstruction,
@@ -21,6 +35,19 @@ pub fn instruction_visible(
                 .viewing_groups()
                 .all(|vg| g.contains(&vg.0) || override_group == Some(vg.0))
         })
+}
+fn original_eligibility(
+    instructions: &[DrawingInstruction],
+    scale: u32,
+    groups: Option<&HashSet<u32>>,
+    override_group: Option<u32>,
+    visibility: Option<&[bool]>,
+) -> Vec<bool> {
+    instructions.iter().enumerate().map(|(i,item)| {
+        visibility.is_none_or(|v|v.get(i).copied().unwrap_or(false))
+            && instruction_visible(item,scale,groups,override_group)
+            && matches!(item,DrawingInstruction::Line(l) if l.screen_ray.is_none() && l.portrayal_path.is_none())
+    }).collect()
 }
 #[derive(Clone, Copy)]
 struct Curve<'a> {
@@ -225,7 +252,239 @@ enum SuppressionRevision {
 }
 
 /// Content validation costs O(V) even on a hit. Results share an Arc and contain
-/// no borrowed vertices. Spatial indexes are temporary and discarded after planning.
+/// no borrowed vertices. Legacy spatial indexes are temporary; opt-in blocks are owned and bounded.
+/// Optional diagnostics only. Child clocks are HOST wall time, not GPU time.
+/// target_relations includes old relation cloning, all coincidence grouping
+/// lookups, spatial queries, exact overlap arithmetic, endpoint sort and budget.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct GrowthCompilerWork {
+    pub attempts: u64,
+    pub admitted: u64,
+    pub group_and_segment_build_ns: u64,
+    pub two_index_build_ns: u64,
+    pub projection_and_placeholder_ns: u64,
+    pub target_relations_ns: u64,
+    pub all_segments: u64,
+    pub new_segments: u64,
+    pub old_targets: u64,
+    pub unchanged_old_target_checks: u64,
+    pub unchanged_old_target_accepts: u64,
+    pub unchanged_segment_windows_avoided: u64,
+    pub new_targets: u64,
+    pub index_block_attempts: u64,
+    pub index_block_admitted: u64,
+    pub index_block_declined: u64,
+    pub index_segments_built: u64,
+    pub index_blocks_reused: u64,
+    pub index_block_payload_peak: u64,
+    pub old_relation_elements_cloned: u64,
+    pub old_relation_capacity_charged: u64,
+}
+
+const MAX_GROWTH_INDEX_BLOCKS: usize = 16;
+struct OwnedGrowthIndex {
+    blocks: Vec<Arc<OwnedOverlapBlock<IndexedSegment>>>,
+    covered: Vec<bool>,
+    bytes: usize,
+}
+impl OwnedGrowthIndex {
+    fn stage(
+        selected: &[(usize, &crate::LineInstruction, Curve<'_>)],
+        covered: &[bool],
+        new_covered: &[bool],
+        prior: Option<&Self>,
+        budget: usize,
+        mut work: Option<&mut GrowthCompilerWork>,
+    ) -> Option<(Self, usize)> {
+        if covered.len() != new_covered.len()
+            || covered
+                .iter()
+                .zip(new_covered)
+                .any(|(old, new)| *old && !*new)
+        {
+            return None;
+        }
+        if prior
+            .is_some_and(|old| old.covered != covered || old.blocks.len() > MAX_GROWTH_INDEX_BLOCKS)
+        {
+            return None;
+        }
+        let mut out = Self {
+            blocks: Vec::new(),
+            covered: Vec::new(),
+            bytes: 0,
+        };
+        // Fixed maximum metadata allocation; actual capacities charged first.
+        let requested = std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<(
+                SuppressionRevision,
+                FlatProjection,
+                usize,
+            )>())?
+            .checked_add(
+                MAX_GROWTH_INDEX_BLOCKS
+                    .checked_mul(std::mem::size_of::<Arc<OwnedOverlapBlock<IndexedSegment>>>())?,
+            )?
+            .checked_add(new_covered.len())?;
+        if requested > budget {
+            return None;
+        }
+        out.blocks.try_reserve_exact(MAX_GROWTH_INDEX_BLOCKS).ok()?;
+        out.covered.try_reserve_exact(new_covered.len()).ok()?;
+        out.bytes = std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<(
+                SuppressionRevision,
+                FlatProjection,
+                usize,
+            )>())?
+            .checked_add(
+                out.blocks
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Arc<OwnedOverlapBlock<IndexedSegment>>>())?,
+            )?
+            .checked_add(out.covered.capacity())?;
+        if out.bytes > budget {
+            return None;
+        }
+        out.covered.extend_from_slice(new_covered);
+        if let Some(old) = prior {
+            for block in &old.blocks {
+                let charge = block
+                    .charged_payload_bytes()
+                    .checked_add(2 * std::mem::size_of::<usize>())?;
+                out.bytes = out.bytes.checked_add(charge)?;
+                if out.bytes > budget {
+                    return None;
+                }
+                out.blocks.push(Arc::clone(block));
+            }
+            if let Some(w) = work.as_mut() {
+                w.index_blocks_reused = w
+                    .index_blocks_reused
+                    .saturating_add(old.blocks.len() as u64);
+            }
+        } else {
+            out.capture(selected, covered, true, budget, work.as_deref_mut())?;
+        }
+        let new_start = out.blocks.len();
+        out.capture(selected, covered, false, budget, work)?;
+        Some((out, new_start))
+    }
+    fn capture(
+        &mut self,
+        selected: &[(usize, &crate::LineInstruction, Curve<'_>)],
+        covered: &[bool],
+        old: bool,
+        budget: usize,
+        mut work: Option<&mut GrowthCompilerWork>,
+    ) -> Option<()> {
+        let count = selected
+            .iter()
+            .filter(|(i, _, _)| covered[*i] == old)
+            .try_fold(0usize, |sum, (_, line, _)| {
+                sum.checked_add(line.points.len().saturating_sub(1))
+            })?;
+        if count == 0 {
+            return Some(());
+        }
+        if self.blocks.len() == MAX_GROWTH_INDEX_BLOCKS {
+            return None;
+        }
+        let arc_header = 2 * std::mem::size_of::<usize>();
+        let remaining = budget.checked_sub(self.bytes)?.checked_sub(arc_header)?;
+        if count
+            .checked_mul(std::mem::size_of::<OwnedEntry<IndexedSegment>>())?
+            .checked_add(std::mem::size_of::<OwnedOverlapBlock<IndexedSegment>>())?
+            > remaining
+        {
+            return None;
+        }
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).ok()?;
+        if entries
+            .capacity()
+            .checked_mul(std::mem::size_of::<OwnedEntry<IndexedSegment>>())?
+            .checked_add(std::mem::size_of::<OwnedOverlapBlock<IndexedSegment>>())?
+            > remaining
+        {
+            return None;
+        }
+        for (i, line, _) in selected.iter().filter(|(i, _, _)| covered[*i] == old) {
+            let priority = (line.display_plane.order().get(), line.priority.0);
+            for pair in line.points.windows(2) {
+                if let Some(segment) = Segment::new(pair[0], pair[1]) {
+                    use rstar::RTreeObject;
+                    let b = segment.envelope();
+                    entries.push(OwnedEntry {
+                        bounds: OwnedBounds {
+                            lower: b.lower(),
+                            upper: b.upper(),
+                        },
+                        payload: IndexedSegment {
+                            segment,
+                            index: *i,
+                            priority,
+                        },
+                    });
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Some(());
+        }
+        let block = OwnedOverlapBlock::try_build_owned(entries, remaining)?;
+        if let Some(w) = work.as_mut() {
+            w.index_segments_built = w.index_segments_built.saturating_add(block.len() as u64);
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(block.charged_payload_bytes())?
+            .checked_add(arc_header)?;
+        if self.bytes > budget {
+            return None;
+        }
+        self.blocks.push(Arc::new(block));
+        Some(())
+    }
+    fn visit(
+        &self,
+        range: std::ops::Range<usize>,
+        bounds: &rstar::AABB<[f64; 2]>,
+        mut callback: impl FnMut(&IndexedSegment) -> Option<()>,
+    ) -> Option<()> {
+        let blocks = self.blocks.get(range)?;
+        let envelope = OwnedBounds {
+            lower: bounds.lower(),
+            upper: bounds.upper(),
+        };
+        for block in blocks {
+            for entry in block.query(envelope)? {
+                callback(&entry.payload)?;
+            }
+        }
+        Some(())
+    }
+    fn any(
+        &self,
+        range: std::ops::Range<usize>,
+        bounds: &rstar::AABB<[f64; 2]>,
+        mut predicate: impl FnMut(&IndexedSegment) -> bool,
+    ) -> Option<bool> {
+        let blocks = self.blocks.get(range)?;
+        let envelope = OwnedBounds {
+            lower: bounds.lower(),
+            upper: bounds.upper(),
+        };
+        for block in blocks {
+            for entry in block.query(envelope)? {
+                if predicate(&entry.payload) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+}
 #[derive(Default)]
 pub struct LineSuppressionCache {
     last: Option<([u8; 32], Arc<LineSuppressionPlan>)>,
@@ -238,10 +497,126 @@ pub struct LineSuppressionCache {
     immutable_last: Option<(Vec<bool>, Arc<LineSuppressionPlan>)>,
     immutable_current: Option<Arc<LineSuppressionPlan>>,
     // Existing default-on bounded prewarm; decline tried once per namespaced source epoch.
+    eligibility_program: eligibility_program::Cache,
+    eligibility_policy: Option<bool>,
+    eligibility_diagnostics_policy: Option<bool>,
+    eligibility_work: Option<LineEligibilityWork>,
     prewarm_policy: Option<bool>,
+    growth_reuse_policy: Option<bool>,
+    unchanged_target_policy: Option<bool>,
+    index_blocks_policy: Option<bool>,
+    immutable_index_blocks: Option<(SuppressionRevision, FlatProjection, usize, OwnedGrowthIndex)>,
+    empty_curve_prewarm_policy: Option<bool>,
+    // Optional bounded counters only; no retained source/geometry.
+    tail_counters: Option<[u64; 10]>,
+    growth_child_work: Option<GrowthCompilerWork>,
     prewarm_attempt: Option<(SuppressionRevision, FlatProjection, usize)>,
 }
 impl LineSuppressionCache {
+    /// New exclusive cache with the same already captured policies, no source plans/indices.
+    /// Unsampled Option policies remain unsampled and keep the original lazy resolution contract.
+    pub fn fork_empty_with_same_policy(&self) -> Self {
+        let mut next = Self {
+            eligibility_policy: self.eligibility_policy,
+            eligibility_diagnostics_policy: self.eligibility_diagnostics_policy,
+            prewarm_policy: self.prewarm_policy,
+            growth_reuse_policy: self.growth_reuse_policy,
+            unchanged_target_policy: self.unchanged_target_policy,
+            index_blocks_policy: self.index_blocks_policy,
+            empty_curve_prewarm_policy: self.empty_curve_prewarm_policy,
+            ..Self::default()
+        };
+        next.set_tail_diagnostics_enabled(self.tail_counters.is_some());
+        next
+    }
+
+    /// Diagnostic only: does not reset or alter any suppression decision.
+    pub fn set_tail_diagnostics_enabled(&mut self, enabled: bool) {
+        self.tail_counters = enabled.then_some([0; 10]);
+        self.growth_child_work = enabled.then_some(GrowthCompilerWork::default());
+    }
+    /// Order: prewarm attempt/success/decline, preparation branch,
+    /// geometry reset, eligible growth, legacy fallback, eligibility-plan hit,
+    /// compiled visibility query, lazy relation-compiler invocation.
+    pub fn tail_diagnostics_counters(&self) -> [u64; 10] {
+        self.tail_counters.unwrap_or([0; 10])
+    }
+    /// Optional cumulative HOST children; does not alter suppression decisions.
+    pub fn growth_compiler_work(&self) -> Option<GrowthCompilerWork> {
+        self.growth_child_work
+    }
+    /// Optional whole eligibility HOST boundary. None means timing/census unavailable.
+    pub fn eligibility_work(&self) -> Option<LineEligibilityWork> {
+        self.eligibility_work
+    }
+    fn context_eligibility(
+        &mut self,
+        context: &crate::RenderContext,
+        scale: u32,
+        groups: Option<&HashSet<u32>>,
+        override_group: Option<u32>,
+        visibility: Option<&[bool]>,
+    ) -> Vec<bool> {
+        let diagnostics = self.eligibility_diagnostics_policy == Some(true);
+        let started = diagnostics.then(std::time::Instant::now);
+        // Explicit group policy ALWAYS executes the complete original predicate.
+        let attempt = self.eligibility_policy == Some(true) && groups.is_none();
+        let (cached, summary) = if attempt {
+            self.eligibility_program
+                .evaluate(context, scale, visibility)
+        } else {
+            (None, eligibility_program::Summary::default())
+        };
+        let optimized = cached.is_some();
+        let eligible = cached.unwrap_or_else(|| {
+            original_eligibility(
+                context.raw_instructions(),
+                scale,
+                groups,
+                override_group,
+                visibility,
+            )
+        });
+        // Stop the whole-call timer BEFORE diagnostic-only eligible-bit counting.
+        if let Some(started) = started {
+            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let w = self.eligibility_work.get_or_insert_with(Default::default);
+            w.calls = w.calls.saturating_add(1);
+            w.optimized_calls = w.optimized_calls.saturating_add(u64::from(optimized));
+            w.fallback_calls = w.fallback_calls.saturating_add(u64::from(!optimized));
+            w.cold = w.cold.saturating_add(u64::from(summary.cold));
+            w.hits = w.hits.saturating_add(u64::from(summary.hit));
+            w.declines = w.declines.saturating_add(u64::from(summary.decline));
+            w.source_checks = w
+                .source_checks
+                .saturating_add(summary.source_checks)
+                .saturating_add(if optimized {
+                    0
+                } else {
+                    context.instruction_count() as u64
+                });
+            w.descriptor_checks = w.descriptor_checks.saturating_add(if optimized {
+                summary.entries as u64
+            } else {
+                0
+            });
+            w.whole_eligibility_host_ns = w.whole_eligibility_host_ns.saturating_add(elapsed);
+            w.eligible = w
+                .eligible
+                .saturating_add(eligible.iter().filter(|v| **v).count() as u64);
+            w.retained_payload_bytes = self.eligibility_program.retained_bytes() as u64;
+            w.mask_payload_bytes = (std::mem::size_of::<Vec<bool>>()
+                + eligible.capacity() * std::mem::size_of::<bool>())
+                as u64;
+        }
+        eligible
+    }
+    fn tail_count(&mut self, index: usize) {
+        if let Some(counts) = &mut self.tail_counters {
+            counts[index] = counts[index].saturating_add(1);
+        }
+    }
+
     fn static_prewarm_policy(value: Option<&str>) -> bool {
         value.is_none_or(|value| value == "1")
     }
@@ -251,7 +626,12 @@ impl LineSuppressionCache {
         self.prewarm_policy = Some(enabled);
     }
     pub fn clear(&mut self) {
+        self.eligibility_program.clear();
+        if let Some(w) = &mut self.eligibility_work {
+            w.retained_payload_bytes = 0;
+        }
         self.prewarm_attempt = None;
+        self.immutable_index_blocks = None;
         self.last = None;
         self.immutable_prepared = None;
         self.immutable_last = None;
@@ -269,6 +649,12 @@ impl LineSuppressionCache {
             .as_ref()
             .map(PreparedLineSuppression::retained_bytes)
     }
+    /// Jointly budgeted immutable index payload, not GPU/RSS/global memory.
+    pub fn immutable_index_bytes(&self) -> usize {
+        self.immutable_index_blocks
+            .as_ref()
+            .map_or(0, |(_, _, _, index)| index.bytes)
+    }
     /// Binding-safe context entry: callers cannot supply a different source slice
     /// with an inherited epoch. Current permissions are still evaluated every call.
     pub fn plan_context_projected_with_visibility(
@@ -279,6 +665,16 @@ impl LineSuppressionCache {
         override_group: Option<u32>,
         visibility: Option<&[bool]>,
     ) -> Arc<LineSuppressionPlan> {
+        let reuse = *self.eligibility_policy.get_or_insert_with(|| {
+            eligibility_program::enabled(
+                std::env::var_os("FERRITE_LINE_ELIGIBILITY_PROGRAM").as_deref(),
+            )
+        });
+        let diagnostics = *self.eligibility_diagnostics_policy.get_or_insert_with(|| {
+            eligibility_program::enabled(
+                std::env::var_os("FERRITE_LINE_ELIGIBILITY_DIAGNOSTICS").as_deref(),
+            )
+        });
         self.plan_immutable_projected_with_visibility_key(
             context.raw_instructions(),
             SuppressionRevision::Context(context.static_line_relation_epoch()),
@@ -287,6 +683,7 @@ impl LineSuppressionCache {
             override_group,
             visibility,
             context.scaler.projection(),
+            (reuse || diagnostics).then_some(context),
         )
     }
     /// Static overlap reuse for immutable RenderContext instruction geometry.
@@ -316,6 +713,7 @@ impl LineSuppressionCache {
             override_group,
             visibility,
             projection,
+            None,
         )
     }
     #[expect(
@@ -331,6 +729,7 @@ impl LineSuppressionCache {
         override_group: Option<u32>,
         visibility: Option<&[bool]>,
         projection: FlatProjection,
+        context: Option<&crate::RenderContext>,
     ) -> Arc<LineSuppressionPlan> {
         debug_assert!(visibility.is_none_or(|v| v.len() == instructions.len()));
         let prewarm = *self.prewarm_policy.get_or_insert_with(|| {
@@ -343,23 +742,41 @@ impl LineSuppressionCache {
         let source = (revision, projection, instructions.len());
         if prewarm && self.prewarm_attempt != Some(source) {
             self.prewarm_attempt = Some(source);
-            if let Some((prepared, compiled)) = Self::try_static_prewarm(
-                instructions,
-                projection,
-                64 * 1024 * 1024,
-                32 * 1024 * 1024,
-            ) {
+            self.tail_count(0);
+            let accept_empty = *self.empty_curve_prewarm_policy.get_or_insert_with(|| {
+                std::env::var("FERRITE_LINE_SUPPRESSION_EMPTY_CURVE_PREWARM").as_deref() == Ok("1")
+            });
+            let static_preparation = if accept_empty {
+                Self::try_static_prewarm_covered_empty(
+                    instructions,
+                    projection,
+                    64 * 1024 * 1024,
+                    32 * 1024 * 1024,
+                )
+            } else {
+                Self::try_static_prewarm(
+                    instructions,
+                    projection,
+                    64 * 1024 * 1024,
+                    32 * 1024 * 1024,
+                )
+            };
+            if let Some((prepared, compiled)) = static_preparation {
                 self.immutable_last = None;
+                self.tail_count(1);
+                self.immutable_index_blocks = None;
                 self.immutable_prepared = Some((revision, projection, prepared, Some(compiled)));
+            } else {
+                self.tail_count(2);
             }
             // Decline changes no original prepared state: lazy admission and its
             // original mutable fallback below remain authoritative.
         }
-        let eligible: Vec<_> = instructions.iter().enumerate().map(|(i,item)| {
-            visibility.is_none_or(|v|v.get(i).copied().unwrap_or(false))
-                && instruction_visible(item,scale,groups,override_group)
-                && matches!(item,DrawingInstruction::Line(l) if l.screen_ray.is_none() && l.portrayal_path.is_none())
-        }).collect();
+        let eligible = if let Some(context) = context {
+            self.context_eligibility(context, scale, groups, override_group, visibility)
+        } else {
+            original_eligibility(instructions, scale, groups, override_group, visibility)
+        };
         let same_geometry = self
             .immutable_prepared
             .as_ref()
@@ -373,6 +790,8 @@ impl LineSuppressionCache {
                     && eligible.iter().zip(prepared).all(|(e, p)| !*e || *p)
             })
         {
+            self.tail_count(3);
+            self.tail_count(if same_geometry { 5 } else { 4 });
             self.immutable_last = None;
             // Prepared candidates grow only when a newly eligible line appears.
             // All live visibility rules still run before applying relations.
@@ -400,10 +819,15 @@ impl LineSuppressionCache {
                     _ => 0,
                 })
                 .sum::<usize>();
+            let mut staged_index = None;
             let compiled = if base
                 .saturating_add(points.saturating_mul(std::mem::size_of::<WorldPoint>()))
                 <= 64 * 1024 * 1024
             {
+                let projection_start = self
+                    .growth_child_work
+                    .as_ref()
+                    .map(|_| std::time::Instant::now());
                 let transformed: Vec<_> = instructions
                     .iter()
                     .zip(&prepared)
@@ -429,13 +853,88 @@ impl LineSuppressionCache {
                         DrawingInstruction::Line(out)
                     })
                     .collect();
-                PreparedLineSuppression::compile(&transformed, 32 * 1024 * 1024)
+                if let (Some(w), Some(start)) = (self.growth_child_work.as_mut(), projection_start)
+                {
+                    w.projection_and_placeholder_ns = w
+                        .projection_and_placeholder_ns
+                        .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                }
+                self.tail_count(9);
+                let reuse = *self.growth_reuse_policy.get_or_insert_with(|| {
+                    retained_growth_enabled("FERRITE_LINE_SUPPRESSION_GROWTH_REUSE")
+                });
+                let unchanged = *self.unchanged_target_policy.get_or_insert_with(|| {
+                    retained_growth_enabled("FERRITE_LINE_SUPPRESSION_UNCHANGED_TARGETS")
+                });
+                let index_blocks = *self.index_blocks_policy.get_or_insert_with(|| {
+                    retained_growth_enabled("FERRITE_LINE_SUPPRESSION_INDEX_BLOCKS")
+                });
+                let indexed = if reuse && same_geometry && index_blocks {
+                    self.immutable_prepared
+                        .as_ref()
+                        .and_then(|(_, _, covered, compiled)| {
+                            compiled.as_ref().and_then(|previous| {
+                                let prior = self
+                                    .immutable_index_blocks
+                                    .as_ref()
+                                    .filter(|(r, p, n, _)| {
+                                        *r == revision
+                                            && *p == projection
+                                            && *n == instructions.len()
+                                    })
+                                    .map(|(_, _, _, index)| index);
+                                PreparedLineSuppression::compile_growth_with_index_blocks(
+                                    &transformed,
+                                    32 * 1024 * 1024,
+                                    previous,
+                                    covered,
+                                    &prepared,
+                                    prior,
+                                    self.growth_child_work.as_mut(),
+                                    unchanged,
+                                )
+                            })
+                        })
+                } else {
+                    None
+                };
+                if index_blocks && reuse && same_geometry && indexed.is_none() {
+                    if let Some(w) = self.growth_child_work.as_mut() {
+                        w.index_block_declined = w.index_block_declined.saturating_add(1);
+                    }
+                }
+                let incremental = if let Some((plan, index)) = indexed {
+                    staged_index = Some(index);
+                    Some(plan)
+                } else if reuse && same_geometry {
+                    self.immutable_prepared
+                        .as_ref()
+                        .and_then(|(_, _, covered, compiled)| {
+                            compiled.as_ref().and_then(|previous| {
+                                PreparedLineSuppression::compile_growth_with_unchanged_targets(
+                                    &transformed,
+                                    32 * 1024 * 1024,
+                                    previous,
+                                    covered,
+                                    self.growth_child_work.as_mut(),
+                                    unchanged,
+                                )
+                            })
+                        })
+                } else {
+                    None
+                };
+                incremental
+                    .or_else(|| PreparedLineSuppression::compile(&transformed, 32 * 1024 * 1024))
             } else {
                 None
             };
+            self.immutable_index_blocks =
+                staged_index.map(|index| (revision, projection, instructions.len(), index));
             self.immutable_prepared = Some((revision, projection, prepared, compiled));
         }
         if self.immutable_prepared.as_ref().unwrap().3.is_none() {
+            self.tail_count(6);
             return self.plan_projected_with_visibility(
                 instructions,
                 scale,
@@ -447,10 +946,13 @@ impl LineSuppressionCache {
         }
         if let Some((old, plan)) = &self.immutable_last {
             if *old == eligible {
-                self.immutable_current = Some(Arc::clone(plan));
-                return Arc::clone(plan);
+                let plan = Arc::clone(plan);
+                self.tail_count(7);
+                self.immutable_current = Some(Arc::clone(&plan));
+                return plan;
             }
         }
+        self.tail_count(8);
         let plan = Arc::new(
             self.immutable_prepared
                 .as_ref()
@@ -519,6 +1021,89 @@ impl LineSuppressionCache {
             if let DrawingInstruction::Line(line) = item {
                 if line.screen_ray.is_none() && line.portrayal_path.is_none() {
                     selected = true;
+                    // Identical original project_y expression and source order.
+                    out.points = line
+                        .points
+                        .iter()
+                        .map(|p| WorldPoint::new(p.x, projection.project_y(p.y)))
+                        .collect();
+                    Curve::new(&out.points)?;
+                    // Extreme arithmetic is left to the original lazy planner.
+                    if out
+                        .points
+                        .windows(2)
+                        .any(|p| !(p[1].x - p[0].x).is_finite() || !(p[1].y - p[0].y).is_finite())
+                    {
+                        return None;
+                    }
+                    out.priority = line.priority;
+                    out.display_plane = line.display_plane;
+                    out.suppressible = line.suppressible;
+                }
+            }
+            prepared.push(selected);
+            transformed.push(DrawingInstruction::Line(out));
+        }
+        let compiled = PreparedLineSuppression::compile(&transformed, compiler_budget)?;
+        Some((prepared, compiled))
+    }
+    fn try_static_prewarm_covered_empty(
+        instructions: &[DrawingInstruction],
+        projection: FlatProjection,
+        transform_budget: usize,
+        compiler_budget: usize,
+    ) -> Option<(Vec<bool>, PreparedLineSuppression)> {
+        let mut points = 0usize;
+        let mut segments = 0usize;
+        let mut lines = 0usize;
+        for item in instructions {
+            if let DrawingInstruction::Line(line) = item {
+                if line.screen_ray.is_none() && line.portrayal_path.is_none() {
+                    // Original Curve::new excludes <2 points before any relation.
+                    // Admit only finite short placeholders; no nonfinite or
+                    // zero-length two-point reinterpretation.
+                    if line.points.len() < 2 {
+                        if line
+                            .points
+                            .iter()
+                            .any(|p| !p.x.is_finite() || !p.y.is_finite())
+                        {
+                            return None;
+                        }
+                        continue;
+                    }
+                    Curve::new(&line.points)?;
+                    points = points.checked_add(line.points.len())?;
+                    segments = segments.checked_add(line.points.len() - 1)?;
+                    lines = lines.checked_add(1)?;
+                }
+            }
+        }
+        let base = instructions
+            .len()
+            .checked_mul(std::mem::size_of::<DrawingInstruction>())?;
+        if base.checked_add(points.checked_mul(std::mem::size_of::<WorldPoint>())?)?
+            > transform_budget
+            || segments.checked_mul(128)? > compiler_budget
+            || lines.checked_mul(128)? > compiler_budget
+        {
+            return None;
+        }
+        let mut prepared = Vec::with_capacity(instructions.len());
+        let mut transformed = Vec::with_capacity(instructions.len());
+        for item in instructions {
+            let mut out = crate::LineInstruction::new(Vec::new());
+            let mut selected = false;
+            if let DrawingInstruction::Line(line) = item {
+                if line.screen_ray.is_none() && line.portrayal_path.is_none() {
+                    selected = true;
+                    if line.points.len() < 2 {
+                        // Covered because it remains absent in both legacy and
+                        // compiled suppression. Raw emission/picking is untouched.
+                        prepared.push(true);
+                        transformed.push(DrawingInstruction::Line(out));
+                        continue;
+                    }
                     // Identical original project_y expression and source order.
                     out.points = line
                         .points
@@ -912,8 +1497,10 @@ mod tests {
         assert!((b.x - (p.x + (q.x - p.x) * 0.75)).abs() < 1e-4);
         let old = scaler.world_to_screen(span.endpoints(&points).unwrap().0);
         assert!((old.y - a.y).abs() > 20.);
-        let mut style = crate::LineStyle::default();
-        style.dash_pattern = vec![30., 20.];
+        let style = crate::LineStyle {
+            dash_pattern: vec![30., 20.],
+            ..Default::default()
+        };
         let spans = crate::dash_line_spans(&points, &scaler, &style, None).unwrap();
         let first = spans[0];
         let (start, end) = first.screen_endpoints(&points, &scaler).unwrap();
@@ -1351,6 +1938,741 @@ impl PreparedLineSuppression {
             targets,
             bytes,
         })
+    }
+    /// Private caller must prove same opaque context epoch/projection and union
+    /// coverage. Only old-old relations are reused; all new relations use overlap.
+    #[cfg(test)]
+    fn compile_growth(
+        instructions: &[DrawingInstruction],
+        budget: usize,
+        previous: &Self,
+        covered: &[bool],
+    ) -> Option<Self> {
+        Self::compile_growth_with_work(instructions, budget, previous, covered, None)
+    }
+    #[cfg(test)]
+    fn compile_growth_with_work(
+        instructions: &[DrawingInstruction],
+        budget: usize,
+        previous: &Self,
+        covered: &[bool],
+        work: Option<&mut GrowthCompilerWork>,
+    ) -> Option<Self> {
+        Self::compile_growth_with_unchanged_targets(
+            instructions,
+            budget,
+            previous,
+            covered,
+            work,
+            false,
+        )
+    }
+    fn compile_growth_with_unchanged_targets(
+        instructions: &[DrawingInstruction],
+        budget: usize,
+        previous: &Self,
+        covered: &[bool],
+        mut work: Option<&mut GrowthCompilerWork>,
+        reuse_unchanged: bool,
+    ) -> Option<Self> {
+        if let Some(w) = work.as_mut() {
+            w.attempts = w.attempts.saturating_add(1);
+        }
+        if previous.dimension != instructions.len() || covered.len() != instructions.len() {
+            return None;
+        }
+        use rstar::RTreeObject;
+        let selected: Vec<_> = instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let DrawingInstruction::Line(line) = item else {
+                    return None;
+                };
+                if line.screen_ray.is_some()
+                    || line.portrayal_path.is_some()
+                    || !line.style.has_visible_stroke()
+                {
+                    return None;
+                }
+                Some((i, line, Curve::new(&line.points)?))
+            })
+            .collect();
+        let segment_count: usize = selected
+            .iter()
+            .map(|(_, line, _)| line.points.len().saturating_sub(1))
+            .sum();
+        let new_segment_count: usize = selected
+            .iter()
+            .filter(|(i, _, _)| !covered[*i])
+            .map(|(_, line, _)| line.points.len().saturating_sub(1))
+            .sum();
+        // Two temporary indexes share the ORIGINAL compiler scratch admission.
+        if segment_count
+            .checked_add(new_segment_count)?
+            .checked_mul(128)?
+            > budget
+        {
+            return None;
+        }
+        // The spatial index is temporary, but cap it before allocating as well.
+        if segment_count.checked_mul(128)? > budget || selected.len().checked_mul(128)? > budget {
+            return None;
+        }
+        if let Some(w) = work.as_mut() {
+            w.all_segments = w.all_segments.saturating_add(segment_count as u64);
+            w.new_segments = w.new_segments.saturating_add(new_segment_count as u64);
+        }
+        let group_start = work.as_ref().map(|_| std::time::Instant::now());
+        type CoincidentSourceGroups<'a> = HashMap<Curve<'a>, Vec<(usize, (i32, i32))>>;
+        let mut groups: CoincidentSourceGroups<'_> = HashMap::new();
+        let mut segments = Vec::with_capacity(segment_count);
+        let mut new_segments = Vec::with_capacity(new_segment_count);
+        for (i, line, curve) in &selected {
+            let priority = (line.display_plane.order().get(), line.priority.0);
+            groups.entry(*curve).or_default().push((*i, priority));
+            for pair in line.points.windows(2) {
+                if let Some(segment) = Segment::new(pair[0], pair[1]) {
+                    let entry = IndexedSegment {
+                        segment,
+                        index: *i,
+                        priority,
+                    };
+                    segments.push(entry);
+                    if !covered[*i] {
+                        new_segments.push(entry);
+                    }
+                }
+            }
+        }
+        if let (Some(w), Some(start)) = (work.as_mut(), group_start) {
+            w.group_and_segment_build_ns = w
+                .group_and_segment_build_ns
+                .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let index_start = work.as_ref().map(|_| std::time::Instant::now());
+        let tree = rstar::RTree::bulk_load(segments);
+        let new_tree = rstar::RTree::bulk_load(new_segments);
+        if let (Some(w), Some(start)) = (work.as_mut(), index_start) {
+            w.two_index_build_ns = w
+                .two_index_build_ns
+                .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let target_start = work.as_ref().map(|_| std::time::Instant::now());
+        let mut previous_target_cursor = 0usize;
+        let mut targets = Vec::new();
+        let mut bytes = std::mem::size_of::<Self>();
+        for (i, line, curve) in selected {
+            if !line.suppressible {
+                continue;
+            }
+            while previous_target_cursor < previous.targets.len()
+                && previous.targets[previous_target_cursor].index < i
+            {
+                previous_target_cursor += 1;
+            }
+            let old_target = if covered[i] {
+                previous
+                    .targets
+                    .get(previous_target_cursor)
+                    .filter(|t| t.index == i)
+            } else {
+                None
+            };
+            if let Some(w) = work.as_mut() {
+                if covered[i] {
+                    w.old_targets = w.old_targets.saturating_add(1);
+                } else {
+                    w.new_targets = w.new_targets.saturating_add(1);
+                }
+            }
+            let query_tree = if covered[i] { &new_tree } else { &tree };
+            let priority = (line.display_plane.order().get(), line.priority.0);
+            let full_higher: Vec<_> = groups[&curve]
+                .iter()
+                .filter(|(_, p)| *p > priority)
+                .map(|(i, _)| *i)
+                .collect();
+            bytes = bytes.checked_add(full_higher.capacity() * std::mem::size_of::<usize>())?;
+            if bytes > budget {
+                return None;
+            }
+            // Superset bbox test ONLY. The source epoch/projection and covered
+            // union are the same private proof as the existing growth compiler.
+            // Full-coincident new sources MUST be checked separately: a repeated
+            // identical-point curve has no Segment::new entries but can still
+            // participate in the ORIGINAL full-curve priority rule.
+            if reuse_unchanged && covered[i] {
+                if let Some(w) = work.as_mut() {
+                    w.unchanged_old_target_checks = w.unchanged_old_target_checks.saturating_add(1);
+                }
+                let new_full_higher = full_higher.iter().any(|j| !covered[*j]);
+                let first = line.points[0];
+                let (mut lower, mut upper) = ([first.x, first.y], [first.x, first.y]);
+                for point in &line.points[1..] {
+                    lower[0] = lower[0].min(point.x);
+                    lower[1] = lower[1].min(point.y);
+                    upper[0] = upper[0].max(point.x);
+                    upper[1] = upper[1].max(point.y);
+                }
+                let envelope = rstar::AABB::from_corners(lower, upper);
+                let possible_partial = new_tree
+                    .locate_in_envelope_intersecting(&envelope)
+                    .any(|other| other.priority > priority && !full_higher.contains(&other.index));
+                let old_is_exact = old_target.is_some_and(|old| old.full_higher == full_higher)
+                    || (old_target.is_none() && full_higher.is_empty());
+                if !new_full_higher && !possible_partial && old_is_exact {
+                    if let Some(w) = work.as_mut() {
+                        w.unchanged_old_target_accepts =
+                            w.unchanged_old_target_accepts.saturating_add(1);
+                        w.unchanged_segment_windows_avoided = w
+                            .unchanged_segment_windows_avoided
+                            .saturating_add(line.points.len().saturating_sub(1) as u64);
+                    }
+                    if let Some(old) = old_target {
+                        // Preserve every old interval bit and ordinal, including
+                        // temporarily hidden occluders. No shared mutable payload.
+                        let mut segments = Vec::new();
+                        let requested = old
+                            .segments
+                            .len()
+                            .checked_mul(std::mem::size_of::<PreparedSegment>())?;
+                        let old_higher_requested =
+                            old.segments.iter().try_fold(0usize, |sum, part| {
+                                sum.checked_add(
+                                    part.higher.len().checked_mul(std::mem::size_of::<(
+                                        usize,
+                                        f64,
+                                        f64,
+                                    )>(
+                                    ))?,
+                                )
+                            })?;
+                        if bytes
+                            .checked_add(requested)?
+                            .checked_add(old_higher_requested)?
+                            > budget
+                        {
+                            return None;
+                        }
+                        segments.try_reserve_exact(old.segments.len()).ok()?;
+                        bytes = bytes.checked_add(
+                            segments
+                                .capacity()
+                                .checked_mul(std::mem::size_of::<PreparedSegment>())?,
+                        )?;
+                        if bytes > budget {
+                            return None;
+                        }
+                        for part in &old.segments {
+                            let mut higher = Vec::new();
+                            higher.try_reserve_exact(part.higher.len()).ok()?;
+                            let charge = higher.capacity().checked_mul(std::mem::size_of::<(
+                                usize,
+                                f64,
+                                f64,
+                            )>(
+                            ))?;
+                            bytes = bytes.checked_add(charge)?;
+                            if bytes > budget {
+                                return None;
+                            }
+                            higher.extend_from_slice(&part.higher);
+                            if let Some(w) = work.as_mut() {
+                                w.old_relation_elements_cloned = w
+                                    .old_relation_elements_cloned
+                                    .saturating_add(higher.len() as u64);
+                                w.old_relation_capacity_charged = w
+                                    .old_relation_capacity_charged
+                                    .saturating_add(charge as u64);
+                            }
+                            segments.push(PreparedSegment {
+                                index: part.index,
+                                higher,
+                            });
+                        }
+                        let capacity = targets.capacity();
+                        targets.push(PreparedTarget {
+                            index: i,
+                            full_higher,
+                            segments,
+                        });
+                        bytes = bytes.checked_add(
+                            (targets.capacity() - capacity)
+                                .checked_mul(std::mem::size_of::<PreparedTarget>())?,
+                        )?;
+                        if bytes > budget {
+                            return None;
+                        }
+                    } else {
+                        // The original compiler would discard this unchanged
+                        // relation-free target. Only metadata is cached; never raw
+                        // drawing, selection, eligibility, or source visibility.
+                        bytes -= full_higher.capacity() * std::mem::size_of::<usize>();
+                    }
+                    continue;
+                }
+            }
+            let mut prepared = Vec::new();
+            let mut changed = !full_higher.is_empty();
+            for (index, pair) in line.points.windows(2).enumerate() {
+                let Some(segment) = Segment::new(pair[0], pair[1]) else {
+                    continue;
+                };
+                let mut higher = old_target
+                    .and_then(|t| {
+                        t.segments
+                            .binary_search_by_key(&index, |s| s.index)
+                            .ok()
+                            .map(|slot| t.segments[slot].higher.clone())
+                    })
+                    .unwrap_or_default();
+                if let Some(w) = work.as_mut() {
+                    w.old_relation_elements_cloned = w
+                        .old_relation_elements_cloned
+                        .saturating_add(higher.len() as u64);
+                    w.old_relation_capacity_charged =
+                        w.old_relation_capacity_charged.saturating_add(
+                            higher
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(usize, f64, f64)>())
+                                as u64,
+                        );
+                }
+                bytes = bytes.checked_add(
+                    higher
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<(usize, f64, f64)>())?,
+                )?;
+                if bytes > budget {
+                    return None;
+                }
+                for other in query_tree.locate_in_envelope_intersecting(&segment.envelope()) {
+                    if other.priority <= priority || full_higher.contains(&other.index) {
+                        continue;
+                    }
+                    if let Some((start, end)) = segment.overlap(other.segment) {
+                        let old_capacity = higher.capacity();
+                        higher.push((other.index, start, end));
+                        bytes = bytes.checked_add(
+                            (higher.capacity() - old_capacity)
+                                * std::mem::size_of::<(usize, f64, f64)>(),
+                        )?;
+                        if bytes > budget {
+                            return None;
+                        }
+                    }
+                }
+                changed |= !higher.is_empty();
+                // Filtering this list by eligibility preserves the original
+                // planner's endpoint sort, including exact signed-zero ordering.
+                higher.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)));
+                let old_capacity = prepared.capacity();
+                prepared.push(PreparedSegment { index, higher });
+                bytes = bytes.checked_add(
+                    (prepared.capacity() - old_capacity) * std::mem::size_of::<PreparedSegment>(),
+                )?;
+                if bytes > budget {
+                    return None;
+                }
+            }
+            if changed {
+                let old_capacity = targets.capacity();
+                targets.push(PreparedTarget {
+                    index: i,
+                    full_higher,
+                    segments: prepared,
+                });
+                bytes = bytes.checked_add(
+                    (targets.capacity() - old_capacity) * std::mem::size_of::<PreparedTarget>(),
+                )?;
+                if bytes > budget {
+                    return None;
+                }
+            } else {
+                bytes -= full_higher.capacity() * std::mem::size_of::<usize>()
+                    + prepared.capacity() * std::mem::size_of::<PreparedSegment>()
+                    + prepared
+                        .iter()
+                        .map(|s| s.higher.capacity() * std::mem::size_of::<(usize, f64, f64)>())
+                        .sum::<usize>();
+            }
+        }
+        if let (Some(w), Some(start)) = (work.as_mut(), target_start) {
+            w.target_relations_ns = w
+                .target_relations_ns
+                .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            w.admitted = w.admitted.saturating_add(1);
+        }
+        Some(Self {
+            dimension: instructions.len(),
+            targets,
+            bytes,
+        })
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep immutable old/current coverage witnesses, private index, original budget, diagnostics, and unchanged-target policy explicit; no public source authority."
+    )]
+    fn compile_growth_with_index_blocks(
+        instructions: &[DrawingInstruction],
+        budget: usize,
+        previous: &Self,
+        covered: &[bool],
+        new_covered: &[bool],
+        prior_index: Option<&OwnedGrowthIndex>,
+        mut work: Option<&mut GrowthCompilerWork>,
+        reuse_unchanged: bool,
+    ) -> Option<(Self, OwnedGrowthIndex)> {
+        if let Some(w) = work.as_mut() {
+            w.index_block_attempts = w.index_block_attempts.saturating_add(1);
+        }
+        if let Some(w) = work.as_mut() {
+            w.attempts = w.attempts.saturating_add(1);
+        }
+        if previous.dimension != instructions.len()
+            || covered.len() != instructions.len()
+            || new_covered.len() != instructions.len()
+        {
+            return None;
+        }
+        use rstar::RTreeObject;
+        let selected: Vec<_> = instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let DrawingInstruction::Line(line) = item else {
+                    return None;
+                };
+                if line.screen_ray.is_some()
+                    || line.portrayal_path.is_some()
+                    || !line.style.has_visible_stroke()
+                {
+                    return None;
+                }
+                Some((i, line, Curve::new(&line.points)?))
+            })
+            .collect();
+        let segment_count: usize = selected
+            .iter()
+            .map(|(_, line, _)| line.points.len().saturating_sub(1))
+            .sum();
+        let new_segment_count: usize = selected
+            .iter()
+            .filter(|(i, _, _)| !covered[*i])
+            .map(|(_, line, _)| line.points.len().saturating_sub(1))
+            .sum();
+        // Two temporary indexes share the ORIGINAL compiler scratch admission.
+        if segment_count
+            .checked_add(new_segment_count)?
+            .checked_mul(128)?
+            > budget
+        {
+            return None;
+        }
+        // The spatial index is temporary, but cap it before allocating as well.
+        if segment_count.checked_mul(128)? > budget || selected.len().checked_mul(128)? > budget {
+            return None;
+        }
+        if let Some(w) = work.as_mut() {
+            w.all_segments = w.all_segments.saturating_add(segment_count as u64);
+            w.new_segments = w.new_segments.saturating_add(new_segment_count as u64);
+        }
+        let group_start = work.as_ref().map(|_| std::time::Instant::now());
+        type CoincidentSourceGroups<'a> = HashMap<Curve<'a>, Vec<(usize, (i32, i32))>>;
+        let mut groups: CoincidentSourceGroups<'_> = HashMap::new();
+
+        for (i, line, curve) in &selected {
+            let priority = (line.display_plane.order().get(), line.priority.0);
+            groups.entry(*curve).or_default().push((*i, priority));
+        }
+
+        if let (Some(w), Some(start)) = (work.as_mut(), group_start) {
+            w.group_and_segment_build_ns = w
+                .group_and_segment_build_ns
+                .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let index_start = work.as_ref().map(|_| std::time::Instant::now());
+        let (owned_index, new_start) = OwnedGrowthIndex::stage(
+            &selected,
+            covered,
+            new_covered,
+            prior_index,
+            budget,
+            work.as_deref_mut(),
+        )?;
+        if let (Some(w), Some(start)) = (work.as_mut(), index_start) {
+            w.two_index_build_ns = w
+                .two_index_build_ns
+                .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
+        let target_start = work.as_ref().map(|_| std::time::Instant::now());
+        let mut previous_target_cursor = 0usize;
+        let mut targets = Vec::new();
+        let mut bytes = std::mem::size_of::<Self>();
+        for (i, line, curve) in selected {
+            if !line.suppressible {
+                continue;
+            }
+            while previous_target_cursor < previous.targets.len()
+                && previous.targets[previous_target_cursor].index < i
+            {
+                previous_target_cursor += 1;
+            }
+            let old_target = if covered[i] {
+                previous
+                    .targets
+                    .get(previous_target_cursor)
+                    .filter(|t| t.index == i)
+            } else {
+                None
+            };
+            if let Some(w) = work.as_mut() {
+                if covered[i] {
+                    w.old_targets = w.old_targets.saturating_add(1);
+                } else {
+                    w.new_targets = w.new_targets.saturating_add(1);
+                }
+            }
+            let query_start = if covered[i] { new_start } else { 0 };
+            let priority = (line.display_plane.order().get(), line.priority.0);
+            let full_higher: Vec<_> = groups[&curve]
+                .iter()
+                .filter(|(_, p)| *p > priority)
+                .map(|(i, _)| *i)
+                .collect();
+            bytes = bytes.checked_add(full_higher.capacity() * std::mem::size_of::<usize>())?;
+            if bytes > budget {
+                return None;
+            }
+            // Superset bbox test ONLY. The source epoch/projection and covered
+            // union are the same private proof as the existing growth compiler.
+            // Full-coincident new sources MUST be checked separately: a repeated
+            // identical-point curve has no Segment::new entries but can still
+            // participate in the ORIGINAL full-curve priority rule.
+            if reuse_unchanged && covered[i] {
+                if let Some(w) = work.as_mut() {
+                    w.unchanged_old_target_checks = w.unchanged_old_target_checks.saturating_add(1);
+                }
+                let new_full_higher = full_higher.iter().any(|j| !covered[*j]);
+                let first = line.points[0];
+                let (mut lower, mut upper) = ([first.x, first.y], [first.x, first.y]);
+                for point in &line.points[1..] {
+                    lower[0] = lower[0].min(point.x);
+                    lower[1] = lower[1].min(point.y);
+                    upper[0] = upper[0].max(point.x);
+                    upper[1] = upper[1].max(point.y);
+                }
+                let envelope = rstar::AABB::from_corners(lower, upper);
+                let possible_partial =
+                    owned_index.any(new_start..owned_index.blocks.len(), &envelope, |other| {
+                        other.priority > priority && !full_higher.contains(&other.index)
+                    })?;
+                let old_is_exact = old_target.is_some_and(|old| old.full_higher == full_higher)
+                    || (old_target.is_none() && full_higher.is_empty());
+                if !new_full_higher && !possible_partial && old_is_exact {
+                    if let Some(w) = work.as_mut() {
+                        w.unchanged_old_target_accepts =
+                            w.unchanged_old_target_accepts.saturating_add(1);
+                        w.unchanged_segment_windows_avoided = w
+                            .unchanged_segment_windows_avoided
+                            .saturating_add(line.points.len().saturating_sub(1) as u64);
+                    }
+                    if let Some(old) = old_target {
+                        // Preserve every old interval bit and ordinal, including
+                        // temporarily hidden occluders. No shared mutable payload.
+                        let mut segments = Vec::new();
+                        let requested = old
+                            .segments
+                            .len()
+                            .checked_mul(std::mem::size_of::<PreparedSegment>())?;
+                        let old_higher_requested =
+                            old.segments.iter().try_fold(0usize, |sum, part| {
+                                sum.checked_add(
+                                    part.higher.len().checked_mul(std::mem::size_of::<(
+                                        usize,
+                                        f64,
+                                        f64,
+                                    )>(
+                                    ))?,
+                                )
+                            })?;
+                        if bytes
+                            .checked_add(requested)?
+                            .checked_add(old_higher_requested)?
+                            > budget
+                        {
+                            return None;
+                        }
+                        segments.try_reserve_exact(old.segments.len()).ok()?;
+                        bytes = bytes.checked_add(
+                            segments
+                                .capacity()
+                                .checked_mul(std::mem::size_of::<PreparedSegment>())?,
+                        )?;
+                        if bytes > budget {
+                            return None;
+                        }
+                        for part in &old.segments {
+                            let mut higher = Vec::new();
+                            higher.try_reserve_exact(part.higher.len()).ok()?;
+                            let charge = higher.capacity().checked_mul(std::mem::size_of::<(
+                                usize,
+                                f64,
+                                f64,
+                            )>(
+                            ))?;
+                            bytes = bytes.checked_add(charge)?;
+                            if bytes > budget {
+                                return None;
+                            }
+                            higher.extend_from_slice(&part.higher);
+                            if let Some(w) = work.as_mut() {
+                                w.old_relation_elements_cloned = w
+                                    .old_relation_elements_cloned
+                                    .saturating_add(higher.len() as u64);
+                                w.old_relation_capacity_charged = w
+                                    .old_relation_capacity_charged
+                                    .saturating_add(charge as u64);
+                            }
+                            segments.push(PreparedSegment {
+                                index: part.index,
+                                higher,
+                            });
+                        }
+                        let capacity = targets.capacity();
+                        targets.push(PreparedTarget {
+                            index: i,
+                            full_higher,
+                            segments,
+                        });
+                        bytes = bytes.checked_add(
+                            (targets.capacity() - capacity)
+                                .checked_mul(std::mem::size_of::<PreparedTarget>())?,
+                        )?;
+                        if bytes > budget {
+                            return None;
+                        }
+                    } else {
+                        // The original compiler would discard this unchanged
+                        // relation-free target. Only metadata is cached; never raw
+                        // drawing, selection, eligibility, or source visibility.
+                        bytes -= full_higher.capacity() * std::mem::size_of::<usize>();
+                    }
+                    continue;
+                }
+            }
+            let mut prepared = Vec::new();
+            let mut changed = !full_higher.is_empty();
+            for (index, pair) in line.points.windows(2).enumerate() {
+                let Some(segment) = Segment::new(pair[0], pair[1]) else {
+                    continue;
+                };
+                let mut higher = old_target
+                    .and_then(|t| {
+                        t.segments
+                            .binary_search_by_key(&index, |s| s.index)
+                            .ok()
+                            .map(|slot| t.segments[slot].higher.clone())
+                    })
+                    .unwrap_or_default();
+                if let Some(w) = work.as_mut() {
+                    w.old_relation_elements_cloned = w
+                        .old_relation_elements_cloned
+                        .saturating_add(higher.len() as u64);
+                    w.old_relation_capacity_charged =
+                        w.old_relation_capacity_charged.saturating_add(
+                            higher
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(usize, f64, f64)>())
+                                as u64,
+                        );
+                }
+                bytes = bytes.checked_add(
+                    higher
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<(usize, f64, f64)>())?,
+                )?;
+                if bytes > budget {
+                    return None;
+                }
+                owned_index.visit(
+                    query_start..owned_index.blocks.len(),
+                    &segment.envelope(),
+                    |other| {
+                        if other.priority <= priority || full_higher.contains(&other.index) {
+                            return Some(());
+                        }
+                        if let Some((start, end)) = segment.overlap(other.segment) {
+                            let old_capacity = higher.capacity();
+                            higher.push((other.index, start, end));
+                            bytes = bytes.checked_add(
+                                (higher.capacity() - old_capacity)
+                                    * std::mem::size_of::<(usize, f64, f64)>(),
+                            )?;
+                            if bytes > budget {
+                                return None;
+                            }
+                        }
+                        Some(())
+                    },
+                )?;
+                changed |= !higher.is_empty();
+                // Filtering this list by eligibility preserves the original
+                // planner's endpoint sort, including exact signed-zero ordering.
+                higher.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)));
+                let old_capacity = prepared.capacity();
+                prepared.push(PreparedSegment { index, higher });
+                bytes = bytes.checked_add(
+                    (prepared.capacity() - old_capacity) * std::mem::size_of::<PreparedSegment>(),
+                )?;
+                if bytes > budget {
+                    return None;
+                }
+            }
+            if changed {
+                let old_capacity = targets.capacity();
+                targets.push(PreparedTarget {
+                    index: i,
+                    full_higher,
+                    segments: prepared,
+                });
+                bytes = bytes.checked_add(
+                    (targets.capacity() - old_capacity) * std::mem::size_of::<PreparedTarget>(),
+                )?;
+                if bytes > budget {
+                    return None;
+                }
+            } else {
+                bytes -= full_higher.capacity() * std::mem::size_of::<usize>()
+                    + prepared.capacity() * std::mem::size_of::<PreparedSegment>()
+                    + prepared
+                        .iter()
+                        .map(|s| s.higher.capacity() * std::mem::size_of::<(usize, f64, f64)>())
+                        .sum::<usize>();
+            }
+        }
+        if bytes.checked_add(owned_index.bytes)? > budget {
+            return None;
+        }
+        if let Some(w) = work.as_mut() {
+            w.index_block_admitted = w.index_block_admitted.saturating_add(1);
+            w.index_block_payload_peak = w.index_block_payload_peak.max(owned_index.bytes as u64);
+        }
+        if let (Some(w), Some(start)) = (work.as_mut(), target_start) {
+            w.target_relations_ns = w
+                .target_relations_ns
+                .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            w.admitted = w.admitted.saturating_add(1);
+        }
+        Some((
+            Self {
+                dimension: instructions.len(),
+                targets,
+                bytes,
+            },
+            owned_index,
+        ))
     }
     pub fn retained_bytes(&self) -> usize {
         self.bytes
@@ -1966,5 +3288,898 @@ mod context_prewarm_epoch_tests {
             cache.prewarm_attempt,
             Some((SuppressionRevision::Legacy(1), _, 2))
         ));
+    }
+}
+
+#[cfg(test)]
+mod tail_diagnostic_controls {
+    use super::*;
+    #[test]
+    fn optional_counters_are_fixed_size_saturating_and_no_policy_change() {
+        let mut c = LineSuppressionCache::default();
+        c.tail_count(0);
+        assert_eq!(c.tail_diagnostics_counters(), [0; 10]);
+        c.set_tail_diagnostics_enabled(true);
+        c.tail_counters.as_mut().unwrap()[0] = u64::MAX;
+        c.tail_count(0);
+        assert_eq!(c.tail_diagnostics_counters()[0], u64::MAX);
+        c.set_tail_diagnostics_enabled(false);
+        assert_eq!(c.tail_diagnostics_counters(), [0; 10]);
+        assert!(c.immutable_prepared.is_none());
+    }
+}
+
+#[cfg(test)]
+mod growth_relation_controls {
+    use super::*;
+    fn line(points: &[(f64, f64)], priority: i32) -> DrawingInstruction {
+        DrawingInstruction::Line(
+            crate::LineInstruction::new(points.iter().map(|p| WorldPoint::new(p.0, p.1)).collect())
+                .with_priority(priority),
+        )
+    }
+    fn masked(items: &[DrawingInstruction], mask: &[bool]) -> Vec<DrawingInstruction> {
+        items
+            .iter()
+            .zip(mask)
+            .map(|(i, v)| {
+                if *v {
+                    i.clone()
+                } else {
+                    DrawingInstruction::Line(crate::LineInstruction::new(Vec::new()))
+                }
+            })
+            .collect()
+    }
+    fn exact(a: &LineSuppressionPlan, b: &LineSuppressionPlan) {
+        assert_eq!(a.fully_suppressed, b.fully_suppressed);
+        assert_eq!(a.partial.len(), b.partial.len());
+        for (i, spans) in &a.partial {
+            let other = b.partial.get(i).unwrap();
+            assert_eq!(spans.len(), other.len());
+            for (x, y) in spans.iter().zip(other) {
+                assert_eq!(
+                    (x.segment, x.start.to_bits(), x.end.to_bits()),
+                    (y.segment, y.start.to_bits(), y.end.to_bits())
+                );
+            }
+        }
+    }
+    #[test]
+    fn growing_old_targets_new_occluders_full_curves_and_all_visibility_masks_exact() {
+        let items = vec![
+            line(&[(0., 0.), (10., 0.)], 1),
+            line(&[(2., 0.), (6., 0.)], 5),
+            line(&[(10., 0.), (0., 0.)], 9),
+            line(&[(5., -1.), (5., 1.)], 8),
+        ];
+        let mut covered = vec![true, false, false, false];
+        let mut previous =
+            PreparedLineSuppression::compile(&masked(&items, &covered), 32 * 1024 * 1024).unwrap();
+        for add in [1, 3, 2] {
+            covered[add] = true;
+            let source = masked(&items, &covered);
+            let incremental =
+                PreparedLineSuppression::compile_growth(&source, 32 * 1024 * 1024, &previous, &{
+                    let mut old = covered.clone();
+                    old[add] = false;
+                    old
+                })
+                .unwrap();
+            let full = PreparedLineSuppression::compile(&source, 32 * 1024 * 1024).unwrap();
+            for bits in 0..16 {
+                let eligible: Vec<_> = (0..4)
+                    .map(|i| covered[i] && (bits & (1 << i) != 0))
+                    .collect();
+                exact(
+                    &incremental.plan(&eligible).unwrap(),
+                    &full.plan(&eligible).unwrap(),
+                );
+                exact(
+                    &incremental.plan(&eligible).unwrap(),
+                    &LineSuppressionCache::default().plan_projected_with_visibility(
+                        &source,
+                        0,
+                        None,
+                        None,
+                        Some(&eligible),
+                        FlatProjection::LocalGeographic,
+                    ),
+                );
+            }
+            assert!(incremental.retained_bytes() <= 32 * 1024 * 1024);
+            previous = incremental;
+        }
+    }
+    #[test]
+    fn finite_empty_prewarm_covered_but_invalid_and_budget_declines_unchanged() {
+        let items = vec![
+            line(&[], 3),
+            line(&[(1., 2.)], 4),
+            line(&[(0., 60.), (10., 60.)], 1),
+            line(&[(2., 60.), (6., 60.)], 7),
+        ];
+        assert!(LineSuppressionCache::try_static_prewarm(
+            &items,
+            FlatProjection::EllipsoidalMercator,
+            64 * 1024 * 1024,
+            32 * 1024 * 1024
+        )
+        .is_none());
+        let (covered, compiled) = LineSuppressionCache::try_static_prewarm_covered_empty(
+            &items,
+            FlatProjection::EllipsoidalMercator,
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(covered, vec![true; 4]);
+        for bits in 0..16 {
+            let mask: Vec<_> = (0..4).map(|i| bits & (1 << i) != 0).collect();
+            exact(
+                &compiled.plan(&mask).unwrap(),
+                &LineSuppressionCache::default().plan_projected_with_visibility(
+                    &items,
+                    0,
+                    None,
+                    None,
+                    Some(&mask),
+                    FlatProjection::EllipsoidalMercator,
+                ),
+            );
+        }
+        assert!(LineSuppressionCache::try_static_prewarm_covered_empty(
+            &items,
+            FlatProjection::LocalGeographic,
+            0,
+            32 * 1024 * 1024
+        )
+        .is_none());
+        assert!(LineSuppressionCache::try_static_prewarm_covered_empty(
+            &items,
+            FlatProjection::LocalGeographic,
+            64 * 1024 * 1024,
+            0
+        )
+        .is_none());
+        let invalid = vec![line(&[(f64::NAN, 0.)], 4)];
+        assert!(LineSuppressionCache::try_static_prewarm_covered_empty(
+            &invalid,
+            FlatProjection::LocalGeographic,
+            64 * 1024 * 1024,
+            32 * 1024 * 1024
+        )
+        .is_none());
+    }
+    #[test]
+    fn reuse_growth_dimensions_decline_and_original_fullcompiler_remains_fallback() {
+        let old = vec![line(&[(0., 0.), (10., 0.)], 1)];
+        let compiled = PreparedLineSuppression::compile(&old, 4096).unwrap();
+        assert!(PreparedLineSuppression::compile_growth(&old, 0, &compiled, &[true]).is_none());
+        assert!(PreparedLineSuppression::compile_growth(&old, 4096, &compiled, &[]).is_none());
+        let changed = vec![
+            line(&[(0., 0.), (10., 0.)], 1),
+            line(&[(0., 0.), (5., 0.)], 9),
+        ];
+        assert!(
+            PreparedLineSuppression::compile_growth(&changed, 4096, &compiled, &[true, false])
+                .is_none()
+        );
+        assert!(PreparedLineSuppression::compile(&changed, 4096).is_some());
+    }
+    #[test]
+    fn context_revision_replacement_and_masks_do_not_reuse_old_geometry() {
+        let a = vec![
+            line(&[(0., 0.), (10., 0.)], 1),
+            line(&[(0., 0.), (5., 0.)], 9),
+        ];
+        let b = vec![
+            line(&[(0., 0.), (10., 0.)], 1),
+            line(&[(5., 0.), (10., 0.)], 9),
+        ];
+        let mut cache = LineSuppressionCache::default();
+        cache.set_static_prewarm_enabled(false);
+        cache.growth_reuse_policy = Some(true);
+        cache.plan_immutable_projected_with_visibility(
+            &a,
+            1,
+            0,
+            None,
+            None,
+            Some(&[true, false]),
+            FlatProjection::LocalGeographic,
+        );
+        exact(
+            &cache.plan_immutable_projected_with_visibility(
+                &a,
+                1,
+                0,
+                None,
+                None,
+                Some(&[true, true]),
+                FlatProjection::LocalGeographic,
+            ),
+            &LineSuppressionCache::default().plan(&a, 0, None, None),
+        );
+        exact(
+            &cache.plan_immutable_projected_with_visibility(
+                &b,
+                2,
+                0,
+                None,
+                None,
+                Some(&[true, true]),
+                FlatProjection::LocalGeographic,
+            ),
+            &LineSuppressionCache::default().plan(&b, 0, None, None),
+        );
+    }
+    #[test]
+    fn projection_source_priority_scale_group_and_time_masks_match_original() {
+        let mut items = vec![
+            line(&[], 1),
+            line(&[(0., 60.), (10., 60.)], 2),
+            line(&[(2., 60.), (6., 60.)], 7),
+        ];
+        if let DrawingInstruction::Line(l) = &mut items[2] {
+            l.viewing_group = crate::ViewingGroup(33010);
+            l.additional_viewing_groups = vec![crate::ViewingGroup(33011)].into_boxed_slice();
+            l.scale_range.scale_minimum = Some(10_000);
+            l.cell_index = Some(9);
+            l.suppressible = false;
+        }
+        let mut cache = LineSuppressionCache {
+            empty_curve_prewarm_policy: Some(true),
+            growth_reuse_policy: Some(true),
+            ..Default::default()
+        };
+        let sets = [
+            None,
+            Some(HashSet::from([33010])),
+            Some(HashSet::from([33010, 33011])),
+        ];
+        for revision in [41, 42] {
+            if revision == 42 {
+                if let DrawingInstruction::Line(l) = &mut items[2] {
+                    l.points.reverse();
+                    l.priority = crate::DisplayPriority(1);
+                    l.cell_index = Some(10);
+                }
+            }
+            for projection in [
+                FlatProjection::LocalGeographic,
+                FlatProjection::EllipsoidalMercator,
+            ] {
+                for scale in [100, 20_000] {
+                    for groups in &sets {
+                        for override_group in [None, Some(33010)] {
+                            for bits in 0..8 {
+                                // Selector mask is the original temporal/coverage result;
+                                // prewarm must not make a hidden contributor suppress.
+                                let mask: Vec<_> = (0..3).map(|i| bits & (1 << i) != 0).collect();
+                                exact(
+                                    &cache.plan_immutable_projected_with_visibility(
+                                        &items,
+                                        revision,
+                                        scale,
+                                        groups.as_ref(),
+                                        override_group,
+                                        Some(&mask),
+                                        projection,
+                                    ),
+                                    &LineSuppressionCache::default()
+                                        .plan_projected_with_visibility(
+                                            &items,
+                                            scale,
+                                            groups.as_ref(),
+                                            override_group,
+                                            Some(&mask),
+                                            projection,
+                                        ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn old_empty_relation_new_lower_equal_plane_signed_zero_and_reappearing_sources_exact() {
+        let mut items = vec![
+            line(&[(-0., -0.), (10., 0.)], 2),
+            line(&[(2., 0.), (6., 0.)], 8),
+            line(&[(10., 0.), (0., -0.)], 9),
+            line(&[(2., 0.), (6., 0.)], 1),
+            line(&[(0., 0.), (10., 0.)], 2),
+            line(&[(0., 0.), (10., 0.)], 2),
+            line(&[(0., 0.), (10., 0.)], 99),
+        ];
+        if let DrawingInstruction::Line(l) = &mut items[5] {
+            l.display_plane = crate::DisplayPlane::OverRadar;
+        }
+        if let DrawingInstruction::Line(l) = &mut items[6] {
+            l.display_plane = crate::DisplayPlane::UnderRadar;
+        }
+        let mut covered = vec![true, false, false, false, false, false, false];
+        let mut previous =
+            PreparedLineSuppression::compile(&masked(&items, &covered), 32 * 1024 * 1024).unwrap();
+        assert!(previous.targets.is_empty());
+        for add in [1, 3, 4, 5, 6, 2] {
+            let old = covered.clone();
+            covered[add] = true;
+            let source = masked(&items, &covered);
+            let result =
+                PreparedLineSuppression::compile_growth(&source, 32 * 1024 * 1024, &previous, &old)
+                    .unwrap();
+            for flags in 0..128 {
+                let visible: Vec<_> = (0..7)
+                    .map(|j| covered[j] && flags & (1 << j) != 0)
+                    .collect();
+                exact(
+                    &result.plan(&visible).unwrap(),
+                    &LineSuppressionCache::default().plan_projected_with_visibility(
+                        &source,
+                        0,
+                        None,
+                        None,
+                        Some(&visible),
+                        FlatProjection::LocalGeographic,
+                    ),
+                );
+            }
+            previous = result;
+        }
+        // One segment fits the old 128-byte scratch admission, whereas old+new
+        // indexes with two segments must decline and use the original full compile.
+        let old = vec![line(&[(0., 0.), (10., 0.)], 1)];
+        let previous = PreparedLineSuppression::compile(&old, 4096).unwrap();
+        let expanded = vec![old[0].clone(), line(&[(2., 0.), (6., 0.)], 8)];
+        assert!(
+            PreparedLineSuppression::compile_growth(&expanded, 256, &previous, &[true, false])
+                .is_none()
+        );
+        assert!(PreparedLineSuppression::compile(&expanded, 4096).is_some());
+    }
+    #[test]
+    fn optional_growth_children_preserve_plan_and_report_admission() {
+        let items = vec![
+            line(&[(0., 0.), (10., 0.)], 1),
+            line(&[(2., 0.), (6., 0.)], 9),
+        ];
+        let previous =
+            PreparedLineSuppression::compile(&masked(&items, &[true, false]), 4096).unwrap();
+        let mut work = GrowthCompilerWork::default();
+        let measured = PreparedLineSuppression::compile_growth_with_work(
+            &items,
+            4096,
+            &previous,
+            &[true, false],
+            Some(&mut work),
+        )
+        .unwrap();
+        let ordinary =
+            PreparedLineSuppression::compile_growth(&items, 4096, &previous, &[true, false])
+                .unwrap();
+        for mask in [[false, false], [true, false], [false, true], [true, true]] {
+            exact(
+                &measured.plan(&mask).unwrap(),
+                &ordinary.plan(&mask).unwrap(),
+            );
+        }
+        assert_eq!(
+            (
+                work.attempts,
+                work.admitted,
+                work.all_segments,
+                work.new_segments
+            ),
+            (1, 1, 2, 1)
+        );
+        assert!(PreparedLineSuppression::compile_growth_with_work(
+            &items,
+            0,
+            &previous,
+            &[true, false],
+            Some(&mut work)
+        )
+        .is_none());
+        assert_eq!((work.attempts, work.admitted), (2, 1));
+    }
+    #[test]
+    fn unchanged_target_guard_all_masks_new_partial_full_far_cross_and_lower_exact() {
+        let items = vec![
+            line(&[(-0., -0.), (10., 0.)], 2),
+            line(&[(2., 0.), (6., 0.)], 8),
+            line(&[(100., 0.), (110., 0.)], 1),
+            line(&[(200., 0.), (201., 0.)], 100),
+            line(&[(4., -1.), (4., 1.)], 99),
+            line(&[(6., 0.), (8., 0.)], 10),
+            line(&[(10., 0.), (0., 0.)], 20),
+            line(&[(2., 0.), (4., 0.)], 0),
+        ];
+        let mut covered = vec![true, true, true, false, false, false, false, false];
+        let mut previous =
+            PreparedLineSuppression::compile(&masked(&items, &covered), 32 * 1024 * 1024).unwrap();
+        let mut work = GrowthCompilerWork::default();
+        for add in [3, 4, 7, 5, 6] {
+            let old = covered.clone();
+            covered[add] = true;
+            let source = masked(&items, &covered);
+            let fast = PreparedLineSuppression::compile_growth_with_unchanged_targets(
+                &source,
+                32 * 1024 * 1024,
+                &previous,
+                &old,
+                Some(&mut work),
+                true,
+            )
+            .unwrap();
+            let original_growth = PreparedLineSuppression::compile_growth_with_work(
+                &source,
+                32 * 1024 * 1024,
+                &previous,
+                &old,
+                None,
+            )
+            .unwrap();
+            for flags in 0..256 {
+                let visible: Vec<_> = (0..8)
+                    .map(|j| covered[j] && flags & (1 << j) != 0)
+                    .collect();
+                exact(
+                    &fast.plan(&visible).unwrap(),
+                    &original_growth.plan(&visible).unwrap(),
+                );
+                exact(
+                    &fast.plan(&visible).unwrap(),
+                    &LineSuppressionCache::default().plan_projected_with_visibility(
+                        &source,
+                        0,
+                        None,
+                        None,
+                        Some(&visible),
+                        FlatProjection::LocalGeographic,
+                    ),
+                );
+            }
+            assert!(fast.retained_bytes() <= 32 * 1024 * 1024);
+            previous = fast;
+        }
+        assert!(work.unchanged_old_target_checks > 0);
+        assert!(work.unchanged_old_target_accepts > 0);
+        assert!(work.unchanged_segment_windows_avoided > 0);
+    }
+    #[test]
+    fn unchanged_guard_must_not_drop_new_full_coincident_zero_edge_curve() {
+        let items = vec![
+            line(&[(0., 0.), (0., 0.)], 1),
+            line(&[(0., 0.), (0., 0.)], 9),
+        ];
+        let old = PreparedLineSuppression::compile(&masked(&items, &[true, false]), 4096).unwrap();
+        let mut work = GrowthCompilerWork::default();
+        let new = PreparedLineSuppression::compile_growth_with_unchanged_targets(
+            &items,
+            4096,
+            &old,
+            &[true, false],
+            Some(&mut work),
+            true,
+        )
+        .unwrap();
+        let full = PreparedLineSuppression::compile(&items, 4096).unwrap();
+        for mask in [[false, false], [true, false], [false, true], [true, true]] {
+            exact(&new.plan(&mask).unwrap(), &full.plan(&mask).unwrap());
+        }
+        assert!(new
+            .plan(&[true, true])
+            .unwrap()
+            .fully_suppressed
+            .contains(&0));
+        assert_eq!(work.unchanged_old_target_accepts, 0);
+    }
+    #[test]
+    fn unchanged_guard_private_cache_resets_source_projection_and_keeps_cap_fallback() {
+        let a = vec![
+            line(&[(0., 60.), (10., 60.)], 1),
+            line(&[(2., 60.), (4., 60.)], 9),
+        ];
+        let mut cache = LineSuppressionCache::default();
+        cache.set_static_prewarm_enabled(false);
+        cache.growth_reuse_policy = Some(true);
+        cache.unchanged_target_policy = Some(true);
+        for projection in [
+            FlatProjection::LocalGeographic,
+            FlatProjection::EllipsoidalMercator,
+        ] {
+            for mask in [[true, false], [true, true], [true, false], [true, true]] {
+                exact(
+                    &cache.plan_immutable_projected_with_visibility(
+                        &a,
+                        400,
+                        0,
+                        None,
+                        None,
+                        Some(&mask),
+                        projection,
+                    ),
+                    &LineSuppressionCache::default().plan_projected_with_visibility(
+                        &a,
+                        0,
+                        None,
+                        None,
+                        Some(&mask),
+                        projection,
+                    ),
+                );
+            }
+        }
+        let b = vec![a[0].clone(), line(&[(6., 60.), (8., 60.)], 9)];
+        exact(
+            &cache.plan_immutable_projected_with_visibility(
+                &b,
+                401,
+                0,
+                None,
+                None,
+                Some(&[true, true]),
+                FlatProjection::EllipsoidalMercator,
+            ),
+            &LineSuppressionCache::default().plan_projected_with_visibility(
+                &b,
+                0,
+                None,
+                None,
+                Some(&[true, true]),
+                FlatProjection::EllipsoidalMercator,
+            ),
+        );
+        let old = PreparedLineSuppression::compile(&a, 4096).unwrap();
+        assert!(
+            PreparedLineSuppression::compile_growth_with_unchanged_targets(
+                &a,
+                0,
+                &old,
+                &[true, true],
+                None,
+                true
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn index_blocks_growth_matches_original_all_masks_and_reuses_owned_blocks() {
+        let items = vec![
+            line(&[(-0., 0.), (10., 0.)], 2),
+            line(&[(2., 0.), (6., 0.)], 8),
+            line(&[(10., 0.), (0., -0.)], 9),
+            line(&[(2., 0.), (6., 0.)], 1),
+            line(&[(1., 1.), (1., 1.)], 20),
+        ];
+        let mut covered = vec![true, false, false, false, false];
+        let mut previous =
+            PreparedLineSuppression::compile(&masked(&items, &covered), 32 * 1024 * 1024).unwrap();
+        let mut blocks = None;
+        for add in [1, 3, 4, 2] {
+            let old = covered.clone();
+            covered[add] = true;
+            let source = masked(&items, &covered);
+            let (next, index) = PreparedLineSuppression::compile_growth_with_index_blocks(
+                &source,
+                32 * 1024 * 1024,
+                &previous,
+                &old,
+                &covered,
+                blocks.as_ref(),
+                None,
+                true,
+            )
+            .unwrap();
+            if let Some(prior) = blocks.as_ref() {
+                for (a, b) in prior.blocks.iter().zip(&index.blocks) {
+                    assert!(Arc::ptr_eq(a, b));
+                }
+            }
+            for flags in 0..32 {
+                let visible: Vec<_> = (0..5)
+                    .map(|j| covered[j] && flags & (1 << j) != 0)
+                    .collect();
+                exact(
+                    &next.plan(&visible).unwrap(),
+                    &LineSuppressionCache::default().plan_projected_with_visibility(
+                        &source,
+                        0,
+                        None,
+                        None,
+                        Some(&visible),
+                        FlatProjection::LocalGeographic,
+                    ),
+                );
+            }
+            assert!(index.bytes + next.bytes <= 32 * 1024 * 1024);
+            previous = next;
+            blocks = Some(index);
+        }
+    }
+    #[test]
+    fn index_blocks_cap_bitmap_mismatch_and_failed_stage_leave_prior_unchanged() {
+        let items: Vec<_> = (0..18)
+            .map(|i| line(&[(i as f64, 0.), (i as f64 + 1., 0.)], i))
+            .collect();
+        let mut covered = vec![false; 18];
+        covered[0] = true;
+        let mut previous =
+            PreparedLineSuppression::compile(&masked(&items, &covered), 32 * 1024 * 1024).unwrap();
+        let mut blocks = None;
+        for add in 1..16 {
+            let old = covered.clone();
+            covered[add] = true;
+            let (next, index) = PreparedLineSuppression::compile_growth_with_index_blocks(
+                &masked(&items, &covered),
+                32 * 1024 * 1024,
+                &previous,
+                &old,
+                &covered,
+                blocks.as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+            previous = next;
+            blocks = Some(index);
+        }
+        let prior = blocks.unwrap();
+        assert_eq!(prior.blocks.len(), 16);
+        let before = prior.bytes;
+        let first = Arc::clone(&prior.blocks[0]);
+        let old = covered.clone();
+        covered[16] = true;
+        assert!(PreparedLineSuppression::compile_growth_with_index_blocks(
+            &masked(&items, &covered),
+            32 * 1024 * 1024,
+            &previous,
+            &old,
+            &covered,
+            Some(&prior),
+            None,
+            false
+        )
+        .is_none());
+        assert!(PreparedLineSuppression::compile_growth_with_index_blocks(
+            &masked(&items, &covered),
+            0,
+            &previous,
+            &old,
+            &covered,
+            Some(&prior),
+            None,
+            false
+        )
+        .is_none());
+        let mut mismatch = old.clone();
+        mismatch[0] = false;
+        assert!(PreparedLineSuppression::compile_growth_with_index_blocks(
+            &masked(&items, &covered),
+            32 * 1024 * 1024,
+            &previous,
+            &mismatch,
+            &covered,
+            Some(&prior),
+            None,
+            false
+        )
+        .is_none());
+        assert_eq!(prior.bytes, before);
+        assert!(Arc::ptr_eq(&first, &prior.blocks[0]));
+        assert!(PreparedLineSuppression::compile_growth(
+            &masked(&items, &covered),
+            32 * 1024 * 1024,
+            &previous,
+            &old
+        )
+        .is_some());
+    }
+    #[test]
+    fn index_blocks_real_cache_source_projection_reset_matches_original() {
+        let mut cache = LineSuppressionCache::default();
+        cache.set_static_prewarm_enabled(false);
+        cache.growth_reuse_policy = Some(true);
+        cache.index_blocks_policy = Some(true);
+        let mut items = vec![
+            line(&[(0., 60.), (10., 60.)], 1),
+            line(&[(2., 60.), (6., 60.)], 9),
+            line(&[(6., 60.), (10., 60.)], 8),
+        ];
+        for revision in [100, 101] {
+            if revision == 101 {
+                if let DrawingInstruction::Line(l) = &mut items[1] {
+                    l.points.reverse();
+                    l.priority = crate::DisplayPriority(0);
+                }
+            }
+            for projection in [
+                FlatProjection::LocalGeographic,
+                FlatProjection::EllipsoidalMercator,
+            ] {
+                for mask in [
+                    [true, false, false],
+                    [true, true, false],
+                    [false, true, true],
+                    [true, true, true],
+                    [true, false, true],
+                ] {
+                    exact(
+                        &cache.plan_immutable_projected_with_visibility(
+                            &items,
+                            revision,
+                            0,
+                            None,
+                            None,
+                            Some(&mask),
+                            projection,
+                        ),
+                        &LineSuppressionCache::default().plan_projected_with_visibility(
+                            &items,
+                            0,
+                            None,
+                            None,
+                            Some(&mask),
+                            projection,
+                        ),
+                    );
+                }
+            }
+        }
+        cache.clear();
+        assert_eq!(cache.immutable_index_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod eligibility_connected_controls {
+    use super::*;
+    use crate::{Color, LineInstruction, RenderContext, ScaleRange, Viewport};
+    fn cache(enabled: bool) -> LineSuppressionCache {
+        LineSuppressionCache {
+            eligibility_policy: Some(enabled),
+            eligibility_diagnostics_policy: Some(true),
+            prewarm_policy: Some(false),
+            ..Default::default()
+        }
+    }
+    fn context() -> RenderContext {
+        let mut c = RenderContext::new(Viewport::new(100., 100.));
+        for (priority, group, lo, hi) in [(1, 1, 0, 100), (9, 33010, 10, 20), (3, 2, 0, 100)] {
+            let mut l =
+                LineInstruction::new(vec![WorldPoint::new(0., 0.), WorldPoint::new(1., 1.)])
+                    .with_priority(priority)
+                    .with_viewing_group(group);
+            l.scale_range = ScaleRange {
+                scale_maximum: Some(lo),
+                scale_minimum: Some(hi),
+            };
+            l.color_token = Some("LINE".into());
+            c.add_instruction(DrawingInstruction::Line(l));
+        }
+        c.add_instruction(DrawingInstruction::Line(LineInstruction::new(vec![])));
+        c
+    }
+    #[test]
+    fn connected_full_plan_masks_and_explicit_groups_follow_original() {
+        let c = context();
+        let mut off = cache(false);
+        let mut on = cache(true);
+        for bits in 0..16 {
+            let mask: Vec<bool> = (0..4).map(|i| bits & (1 << i) != 0).collect();
+            for scale in [0, 9, 10, 20, 21, 100, 101] {
+                for groups in [None, Some(HashSet::new()), Some(HashSet::from([1, 2]))] {
+                    for override_group in [None, Some(33010)] {
+                        let a = off.plan_context_projected_with_visibility(
+                            &c,
+                            scale,
+                            groups.as_ref(),
+                            override_group,
+                            Some(&mask),
+                        );
+                        let b = on.plan_context_projected_with_visibility(
+                            &c,
+                            scale,
+                            groups.as_ref(),
+                            override_group,
+                            Some(&mask),
+                        );
+                        assert_eq!(a, b);
+                    }
+                }
+            }
+        }
+        assert!(on.eligibility_work().unwrap().optimized_calls > 0);
+        assert!(on.eligibility_work().unwrap().fallback_calls > 0);
+    }
+    #[test]
+    fn connected_palette_new_source_and_clear_preserve_original() {
+        let mut c = context();
+        let mut off = cache(false);
+        let mut on = cache(true);
+        for alpha in [1., 0., f32::NAN, 1.] {
+            c.remap_colors(&|_| Color::rgba(0., 0., 0., alpha));
+            assert_eq!(
+                off.plan_context_projected_with_visibility(&c, 15, None, None, None),
+                on.plan_context_projected_with_visibility(&c, 15, None, None, None)
+            );
+        }
+        on.clear();
+        assert_eq!(
+            off.plan_context_projected_with_visibility(&context(), 15, None, None, None),
+            on.plan_context_projected_with_visibility(&context(), 15, None, None, None)
+        );
+    }
+    #[test]
+    fn diagnostics_unavailable_when_disabled_and_legacy_numeric_api_not_cached() {
+        let mut c = cache(true);
+        c.eligibility_diagnostics_policy = Some(false);
+        let ctx = context();
+        c.plan_context_projected_with_visibility(&ctx, 15, None, None, None);
+        assert!(c.eligibility_work().is_none());
+        let mut raw_only = cache(true);
+        raw_only.plan_immutable_projected_with_visibility(
+            ctx.raw_instructions(),
+            1,
+            15,
+            None,
+            None,
+            None,
+            ctx.scaler.projection(),
+        );
+        assert!(raw_only.eligibility_program.plan_for_test_is_absent());
+        assert!(raw_only.eligibility_work().is_none());
+    }
+}
+
+#[cfg(test)]
+mod independent_suppression_cache_fork_tests {
+    use super::*;
+    #[test]
+    fn cold_fork_retains_captured_policy_but_not_geometry_or_attempt_history() {
+        let mut source = LineSuppressionCache {
+            eligibility_policy: Some(true),
+            eligibility_diagnostics_policy: Some(false),
+            prewarm_policy: Some(false),
+            growth_reuse_policy: Some(true),
+            unchanged_target_policy: Some(false),
+            index_blocks_policy: Some(true),
+            empty_curve_prewarm_policy: Some(true),
+            ..Default::default()
+        };
+        source.set_tail_diagnostics_enabled(true);
+        source.tail_counters.as_mut().unwrap()[0] = 17;
+        let cold = source.fork_empty_with_same_policy();
+        assert_eq!(cold.eligibility_policy, source.eligibility_policy);
+        assert_eq!(
+            cold.eligibility_diagnostics_policy,
+            source.eligibility_diagnostics_policy
+        );
+        assert_eq!(cold.prewarm_policy, source.prewarm_policy);
+        assert_eq!(cold.growth_reuse_policy, source.growth_reuse_policy);
+        assert_eq!(cold.unchanged_target_policy, source.unchanged_target_policy);
+        assert_eq!(cold.index_blocks_policy, source.index_blocks_policy);
+        assert_eq!(
+            cold.empty_curve_prewarm_policy,
+            source.empty_curve_prewarm_policy
+        );
+        assert_eq!(cold.tail_diagnostics_counters(), [0; 10]);
+        assert_eq!(source.tail_diagnostics_counters()[0], 17);
+        assert!(
+            cold.last.is_none()
+                && cold.immutable_prepared.is_none()
+                && cold.immutable_last.is_none()
+                && cold.immutable_current.is_none()
+                && cold.immutable_index_blocks.is_none()
+                && cold.prewarm_attempt.is_none()
+        );
+        assert!(LineSuppressionCache::default()
+            .fork_empty_with_same_policy()
+            .prewarm_policy
+            .is_none());
     }
 }

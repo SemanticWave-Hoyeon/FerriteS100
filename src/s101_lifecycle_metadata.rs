@@ -1,10 +1,12 @@
 //! Owned metadata evidence for S-101 lifecycle decisions. OFF reads producer
 //! metadata without any authenticity claim; it never constructs signed wrappers.
+use crate::s101_xc_coverage::{self, XcDataCoverage};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::NaiveDate;
 use ferrite_security::{AuthorizedDatasets, DatasetDiscoveryAuthorization, DatasetPurpose};
 use roxmltree::{Document, Node, ParsingOptions};
 use sha2::{Digest, Sha256, Sha384};
+use std::sync::Arc;
 use std::{
     fs::File,
     io::Read,
@@ -27,11 +29,31 @@ enum CatalogueHash {
 }
 
 #[derive(Clone)]
+enum CapturedCoverageCatalogue {
+    Authenticated(ferrite_security::AuthenticatedDatasetDiscovery),
+    Unverified {
+        canonical_path: PathBuf,
+        bytes: Arc<[u8]>,
+    },
+}
+impl CapturedCoverageCatalogue {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Authenticated(bound) => bound.original_authentication().catalogue_bytes(),
+            Self::Unverified { bytes, .. } => bytes,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct MetadataEvidence {
     pub purpose: DatasetPurpose,
     pub edition: u32,
     pub update: Option<u32>,
     pub issue_date: NaiveDate,
+    pub(crate) data_coverage: Vec<XcDataCoverage>,
+    product_specification: Option<crate::s101_xc_consistency::XcProduct>,
+    coverage_catalogue: Option<CapturedCoverageCatalogue>,
     original_canonical_key: PathBuf,
     raw_resource_sha256: [u8; 32],
     catalogue_xml_hash: CatalogueHash,
@@ -73,12 +95,88 @@ impl MetadataEvidence {
             original == self.original_canonical_key,
             "Lifecycle metadata original canonical key mismatch"
         );
+        if let Some(capture) = &self.coverage_catalogue {
+            match (capture, &self.catalogue_xml_hash) {
+                (
+                    CapturedCoverageCatalogue::Authenticated(bound),
+                    CatalogueHash::AuthenticatedSha384(expected),
+                ) => ensure!(
+                    bound.catalogue_sha384() == expected,
+                    "Retained XC coverage authentication mismatch"
+                ),
+                (
+                    CapturedCoverageCatalogue::Unverified { canonical_path, .. },
+                    CatalogueHash::UnverifiedSha256(expected),
+                ) => {
+                    ensure!(
+                        canonical_path.is_absolute(),
+                        "Retained XC path must be canonical absolute"
+                    );
+                    ensure!(
+                        <[u8; 32]>::from(Sha256::digest(capture.bytes())) == *expected,
+                        "Retained XC coverage bytes mismatch"
+                    );
+                }
+                _ => bail!("Retained XC coverage provenance mismatch"),
+            }
+            for row in &self.data_coverage {
+                ensure!(
+                    capture.bytes().get(row.entry_range.clone()).is_some()
+                        && capture
+                            .bytes()
+                            .get(row.bounding_polygon_range.clone())
+                            .is_some(),
+                    "Retained XC coverage range mismatch"
+                );
+            }
+        }
         let (digest, _, _) = resource_digest(retained_data)?;
         ensure!(
             digest == self.raw_resource_sha256,
             "Retained dataset differs from lifecycle metadata evidence"
         );
         Ok(())
+    }
+    pub(crate) fn validate_xc_profile(
+        &self,
+        id: &ferrite_s100_core::DatasetIdentification,
+    ) -> Result<()> {
+        crate::s101_xc_consistency::validate_profile(
+            self.product_specification.as_ref(),
+            self.purpose,
+            &self.data_coverage,
+            id,
+        )?;
+        Ok(())
+    }
+    pub(crate) fn validate_effective_xc_scales(
+        &self,
+        cell: &ferrite_s100_core::S101Cell,
+    ) -> Result<crate::s101_xc_consistency::ScaleConsistency> {
+        crate::s101_xc_consistency::compare_effective(
+            self.product_specification.as_ref(),
+            self.purpose,
+            &self.data_coverage,
+            cell,
+        )
+    }
+    pub(crate) fn validate_xc_regions(
+        &self,
+        cell: &ferrite_s100_core::S101Cell,
+    ) -> Result<crate::s101_xc_region::RegionStatus> {
+        let numeric = self.validate_effective_xc_scales(cell)?;
+        if matches!(
+            numeric,
+            crate::s101_xc_consistency::ScaleConsistency::LegacyNotApplied
+                | crate::s101_xc_consistency::ScaleConsistency::CancellationRequiresRetainedOriginal
+                | crate::s101_xc_consistency::ScaleConsistency::NullInterpretationRequired
+        ) {
+            return Ok(crate::s101_xc_region::RegionStatus::Unverified);
+        }
+        let Some(capture) = &self.coverage_catalogue else {
+            return Ok(crate::s101_xc_region::RegionStatus::Unverified);
+        };
+        crate::s101_xc_region::compare(capture.bytes(), &self.data_coverage, cell)
     }
     pub(crate) fn is_authenticated(&self) -> bool {
         matches!(self.provenance, Provenance::AuthenticatedCatalogue)
@@ -211,6 +309,43 @@ fn resource_path(root: &Path, uri: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Select only the entry bound by the verifier, from its full namespace-owning
+/// retained catalogue. A helper test is not construction of an authority token.
+fn capture_authenticated_rows(
+    bytes: &[u8],
+    range: std::ops::Range<usize>,
+    resource_uri: &str,
+) -> Result<(
+    Vec<XcDataCoverage>,
+    Option<crate::s101_xc_consistency::XcProduct>,
+)> {
+    let xml = std::str::from_utf8(bytes)?;
+    let document = Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 200_000,
+        },
+    )?;
+    let entry = document
+        .descendants()
+        .find(|n| {
+            n.is_element()
+                && n.tag_name().namespace() == Some(XC)
+                && n.tag_name().name() == "S100_DatasetDiscoveryMetadata"
+                && n.range() == range
+        })
+        .context("Authenticated coverage discovery range mismatch")?;
+    ensure!(
+        text(child(entry, "fileName")?)? == resource_uri,
+        "Authenticated coverage discovery logical URI mismatch"
+    );
+    Ok((
+        s101_xc_coverage::capture(entry)?,
+        crate::s101_xc_consistency::capture_product(entry)?,
+    ))
+}
+
 pub(crate) fn capture(
     original: &Path,
     retained_data: &Path,
@@ -227,6 +362,12 @@ pub(crate) fn capture(
                     && bound.resource_sha384() == hex(&sha384),
                 "Lifecycle input differs from authenticated discovery resource"
             );
+            let proof = bound.original_authentication();
+            let (data_coverage, product_specification) = capture_authenticated_rows(
+                proof.catalogue_bytes(),
+                proof.discovery_range(),
+                proof.resource_uri(),
+            )?;
             let discovery = bound.discovery();
             ensure!(
                 discovery.edition_number > 0 && discovery.update_number.is_none_or(|n| n <= 999),
@@ -242,6 +383,9 @@ pub(crate) fn capture(
                 catalogue_xml_hash: CatalogueHash::AuthenticatedSha384(
                     bound.catalogue_sha384().to_owned(),
                 ),
+                data_coverage,
+                product_specification,
+                coverage_catalogue: Some(CapturedCoverageCatalogue::Authenticated(bound.clone())),
                 provenance: Provenance::AuthenticatedCatalogue,
             }))
         }
@@ -332,6 +476,12 @@ pub(crate) fn capture(
                 original_canonical_key: key,
                 raw_resource_sha256,
                 catalogue_xml_hash: CatalogueHash::UnverifiedSha256(Sha256::digest(&bytes).into()),
+                data_coverage: s101_xc_coverage::capture(entry)?,
+                product_specification: crate::s101_xc_consistency::capture_product(entry)?,
+                coverage_catalogue: Some(CapturedCoverageCatalogue::Unverified {
+                    canonical_path: xml_path.clone(),
+                    bytes: crate::s101_xc_capture_pool::retain_unverified(&xml_path, &bytes)?,
+                }),
                 provenance: Provenance::UnverifiedCatalogue,
             };
             // Retain and report the exact OFF catalogue identity without treating
@@ -404,6 +554,9 @@ mod tests {
             original_canonical_key: "/a/101TEST.001".into(),
             raw_resource_sha256: [1; 32],
             catalogue_xml_hash: CatalogueHash::UnverifiedSha256([2; 32]),
+            data_coverage: Vec::new(),
+            product_specification: None,
+            coverage_catalogue: None,
             provenance: Provenance::UnverifiedCatalogue,
         };
         let mut b = a.clone();
@@ -602,3 +755,7 @@ mod tests {
         assert!(UnauthenticatedSnapshot::copy_bounded(&f.original, u64::MAX).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "s101_xc_authenticated_tests.rs"]
+mod authenticated_xc_tests;

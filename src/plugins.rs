@@ -23,7 +23,14 @@ pub struct PluginSystem {
 impl PluginSystem {
     /// Create a new plugin system
     pub fn new(plugins_dir: PathBuf, host_version: &str) -> Self {
-        let development_mode = cfg!(debug_assertions);
+        // Unsigned native code is a deliberate development opt-in, including Debug.
+        // Release remains reject-all until a trusted signing key is provisioned.
+        let development_mode = unsigned_development_plugins_enabled(
+            cfg!(debug_assertions),
+            std::env::var("FERRITE_ALLOW_UNSIGNED_PLUGINS")
+                .ok()
+                .as_deref(),
+        );
         let manager = PluginManager::new(plugins_dir, host_version, development_mode);
         let host_context = manager.host_context_mut();
 
@@ -203,6 +210,8 @@ impl PluginSystem {
                         text.to_string(),
                         WorldPoint::new(position.lon, position.lat),
                     )
+                    // The plugin API's point labels retain their established centred placement.
+                    .with_alignment(ferrite_render::HAlign::Left, ferrite_render::VAlign::Middle)
                     .with_font_size(font_size)
                     .with_color(text_color)
                     .with_priority(priority);
@@ -250,6 +259,12 @@ impl PluginSystem {
         }
 
         instructions
+    }
+
+    /// Allocation-free capability: even inactive loaded plugins can draw or
+    /// execute interior-mutating callbacks. Navigation coalescing requires none.
+    pub fn has_loaded_plugins(&self) -> bool {
+        self.manager.all_plugins().next().is_some()
     }
 
     /// Get loaded plugin info for UI
@@ -382,4 +397,20 @@ pub struct ToolbarButton {
     pub label: String,
     pub tooltip: Option<String>,
     pub active: bool,
+}
+
+fn unsigned_development_plugins_enabled(debug_build: bool, opt_in: Option<&str>) -> bool {
+    debug_build && opt_in == Some("1")
+}
+#[cfg(test)]
+mod plugin_trust_policy_tests {
+    use super::unsigned_development_plugins_enabled;
+    #[test]
+    fn unsigned_native_plugins_require_explicit_debug_opt_in() {
+        for value in [None, Some("0"), Some("true"), Some("")] {
+            assert!(!unsigned_development_plugins_enabled(true, value));
+        }
+        assert!(unsigned_development_plugins_enabled(true, Some("1")));
+        assert!(!unsigned_development_plugins_enabled(false, Some("1")));
+    }
 }

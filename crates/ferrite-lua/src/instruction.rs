@@ -267,6 +267,7 @@ pub enum DrawingCommand {
         bg_transparency: f64,
         bold: bool,
         italic: bool,
+        font_weight: String,
         font_proportion: String,
         serifs: bool,
         underline: bool,
@@ -1578,6 +1579,7 @@ fn parse_command(
                 bg_transparency: state.font_bg_transparency,
                 bold: state.font_weight == "Bold",
                 italic: state.font_slant == "Italics",
+                font_weight: state.font_weight.clone(),
                 font_proportion: state.font_proportion.clone(),
                 serifs: state.font_serifs,
                 underline: state.font_underline,
@@ -1859,6 +1861,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn font_commands_keep_weight_characteristics_reference_and_decorations() {
+        let result = parse_instruction_string("F1", "FontWeight:Light;FontProportion:MonoSpaced;FontSerifs:true;FontUnderline:true;FontStrikethrough:true;FontUpperline:true;FontReference:Font-A;TextInstruction:depth").unwrap();
+        let DrawingCommand::TextInstruction {
+            font_weight,
+            font_proportion,
+            serifs,
+            underline,
+            strikethrough,
+            upperline,
+            font_reference,
+            ..
+        } = &result.commands[0]
+        else {
+            panic!()
+        };
+        assert_eq!(font_weight, "Light");
+        assert_eq!(font_proportion, "MonoSpaced");
+        assert!(*serifs && *underline && *strikethrough && *upperline);
+        assert_eq!(font_reference, "Font-A");
+    }
     #[test]
     fn test_parse_text_with_state() {
         let result = parse_instruction_string(

@@ -10,9 +10,10 @@ use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 
 /// S-421 Catalogue status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CatalogueStatus {
     /// Not loaded yet
+    #[default]
     NotLoaded,
     /// Loading in progress
     Loading,
@@ -23,12 +24,6 @@ pub enum CatalogueStatus {
     },
     /// Failed to load
     Error(String),
-}
-
-impl Default for CatalogueStatus {
-    fn default() -> Self {
-        Self::NotLoaded
-    }
 }
 
 /// S-421 Feature Catalogue (simplified)
@@ -261,15 +256,32 @@ impl CatalogueManager {
         (fc_result, pc_result)
     }
 
-    /// Get symbol file path
+    /// Resolve a PC-declared symbol only. This path is a lookup hint, not a
+    /// captured/authenticated resource; consumers must capture bytes before use.
     pub fn get_symbol_path(&self, symbol_ref: &str) -> Option<PathBuf> {
-        let symbols_dir = self.pc_path().join("Symbols");
-        let path = symbols_dir.join(format!("{}.svg", symbol_ref));
-        if path.exists() {
-            Some(path)
-        } else {
-            None
+        let symbol = self.pc.as_ref()?.symbols.get(symbol_ref)?;
+        let root = self.pc_path().canonicalize().ok()?;
+        let symbols = root.join("Symbols");
+        let directory = std::fs::symlink_metadata(&symbols).ok()?;
+        if !directory.is_dir() || directory.file_type().is_symlink() {
+            return None;
         }
+        let declared = Path::new(&symbol.file_path);
+        let filename = declared.file_name()?.to_str()?;
+        if !portable_svg_filename(filename) {
+            return None;
+        }
+        let path = symbols.join(filename);
+        // The parsed declaration's directory must agree with this PC owner.
+        if declared.parent()?.canonicalize().ok()? != symbols {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return None;
+        }
+        let canonical = path.canonicalize().ok()?;
+        (canonical.parent() == Some(symbols.as_path())).then_some(canonical)
     }
 
     /// Get color by token
@@ -282,9 +294,8 @@ impl CatalogueManager {
 
     /// Get color as RGBA u32 (0xRRGGBBAA format)
     pub fn get_color_rgba(&self, token: &str) -> Option<u32> {
-        self.get_color(token).map(|(r, g, b)| {
-            ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF
-        })
+        self.get_color(token)
+            .map(|(r, g, b)| ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF)
     }
 
     /// Get line style by ID
@@ -293,10 +304,60 @@ impl CatalogueManager {
     }
 }
 
+// Root admission is deliberately separate from generic XML resource safety.
+// Legacy published PC blank productId/version remain unknown, never invented.
+fn check_catalogue_root(content: &str, feature: bool) -> Result<(), String> {
+    let document = roxmltree::Document::parse_with_options(
+        content,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 100_000,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let root = document.root_element();
+    let correct = if feature {
+        root.tag_name().name() == "S100_FC_FeatureCatalogue"
+            && matches!(
+                root.tag_name().namespace(),
+                Some("http://www.iho.int/S100FC" | "http://www.iho.int/S100FC/5.0")
+            )
+    } else {
+        root.tag_name().name() == "portrayalCatalog" && root.tag_name().namespace().is_none()
+    };
+    if !correct {
+        return Err("Unsupported S421 catalogue root/namespace".into());
+    }
+    let identifiers = if feature {
+        root.children()
+            .filter(|node| {
+                node.is_element()
+                    && node.tag_name().name() == "productId"
+                    && node.tag_name().namespace() == root.tag_name().namespace()
+            })
+            .map(|node| node.text().unwrap_or("").trim())
+            .collect::<Vec<_>>()
+    } else {
+        root.attribute("productId")
+            .into_iter()
+            .map(str::trim)
+            .collect()
+    };
+    if identifiers.len() > 1
+        || identifiers
+            .iter()
+            .any(|id| !id.is_empty() && !matches!(*id, "S-421" | "S421"))
+    {
+        return Err("Catalogue productId contradicts S421".into());
+    }
+    Ok(())
+}
+
 /// Parse Feature Catalogue XML
 fn parse_feature_catalogue(path: &Path) -> Result<S421FeatureCatalogue, String> {
-    let content = std::fs::read_to_string(path)
+    let content = crate::s421::read_xml_bounded(path)
         .map_err(|e| format!("Failed to read FC file: {}", e))?;
+    check_catalogue_root(&content, true)?;
 
     let mut reader = Reader::from_str(&content);
     reader.config_mut().trim_text(true);
@@ -398,37 +459,100 @@ fn parse_feature_catalogue(path: &Path) -> Result<S421FeatureCatalogue, String> 
     Ok(fc)
 }
 
+// Portable single-file receiver policy; unsupported names are not claimed to
+// violate S-421. No separators, ADS, Windows device names or hidden dot names.
+fn portable_svg_filename(name: &str) -> bool {
+    if name.len() > 255
+        || !name.ends_with(".svg")
+        || name.starts_with('.')
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    !stem.is_empty()
+        && !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !(stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+}
+
 /// Parse Portrayal Catalogue XML
 fn parse_portrayal_catalogue(path: &Path) -> Result<S421PortrayalCatalogue, String> {
-    let content = std::fs::read_to_string(path)
+    let content = crate::s421::read_xml_bounded(path)
         .map_err(|e| format!("Failed to read PC file: {}", e))?;
+    check_catalogue_root(&content, false)?;
 
     let mut reader = Reader::from_str(&content);
     reader.config_mut().trim_text(true);
 
     let mut pc = S421PortrayalCatalogue::default();
+    let document = roxmltree::Document::parse_with_options(
+        &content,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 100_000,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    pc.version = document
+        .root_element()
+        .attribute("version")
+        .unwrap_or("")
+        .to_owned();
     let mut buf = Vec::new();
     let mut current_element = String::new();
 
     let pc_dir = path.parent().unwrap_or(Path::new("."));
 
-    // Scan for symbol files in the Symbols directory
-    let symbols_dir = pc_dir.join("Symbols");
-    if symbols_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&symbols_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.extension().map(|e| e == "svg").unwrap_or(false) {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        pc.symbols.insert(
-                            stem.to_string(),
-                            SymbolInfo {
-                                id: stem.to_string(),
-                                file_path: path.display().to_string(),
-                            },
-                        );
-                    }
-                }
+    // Catalogue declarations are authoritative; a directory census is not.
+    // Keep ID and filename distinct: a PC may deliberately use different names.
+    for group in document.root_element().children().filter(|node| {
+        node.is_element()
+            && node.tag_name().namespace().is_none()
+            && node.tag_name().name() == "symbols"
+    }) {
+        for declaration in group.children().filter(|node| {
+            node.is_element()
+                && node.tag_name().namespace().is_none()
+                && node.tag_name().name() == "symbol"
+        }) {
+            let id = declaration
+                .attribute("id")
+                .ok_or("Symbol declaration missing ID")?;
+            if id.is_empty() || id.trim() != id || id.len() > 255 {
+                return Err("Unsupported symbol declaration ID".into());
+            }
+            let files: Vec<_> = declaration
+                .children()
+                .filter(|node| {
+                    node.is_element()
+                        && node.tag_name().namespace().is_none()
+                        && node.tag_name().name() == "fileName"
+                })
+                .collect();
+            if files.len() != 1
+                || files[0].children().any(|node| node.is_element())
+                || files[0].children().filter(|node| node.is_text()).count() != 1
+            {
+                return Err("Symbol declaration requires one scalar filename".into());
+            }
+            let filename = files[0].text().unwrap_or("");
+            if !portable_svg_filename(filename) {
+                return Err("Unsupported symbol resource filename".into());
+            }
+            let symbol = SymbolInfo {
+                id: id.to_owned(),
+                file_path: pc_dir
+                    .join("Symbols")
+                    .join(filename)
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            if pc.symbols.insert(id.to_owned(), symbol).is_some() {
+                return Err("Duplicate symbol declaration ID".into());
             }
         }
     }
@@ -481,17 +605,12 @@ fn parse_portrayal_catalogue(path: &Path) -> Result<S421PortrayalCatalogue, Stri
         buf.clear();
     }
 
-    // Set default version if not found
-    if pc.version.is_empty() {
-        pc.version = "1.0.0".to_string();
-    }
-
     Ok(pc)
 }
 
 /// Parse ColorProfile XML (Day palette)
 fn parse_color_profile(path: &Path) -> Result<HashMap<String, ColorInfo>, String> {
-    let content = std::fs::read_to_string(path)
+    let content = crate::s421::read_xml_bounded(path)
         .map_err(|e| format!("Failed to read color profile: {}", e))?;
 
     let mut reader = Reader::from_str(&content);
@@ -588,7 +707,7 @@ fn parse_color_profile(path: &Path) -> Result<HashMap<String, ColorInfo>, String
 
 /// Parse LineStyle XML
 fn parse_line_style(path: &Path, id: &str) -> Result<LineStyleInfo, String> {
-    let content = std::fs::read_to_string(path)
+    let content = crate::s421::read_xml_bounded(path)
         .map_err(|e| format!("Failed to read line style: {}", e))?;
 
     let mut reader = Reader::from_str(&content);
@@ -676,5 +795,140 @@ mod tests {
         let mgr = CatalogueManager::default();
         assert_eq!(mgr.fc_status, CatalogueStatus::NotLoaded);
         assert_eq!(mgr.pc_status, CatalogueStatus::NotLoaded);
+    }
+
+    struct PrivateXml {
+        directory: PathBuf,
+        file: PathBuf,
+    }
+    impl PrivateXml {
+        fn new(raw: &[u8]) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            loop {
+                let directory = std::env::temp_dir().join(format!(
+                    "ferrite-s421-catalogue-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&directory) {
+                    Ok(()) => {
+                        let file = directory.join("input.xml");
+                        std::fs::write(&file, raw).unwrap();
+                        return Self { directory, file };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        }
+    }
+    impl Drop for PrivateXml {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+    #[test]
+    fn published_fc_is_catalogue_not_route_and_retains_original_version() {
+        let raw = include_bytes!("../tests/fixtures/published-FC.xml");
+        let input = PrivateXml::new(raw);
+        let fc = parse_feature_catalogue(&input.file).unwrap();
+        assert_eq!(fc.version, "1.0.0");
+        assert!(fc.feature_types.contains_key("Route"));
+        assert!(fc.feature_types.contains_key("RouteWaypoint"));
+        assert_eq!(std::fs::read(&input.file).unwrap().as_slice(), &raw[..]);
+    }
+    #[test]
+    fn published_pc_blank_metadata_stays_blank_without_route_validation() {
+        let raw = include_bytes!("../tests/fixtures/published-PC.xml");
+        let input = PrivateXml::new(raw);
+        let pc = parse_portrayal_catalogue(&input.file).unwrap();
+        assert!(pc.version.is_empty());
+        assert_eq!(std::fs::read(&input.file).unwrap().as_slice(), &raw[..]);
+    }
+    #[test]
+    fn generic_resource_xml_and_catalogue_roots_are_separate() {
+        let input = PrivateXml::new(b"<colorProfile/>");
+        assert!(crate::s421::read_xml_bounded(&input.file).is_ok());
+        assert!(parse_feature_catalogue(&input.file).is_err());
+        assert!(parse_portrayal_catalogue(&input.file).is_err());
+        for xml in [
+            "<S100_FC_FeatureCatalogue xmlns='http://foreign.invalid'/>",
+            "<portrayalCatalog productId='S-101'/>",
+            "<portrayalCatalog xmlns='http://foreign.invalid'/>",
+        ] {
+            assert!(check_catalogue_root(xml, false).is_err());
+        }
+        assert!(check_catalogue_root("<S100_FC_FeatureCatalogue xmlns='http://www.iho.int/S100FC'><productId>S-101</productId></S100_FC_FeatureCatalogue>",true).is_err());
+    }
+    #[test]
+    fn generic_xml_still_rejects_dtd_malformed_entity_and_deep_tree() {
+        for raw in [
+            "<!DOCTYPE x [<!ENTITY e 'x'>]><x>&e;</x>".to_owned(),
+            "<x>&unknown;</x>".to_owned(),
+            format!("{}{}", "<x>".repeat(129), "</x>".repeat(129)),
+        ] {
+            let input = PrivateXml::new(raw.as_bytes());
+            assert!(crate::s421::read_xml_bounded(&input.file).is_err());
+        }
+    }
+    fn symbol_pc(xml: &str) -> (PrivateXml, CatalogueManager) {
+        let input = PrivateXml::new(b"unused");
+        let pc_dir = input.directory.join("PC/S-421");
+        std::fs::create_dir_all(pc_dir.join("Symbols")).unwrap();
+        let file = pc_dir.join("portrayal_catalogue.xml");
+        std::fs::write(&file, xml).unwrap();
+        let mut manager = CatalogueManager::new(input.directory.clone());
+        manager.load_pc().unwrap();
+        (input, manager)
+    }
+    #[test]
+    fn only_declared_symbol_id_resolves_its_declared_filename() {
+        let (input, manager) = symbol_pc("<portrayalCatalog><symbols><symbol id='MARKER'><fileName>actual.svg</fileName></symbol></symbols></portrayalCatalog>");
+        let symbols = input.directory.join("PC/S-421/Symbols");
+        std::fs::write(symbols.join("actual.svg"), "<svg/>").unwrap();
+        std::fs::write(symbols.join("EXTRA.svg"), "<svg/>").unwrap();
+        assert_eq!(manager.pc.as_ref().unwrap().symbols.len(), 1);
+        assert_eq!(
+            manager.get_symbol_path("MARKER"),
+            Some(symbols.join("actual.svg").canonicalize().unwrap())
+        );
+        assert!(manager.get_symbol_path("actual").is_none());
+        assert!(manager.get_symbol_path("EXTRA").is_none());
+        assert!(manager.get_symbol_path("../input").is_none());
+    }
+    #[test]
+    fn ambiguous_and_escaping_symbol_declarations_are_rejected() {
+        for filename in [
+            "../outside.svg",
+            "/outside.svg",
+            "C:evil.svg",
+            "a\\b.svg",
+            "CON.svg",
+            "LPT1.svg",
+            ".svg",
+            "a.svg ",
+        ] {
+            let input = PrivateXml::new(format!("<portrayalCatalog><symbols><symbol id='X'><fileName>{filename}</fileName></symbol></symbols></portrayalCatalog>").as_bytes());
+            assert!(
+                parse_portrayal_catalogue(&input.file).is_err(),
+                "{filename}"
+            );
+        }
+        for declaration in ["<symbol id='X'><fileName>a.svg</fileName></symbol><symbol id='X'><fileName>b.svg</fileName></symbol>", "<symbol id='X'><fileName>a.svg</fileName><fileName>b.svg</fileName></symbol>", "<symbol id='X'><fileName><name>a.svg</name></fileName></symbol>"] {
+            let input = PrivateXml::new(format!("<portrayalCatalog><symbols>{declaration}</symbols></portrayalCatalog>").as_bytes());
+            assert!(parse_portrayal_catalogue(&input.file).is_err());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symbol_file_and_directory_symlinks_cannot_escape_owner() {
+        let (input, manager) = symbol_pc("<portrayalCatalog><symbols><symbol id='X'><fileName>actual.svg</fileName></symbol></symbols></portrayalCatalog>");
+        let symbols = input.directory.join("PC/S-421/Symbols");
+        std::os::unix::fs::symlink(&input.file, symbols.join("actual.svg")).unwrap();
+        assert!(manager.get_symbol_path("X").is_none());
+        std::fs::remove_file(symbols.join("actual.svg")).unwrap();
+        std::fs::remove_dir(&symbols).unwrap();
+        std::os::unix::fs::symlink(&input.directory, &symbols).unwrap();
+        assert!(manager.get_symbol_path("X").is_none());
     }
 }

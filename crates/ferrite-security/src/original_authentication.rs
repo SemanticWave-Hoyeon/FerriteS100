@@ -78,6 +78,18 @@ impl std::fmt::Debug for OriginalDatasetAuthentication {
     }
 }
 impl OriginalDatasetAuthentication {
+    /// Same live immutable authentication owners, including import time and entry.
+    /// Intentional clones retain this identity; independently reverified identical
+    /// bytes do not. This grants no authority and does not reopen/hash resources.
+    pub fn shares_retained_authentication_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.resource, &other.resource)
+            && Arc::ptr_eq(&self.catalogue, &other.catalogue)
+            && Arc::ptr_eq(&self.catalogue_bytes, &other.catalogue_bytes)
+            && Arc::ptr_eq(&self.trust_anchor_sha256, &other.trust_anchor_sha256)
+            && self.verified_unix_seconds == other.verified_unix_seconds
+            && self.resource_uri == other.resource_uri
+            && self.discovery_range == other.discovery_range
+    }
     /// Raw signed logical URI, independent of later live filesystem state.
     pub fn resource_uri(&self) -> &str {
         &self.resource_uri

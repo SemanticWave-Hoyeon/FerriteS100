@@ -484,7 +484,7 @@ mod device_point_tests {
 #[cfg(test)]
 mod northing_source_conversion_tests {
     use super::*;
-    use crate::{FlatProjection, GeoBounds, Scaler, Viewport};
+    use crate::{FlatProjection, GeoBounds, Viewport};
     fn result_bits(
         result: Result<Option<crate::ScreenPoint>>,
     ) -> std::result::Result<Option<[u32; 2]>, String> {

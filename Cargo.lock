@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-feature-catalog"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "quick-xml 0.37.5",
  "serde",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-interoperability"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "ferrite-kernel",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-iso8211"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "bytes",
  "encoding_rs",
@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-kernel"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-lua"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "ferrite-feature-catalog",
  "ferrite-kernel",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-lua-runtime"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "cc",
  "mlua",
@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-mcp"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1485,29 +1485,31 @@ dependencies = [
 
 [[package]]
 name = "ferrite-plugin-api"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "abi_stable",
 ]
 
 [[package]]
 name = "ferrite-plugin-loader"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "abi_stable",
  "ed25519-dalek",
  "ferrite-plugin-api",
+ "libc",
  "libloading 0.8.9",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.17",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "ferrite-portrayal-catalog"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "ferrite-kernel",
  "quick-xml 0.37.5",
@@ -1523,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-render"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1543,10 +1545,11 @@ dependencies = [
 
 [[package]]
 name = "ferrite-s100"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "abi_stable",
  "anyhow",
+ "base64 0.22.1",
  "bincode",
  "chrono",
  "egui",
@@ -1565,19 +1568,23 @@ dependencies = [
  "ferrite-s100-core",
  "ferrite-s101",
  "ferrite-s102",
+ "ferrite-s421",
  "ferrite-security",
  "ferrite-wgpu",
  "hdf5-metno",
  "image",
  "libc",
  "mimalloc",
+ "openssl",
  "pollster",
+ "quick-xml 0.37.5",
  "rayon",
  "rfd",
  "roxmltree",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1590,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-s100-core"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "chrono",
  "ferrite-iso8211",
@@ -1603,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-s101"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1621,21 +1628,42 @@ dependencies = [
 
 [[package]]
 name = "ferrite-s102"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chrono",
  "ferrite-interoperability",
  "ferrite-kernel",
  "ferrite-lua",
  "ferrite-portrayal-catalog",
  "ferrite-render",
+ "ferrite-security",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "openssl",
+ "roxmltree",
+ "serde",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "ferrite-s421"
+version = "2.0.0"
+dependencies = [
+ "abi_stable",
+ "ferrite-kernel",
+ "ferrite-plugin-api",
+ "quick-xml 0.37.5",
+ "roxmltree",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "ferrite-secom"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1649,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "ferrite-security"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1664,8 +1692,9 @@ dependencies = [
 
 [[package]]
 name = "ferrite-wgpu"
-version = "1.0.5"
+version = "2.0.0"
 dependencies = [
+ "ab_glyph",
  "bytemuck",
  "earcutr",
  "egui",
@@ -1674,13 +1703,17 @@ dependencies = [
  "ferrite-kernel",
  "ferrite-portrayal-catalog",
  "ferrite-render",
+ "ferrite-s102",
+ "ferrite-s421",
  "image",
  "lyon_tessellation",
  "pollster",
  "rayon",
  "resvg",
  "rustc-hash 2.1.1",
+ "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.17",
  "tracing",
  "wgpu",

@@ -1,0 +1,12 @@
+{
+  "published-FC.xml": {
+    "original": "Standards/S-421/1.0-published-support/selected-public-adjuncts/FC/S-421-FC.xml",
+    "sha256": "4c3920bc5dac7216975e0e8f189222b838fc82c94b1b161e72a6ebebf35bd9d5",
+    "bytes": 105328
+  },
+  "published-PC.xml": {
+    "original": "Standards/S-421/1.0-published-support/selected-public-adjuncts/PC/PortrayalLibrary/portrayal_catalogue.xml",
+    "sha256": "2d18c3b0a2db68b4406595c331a79562f626ed5c43b8047d25fab2ad7531563a",
+    "bytes": 15113
+  }
+}

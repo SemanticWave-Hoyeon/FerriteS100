@@ -245,6 +245,9 @@ enum RuleTarget {
 }
 #[derive(Debug, Clone)]
 struct Rule {
+    // Plane order is a drawing key, not plane identity. Different planes may
+    // carry the same order and still require unambiguous feature partitioning.
+    plane_index: usize,
     target: RuleTarget,
     identifier: String,
     geometry: Vec<String>,
@@ -253,18 +256,14 @@ struct Rule {
 }
 /// Expected O(R) time and O(R) memory within each product/feature rule bucket.
 fn validate_selector_consistency(rules: &[Rule]) -> Result<()> {
-    type Selector = (i32, Vec<String>, Option<AttributeFilter>);
+    type Selector = (usize, Vec<String>, Option<AttributeFilter>);
     let mut seen: HashMap<Selector, [Option<&Rule>; 2]> = HashMap::new();
     for rule in rules {
         // geometryType is a set of selected primitives; XML order is irrelevant.
         let mut geometry = rule.geometry.clone();
         geometry.sort_unstable();
         geometry.dedup();
-        let key = (
-            rule.assignment.plane.order.get(),
-            geometry,
-            rule.filter.clone(),
-        );
+        let key = (rule.plane_index, geometry, rule.filter.clone());
         let kind = match rule.target {
             RuleTarget::Feature => 0,
             RuleTarget::DrawingInstruction => 1,
@@ -450,7 +449,7 @@ impl Catalogue {
         let mut names = HashSet::new();
         let mut rule_ids = HashSet::new();
         let mut rules: HashMap<String, HashMap<String, Vec<Rule>>> = HashMap::new();
-        for p in &planes {
+        for (plane_index, p) in planes.iter().enumerate() {
             allowed(
                 *p,
                 &[
@@ -540,6 +539,7 @@ impl Catalogue {
                         .entry(feature)
                         .or_default()
                         .push(Rule {
+                            plane_index,
                             target: if tag == "S100_IC_Feature" {
                                 RuleTarget::Feature
                             } else {
@@ -607,7 +607,7 @@ impl Catalogue {
         let Some(rules) = self.rules.get(product).and_then(|m| m.get(feature)) else {
             return Ok(None);
         };
-        let mut found: Option<&Assignment> = None;
+        let mut found: Option<&Rule> = None;
         for r in rules {
             let geometry = match r.target {
                 RuleTarget::Feature => feature_geometry,
@@ -622,16 +622,25 @@ impl Catalogue {
                 }
             }
             if let Some(old) = found {
+                // Part 16-4.4.2.2 requires instances to be partitioned
+                // unambiguously between display planes. Equal drawing keys
+                // cannot turn matches in two distinct planes into one match.
                 ensure!(
-                    old == &r.assignment,
+                    old.plane_index == r.plane_index,
+                    "Ambiguous IC display-plane match for {product}/{feature}: {} and {}",
+                    old.identifier,
+                    r.identifier
+                );
+                ensure!(
+                    old.assignment == r.assignment,
                     "Ambiguous IC match for {product}/{feature}: {}",
                     r.identifier
                 );
             } else {
-                found = Some(&r.assignment);
+                found = Some(r);
             }
         }
-        Ok(found.cloned())
+        Ok(found.map(|rule| rule.assignment.clone()))
     }
 }
 #[cfg(test)]
@@ -813,6 +822,93 @@ mod tests {
                 .is_err()
         );
     }
+    fn duplicate_coverage_plane(xml: &str, transform: impl FnOnce(String) -> String) -> String {
+        let start = xml.find("<S100_IC_DisplayPlane>").unwrap();
+        let end = xml.find("</S100_IC_DisplayPlane>").unwrap() + "</S100_IC_DisplayPlane>".len();
+        let duplicate = xml[start..end]
+            .replace("CoveragePlane", "OtherCoveragePlane")
+            .replace("<name>Coverage", "<name>Other coverage")
+            .replace("coverageRule", "otherCoverageRule");
+        let mut result = xml.to_owned();
+        result.insert_str(end, &transform(duplicate));
+        result
+    }
+
+    #[test]
+    fn identical_drawing_keys_do_not_merge_distinct_display_planes() {
+        let xml = duplicate_coverage_plane(&fixture(), |plane| plane);
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        let error = catalogue
+            .resolve("S-102", "BathymetryCoverage", "coverage", |_| panic!())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Ambiguous IC display-plane match"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn overlapping_geometry_selectors_in_equal_order_planes_are_still_ambiguous() {
+        let xml = duplicate_coverage_plane(&fixture(), |plane| {
+            plane.replace("<geometryType>coverage</geometryType>", "")
+        });
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        assert!(catalogue
+            .resolve("S-102", "BathymetryCoverage", "coverage", |_| panic!())
+            .is_err());
+        // A non-overlapping primitive selects only the unrestricted second plane.
+        assert!(catalogue
+            .resolve("S-102", "BathymetryCoverage", "surface", |_| panic!())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn separate_plane_selectors_can_partition_instances_at_the_same_drawing_order() {
+        let xml = fixture().replace("<geometryType>coverage</geometryType>",
+            "<geometryType>coverage</geometryType><attributeCombination>depth lt 30</attributeCombination>");
+        let xml = duplicate_coverage_plane(&xml, |plane| {
+            plane
+                .replace("depth lt 30", "depth ge 30")
+                .replace("<drawingPriority>3", "<drawingPriority>7")
+        });
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        for (depth, priority) in [("29.99999", 3), ("30", 7), ("9007199254740993", 7)] {
+            let resolved = catalogue
+                .resolve("S-102", "BathymetryCoverage", "coverage", |_| {
+                    Ok(Some(Scalar::Number(Decimal::parse(depth)?)))
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.priority, priority);
+        }
+        assert!(catalogue
+            .resolve("S-102", "BathymetryCoverage", "coverage", |_| Ok(None))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn equal_assignments_from_overlapping_rules_in_the_same_plane_remain_valid() {
+        let mut xml = fixture();
+        let start = xml.find("<S100_IC_Feature>").unwrap();
+        let end = xml.find("</S100_IC_Feature>").unwrap() + "</S100_IC_Feature>".len();
+        let duplicate = xml[start..end]
+            .replace("coverageRule", "secondRule")
+            .replace("<geometryType>coverage</geometryType>", "");
+        xml.insert_str(end, &duplicate);
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        assert_eq!(
+            catalogue
+                .resolve("S-102", "BathymetryCoverage", "coverage", |_| panic!())
+                .unwrap()
+                .unwrap()
+                .priority,
+            3
+        );
+    }
+
     #[test]
     fn source_and_portrayal_primitive_selectors_are_distinct() {
         let c = Catalogue::parse(&fixture()).unwrap();

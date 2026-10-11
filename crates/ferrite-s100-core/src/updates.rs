@@ -211,6 +211,13 @@ impl S100RecordStore {
     pub fn record(&self, key: RecordKey) -> Option<&DR> {
         self.records.get(&key).map(AsRef::as_ref)
     }
+    /// Borrow retained data records without cloning the materialized dataset.
+    pub(crate) fn records(&self) -> impl Iterator<Item = (RecordKey, &DR)> {
+        self.records
+            .iter()
+            .map(|(key, record)| (*key, record.as_ref()))
+    }
+
     pub fn payload_bytes(&self) -> usize {
         self.payload_bytes
     }
@@ -221,6 +228,13 @@ impl S100RecordStore {
         for record in self.records.values() {
             for f in &record.fields {
                 let d = f.data_trimmed();
+                if matches!(f.tag.as_str(), "CUCO" | "RIAS") {
+                    crate::cell::validate_curve_association_field(d, f.tag == "RIAS")?;
+                }
+                if f.tag == "SPAS" {
+                    // Share the cell parser's target/orientation/command checks.
+                    crate::cell::validate_materialized_spas(d)?;
+                }
                 let (width, instruction, kind) = match f.tag.as_str() {
                     "PTAS" => (6, None, 110),
                     "CUCO" => (6, None, 120),
@@ -973,13 +987,38 @@ mod tests {
         DR::parse(&data).unwrap()
     }
     #[test]
+    fn retained_invalid_ring_usage_and_spatial_direction_are_rejected() {
+        let curve = dr(vec![id("CRID", 1, 1, 1)]);
+        for (tag, tuple) in [
+            ("RIAS", vec![120, 1, 0, 0, 0, 1, 0, 1]),
+            ("RIAS", vec![120, 1, 0, 0, 0, 1, 3, 1]),
+            ("SPAS", vec![120, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        ] {
+            let record = if tag == "RIAS" {
+                dr(vec![id("SRID", 2, 1, 1), field(tag, tuple)])
+            } else {
+                let mut feature = vec![100, 2, 0, 0, 0, 1, 0, 1, 0, 1];
+                dr(vec![
+                    field("FRID", std::mem::take(&mut feature)),
+                    field(tag, tuple),
+                ])
+            };
+            let store =
+                S100RecordStore::from_base(vec![curve.clone(), record], UpdateLimits::default())
+                    .unwrap();
+            assert!(store.validate_references().is_err());
+        }
+    }
+    #[test]
     fn metadata_replacement_budget_failure_keeps_store_unchanged() {
         let metadata = dr(vec![
             field("DSID", vec![10, 1, 0, 0, 0]),
             field("FTCS", b"Old\x1f\x01\x00".to_vec()),
         ]);
-        let mut limits = UpdateLimits::default();
-        limits.max_dataset_bytes = bytes(&metadata).unwrap() + 4;
+        let limits = UpdateLimits {
+            max_dataset_bytes: bytes(&metadata).unwrap() + 4,
+            ..UpdateLimits::default()
+        };
         let mut store = S100RecordStore::from_base(vec![metadata.clone()], limits).unwrap();
         let old = store.payload_bytes();
         let large = dr(vec![
@@ -1128,6 +1167,7 @@ mod tests {
             "MRID" => 115,
             "CRID" => 120,
             "CCID" => 125,
+            "SRID" => 130,
             "FRID" => 100,
             _ => unreachable!(),
         };

@@ -291,7 +291,8 @@ impl PatternVertex {
     }
 }
 
-/// Render pipelines for chart display
+/// Render pipelines for chart display. Cloning copies GPU handles only.
+#[derive(Clone)]
 pub struct RenderPipelines {
     /// Pipeline for solid colored polygons (areas)
     pub area_pipeline: wgpu::RenderPipeline,
@@ -678,62 +679,13 @@ impl RenderPipelines {
                     cache: None,
                 });
 
-        let chart_text_pipeline =
-            state
-                .device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("coverage_lattice_pipeline"),
-                    layout: Some(&texture_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &chart_text_shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[ChartTextVertex::desc()],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &chart_text_shader,
-                        entry_point: Some(if state.format().is_srgb() {
-                            "fs_linear"
-                        } else {
-                            "fs_gamma"
-                        }),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: state.format(),
-                            // Premultiplied alpha blending: src + dst * (1 - src_alpha)
-                            blend: Some(wgpu::BlendState {
-                                color: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                                alpha: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                            }),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count: MSAA_SAMPLE_COUNT,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    multiview: None,
-                    cache: None,
-                });
+        let chart_text_pipeline = create_chart_text_pipeline(
+            &state.device,
+            &texture_pipeline_layout,
+            &chart_text_shader,
+            state.format(),
+            MSAA_SAMPLE_COUNT,
+        );
 
         // Create texture sampler (ClampToEdge for symbols)
         let texture_sampler = state.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1143,3 +1095,66 @@ fn glyph(v:Out)->vec4<f32>{
 @fragment fn fs_gamma(v:Out)->@location(0) vec4<f32>{return glyph(v);}
 @fragment fn fs_linear(v:Out)->@location(0) vec4<f32>{let c=glyph(v);if c.a<=0. {return vec4<f32>(0.);};return vec4<f32>(to_linear(c.rgb/c.a)*c.a,c.a);}
 "#;
+
+/// Shared immutable chart glyph pipeline factory; ordinary renderer and ignored GPU probe.
+pub(crate) fn create_chart_text_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    sample_count: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("coverage_lattice_pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[ChartTextVertex::desc()],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if format.is_srgb() {
+                "fs_linear"
+            } else {
+                "fs_gamma"
+            }),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // Premultiplied alpha blending: src + dst * (1 - src_alpha)
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    })
+}

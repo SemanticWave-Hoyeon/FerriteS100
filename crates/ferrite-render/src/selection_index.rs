@@ -73,6 +73,30 @@ impl SelectionIndex {
         scaler: &Scaler,
         spans: impl Fn(usize) -> Option<&'a [LineSpan]>,
     ) {
+        self.rebuild_resolved(instructions, displayed, scaler, spans, |_| None);
+    }
+    pub fn rebuild_in_context<'a>(
+        &mut self,
+        context: &crate::RenderContext,
+        displayed: &[usize],
+        spans: impl Fn(usize) -> Option<&'a [LineSpan]>,
+    ) {
+        self.rebuild_resolved(
+            context.raw_instructions(),
+            displayed,
+            &context.scaler,
+            spans,
+            |index| context.resolved_line_paths(index, &context.scaler),
+        );
+    }
+    fn rebuild_resolved<'a, 'b>(
+        &mut self,
+        instructions: &'b [DrawingInstruction],
+        displayed: &[usize],
+        scaler: &Scaler,
+        spans: impl Fn(usize) -> Option<&'a [LineSpan]>,
+        resolve: impl Fn(usize) -> Option<crate::ResolvedLinePaths<'b>>,
+    ) {
         let started = std::time::Instant::now();
         self.clear();
         self.instructions.extend_from_slice(displayed);
@@ -98,7 +122,7 @@ impl SelectionIndex {
             };
             match instructions.get(index) {
                 Some(DrawingInstruction::Line(line)) => {
-                    for path in line.render_paths(scaler) {
+                    for path in resolve(index).unwrap_or_else(|| line.render_paths(scaler)) {
                         for &p in path.iter() {
                             add(scaler.world_to_screen(p));
                         }

@@ -481,7 +481,15 @@ fn authorized_inputs_with_budget(
         };
         let metadata = match crate::s101_lifecycle_metadata::capture(&path, &data, authorization) {
             Ok(value) => value,
-            Err(error) if !require_signature && cancellation.is_none() => {
+            Err(error)
+                if !require_signature
+                    && cancellation.is_none()
+                    && id
+                        .product_edition
+                        .parse::<ferrite_kernel::SpecificationVersion>()?
+                        .edition
+                        == 1 =>
+            {
                 tracing::warn!("Unchecked catalogue metadata unavailable for {}: {error:#}; ordinary data still opens without a lifecycle date claim",path.display());
                 None
             }
@@ -496,6 +504,9 @@ fn authorized_inputs_with_budget(
                     metadata.update,
                 )?;
             }
+        }
+        if let Some(metadata) = &metadata {
+            metadata.validate_xc_profile(&id)?;
         }
         let input = Input {
             original: path,
@@ -693,27 +704,34 @@ impl Plan {
     ) -> Option<&crate::s101_lifecycle_metadata::MetadataEvidence> {
         self.updates.last().unwrap_or(&self.base).metadata.as_ref()
     }
-    pub(crate) fn load(&self) -> Result<(S101Cell, ferrite_s100_core::CellSourceIdentity)> {
+    /// Ordered captured raw-byte identity only; does not authenticate live paths.
+    pub(crate) fn captured_source_identity_sha(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
+        if self.updates.is_empty() {
+            self.base.data_sha256
+        } else {
+            let mut hash = Sha256::new();
+            hash.update(b"FerriteS100/S101/ordered-raw-update-chain/v1\0");
+            hash.update(((self.updates.len() + 1) as u64).to_le_bytes());
+            for (index, input) in std::iter::once(&self.base)
+                .chain(self.updates.iter())
+                .enumerate()
+            {
+                hash.update((index as u64).to_le_bytes());
+                hash.update(input.data_length.to_le_bytes());
+                hash.update(input.data_sha256);
+            }
+            hash.finalize().into()
+        }
+    }
+    pub(crate) fn load(&self) -> Result<(S101Cell, ferrite_s100_core::CellSourceIdentity)> {
         let chain: Vec<_> = std::iter::once(&self.base)
             .chain(self.updates.iter())
             .collect();
         for input in &chain {
             input.verify_captured()?;
         }
-        let expected: [u8; 32] = if self.updates.is_empty() {
-            self.base.data_sha256
-        } else {
-            let mut hash = Sha256::new();
-            hash.update(b"FerriteS100/S101/ordered-raw-update-chain/v1\0");
-            hash.update((chain.len() as u64).to_le_bytes());
-            for (index, input) in chain.iter().enumerate() {
-                hash.update((index as u64).to_le_bytes());
-                hash.update(input.data_length.to_le_bytes());
-                hash.update(input.data_sha256);
-            }
-            hash.finalize().into()
-        };
+        let expected = self.captured_source_identity_sha();
         let updates: Vec<_> = self.updates.iter().map(|i| i.data.clone()).collect();
         let result = S101Cell::load_update_chain_from_with_identity(
             &self.base.original,
@@ -725,6 +743,43 @@ impl Plan {
             "Materialized S-101 chain differs from captured raw inputs"
         );
         self.validate_materialized(&result.0)?;
+        Ok(result)
+    }
+    /// Call only after the existing authorization/planning/cancellation checks.
+    /// Cache raw parser output BEFORE normalization or Feature Catalogue resolution.
+    pub(crate) fn load_with_decoded_cache(
+        &self,
+        cache: &crate::decoded_chart_cache::SharedDecodedChartCache,
+    ) -> Result<(S101Cell, ferrite_s100_core::CellSourceIdentity)> {
+        if std::env::var_os("FERRITE_NO_CACHE").is_some() {
+            return self.load();
+        }
+        let key = self.captured_source_identity_sha();
+        let (hit, generation) = match cache.lock() {
+            Ok(mut cache) => (cache.get(&key), Some(cache.generation())),
+            Err(_) => (None, None), // poisoned memo is unavailable; original parser remains authoritative
+        };
+        if let Some((mut cell, identity)) = hit {
+            // Verify AFTER deep clone and before returning any cached materialization.
+            // On misses original load performs its own precheck and parsed-byte identity check.
+            for input in std::iter::once(&self.base).chain(self.updates.iter()) {
+                input.verify_captured()?;
+            }
+
+            ensure!(
+                *identity.sha256() == key,
+                "Decoded cache raw identity differs"
+            );
+            cell.file_path.clone_from(&self.base.original);
+            self.validate_materialized(&cell)?;
+            return Ok((cell, identity));
+        }
+        let result = self.load()?;
+        if let Some(generation) = generation {
+            if let Ok(mut cache) = cache.lock() {
+                cache.remember(key, &result, generation);
+            }
+        }
         Ok(result)
     }
     pub(crate) fn input_paths(&self) -> Vec<PathBuf> {
@@ -749,6 +804,15 @@ impl Plan {
                 && cell.dsid.update_number == expected,
             "Dataset identity changed after chain planning; reopen it"
         );
+        // Both decoded-cache hits and parser misses validate here. Use only
+        // ending update metadata against the final materialized cell.
+        if let Some(metadata) = self.ending_metadata() {
+            let status = metadata.validate_xc_regions(cell)?;
+            tracing::info!(
+                ?status,
+                "S101 XC bounded exact-region validation; unresolved correspondence is not certified"
+            );
+        }
         Ok(())
     }
 }
@@ -775,6 +839,37 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+    #[test]
+    fn captured_chain_identity_keeps_original_domain_order_length_and_single_input() {
+        use sha2::{Digest, Sha256};
+        let mut base = input(1, 0, "1");
+        base.data_sha256 = [1; 32];
+        base.data_length = 17;
+        let mut update = input(1, 1, "1");
+        update.data_sha256 = [2; 32];
+        update.data_length = 23;
+        let mut plan = Plan {
+            base,
+            updates: vec![update],
+        };
+        let mut original = Sha256::new();
+        original.update(b"FerriteS100/S101/ordered-raw-update-chain/v1\0");
+        original.update(2u64.to_le_bytes());
+        for (i, len, sha) in [(0u64, 17u64, [1u8; 32]), (1, 23, [2; 32])] {
+            original.update(i.to_le_bytes());
+            original.update(len.to_le_bytes());
+            original.update(sha);
+        }
+        assert_eq!(
+            plan.captured_source_identity_sha(),
+            <[u8; 32]>::from(original.finalize())
+        );
+        let old = plan.captured_source_identity_sha();
+        plan.updates[0].data_length += 1;
+        assert_ne!(old, plan.captured_source_identity_sha());
+        plan.updates.clear();
+        assert_eq!(plan.captured_source_identity_sha(), [1; 32]);
     }
     #[test]
     fn signed_catalogue_identity_rejects_wrong_edition_counter_and_purpose() {
@@ -924,7 +1019,8 @@ mod tests {
                         let (cell, identity) = plan.load().unwrap();
                         rows.push(serde_json::json!({"choice":choice,"dataset":cell.dsid.dataset_name,
                         "edition":cell.dsid.edition_number,"update":cell.dsid.update_number,
-                        "features":cell.features.len(),"sha256":identity.sha256(),"paths":plan.input_paths()}));
+                        "features":cell.features.len(),"sha256":identity.sha256(),"paths":plan.input_paths(),
+                        "xc_region_status":plan.ending_metadata().map(|m| format!("{:?}",m.validate_xc_regions(&cell).unwrap()))}));
                     }
                 }
                 Err(error) => {
@@ -1075,6 +1171,7 @@ mod tests {
             "source":cell.file_path,"edition":cell.dsid.edition_number,"update":cell.dsid.update_number,
             "feature_count":cell.features.len(),"input_paths":plans[0].input_paths(),
             "source_sha256":identity.sha256(),"features":rows,
+            "xc_region_status":plans[0].ending_metadata().map(|m| format!("{:?}",m.validate_xc_regions(&cell).unwrap())),
             "association_mappings":{"FACS":cell.code_mappings.feature_associations.num_to_str,
                 "IACS":cell.code_mappings.information_associations.num_to_str,
                 "ARCS":cell.code_mappings.association_roles.num_to_str},
@@ -1150,7 +1247,7 @@ mod tests {
         std::fs::write(&cancel, fixture("2", "0", "101AA00TEST.003")).unwrap();
         let xml = |purpose: &str, date: &str| {
             format!(
-                r#"<S100_ExchangeCatalogue xmlns="http://www.iho.int/s100/xc/5.2"><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.002</fileName><purpose>4</purpose><editionNumber>4</editionNumber><updateNumber>2</updateNumber><issueDate>2024-10-16</issueDate></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.003</fileName><purpose>{purpose}</purpose><editionNumber>4</editionNumber><updateNumber>3</updateNumber><issueDate>{date}</issueDate></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata></S100_ExchangeCatalogue>"#
+                r#"<S100_ExchangeCatalogue xmlns="http://www.iho.int/s100/xc/5.2"><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.002</fileName><purpose>4</purpose><editionNumber>4</editionNumber><updateNumber>2</updateNumber><issueDate>2024-10-16</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.003</fileName><purpose>{purpose}</purpose><editionNumber>4</editionNumber><updateNumber>3</updateNumber><issueDate>{date}</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata></S100_ExchangeCatalogue>"#
             )
         };
         std::fs::write(folder.join("CATALOG.XML"), xml("5", "2024-10-17")).unwrap();
@@ -1309,7 +1406,7 @@ mod tests {
         std::fs::write(&update, fixture("2", "4.003", "101AA00TEST.003")).unwrap();
         let xml = |date: &str| {
             format!(
-                r#"<S100_ExchangeCatalogue xmlns="http://www.iho.int/s100/xc/5.2"><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.002</fileName><purpose>4</purpose><editionNumber>4</editionNumber><updateNumber>2</updateNumber><issueDate>{date}</issueDate></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.003</fileName><purpose>3</purpose><editionNumber>4</editionNumber><updateNumber>3</updateNumber><issueDate>2024-10-19</issueDate></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata></S100_ExchangeCatalogue>"#
+                r#"<S100_ExchangeCatalogue xmlns="http://www.iho.int/s100/xc/5.2"><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.002</fileName><purpose>4</purpose><editionNumber>4</editionNumber><updateNumber>2</updateNumber><issueDate>{date}</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.003</fileName><purpose>3</purpose><editionNumber>4</editionNumber><updateNumber>3</updateNumber><issueDate>2024-10-19</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata></S100_ExchangeCatalogue>"#
             )
         };
         std::fs::write(folder.join("CATALOG.XML"), xml("2024-10-16")).unwrap();
@@ -1476,5 +1573,26 @@ mod tests {
                 assert!(notices.iter().any(|v| v.contains("Conflicting duplicate")));
             }
         }
+    }
+    #[test]
+    fn decoded_cache_key_changes_on_same_path_content_and_update_order() {
+        let mut p = Plan {
+            base: input(1, 0, "1"),
+            updates: vec![input(1, 1, "1"), input(1, 2, "1")],
+        };
+        p.base.data_sha256 = [1; 32];
+        p.updates[0].data_sha256 = [2; 32];
+        p.updates[1].data_sha256 = [3; 32];
+        let original = p.captured_source_identity_sha();
+        p.updates.swap(0, 1);
+        assert_ne!(p.captured_source_identity_sha(), original);
+        p.updates.swap(0, 1);
+        p.base.data_sha256 = [4; 32];
+        assert_ne!(p.captured_source_identity_sha(), original);
+        // Catalogue/profile changes do not grant reuse of an already-resolved mutable cell.
+        // The raw cache key intentionally remains source-only; downstream FC validation stays live.
+        p.base.data_sha256 = [1; 32];
+        p.base.original = "different/original/101TEST.000".into();
+        assert_eq!(p.captured_source_identity_sha(), original);
     }
 }

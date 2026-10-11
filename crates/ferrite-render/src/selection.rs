@@ -23,6 +23,16 @@ pub fn hit_geometry_visible(
     radius: f64,
     spans: Option<&[crate::LineSpan]>,
 ) -> Option<GeometryHit> {
+    hit_geometry_visible_resolved(instruction, scaler, query, radius, spans, None)
+}
+fn hit_geometry_visible_resolved<'a>(
+    instruction: &'a DrawingInstruction,
+    scaler: &Scaler,
+    query: ScreenPoint,
+    radius: f64,
+    spans: Option<&[crate::LineSpan]>,
+    resolved: Option<crate::ResolvedLinePaths<'a>>,
+) -> Option<GeometryHit> {
     if !radius.is_finite() || radius < 0.0 {
         return None;
     }
@@ -35,8 +45,8 @@ pub fn hit_geometry_visible(
         return None;
     }
     let result = match instruction {
-        DrawingInstruction::Line(line) => line
-            .render_paths(scaler)
+        DrawingInstruction::Line(line) => resolved
+            .unwrap_or_else(|| line.render_paths(scaler))
             .filter_map(|points| {
                 let styled = crate::dash_line_spans(&points, scaler, &line.style, spans);
                 let visible = styled.as_deref().or(spans);
@@ -140,6 +150,37 @@ pub fn hit_geometry_wrapped_visible(
                 ScreenPoint::new(query.x - pixels, query.y),
                 radius,
                 spans,
+            )?;
+            hit.nearest.x += pixels;
+            Some(WrappedGeometryHit {
+                hit,
+                longitude_shift: shift,
+            })
+        })
+        .min_by(|a, b| a.hit.distance.total_cmp(&b.hit.distance))
+}
+pub fn hit_geometry_wrapped_visible_in_context(
+    context: &crate::RenderContext,
+    ordinal: usize,
+    query: ScreenPoint,
+    radius: f64,
+    spans: Option<&[crate::LineSpan]>,
+    wrapping: bool,
+) -> Option<WrappedGeometryHit> {
+    let instruction = context.raw_instructions().get(ordinal)?;
+    let scaler = &context.scaler;
+    let offsets = [0., -360., 360.];
+    offsets[..if wrapping { 3 } else { 1 }]
+        .iter()
+        .filter_map(|&shift| {
+            let pixels = (shift * scaler.scale_x()) as f32;
+            let mut hit = hit_geometry_visible_resolved(
+                instruction,
+                scaler,
+                ScreenPoint::new(query.x - pixels, query.y),
+                radius,
+                spans,
+                context.resolved_line_paths(ordinal, scaler),
             )?;
             hit.nearest.x += pixels;
             Some(WrappedGeometryHit {

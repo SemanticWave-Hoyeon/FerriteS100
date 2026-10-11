@@ -12,17 +12,39 @@ pub const MSAA_SAMPLE_COUNT: u32 = 4;
 
 /// GPU state containing device, queue, and surface
 pub struct GpuState {
-    pub surface: wgpu::Surface<'static>,
+    /// Shared only so a worker shadow can exist; only the owner presents.
+    pub surface: Arc<wgpu::Surface<'static>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     pub window: Arc<Window>,
+    /// Window density sampled on the UI thread (creation and resize). Scene
+    /// emission reads this; a worker must never call into the macOS window,
+    /// which synchronously dispatches to the main thread.
+    scale_factor: f64,
     /// MSAA render target texture
     pub msaa_texture: Option<wgpu::Texture>,
     pub msaa_view: Option<wgpu::TextureView>,
     /// GPU adapter name
     pub gpu_name: String,
+    /// Actual adapter capability metadata; device request remains unchanged.
+    pub adapter_features: wgpu::Features,
+    pub adapter_backend: wgpu::Backend,
+    surface_pacing: Option<std::cell::RefCell<crate::surface_pacing::Capture>>,
+    /// Buffers created off the UI thread for exact CPU slices of a scene that
+    /// is about to be uploaded; consumed by `create_*_buffer`, else dropped.
+    prebuilt: std::cell::RefCell<Vec<PrebuiltBuffer>>,
+}
+
+/// A GPU buffer already initialised from the slice at `address`/`len`.
+/// Identity is the live allocation, valid only until that slice can change.
+pub(crate) struct PrebuiltBuffer {
+    label: &'static str,
+    usage: wgpu::BufferUsages,
+    address: usize,
+    len: usize,
+    buffer: wgpu::Buffer,
 }
 
 impl GpuState {
@@ -97,9 +119,10 @@ impl GpuState {
             .unwrap_or(surface_caps.formats[0]);
 
         // Use Fifo (VSync) to match monitor refresh rate — no wasted frames.
-        // desired_maximum_frame_latency = 1 minimizes input-to-display latency:
-        // the CPU starts the next frame only after the GPU finishes the previous one,
-        // keeping the GPU queue shallow for the freshest possible input state.
+        // Default latency hint remains 1. Exact opt-in value 2 is experimental.
+        // Depending on backend, hint 1 may serialize CPU/GPU at acquisition;
+        // hint 2 may reduce starvation while adding latency/in-flight resources.
+        // Neither the hint nor a hidden surface proves physical display cadence.
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -108,7 +131,9 @@ impl GpuState {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 1,
+            desired_maximum_frame_latency: crate::surface_pacing::requested_latency(
+                std::env::var_os("FERRITE_SURFACE_FRAME_LATENCY").as_deref(),
+            ),
         };
         surface.configure(&device, &config);
 
@@ -118,15 +143,26 @@ impl GpuState {
         tracing::info!("MSAA enabled with {} samples", MSAA_SAMPLE_COUNT);
 
         Ok(GpuState {
-            surface,
+            surface: Arc::new(surface),
             device,
             queue,
             config,
             size,
-            window,
+            window: Arc::clone(&window),
+            scale_factor: window.scale_factor(),
             msaa_texture: Some(msaa_texture),
             msaa_view: Some(msaa_view),
             gpu_name,
+            adapter_features,
+            adapter_backend: adapter_info.backend,
+            surface_pacing: crate::surface_pacing::Capture::new(
+                std::env::var_os("FERRITE_SURFACE_PACING_DIAGNOSTICS").as_deref(),
+                crate::background_test::enabled()
+                    && window.is_visible() == Some(false)
+                    && !window.has_focus(),
+            )
+            .map(std::cell::RefCell::new),
+            prebuilt: Default::default(),
         })
     }
 
@@ -153,8 +189,30 @@ impl GpuState {
         (texture, view)
     }
 
+    /// Read-only device/size copy for preparing a scene on a worker thread.
+    /// It never acquires or presents, and carries no pacing collector.
+    pub(crate) fn worker_shadow(&self) -> Self {
+        Self {
+            surface: Arc::clone(&self.surface),
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            config: self.config.clone(),
+            size: self.size,
+            window: Arc::clone(&self.window),
+            scale_factor: self.scale_factor,
+            msaa_texture: None,
+            msaa_view: None,
+            gpu_name: self.gpu_name.clone(),
+            adapter_features: self.adapter_features,
+            adapter_backend: self.adapter_backend,
+            surface_pacing: None,
+            prebuilt: Default::default(),
+        }
+    }
+
     /// Resize the surface
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        self.scale_factor = self.window.scale_factor();
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
             self.config.width = new_size.width;
@@ -170,9 +228,55 @@ impl GpuState {
 
     /// Get current surface texture for rendering
     pub fn get_current_texture(&self) -> Result<wgpu::SurfaceTexture> {
-        self.surface
+        let timer = self.surface_pacing_clock();
+        let result = self
+            .surface
             .get_current_texture()
-            .map_err(|e| WgpuError::Render(e.to_string()))
+            .map_err(|e| WgpuError::Render(e.to_string()));
+        self.surface_pacing_record(crate::surface_pacing::Stage::Acquire, timer);
+        if let Some(capture) = &self.surface_pacing {
+            capture.borrow_mut().acquire(result.is_err());
+        }
+        result
+    }
+
+    pub(crate) fn surface_pacing_arm(&self, frame: u64, source: u64, view: u64) {
+        if let Some(capture) = &self.surface_pacing {
+            capture.borrow_mut().arm(frame, source, view);
+        }
+    }
+    pub(crate) fn surface_pacing_clock(&self) -> Option<std::time::Instant> {
+        self.surface_pacing
+            .as_ref()
+            .and_then(|capture| capture.borrow().clock())
+    }
+    pub(crate) fn surface_pacing_record(
+        &self,
+        stage: crate::surface_pacing::Stage,
+        timer: Option<std::time::Instant>,
+    ) {
+        if let (Some(capture), Some(timer)) = (&self.surface_pacing, timer) {
+            let elapsed = timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            capture.borrow_mut().record(stage, elapsed);
+        }
+    }
+    pub(crate) fn surface_pacing_presented(&self) {
+        if let Some(capture) = &self.surface_pacing {
+            capture.borrow_mut().presented();
+        }
+    }
+    pub(crate) fn surface_pacing_finish(&self) {
+        if let Some(capture) = &self.surface_pacing {
+            capture.borrow_mut().finish();
+        }
+    }
+    pub(crate) fn surface_pacing_snapshot(&self) -> Option<serde_json::Value> {
+        self.surface_pacing.as_ref().map(|capture| {
+            capture.borrow().snapshot(
+                self.config.desired_maximum_frame_latency,
+                [self.config.width, self.config.height],
+            )
+        })
     }
 
     /// Create a uniform buffer
@@ -193,6 +297,13 @@ impl GpuState {
         label: &str,
     ) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
+        if let Some(buffer) = self.take_prebuilt(
+            label,
+            wgpu::BufferUsages::VERTEX,
+            bytemuck::cast_slice(vertices),
+        ) {
+            return buffer;
+        }
         self.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
@@ -204,12 +315,73 @@ impl GpuState {
     /// Create an index buffer
     pub fn create_index_buffer(&self, indices: &[u32], label: &str) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
+        if let Some(buffer) = self.take_prebuilt(
+            label,
+            wgpu::BufferUsages::INDEX,
+            bytemuck::cast_slice(indices),
+        ) {
+            return buffer;
+        }
         self.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
                 contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             })
+    }
+
+    /// Create (on any thread) the buffer `create_*_buffer` would create for
+    /// exactly this slice, and hold it for that later call.
+    pub(crate) fn prebuild_buffer(
+        &self,
+        label: &'static str,
+        usage: wgpu::BufferUsages,
+        contents: &[u8],
+    ) {
+        use wgpu::util::DeviceExt;
+        if contents.is_empty() {
+            return;
+        }
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage,
+            });
+        self.prebuilt.borrow_mut().push(PrebuiltBuffer {
+            label,
+            usage,
+            address: contents.as_ptr() as usize,
+            len: contents.len(),
+            buffer,
+        });
+    }
+    pub(crate) fn take_prebuilt_buffers(&self) -> Vec<PrebuiltBuffer> {
+        self.prebuilt.take()
+    }
+    /// Replace held buffers; their slices must be unchanged until consumed.
+    pub(crate) fn hold_prebuilt_buffers(&self, buffers: Vec<PrebuiltBuffer>) {
+        *self.prebuilt.borrow_mut() = buffers;
+    }
+    /// Drop held buffers once their slices may change or were uploaded.
+    pub(crate) fn clear_prebuilt_buffers(&self) {
+        self.prebuilt.borrow_mut().clear();
+    }
+    fn take_prebuilt(
+        &self,
+        label: &str,
+        usage: wgpu::BufferUsages,
+        contents: &[u8],
+    ) -> Option<wgpu::Buffer> {
+        let mut held = self.prebuilt.borrow_mut();
+        let index = held.iter().position(|b| {
+            b.label == label
+                && b.usage == usage
+                && b.address == contents.as_ptr() as usize
+                && b.len == contents.len()
+        })?;
+        Some(held.swap_remove(index).buffer)
     }
 
     /// Update view uniforms
@@ -221,6 +393,17 @@ impl GpuState {
     /// Get surface format
     pub fn format(&self) -> wgpu::TextureFormat {
         self.config.format
+    }
+
+    /// Re-sample density on the UI thread before a scene emission.
+    pub(crate) fn sync_scale_factor(&mut self) {
+        self.scale_factor = self.window.scale_factor();
+    }
+
+    /// Window density as of creation, the last resize or the last
+    /// `sync_scale_factor`.
+    pub fn scale_factor(&self) -> f64 {
+        self.scale_factor
     }
 
     /// Get viewport dimensions

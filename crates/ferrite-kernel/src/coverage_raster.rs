@@ -37,6 +37,49 @@ impl PixelMask {
             && y < self.size[1]
             && self.pixels[y as usize * self.size[0] as usize + x as usize] != 0
     }
+    /// OR cropped immutable R8 masks once. Overlapping annotation owners must
+    /// not blend the same pattern twice. Budget excludes callers' input masks.
+    pub fn union_masks(masks: &[Self], byte_budget: usize) -> Result<Self> {
+        let nonempty: Vec<_> = masks.iter().filter(|m| !m.size.contains(&0)).collect();
+        if nonempty.is_empty() {
+            return Ok(Self::empty());
+        }
+        let mut origin = [u32::MAX; 2];
+        let mut end = [0; 2];
+        for m in &nonempty {
+            for axis in 0..2 {
+                origin[axis] = origin[axis].min(m.origin[axis]);
+                end[axis] = end[axis].max(
+                    m.origin[axis]
+                        .checked_add(m.size[axis])
+                        .ok_or_else(|| anyhow::anyhow!("Mask union extent overflow"))?,
+                );
+            }
+        }
+        let size = [end[0] - origin[0], end[1] - origin[1]];
+        let bytes = (size[0] as usize)
+            .checked_mul(size[1] as usize)
+            .ok_or_else(|| anyhow::anyhow!("Mask union storage overflow"))?;
+        ensure!(bytes <= byte_budget, "Mask union byte budget exceeded");
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(bytes)?;
+        pixels.resize(bytes, 0);
+        for m in nonempty {
+            for y in 0..m.size[1] as usize {
+                let dst = (y + (m.origin[1] - origin[1]) as usize) * size[0] as usize
+                    + (m.origin[0] - origin[0]) as usize;
+                let src = y * m.size[0] as usize;
+                for x in 0..m.size[0] as usize {
+                    pixels[dst + x] |= m.pixels[src + x];
+                }
+            }
+        }
+        Ok(Self {
+            origin,
+            size,
+            pixels,
+        })
+    }
     fn empty() -> Self {
         Self {
             origin: [0, 0],
@@ -145,6 +188,64 @@ pub fn rasterize_selected_masks(
     Ok(result)
 }
 
+fn scanline_crossings(region: &Region, y: f64, crossings: &mut Vec<f64>) -> Result<()> {
+    crossings.clear();
+    for polygon in region.polygons() {
+        for ring in std::iter::once(polygon.exterior()).chain(polygon.interiors()) {
+            for edge in ring.0.windows(2) {
+                let (a, b) = if edge[0].y <= edge[1].y {
+                    (edge[0], edge[1])
+                } else {
+                    (edge[1], edge[0])
+                };
+                // Horizontal edges and upper endpoints contribute no crossing.
+                if (a.y > y) == (b.y > y) {
+                    continue;
+                }
+                // Halved differences avoid overflowing opposite large values.
+                let t = (y * 0.5 - a.y * 0.5) / (b.y * 0.5 - a.y * 0.5);
+                let x = if a.x == b.x {
+                    a.x
+                } else {
+                    a.x * (1. - t) + b.x * t
+                };
+                ensure!(x.is_finite(), "Non-finite coverage edge intersection");
+                crossings.push(x);
+            }
+        }
+    }
+    crossings.sort_unstable_by(f64::total_cmp);
+    ensure!(
+        crossings.len().is_multiple_of(2),
+        "Unpaired coverage scanline intersections"
+    );
+    Ok(())
+}
+
+/// Same centre/half-open row sampler as rasterize, without allocating a bitmap.
+/// A coordinate addresses the physical pixel floor(x),floor(y), as GPU masks do.
+pub fn sample_region_pixel(region: &Region, extent: [u32; 2], point: [f64; 2]) -> Result<bool> {
+    ensure!(
+        point.iter().all(|v| v.is_finite()),
+        "Invalid annotation sample point"
+    );
+    if point[0] < 0.
+        || point[1] < 0.
+        || point[0] >= extent[0] as f64
+        || point[1] >= extent[1] as f64
+    {
+        return Ok(false);
+    }
+    let pixel = [point[0].floor() as u32, point[1].floor() as u32];
+    let mut crossings = Vec::new();
+    scanline_crossings(region, pixel[1] as f64 + 0.5, &mut crossings)?;
+    let clamp = |v: f64| v.clamp(0., extent[0] as f64) as u32;
+    Ok(crossings.as_chunks::<2>().0.iter().any(|pair| {
+        let start = clamp((pair[0] - 0.5).ceil());
+        let stop = clamp((pair[1] - 0.5).ceil());
+        pixel[0] >= start && pixel[0] < stop
+    }))
+}
 /// Rasterize a normalized Region into the supplied device extent, with an
 /// explicit allocation limit. No large full-viewport allocation is required
 /// for a small coverage. Budget failures return an error; they never disable
@@ -199,35 +300,7 @@ pub fn rasterize(region: &Region, extent: [u32; 2], byte_budget: usize) -> Resul
     for row in 0..size[1] {
         crossings.clear();
         let y = (origin[1] + row) as f64 + 0.5;
-        for polygon in region.polygons() {
-            for ring in std::iter::once(polygon.exterior()).chain(polygon.interiors()) {
-                for edge in ring.0.windows(2) {
-                    let (a, b) = if edge[0].y <= edge[1].y {
-                        (edge[0], edge[1])
-                    } else {
-                        (edge[1], edge[0])
-                    };
-                    // Horizontal edges and upper endpoints contribute no crossing.
-                    if (a.y > y) == (b.y > y) {
-                        continue;
-                    }
-                    // Halved differences avoid overflowing opposite large values.
-                    let t = (y * 0.5 - a.y * 0.5) / (b.y * 0.5 - a.y * 0.5);
-                    let x = if a.x == b.x {
-                        a.x
-                    } else {
-                        a.x * (1. - t) + b.x * t
-                    };
-                    ensure!(x.is_finite(), "Non-finite coverage edge intersection");
-                    crossings.push(x);
-                }
-            }
-        }
-        crossings.sort_unstable_by(f64::total_cmp);
-        ensure!(
-            crossings.len() % 2 == 0,
-            "Unpaired coverage scanline intersections"
-        );
+        scanline_crossings(region, y, &mut crossings)?;
         let offset = row as usize * size[0] as usize;
         for pair in crossings.as_chunks::<2>().0 {
             // A centre lies in [left,right), independent of ring winding.

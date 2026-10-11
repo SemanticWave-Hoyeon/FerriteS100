@@ -897,3 +897,19 @@ pub use exchange_catalogue_authentication::{
     verify_exchange_catalogue, AuthenticatedExchangeCatalogue, CatalogueDiscoveryView,
     OriginalEntryView,
 };
+
+mod copied_original_signatures;
+pub use copied_original_signatures::CopiedOriginalSignatureBinding;
+mod incoming_exchange;
+pub use incoming_exchange::{
+    capture_catalogue_authenticated_incoming_exchange, CatalogueAuthenticatedIncomingExchange,
+    IncomingAsciiResourceAbsence, IncomingExchangeLimits,
+};
+mod trusted_cancellation_authority;
+pub use trusted_cancellation_authority::{
+    CancellationAuthorityRole, CancellationDatasetScope, CatalogueCancellationAuthority,
+    TrustedCancellationGrant, TrustedCancellationPolicy,
+};
+
+mod original_retained_storage;
+pub use original_retained_storage::retained_original_authentication_storage;

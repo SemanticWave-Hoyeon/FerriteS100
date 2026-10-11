@@ -210,7 +210,11 @@ impl FeatureDefinition {
         })
     }
 }
-fn definitions(g: &hdf5::Group, name: &str, max_rows: usize) -> Result<Vec<FeatureDefinition>> {
+pub(crate) fn definitions(
+    g: &hdf5::Group,
+    name: &str,
+    max_rows: usize,
+) -> Result<Vec<FeatureDefinition>> {
     let d = g
         .dataset(name)
         .with_context(|| format!("Missing Group_F/{name}"))?;
@@ -313,14 +317,24 @@ impl FeatureMetadata {
             );
             ensure!(seen.insert(code.as_str()), "Duplicate Group_F featureCode");
         }
+        // Quality coverage is optional (S-102 3.0). It is absent only when the
+        // list entry, the definition table and the coverage group are all
+        // missing (UKHO 2026); any partial presence still requires the table.
+        let quality_absent = !seen.contains(FEATURES[1])
+            && !g.link_exists(FEATURES[1])
+            && !file.link_exists(FEATURES[1]);
         let diagnostics = FEATURES
             .iter()
-            .filter(|f| !seen.contains(**f))
+            .filter(|f| !seen.contains(**f) && !(quality_absent && **f == FEATURES[1]))
             .map(|f| FeatureMetadataDiagnostic::MissingDeclaredFeature((*f).into()))
             .collect();
         // Actual named definition tables are required even when a producer omits a list entry.
         let bathymetry = definitions(&g, FEATURES[0], 2)?;
-        let quality = definitions(&g, FEATURES[1], 1)?;
+        let quality = if quality_absent {
+            Vec::new()
+        } else {
+            definitions(&g, FEATURES[1], 1)?
+        };
         let mut codes = std::collections::BTreeSet::new();
         for row in &bathymetry {
             ensure!(
@@ -342,14 +356,15 @@ impl FeatureMetadata {
             );
         }
         ensure!(codes.contains("depth"), "Missing depth feature definition");
-        let q = &quality[0];
-        ensure!(
-            q.code == "iD"
-                && q.unit.is_empty()
-                && q.datatype == "H5T_INTEGER"
-                && q.fill_value.parse::<u32>()? == 0,
-            "Unsupported S102 quality feature definition"
-        );
+        if let Some(q) = quality.first() {
+            ensure!(
+                q.code == "iD"
+                    && q.unit.is_empty()
+                    && q.datatype == "H5T_INTEGER"
+                    && q.fill_value.parse::<u32>()? == 0,
+                "Unsupported S102 quality feature definition"
+            );
+        }
         Ok(Self {
             declared_features,
             bathymetry,
@@ -471,6 +486,22 @@ mod tests {
         );
         assert!(m.validate_declaration().is_err());
         assert_eq!(m.quality.len(), 1);
+    }
+    #[test]
+    fn quality_is_optional_only_when_list_table_and_coverage_are_all_absent() {
+        let f = fixture(&[FEATURES[0]]);
+        f.1.group("Group_F").unwrap().unlink(FEATURES[1]).unwrap();
+        let m = FeatureMetadata::read(&f.1).unwrap();
+        assert!(m.quality.is_empty());
+        assert!(m.diagnostics.is_empty());
+        // Declared but without a table, or a coverage group without a table: refused.
+        let f = fixture(&FEATURES);
+        f.1.group("Group_F").unwrap().unlink(FEATURES[1]).unwrap();
+        assert!(FeatureMetadata::read(&f.1).is_err());
+        let f = fixture(&[FEATURES[0]]);
+        f.1.group("Group_F").unwrap().unlink(FEATURES[1]).unwrap();
+        f.1.create_group(FEATURES[1]).unwrap();
+        assert!(FeatureMetadata::read(&f.1).is_err());
     }
     #[test]
     fn feature_codes_admit_only_known_unique_variable_1d_strings() {
@@ -672,14 +703,14 @@ mod tests {
         let ty = d.dtype().unwrap();
         let bad = [0xffu8, 0];
         let raw = [
-            b"depth\0".as_ptr(),
+            c"depth".as_ptr().cast::<u8>(),
             bad.as_ptr(),
-            b"metres\0".as_ptr(),
-            b"1000000\0".as_ptr(),
-            b"H5T_FLOAT\0".as_ptr(),
-            b"-14\0".as_ptr(),
-            b"11050\0".as_ptr(),
-            b"closedInterval\0".as_ptr(),
+            c"metres".as_ptr().cast::<u8>(),
+            c"1000000".as_ptr().cast::<u8>(),
+            c"H5T_FLOAT".as_ptr().cast::<u8>(),
+            c"-14".as_ptr().cast::<u8>(),
+            c"11050".as_ptr().cast::<u8>(),
+            c"closedInterval".as_ptr().cast::<u8>(),
         ];
         let status = hdf5::sync::sync(|| unsafe {
             hdf5_sys::h5d::H5Dwrite(

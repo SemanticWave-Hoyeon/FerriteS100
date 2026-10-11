@@ -62,6 +62,16 @@ impl Leader {
         let reserved = data[22] as char;
         let size_field_tag = parse_ascii_digit(data[23])?;
 
+        // A file-supplied base address must never become an unchecked slice.
+        if record_length < Self::SIZE as u32
+            || base_address < Self::SIZE as u32
+            || base_address > record_length
+        {
+            return Err(Iso8211Error::InvalidLeader(format!(
+                "Invalid record/base bounds: length={record_length}, base={base_address}"
+            )));
+        }
+
         Ok(Leader {
             record_length,
             interchange_level,

@@ -259,6 +259,39 @@ pub fn plan_interoperability(
     }
     Ok(InteroperabilityPlan { changes })
 }
+/// Build one aggregate immutable plan against the same ORIGINAL whole stream.
+/// Each existing product planner uses its own FC and unchanged global cell index.
+/// No per-Edition stream split, renumbering, intermediate mutation or re-sort.
+pub fn plan_interoperability_for_cells(
+    catalogue: &Catalogue,
+    cells: &[S101Cell],
+    fcs: &[&FeatureCatalogue],
+    instructions: &[DrawingInstruction],
+) -> Result<InteroperabilityPlan> {
+    ensure!(
+        cells.len() == fcs.len(),
+        "IC cell catalogue owner count mismatch"
+    );
+    ensure!(
+        cells.len() <= 4096,
+        "IC cell catalogue owner limit exceeded"
+    );
+    for instruction in instructions {
+        if let Some(index) = instruction.cell_index() {
+            ensure!(
+                (index as usize) < cells.len(),
+                "IC instruction source cell is out of range"
+            );
+        }
+    }
+    let mut changes = Vec::new();
+    for (index, (cell, fc)) in cells.iter().zip(fcs).enumerate() {
+        let plan = plan_interoperability(catalogue, cell, fc, instructions, u32::try_from(index)?)?;
+        changes.try_reserve(plan.changes.len())?;
+        changes.extend(plan.changes);
+    }
+    Ok(InteroperabilityPlan { changes })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +380,178 @@ mod tests {
             .is_err());
         assert!(AttributeForest::new(&[a("x", 2, ""), a("y", 1, "")]).is_err());
         assert!(AttributeForest::new(&[a("x", 9, "")]).is_err());
+    }
+
+    fn owner_fixture(
+        use_type: ferrite_feature_catalog::FeatureUseType,
+    ) -> (FeatureCatalogue, S101Cell) {
+        let mut fc = fc();
+        fc.feature_types.insert(
+            "Wreck".into(),
+            ferrite_feature_catalog::FeatureType {
+                code: "Wreck".into(),
+                name: "Test".into(),
+                definition: None,
+                is_abstract: false,
+                super_type: None,
+                feature_use_type: Some(use_type),
+                attribute_bindings: vec![],
+                information_bindings: vec![],
+                feature_bindings: vec![],
+                permitted_primitives: vec![],
+            },
+        );
+        let mut cell = S101Cell {
+            file_path: Default::default(),
+            dsid: Default::default(),
+            code_mappings: ferrite_s100_core::DatasetCodeMappings::new(),
+            coord_factor: 1.,
+            coord_factor_y: 1.,
+            coord_factor_z: 1.,
+            coord_origin_x: 0.,
+            coord_origin_y: 0.,
+            coord_origin_z: 0.,
+            minimum_display_scale: None,
+            maximum_display_scale: None,
+            points: HashMap::new(),
+            multi_points: HashMap::new(),
+            curves: HashMap::new(),
+            composite_curves: HashMap::new(),
+            surfaces: HashMap::new(),
+            features: HashMap::new(),
+            information: HashMap::new(),
+            spatial_information_associations: HashMap::new(),
+        };
+        cell.features.insert(
+            1,
+            FeatureRecord {
+                frid: ferrite_s100_core::FRID {
+                    rcid: 1,
+                    nftc: 1,
+                    rver: 1,
+                    ruin: 1,
+                },
+                foid: None,
+                attributes: vec![],
+                spatial_associations: vec![],
+                information_associations: vec![],
+                feature_associations: vec![],
+                masks: vec![],
+                feature_code: Some("Wreck".into()),
+                primitive_type: SpatialPrimitiveType::Point,
+            },
+        );
+        (fc, cell)
+    }
+    #[test]
+    fn aggregate_owner_plan_preserves_interleaved_indexes_and_per_owner_meta_semantics() {
+        use ferrite_feature_catalog::FeatureUseType;
+        use ferrite_render::{PointInstruction, WorldPoint};
+        let (meta, a) = owner_fixture(FeatureUseType::Meta);
+        let (geographic, b) = owner_fixture(FeatureUseType::Geographic);
+        let cells = vec![a, b];
+        let xml = include_str!("../../ferrite-interoperability/tests/display-plane.xml").replace(
+            "<attributeCombination>categoryOfWreck = 1</attributeCombination>",
+            "",
+        );
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        let make = |index| {
+            DrawingInstruction::Point(
+                PointInstruction::new("SAME_RAW_ID".into(), WorldPoint::new(0., 0.))
+                    .with_cell_index(index)
+                    .with_feature_id(1),
+            )
+        };
+        let original = vec![make(1), make(0), make(1)];
+        let mut expected = original.clone();
+        plan_interoperability(&catalogue, &cells[0], &meta, &expected, 0)
+            .unwrap()
+            .apply(&mut expected)
+            .unwrap();
+        plan_interoperability(&catalogue, &cells[1], &geographic, &expected, 1)
+            .unwrap()
+            .apply(&mut expected)
+            .unwrap();
+        let aggregate =
+            plan_interoperability_for_cells(&catalogue, &cells, &[&meta, &geographic], &original)
+                .unwrap();
+        assert_eq!(aggregate.len(), 2);
+        let mut actual = original.clone();
+        aggregate.apply(&mut actual).unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(DrawingInstruction::cell_index)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(0), Some(1)]
+        );
+        assert_eq!(
+            serde_json::to_value(&actual[1]).unwrap(),
+            serde_json::to_value(&original[1]).unwrap()
+        );
+        let mut invalid = geographic;
+        invalid
+            .feature_types
+            .get_mut("Wreck")
+            .unwrap()
+            .feature_use_type = None;
+        assert!(
+            plan_interoperability_for_cells(&catalogue, &cells, &[&meta, &invalid], &original)
+                .is_err()
+        );
+        assert!(plan_interoperability_for_cells(&catalogue, &cells, &[&meta], &original).is_err());
+        assert!(plan_interoperability_for_cells(
+            &catalogue,
+            &cells,
+            &[&meta, &invalid],
+            &[make(2)]
+        )
+        .is_err());
+        assert_eq!(
+            original
+                .iter()
+                .map(DrawingInstruction::cell_index)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(0), Some(1)]
+        );
+    }
+    #[test]
+    fn ambiguous_planes_abort_aggregate_planning_without_changing_portrayal() {
+        use ferrite_feature_catalog::FeatureUseType;
+        use ferrite_render::{PointInstruction, WorldPoint};
+        let (fc, cell) = owner_fixture(FeatureUseType::Geographic);
+        let mut xml = include_str!("../../ferrite-interoperability/tests/display-plane.xml")
+            .replace(
+                "<attributeCombination>categoryOfWreck = 1</attributeCombination>",
+                "",
+            );
+        let start = xml.rfind("<S100_IC_DisplayPlane>").unwrap();
+        let end = xml.rfind("</S100_IC_DisplayPlane>").unwrap() + "</S100_IC_DisplayPlane>".len();
+        let duplicate = xml[start..end]
+            .replace("DangerPlane", "OtherDangerPlane")
+            .replace("<name>Danger", "<name>Other danger")
+            .replace("wreckRule", "otherWreckRule");
+        xml.insert_str(end, &duplicate);
+        let catalogue = Catalogue::parse(&xml).unwrap();
+        let original = vec![DrawingInstruction::Point(
+            PointInstruction::new("ORIGINAL".into(), WorldPoint::new(129., 35.))
+                .with_feature_id(1)
+                .with_cell_index(0),
+        )];
+        let before = serde_json::to_value(&original).unwrap();
+        let error = match plan_interoperability_for_cells(&catalogue, &[cell], &[&fc], &original) {
+            Ok(_) => panic!("ambiguous plane assignment was accepted"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("Ambiguous IC display-plane match"),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_value(&original).unwrap(), before);
     }
 
     #[test]

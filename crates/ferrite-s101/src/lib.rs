@@ -10,6 +10,110 @@ use ferrite_render::{
 use ferrite_s100_core::S101Cell;
 use tracing::debug;
 
+/// Validate supported geometry before any result in the batch mutates the context.
+/// A rejected command must not become a successful, partially drawn feature.
+fn preflight_augmented_line_geometry(
+    ray: Option<&ferrite_lua::AugmentedRayDef>,
+    crs: Option<&ferrite_lua::AugmentedPathCrs>,
+    segments: &[ferrite_lua::PathSegment],
+    cell: &S101Cell,
+    feature_id: &str,
+) -> anyhow::Result<()> {
+    use ferrite_lua::PathSegment;
+    let point_origin = || {
+        feature_id
+            .split('|')
+            .next_back()
+            .and_then(|id| id.parse::<i64>().ok())
+            .and_then(|id| cell.features.get(&id))
+            .and_then(|feature| {
+                feature
+                    .spatial_associations
+                    .iter()
+                    .find_map(|association| cell.points.get(&association.spatial_id.key()))
+            })
+            .map(|point| (point.position.x, point.position.y))
+    };
+    if let Some(ray) = ray {
+        let geographic = ray.direction_crs == "GeographicCRS" && ray.length_crs == "GeographicCRS";
+        let screen_units = matches!(ray.length_crs.as_str(), "LocalCRS" | "PortrayalCRS")
+            && matches!(
+                ray.direction_crs.as_str(),
+                "LocalCRS" | "PortrayalCRS" | "GeographicCRS"
+            );
+        anyhow::ensure!(
+            geographic || screen_units,
+            "Unsupported AugmentedRay CRS combination: {}/{}",
+            ray.direction_crs,
+            ray.length_crs
+        );
+        let (x, y) = point_origin()
+            .ok_or_else(|| anyhow::anyhow!("AugmentedRay requires a feature point origin"))?;
+        anyhow::ensure!(
+            x.is_finite()
+                && y.is_finite()
+                && ray.direction.is_finite()
+                && ray.length.is_finite()
+                && ray.length >= 0.,
+            "Invalid AugmentedRay origin, direction or length"
+        );
+        if geographic {
+            // Validate the same geodesic operation that conversion will use.
+            geographic_ray_points(x, y, ray.direction, ray.length)?;
+        }
+        return Ok(());
+    }
+    let Some(crs) = crs else {
+        return Ok(());
+    };
+    // An explicitly active empty path stays empty; it never uses feature geometry.
+    if segments.is_empty() {
+        return Ok(());
+    }
+    if crs.crs_position == "LocalCRS"
+        && matches!(crs.crs_distance.as_str(), "LocalCRS" | "PortrayalCRS")
+        && matches!(
+            crs.crs_angle.as_str(),
+            "LocalCRS" | "PortrayalCRS" | "GeographicCRS"
+        )
+    {
+        let (x, y) = point_origin().ok_or_else(|| {
+            anyhow::anyhow!("AugmentedPath requires a local feature point origin")
+        })?;
+        anyhow::ensure!(
+            x.is_finite() && y.is_finite(),
+            "Invalid local feature point origin"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        crs.crs_position == "GeographicCRS",
+        "Unsupported AugmentedPath CRS combination: {}/{}/{}",
+        crs.crs_position,
+        crs.crs_angle,
+        crs.crs_distance
+    );
+    for segment in segments {
+        match segment {
+            PathSegment::Polyline(_) => {}
+            PathSegment::Arc3Points { .. } => {
+                // Part 9 defines an arbitrary median, but the geographic
+                // interpolation model is not implemented. Do not omit this arc.
+                anyhow::bail!("Unsupported GeographicCRS Arc3Points interpolation");
+            }
+            PathSegment::ArcByRadius { .. } | PathSegment::Annulus { .. } => {
+                anyhow::ensure!(
+                    crs.crs_angle == "GeographicCRS" && crs.crs_distance == "GeographicCRS",
+                    "Unsupported mixed CRS geographic arc or annulus: {}/{}",
+                    crs.crs_angle,
+                    crs.crs_distance
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Convert Lua portrayal results to drawing instructions for a single cell
 /// Uses only this cell's data to avoid feature ID collisions across cells
 pub fn convert_lua_results_for_cell(
@@ -42,14 +146,33 @@ pub fn convert_lua_results_for_cell(
                     DrawingCommand::LineInstruction {
                         style_refs,
                         simple_style,
+                        augmented_ray,
+                        augmented_segments,
+                        augmented_crs,
                         ..
                     }
                     | DrawingCommand::LineInstructionUnsuppressed {
                         style_refs,
                         simple_style,
+                        augmented_ray,
+                        augmented_segments,
+                        augmented_crs,
                         ..
                     } => {
                         resolve_line_strokes(style_refs, simple_style.as_ref(), pc, profile_name)?;
+                        preflight_augmented_line_geometry(
+                            augmented_ray.as_ref(),
+                            augmented_crs.as_ref(),
+                            augmented_segments,
+                            cell,
+                            &result.feature_id,
+                        )
+                        .map_err(|error| {
+                            error.context(format!(
+                                "Augmented line geometry for feature {}",
+                                result.feature_id
+                            ))
+                        })?;
                     }
                     DrawingCommand::HatchFill {
                         area_crs,
@@ -752,6 +875,9 @@ pub fn convert_lua_results_for_cell(
                                 geometry_instructions.push(line_inst);
                             }
                         } else if let Some(crs) = augmented_crs {
+                            if augmented_segments.is_empty() {
+                                continue;
+                            }
                             // An active empty path is empty geometry, never feature geometry.
                             let origin = feature.and_then(|f| {
                                 f.spatial_associations.iter().find_map(|a| {
@@ -866,7 +992,7 @@ pub fn convert_lua_results_for_cell(
                                         geometry_instructions.push(line);
                                     }
                                 } else {
-                                    tracing::error!(
+                                    anyhow::bail!(
                                         "AugmentedPath requires local origin: feature {:?}",
                                         feature_id
                                     );
@@ -906,8 +1032,7 @@ pub fn convert_lua_results_for_cell(
                                         if crs.crs_angle != "GeographicCRS"
                                             || crs.crs_distance != "GeographicCRS"
                                         {
-                                            tracing::error!("Unsupported mixed CRS geographic arc: feature {:?}",feature_id);
-                                            continue;
+                                            anyhow::bail!("Unsupported mixed CRS geographic arc: feature {:?}", feature_id);
                                         }
                                         // Geographic X/Y follows the same chart contract as
                                         // the adjacent existing Polyline adapter. Retain the
@@ -938,12 +1063,52 @@ pub fn convert_lua_results_for_cell(
                                             line = line.with_unsuppressed();
                                         }
                                         geometry_instructions.push(line);
+                                    } else if let ferrite_lua::PathSegment::Annulus {
+                                        center,
+                                        outer_radius,
+                                        inner_radius,
+                                        start_angle,
+                                        angular_distance,
+                                    } = seg
+                                    {
+                                        anyhow::ensure!(
+                                            crs.crs_angle == "GeographicCRS"
+                                                && crs.crs_distance == "GeographicCRS",
+                                            "Unsupported mixed CRS geographic annulus"
+                                        );
+                                        let point = WorldPoint::new(center.0, center.1);
+                                        let mut line = LineInstruction::new(vec![point, point])
+                                            .with_style(strokes[0].clone())
+                                            .with_priority(visibility.drawing_priority)
+                                            .with_viewing_groups(
+                                                &pc.viewing_groups.resolve_drawing_groups(
+                                                    &visibility.viewing_groups,
+                                                    &visibility.named_viewing_groups,
+                                                )?,
+                                            )
+                                            .with_scale_range(make_scale_range(visibility))
+                                            .with_display_plane(make_display_plane(visibility))
+                                            .with_feature_id(feature_id.unwrap_or(0))
+                                            .with_cell_index(cell_index);
+                                        line.portrayal_path = Some(
+                                            ferrite_render::PortrayalPath::GeographicAnnulus {
+                                                center: *center,
+                                                outer: *outer_radius,
+                                                inner: *inner_radius,
+                                                start: *start_angle,
+                                                sweep: *angular_distance,
+                                            },
+                                        );
+                                        if unsuppressed {
+                                            line = line.with_unsuppressed();
+                                        }
+                                        geometry_instructions.push(line);
                                     } else {
-                                        tracing::error!("Geographic augmented arc not implemented: feature {:?}",feature_id);
+                                        anyhow::bail!("Unsupported GeographicCRS Arc3Points interpolation for feature {:?}", feature_id);
                                     }
                                 }
                             } else {
-                                tracing::error!(
+                                anyhow::bail!(
                                     "Unsupported AugmentedPath CRS {:?}: feature {:?}",
                                     crs,
                                     feature_id
@@ -1323,6 +1488,13 @@ pub fn convert_lua_results_for_cell(
                         text,
                         font_size,
                         color_token,
+                        font_weight,
+                        font_proportion,
+                        serifs,
+                        underline,
+                        strikethrough,
+                        upperline,
+                        font_reference,
                         bold,
                         italic,
                         h_align,
@@ -1339,6 +1511,19 @@ pub fn convert_lua_results_for_cell(
                         bg_transparency,
                         ..
                     } => {
+                        let font_style = ferrite_render::TextFontStyle {
+                            weight: ferrite_render::TextFontWeight::from_lua(font_weight)
+                                .map_err(anyhow::Error::msg)?,
+                            proportion: ferrite_render::TextFontProportion::from_lua(
+                                font_proportion,
+                            )
+                            .map_err(anyhow::Error::msg)?,
+                            serifs: *serifs,
+                            underline: *underline,
+                            strikethrough: *strikethrough,
+                            upperline: *upperline,
+                            reference: (!font_reference.is_empty()).then(|| font_reference.clone()),
+                        };
                         let color = lookup_color(color_token);
                         let opacity = 1.0 - *color_transparency as f32;
                         let background = if bg_color_token.is_empty() {
@@ -1374,6 +1559,7 @@ pub fn convert_lua_results_for_cell(
                                 .with_display_plane(make_display_plane(visibility))
                                 .with_feature_id(feature_id.unwrap_or(0))
                                 .with_cell_index(cell_index);
+                            text_inst.font_style = font_style.clone();
                             text_inst.bold = *bold;
                             text_inst.italic = *italic;
                             if let Some(background) = background {
@@ -1422,6 +1608,7 @@ pub fn convert_lua_results_for_cell(
                                     .with_display_plane(make_display_plane(visibility))
                                     .with_feature_id(feature_id.unwrap_or(0))
                                     .with_cell_index(cell_index);
+                                    ti.font_style = font_style.clone();
                                     ti.bold = *bold;
                                     ti.italic = *italic;
                                     if let Some(background) = background {
@@ -1497,6 +1684,7 @@ pub fn convert_lua_results_for_cell(
                                             .with_display_plane(make_display_plane(visibility))
                                             .with_feature_id(feature_id.unwrap_or(0))
                                             .with_cell_index(cell_index);
+                                            ti.font_style = font_style.clone();
                                             ti.bold = *bold;
                                             ti.italic = *italic;
                                             if let Some(background) = background {
@@ -1624,7 +1812,9 @@ mod line_geometry;
 pub use line_geometry::{intersect_scale_ranges, resolve_feature_line_geometry, SpatialLine};
 
 mod interoperability;
-pub use interoperability::{plan_interoperability, InteroperabilityPlan};
+pub use interoperability::{
+    plan_interoperability, plan_interoperability_for_cells, InteroperabilityPlan,
+};
 
 mod catalogue_compatibility;
 pub use catalogue_compatibility::{validate_catalogue_pair, validate_dataset_catalogues};
@@ -2072,8 +2262,7 @@ mod hatch_resource_tests {
             spatial_information_associations: Default::default(),
         }
     }
-    #[test]
-    fn lua_symbol_fill_retains_clip_policy_geometry_and_source() {
+    fn surface_text_fixture() -> S101Cell {
         use ferrite_s100_core::*;
         let mut cell = empty_plane_cell();
         let curve_id = RecordId::new(120, 1);
@@ -2133,6 +2322,183 @@ mod hatch_resource_tests {
                 primitive_type: SpatialPrimitiveType::Surface,
             },
         );
+        cell
+    }
+    #[test]
+    fn all_three_text_placement_branches_keep_full_font_metadata() {
+        use ferrite_s100_core::*;
+        for placement in [0, 1, 2] {
+            let mut cell = surface_text_fixture();
+            if placement == 1 {
+                let id = RecordId::new(110, 9);
+                cell.points.insert(
+                    id.key(),
+                    PointRecord {
+                        id,
+                        position: Coordinate::new(2., 3.),
+                        update_instruction: 0,
+                    },
+                );
+                let feature = cell.features.get_mut(&42).unwrap();
+                feature.primitive_type = SpatialPrimitiveType::Point;
+                feature.spatial_associations[0].spatial_id = id;
+            }
+            let position = if placement == 0 {
+                "AugmentedPoint:GeographicCRS,2,3;"
+            } else {
+                ""
+            };
+            let result = ferrite_lua::PortrayalResult::parse("42", &format!("{position}FontWeight:Light;FontProportion:MonoSpaced;FontSerifs:true;FontUnderline:true;FontStrikethrough:true;FontUpperline:true;FontReference:Font-A;TextInstruction:depth"), "").unwrap();
+            let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+            convert_lua_results_for_cell(&[result], &cell, &catalogue(), &mut context, 3, "Day")
+                .unwrap();
+            assert_eq!(context.raw_instructions().len(), 1);
+            let ferrite_render::DrawingInstruction::Text(text) = &context.raw_instructions()[0]
+            else {
+                panic!()
+            };
+            assert_eq!(
+                text.font_style.weight,
+                ferrite_render::TextFontWeight::Light
+            );
+            assert_eq!(
+                text.font_style.proportion,
+                ferrite_render::TextFontProportion::MonoSpaced
+            );
+            assert!(
+                text.font_style.serifs
+                    && text.font_style.underline
+                    && text.font_style.strikethrough
+                    && text.font_style.upperline
+            );
+            assert_eq!(text.font_style.reference.as_deref(), Some("Font-A"));
+            assert_eq!(text.cell_index, Some(3));
+            assert_eq!(text.feature_id, Some(42));
+        }
+    }
+    #[test]
+    fn augmented_geometry_preflight_rejects_entire_batch_before_mutation() {
+        let cell = surface_text_fixture();
+        let pc = catalogue();
+        let parse = |script: &str| ferrite_lua::PortrayalResult::parse("42", script, "").unwrap();
+        let valid = parse("Polyline:0,0,1,1;AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.32,CHBLK;LineInstruction:L");
+        for (geometry, crs, expected) in [
+            (
+                "Arc3Points:0,0,1,1,2,0",
+                "GeographicCRS,GeographicCRS,GeographicCRS",
+                "Arc3Points",
+            ),
+            (
+                "ArcByRadius:0,0,10",
+                "GeographicCRS,LocalCRS,GeographicCRS",
+                "mixed CRS",
+            ),
+            (
+                "Annulus:0,0,10,5",
+                "GeographicCRS,GeographicCRS,LocalCRS",
+                "mixed CRS",
+            ),
+            (
+                "Polyline:0,0,1,1",
+                "PortrayalCRS,LocalCRS,LocalCRS",
+                "CRS combination",
+            ),
+            (
+                "Polyline:0,0,1,1",
+                "LocalCRS,LocalCRS,LocalCRS",
+                "point origin",
+            ),
+        ] {
+            for command in ["LineInstruction", "LineInstructionUnsuppressed"] {
+                let rejected = parse(&format!(
+                    "{geometry};AugmentedPath:{crs};LineStyle:L,,0.32,CHBLK;{command}:L"
+                ));
+                let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+                convert_lua_results_for_cell(
+                    std::slice::from_ref(&valid),
+                    &cell,
+                    &pc,
+                    &mut context,
+                    3,
+                    "Day",
+                )
+                .unwrap();
+                let before = serde_json::to_value(context.raw_instructions()).unwrap();
+                let owner = context.static_instruction_order_identity();
+                let error = convert_lua_results_for_cell(
+                    &[valid.clone(), rejected],
+                    &cell,
+                    &pc,
+                    &mut context,
+                    3,
+                    "Day",
+                )
+                .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("feature 42") && message.contains(expected),
+                    "{message}"
+                );
+                assert_eq!(
+                    before,
+                    serde_json::to_value(context.raw_instructions()).unwrap()
+                );
+                assert!(std::sync::Arc::ptr_eq(
+                    &owner,
+                    &context.static_instruction_order_identity()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn ray_preflight_catches_missing_origin_and_unsupported_metre_direction() {
+        let cell = surface_text_fixture();
+        let pc = catalogue();
+        for (ray, expected) in [
+            ("GeographicCRS,90,LocalCRS,10", "point origin"),
+            ("LocalCRS,90,GeographicCRS,10", "CRS combination"),
+        ] {
+            let valid = ferrite_lua::PortrayalResult::parse("42", "Polyline:0,0,1,1;AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.32,CHBLK;LineInstruction:L", "").unwrap();
+            let rejected = ferrite_lua::PortrayalResult::parse(
+                "42",
+                &format!("AugmentedRay:{ray};LineStyle:L,,0.32,CHBLK;LineInstruction:L"),
+                "",
+            )
+            .unwrap();
+            let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+            let error = convert_lua_results_for_cell(
+                &[valid, rejected],
+                &cell,
+                &pc,
+                &mut context,
+                3,
+                "Day",
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected));
+            assert!(context.raw_instructions().is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_empty_local_path_needs_no_origin_and_never_draws_feature_geometry() {
+        let cell = surface_text_fixture();
+        let pc = catalogue();
+        let result = ferrite_lua::PortrayalResult::parse(
+            "42",
+            "AugmentedPath:LocalCRS,LocalCRS,LocalCRS;LineStyle:L,,0.32,CHBLK;LineInstruction:L",
+            "",
+        )
+        .unwrap();
+        let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+        convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 3, "Day").unwrap();
+        assert!(context.raw_instructions().is_empty());
+    }
+
+    #[test]
+    fn lua_symbol_fill_retains_clip_policy_geometry_and_source() {
+        let cell = surface_text_fixture();
         let pc = catalogue();
         for (suffix, expected) in [(",false", false), (",true", true), ("", true)] {
             let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
@@ -2171,6 +2537,117 @@ mod hatch_resource_tests {
             assert!(restored.pattern_clip_symbols);
         }
     }
+    #[test]
+    fn geographic_annulus_coverage_origin_follows_actual_feature_not_rendered_center() {
+        use ferrite_s100_core::*;
+        let pc = catalogue();
+        let mut cell = surface_text_fixture();
+        let script = "Annulus:179.9,50,50000,25000,35,360;AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.32,CHBLK;LineInstructionUnsuppressed:L";
+        let convert = |cell: &S101Cell, id: &str| {
+            let result = ferrite_lua::PortrayalResult::parse(id, script, "").unwrap();
+            let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+            convert_lua_results_for_cell(&[result], cell, &pc, &mut context, 3, "Day").unwrap();
+            assert_eq!(context.raw_instructions().len(), 1);
+            context.raw_instructions()[0].portrayal_origin().clone()
+        };
+        assert_eq!(
+            convert(&cell, "42"),
+            ferrite_render::PortrayalOrigin::NonPoint
+        );
+        assert_eq!(
+            convert(&cell, "43"),
+            ferrite_render::PortrayalOrigin::Unspecified
+        );
+        let point_id = RecordId::new(110, 9);
+        cell.points.insert(
+            point_id.key(),
+            PointRecord {
+                id: point_id,
+                position: Coordinate::new(2., 3.),
+                update_instruction: 0,
+            },
+        );
+        let feature = cell.features.get_mut(&42).unwrap();
+        feature.primitive_type = SpatialPrimitiveType::Point;
+        feature.spatial_associations[0].spatial_id = point_id;
+        assert_eq!(
+            convert(&cell, "42"),
+            ferrite_render::PortrayalOrigin::feature_point(WorldPoint::new(2., 3.)).unwrap()
+        );
+    }
+    #[test]
+    fn geographic_annulus_actual_commands_retain_source_order_scale_and_separate_rings() {
+        let pc = catalogue();
+        let cell = surface_text_fixture();
+        let scaler = ferrite_render::Scaler::new(
+            ferrite_render::GeoBounds::new(178.9, 49., 180.9, 51.),
+            ferrite_render::Viewport::new(800., 600.),
+        );
+        for (inner, sweep, expected_runs) in [
+            (25_000., 360_f64, 2),
+            (0., 360., 1),
+            (25_000., -270., 1),
+            (0., 270., 1),
+        ] {
+            let instructions=format!("DrawingPriority:7;ScaleMinimum:200000;ScaleMaximum:10000;Annulus:179.9,50,50000,{inner},35,{sweep};AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.32,CHBLK;LineInstructionUnsuppressed:L");
+            let result = ferrite_lua::PortrayalResult::parse("42", &instructions, "").unwrap();
+            let mut context = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
+            convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 3, "Day").unwrap();
+            assert_eq!(context.raw_instructions().len(), 1);
+            assert_eq!(
+                *context.raw_instructions()[0].portrayal_origin(),
+                ferrite_render::PortrayalOrigin::NonPoint
+            );
+            let ferrite_render::DrawingInstruction::Line(line) = &context.raw_instructions()[0]
+            else {
+                panic!("annulus remains authored line")
+            };
+            assert_eq!(line.cell_index, Some(3));
+            assert_eq!(line.feature_id, Some(42));
+            assert_eq!(line.priority.0, 7);
+            assert!(matches!(
+                line.portrayal_path,
+                Some(ferrite_render::PortrayalPath::GeographicAnnulus {
+                    center: (179.9, 50.),
+                    outer: 50_000.,
+                    ..
+                })
+            ));
+            assert!(!line.suppressible);
+            assert_eq!(line.scale_range.scale_minimum, Some(200000));
+            assert_eq!(line.scale_range.scale_maximum, Some(10000));
+            for scale in [10000, 50000, 200000] {
+                assert!(line.scale_range.is_visible_at(scale));
+            }
+            for scale in [9999, 200001] {
+                assert!(!line.scale_range.is_visible_at(scale));
+            }
+            let paths = line.render_paths(&scaler).collect::<Vec<_>>();
+            assert_eq!(paths.len(), expected_runs);
+            assert!(paths.iter().all(|p| p.first() == p.last() && p.len() > 2));
+            use ferrite_kernel::geodesy::{direct, GeographicPosition};
+            let center = GeographicPosition::new(50., 179.9).unwrap();
+            let query = |radius| {
+                let p = direct(center, 35., radius).unwrap();
+                scaler.world_to_screen(WorldPoint::new(
+                    p.longitude_near(179.9).unwrap(),
+                    p.latitude(),
+                ))
+            };
+            let command = &context.raw_instructions()[0];
+            assert!(ferrite_render::hit_geometry(command, &scaler, query(50000.), 3.).is_some());
+            if inner > 0. {
+                assert!(ferrite_render::hit_geometry(command, &scaler, query(inner), 3.).is_some());
+            }
+            let ray_mid = (inner + 50000.) * 0.5;
+            assert_eq!(
+                ferrite_render::hit_geometry(command, &scaler, query(ray_mid), 3.).is_some(),
+                sweep.abs() != 360.,
+                "full ring must not invent a radial selection edge"
+            );
+        }
+    }
+
     #[test]
     fn geographic_radius_arc_reaches_retained_geometry_with_order_and_source() {
         let pc = catalogue();

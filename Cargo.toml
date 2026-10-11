@@ -5,6 +5,7 @@ members = [
     "crates/ferrite-s100-core",
     "crates/ferrite-s101",
     "crates/ferrite-s102",
+    "crates/ferrite-s421",
     "crates/ferrite-kernel",
     "crates/ferrite-interoperability",
     "crates/ferrite-security",
@@ -24,7 +25,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.0.5"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/user/ferrite-s100"
@@ -117,23 +118,25 @@ winres = "0.1"
 
 [features]
 default = ["lua54"]
-lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54"]
-lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55"]
+lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferrite-wgpu/lua54"]
+lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-wgpu/lua55"]
 
 [dependencies]
+quick-xml.workspace = true
 roxmltree = "=0.20.0"
 chrono.workspace = true
 ferrite-iso8211.workspace = true
 ferrite-s100-core.workspace = true
 ferrite-s101.workspace = true
 ferrite-s102.workspace = true
+ferrite-s421 = { path = "crates/ferrite-s421" }
 ferrite-kernel.workspace = true
 ferrite-interoperability.workspace = true
 ferrite-security.workspace = true
 ferrite-feature-catalog.workspace = true
 ferrite-portrayal-catalog.workspace = true
 ferrite-render.workspace = true
-ferrite-wgpu.workspace = true
+ferrite-wgpu = { workspace = true, features = ["s102-portrayal"] }
 ferrite-lua.workspace = true
 ferrite-plugin-api.workspace = true
 ferrite-plugin-loader.workspace = true
@@ -156,14 +159,18 @@ sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mimalloc = "0.1"
+tempfile = "3"
 
 # HDF5 fixture authoring for end-to-end coverage examples only.
 [dev-dependencies]
+# Test-only actual ECDSA fixture; already used by ferrite-security.
+openssl = { version = "0.10", features = ["vendored"] }
+base64 = "=0.22.1"
 wgpu.workspace = true
 egui-wgpu.workspace = true
 hdf5 = { package = "hdf5-metno", version = "=0.14.1", features = ["static", "zlib"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Windows system APIs (for debug info)
@@ -172,6 +179,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

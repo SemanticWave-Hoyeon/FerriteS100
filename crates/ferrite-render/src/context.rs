@@ -13,7 +13,7 @@ fn next_geometry_revision() -> u64 {
 use crate::{Color, DrawingInstruction, GeoBounds, Scaler, ViewingGroup, Viewport};
 
 /// Display settings
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DisplaySettings {
     /// Active color profile (Day, Dusk, Night)
     pub color_profile: String,
@@ -67,7 +67,7 @@ impl Default for DisplaySettings {
 }
 
 /// Viewing group layer visibility
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ViewingGroupState {
     /// Viewing groups that are currently visible
     visible_groups: HashMap<u32, bool>,
@@ -117,6 +117,61 @@ impl Default for ViewingGroupState {
     }
 }
 
+/// Opaque constant-size owner of the exact current instruction order/content.
+/// Only RenderContext can mint it. It contains no group permission or visibility.
+#[derive(Debug)]
+pub struct StaticInstructionOrderIdentity {
+    _private: (),
+}
+
+/// Source-only classification in the exact current raw instruction order.
+/// It contains no visibility, scale, palette, coverage, projection or pick result.
+#[derive(Debug)]
+pub struct StaticSourceClassification {
+    device_fixed: Vec<bool>,
+    view_dependent: bool,
+}
+impl StaticSourceClassification {
+    fn compile(instructions: &[DrawingInstruction]) -> Self {
+        let device_fixed = instructions
+            .iter()
+            .map(|i| i.portrayal_origin().is_device_fixed())
+            .collect();
+        let view_dependent = instructions.iter().any(|p| {
+            p.portrayal_origin().requires_view_reprojection()
+                || match p {
+                    DrawingInstruction::Point(p) => {
+                        p.line_placement.is_some()
+                            || p.rotation_crs == crate::RotationCrs::Geographic
+                            || p.curve_tangent_bearing.is_some()
+                    }
+                    DrawingInstruction::Text(t) => {
+                        t.rotation_crs == crate::RotationCrs::Geographic
+                            || t.curve_tangent_bearing.is_some()
+                    }
+                    _ => false,
+                }
+        });
+        Self {
+            device_fixed,
+            view_dependent,
+        }
+    }
+    pub fn is_device_fixed(&self, ordinal: usize) -> bool {
+        self.device_fixed.get(ordinal).copied().unwrap_or(false)
+    }
+    pub fn requires_view_reprojection(&self) -> bool {
+        self.view_dependent
+    }
+}
+
+/// Negative source-content memo only; never coverage permission or visibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoverageExemptPresence {
+    KnownEmpty,
+    Unknown,
+}
+
 /// Render context - manages rendering state and instruction collection
 #[derive(Debug)]
 pub struct RenderContext {
@@ -128,8 +183,15 @@ pub struct RenderContext {
     pub viewing_groups: ViewingGroupState,
     /// Background color
     pub background_color: Color,
-    /// Collected drawing instructions (by priority)
-    instructions: Vec<DrawingInstruction>,
+    /// Collected drawing instructions (by priority). Shared copy-on-write with
+    /// `fork_for_emission` owners; every mutation goes through `instructions_mut`.
+    instructions: std::sync::Arc<Vec<DrawingInstruction>>,
+    /// Conservative presence hint only; KnownEmpty proves no coverage-exempt command.
+    coverage_exempt_presence: CoverageExemptPresence,
+    coverage_exempt_empty_fast_path: bool,
+    retained_path_cache:
+        std::sync::Arc<std::sync::Mutex<crate::retained_path_cache::RetainedPathCache>>,
+    retained_path_cache_enabled: bool,
     /// Unique feature IDs (for statistics only - no instruction duplication)
     feature_ids: HashSet<i64>,
     /// Optimization: cache sorted state to avoid re-sorting during animation
@@ -147,6 +209,8 @@ pub struct RenderContext {
     coverage_view_revision: u64,
     coverage_scaler_signature: Option<[u64; 15]>,
     scene_spatial: std::sync::OnceLock<std::sync::Arc<crate::SceneSpatialIndex>>,
+    static_source_classification: std::sync::OnceLock<std::sync::Arc<StaticSourceClassification>>,
+    static_instruction_order: std::sync::OnceLock<std::sync::Arc<StaticInstructionOrderIdentity>>,
     temporal_indices: Vec<usize>,
     temporal_index_dirty: bool,
     /// Optimization: animation mode (skip expensive operations)
@@ -161,7 +225,19 @@ impl RenderContext {
             settings: DisplaySettings::default(),
             viewing_groups: ViewingGroupState::default(),
             background_color: Color::from_hex("#DEEBF7").unwrap_or(Color::WHITE), // Light blue water
-            instructions: Vec::new(),
+            instructions: std::sync::Arc::new(Vec::new()),
+            coverage_exempt_presence: CoverageExemptPresence::KnownEmpty,
+            // Qualified source-bound native comparison; explicit 0 retains the reference scan.
+            coverage_exempt_empty_fast_path: std::env::var(
+                "FERRITE_COVERAGE_EXEMPT_EMPTY_FAST_PATH",
+            )
+            .as_deref()
+                != Ok("0"),
+            retained_path_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::retained_path_cache::RetainedPathCache::default(),
+            )),
+            retained_path_cache_enabled: std::env::var("FERRITE_RETAINED_PATH_CACHE").as_deref()
+                != Ok("0"),
             feature_ids: HashSet::new(),
             sorted: false,
             geometry_revision: next_geometry_revision(),
@@ -175,6 +251,8 @@ impl RenderContext {
             coverage_view_revision: next_geometry_revision(),
             coverage_scaler_signature: None,
             scene_spatial: std::sync::OnceLock::new(),
+            static_source_classification: std::sync::OnceLock::new(),
+            static_instruction_order: std::sync::OnceLock::new(),
             temporal_indices: Vec::new(),
             temporal_index_dirty: false,
             animation_mode: false,
@@ -190,7 +268,56 @@ impl RenderContext {
         next.background_color = self.background_color;
         next.animation_mode = self.animation_mode;
         next.dependency_plan_cache_enabled = self.dependency_plan_cache_enabled;
+        next.retained_path_cache_enabled = self.retained_path_cache_enabled;
+        next.coverage_exempt_empty_fast_path = self.coverage_exempt_empty_fast_path;
         next
+    }
+
+    /// Copy-on-write access: clones the instruction list only while a
+    /// `fork_for_emission` owner still shares it.
+    fn instructions_mut(&mut self) -> &mut Vec<DrawingInstruction> {
+        std::sync::Arc::make_mut(&mut self.instructions)
+    }
+
+    /// Same source, order, identities and immutable caches as `self`, without
+    /// copying geometry. Emission caches keyed by these identities stay valid on
+    /// the fork. A later mutation of either owner copies its list first and
+    /// issues fresh identities, so neither observes the other's change.
+    pub fn fork_for_emission(&self) -> Self {
+        Self {
+            scaler: self.scaler.clone(),
+            settings: self.settings.clone(),
+            viewing_groups: self.viewing_groups.clone(),
+            background_color: self.background_color,
+            instructions: std::sync::Arc::clone(&self.instructions),
+            coverage_exempt_presence: self.coverage_exempt_presence,
+            coverage_exempt_empty_fast_path: self.coverage_exempt_empty_fast_path,
+            retained_path_cache: std::sync::Arc::clone(&self.retained_path_cache),
+            retained_path_cache_enabled: self.retained_path_cache_enabled,
+            feature_ids: self.feature_ids.clone(),
+            sorted: self.sorted,
+            geometry_revision: self.geometry_revision,
+            static_line_relation_epoch: self.static_line_relation_epoch,
+            static_area_geometry_epoch: self.static_area_geometry_epoch,
+            dependency_graph: self.dependency_graph.clone(),
+            dependency_plan_cache_enabled: self.dependency_plan_cache_enabled,
+            prepared_coverage: self.prepared_coverage.clone(),
+            coverage_required: self.coverage_required,
+            coverage_visibility_fusion_enabled: self.coverage_visibility_fusion_enabled,
+            coverage_view_revision: self.coverage_view_revision,
+            coverage_scaler_signature: self.coverage_scaler_signature,
+            scene_spatial: self.scene_spatial.clone(),
+            static_source_classification: self.static_source_classification.clone(),
+            static_instruction_order: self.static_instruction_order.clone(),
+            temporal_indices: self.temporal_indices.clone(),
+            temporal_index_dirty: self.temporal_index_dirty,
+            animation_mode: self.animation_mode,
+        }
+    }
+
+    /// True when both owners hold the very same instruction allocation.
+    pub fn shares_instructions_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.instructions, &other.instructions)
     }
 
     /// Set animation mode (enables fast-path optimizations)
@@ -242,12 +369,20 @@ impl RenderContext {
             self.feature_ids.insert(feature_id);
         }
 
-        self.instructions.push(instruction);
+        if matches!(
+            instruction.portrayal_origin(),
+            crate::PortrayalOrigin::CoverageExempt
+        ) {
+            self.coverage_exempt_presence = CoverageExemptPresence::Unknown;
+        }
+        self.instructions_mut().push(instruction);
         self.geometry_revision = next_geometry_revision();
         self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
         self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
+        self.static_source_classification.take();
+        self.static_instruction_order.take();
         self.temporal_index_dirty = true;
     }
 
@@ -272,7 +407,9 @@ impl RenderContext {
             // Unstable sorts can reorder same-priority instructions differently each frame
             self.dependency_graph.take();
             self.scene_spatial.take();
-            self.instructions.sort_by_key(|i| i.render_order());
+            self.static_source_classification.take();
+            self.static_instruction_order.take();
+            self.instructions_mut().sort_by_key(|i| i.render_order());
             self.sorted = true;
         }
         if self.temporal_index_dirty {
@@ -289,12 +426,15 @@ impl RenderContext {
 
     /// Clear all instructions
     pub fn clear_instructions(&mut self) {
-        self.instructions.clear();
+        self.instructions_mut().clear();
+        self.coverage_exempt_presence = CoverageExemptPresence::KnownEmpty;
         self.geometry_revision = next_geometry_revision();
         self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
         self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
+        self.static_source_classification.take();
+        self.static_instruction_order.take();
         self.temporal_indices.clear();
         self.temporal_index_dirty = false;
         self.feature_ids.clear();
@@ -306,10 +446,15 @@ impl RenderContext {
         if start >= self.instructions.len() {
             return;
         }
+        if matches!(origin, crate::PortrayalOrigin::CoverageExempt) {
+            self.coverage_exempt_presence = CoverageExemptPresence::Unknown;
+        }
         self.geometry_revision = next_geometry_revision();
         self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
         self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
-        for instruction in self.instructions.iter_mut().skip(start) {
+        self.static_source_classification.take();
+        self.static_instruction_order.take();
+        for instruction in self.instructions_mut().iter_mut().skip(start) {
             instruction.set_portrayal_origin(origin.clone());
         }
     }
@@ -326,8 +471,10 @@ impl RenderContext {
         if start < self.instructions.len() {
             self.dependency_graph.take();
             self.scene_spatial.take();
+            self.static_source_classification.take();
+            self.static_instruction_order.take();
         }
-        for instruction in self.instructions.iter_mut().skip(start) {
+        for instruction in self.instructions_mut().iter_mut().skip(start) {
             instruction.set_dependency(dependency.clone());
         }
     }
@@ -341,7 +488,7 @@ impl RenderContext {
         if intervals.is_empty() {
             return;
         }
-        for instruction in self.instructions.iter_mut().skip(start) {
+        for instruction in self.instructions_mut().iter_mut().skip(start) {
             instruction.set_time_intervals(intervals);
         }
         self.temporal_index_dirty = true;
@@ -622,17 +769,30 @@ impl RenderContext {
         self.instructions.len()
     }
 
+    /// Presence hint is not a visibility/coverage authorization. True can be stale;
+    /// callers must retain the original exact ordinal filter whenever it is true.
+    pub fn may_have_coverage_exempt_instructions(&self) -> bool {
+        !self.coverage_exempt_empty_fast_path
+            || self.coverage_exempt_presence == CoverageExemptPresence::Unknown
+    }
+
     /// Remove explicit host overlays even after they interleave with chart commands.
     pub fn remove_coverage_exempt_instructions(&mut self) {
+        if !self.may_have_coverage_exempt_instructions() {
+            return;
+        }
         let before = self.instructions.len();
-        self.instructions
+        self.instructions_mut()
             .retain(|i| !matches!(i.portrayal_origin(), crate::PortrayalOrigin::CoverageExempt));
+        self.coverage_exempt_presence = CoverageExemptPresence::KnownEmpty;
         if before != self.instructions.len() {
             self.geometry_revision = next_geometry_revision();
             self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
             self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
             self.dependency_graph.take();
             self.scene_spatial.take();
+            self.static_source_classification.take();
+            self.static_instruction_order.take();
             self.temporal_index_dirty = true;
             self.sorted = false;
         }
@@ -655,12 +815,14 @@ impl RenderContext {
     /// Used to remove plugin instructions while keeping chart instructions
     pub fn truncate_instructions(&mut self, count: usize) {
         if count < self.instructions.len() {
-            self.instructions.truncate(count);
+            self.instructions_mut().truncate(count);
             self.geometry_revision = next_geometry_revision();
             self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
             self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
             self.dependency_graph.take();
             self.scene_spatial.take();
+            self.static_source_classification.take();
+            self.static_instruction_order.take();
             self.temporal_index_dirty = true;
             self.sorted = false;
         }
@@ -669,7 +831,11 @@ impl RenderContext {
     /// Remap all instruction colors using a token-to-color lookup function.
     /// Used for color profile switch (Day/Dusk/Night) without re-running Lua.
     pub fn remap_colors(&mut self, lookup: &dyn Fn(&str) -> Color) {
-        for inst in &mut self.instructions {
+        // A palette can change alpha and therefore original line-stroke admission.
+        // Retire metadata identity BEFORE any possibly panicking lookup mutates colors.
+        // Geometry/topology identities remain valid: no points/order changed.
+        self.static_instruction_order.take();
+        for inst in self.instructions_mut().iter_mut() {
             inst.remap_colors(lookup);
         }
     }
@@ -745,6 +911,8 @@ impl RenderContext {
         if !enabled {
             self.dependency_graph.take();
             self.scene_spatial.take();
+            self.static_source_classification.take();
+            self.static_instruction_order.take();
         }
     }
 
@@ -758,6 +926,101 @@ impl RenderContext {
             .clone()
     }
 
+    /// Caller must sort before borrowing this ordinal classification for emission.
+    /// Unsorted callers still receive the exact current order; a subsequent sort invalidates it.
+    pub fn static_source_classification(&self) -> std::sync::Arc<StaticSourceClassification> {
+        self.static_source_classification
+            .get_or_init(|| {
+                std::sync::Arc::new(StaticSourceClassification::compile(&self.instructions))
+            })
+            .clone()
+    }
+
+    /// Constant-size source identity for exact ordered caches. Source changes and
+    /// sorting and color remapping replace it; palette alpha can affect stroke admission.
+    /// Camera/date/coverage still do not grant cached execution visibility.
+    pub fn static_instruction_order_identity(
+        &self,
+    ) -> std::sync::Arc<StaticInstructionOrderIdentity> {
+        self.static_instruction_order
+            .get_or_init(|| std::sync::Arc::new(StaticInstructionOrderIdentity { _private: () }))
+            .clone()
+    }
+
+    /// Pure geometry reuse does not authorize visibility, coverage, suppression or picking.
+    pub fn resolved_line_paths<'a>(
+        &'a self,
+        ordinal: usize,
+        scaler: &Scaler,
+    ) -> Option<crate::ResolvedLinePaths<'a>> {
+        let DrawingInstruction::Line(line) = self.instructions.get(ordinal)? else {
+            return None;
+        };
+        if self.retained_path_cache_enabled
+            && matches!(
+                line.portrayal_path.as_ref(),
+                Some(
+                    crate::PortrayalPath::GeographicArc { .. }
+                        | crate::PortrayalPath::GeographicAnnulus { .. }
+                )
+            )
+        {
+            // Charge snapshots too; current policy is checked on every lookup, never hashed approximately.
+            let policy_bytes = self
+                .settings
+                .color_profile
+                .capacity()
+                .saturating_add(
+                    self.settings
+                        .current_date
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
+                .saturating_add(
+                    self.settings
+                        .current_datetime
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
+                .saturating_add(
+                    self.viewing_groups
+                        .visible_groups
+                        .capacity()
+                        .saturating_mul(64),
+                )
+                .saturating_add(1024);
+            if let Some(runs) = self.retained_path_cache.lock().ok().and_then(|mut cache| {
+                cache.resolve(
+                    self.static_instruction_order_identity(),
+                    self.geometry_revision,
+                    self.coverage_view_revision,
+                    &self.settings,
+                    &self.viewing_groups,
+                    policy_bytes,
+                    ordinal,
+                    line,
+                    scaler,
+                )
+            }) {
+                return Some(crate::ResolvedLinePaths::Shared { runs, next: 0 });
+            }
+        }
+        Some(line.render_paths(scaler))
+    }
+    pub fn set_retained_path_cache_enabled(&mut self, enabled: bool) {
+        self.retained_path_cache_enabled = enabled;
+        if !enabled {
+            if let Ok(mut cache) = self.retained_path_cache.lock() {
+                cache.clear();
+            }
+        }
+    }
+    pub fn retained_path_cache_stats(&self) -> crate::RetainedPathCacheStats {
+        self.retained_path_cache
+            .lock()
+            .map(|c| c.stats())
+            .unwrap_or_default()
+    }
     /// Get raw instructions slice for cache serialization
     pub fn raw_instructions(&self) -> &[DrawingInstruction] {
         &self.instructions
@@ -765,16 +1028,24 @@ impl RenderContext {
 
     /// Set instructions from a pre-built cache (skips viewing group filtering)
     pub fn set_instructions_from_cache(&mut self, instructions: Vec<DrawingInstruction>) {
-        self.instructions = instructions;
+        self.instructions = std::sync::Arc::new(instructions);
+        // Imported vectors are conservatively unknown until the first exact removal.
+        self.coverage_exempt_presence = if self.instructions.is_empty() {
+            CoverageExemptPresence::KnownEmpty
+        } else {
+            CoverageExemptPresence::Unknown
+        };
         self.geometry_revision = next_geometry_revision();
         self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
         self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         self.dependency_graph.take();
         self.scene_spatial.take();
+        self.static_source_classification.take();
+        self.static_instruction_order.take();
         self.temporal_index_dirty = true;
         self.sorted = false;
         self.feature_ids.clear();
-        for inst in &self.instructions {
+        for inst in self.instructions.iter() {
             if let Some(feature_id) = inst.feature_id() {
                 self.feature_ids.insert(feature_id);
             }
@@ -785,7 +1056,7 @@ impl RenderContext {
     pub fn statistics(&self) -> RenderStatistics {
         let mut stats = RenderStatistics::default();
 
-        for instruction in &self.instructions {
+        for instruction in self.instructions.iter() {
             match instruction {
                 DrawingInstruction::Point(_) => stats.point_count += 1,
                 DrawingInstruction::Line(_) => stats.line_count += 1,
@@ -1255,7 +1526,7 @@ mod dependency_tests {
                 .map(DrawingInstruction::dependency),
         );
         assert_eq!(
-            g.resolve(&vec![true; 5])
+            g.resolve(&[true; 5])
                 .unwrap()
                 .executed
                 .iter()
@@ -1794,7 +2065,7 @@ mod indexed_date_visibility_controls {
             ferrite_kernel::IntervalClosure::Closed,
         )
         .unwrap();
-        c.set_time_intervals_from(127, &[invalid.clone()]);
+        c.set_time_intervals_from(127, std::slice::from_ref(&invalid));
         check(&c);
         c.get_sorted_instructions();
         check(&c);
@@ -1863,5 +2134,386 @@ mod indexed_date_visibility_controls {
         check(&c);
         c.settings.date_dependent = false;
         check(&c);
+    }
+}
+
+#[cfg(test)]
+mod static_source_classification_tests {
+    use super::*;
+    use std::sync::Arc;
+    fn point(priority: i32, fixed: bool) -> DrawingInstruction {
+        let mut p = crate::PointInstruction::new("test".into(), crate::WorldPoint::new(0., 0.));
+        p.priority = crate::DisplayPriority(priority);
+        if fixed {
+            p.portrayal_origin =
+                crate::PortrayalOrigin::augmented_point(crate::PointOriginCrs::Portrayal, [1., 2.])
+                    .unwrap();
+        }
+        DrawingInstruction::Point(p)
+    }
+    fn oracle(c: &RenderContext) {
+        let x = c.static_source_classification();
+        for (i, p) in c.raw_instructions().iter().enumerate() {
+            assert_eq!(x.is_device_fixed(i), p.portrayal_origin().is_device_fixed());
+        }
+        assert!(!x.is_device_fixed(c.instruction_count()));
+        let expected = c.raw_instructions().iter().any(|p| {
+            p.portrayal_origin().requires_view_reprojection()
+                || match p {
+                    DrawingInstruction::Point(p) => {
+                        p.line_placement.is_some()
+                            || p.rotation_crs == crate::RotationCrs::Geographic
+                            || p.curve_tangent_bearing.is_some()
+                    }
+                    DrawingInstruction::Text(t) => {
+                        t.rotation_crs == crate::RotationCrs::Geographic
+                            || t.curve_tangent_bearing.is_some()
+                    }
+                    _ => false,
+                }
+        });
+        assert_eq!(x.requires_view_reprojection(), expected);
+    }
+    #[test]
+    fn ordinal_sort_and_origin_changes_do_not_reuse_stale_bits() {
+        let mut c = RenderContext::new(Viewport::new(800., 600.));
+        c.add_instruction(point(3, true));
+        c.add_instruction(point(1, false));
+        let before = c.static_source_classification();
+        let revision = c.geometry_revision();
+        assert!(before.is_device_fixed(0));
+        c.get_sorted_instructions();
+        assert_eq!(revision, c.geometry_revision());
+        let after = c.static_source_classification();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(!after.is_device_fixed(0));
+        assert!(after.is_device_fixed(1));
+        oracle(&c);
+        c.set_portrayal_origin_from(0, crate::PortrayalOrigin::NonPoint);
+        assert!(!Arc::ptr_eq(&after, &c.static_source_classification()));
+        oracle(&c);
+        assert!(before.is_device_fixed(0)); // Previous prepared owner stays immutable.
+    }
+    #[test]
+    fn camera_palette_settings_and_coverage_do_not_cache_execution_decisions() {
+        let mut c = RenderContext::new(Viewport::new(800., 600.));
+        c.add_instruction(point(1, true));
+        c.get_sorted_instructions();
+        let before = c.static_source_classification();
+        c.set_bounds(GeoBounds::new(-2., 48., 2., 52.));
+        c.set_viewport(1600., 1200.);
+        c.remap_colors(&|_| Color::WHITE);
+        c.settings.safety_depth = 12.0;
+        c.viewing_groups.disable_all();
+        c.invalidate_coverage_view();
+        assert!(Arc::ptr_eq(&before, &c.static_source_classification()));
+        oracle(&c);
+        assert!(!Arc::ptr_eq(
+            &before,
+            &c.empty_for_rebuild().static_source_classification()
+        ));
+    }
+    #[test]
+    fn insert_truncate_replace_clear_and_overlay_removal_invalidate() {
+        let mut c = RenderContext::new(Viewport::new(800., 600.));
+        let old = c.static_source_classification();
+        c.add_instruction(point(1, true));
+        assert!(!Arc::ptr_eq(&old, &c.static_source_classification()));
+        let old = c.static_source_classification();
+        c.truncate_instructions(0);
+        assert!(!Arc::ptr_eq(&old, &c.static_source_classification()));
+        c.set_instructions_from_cache(vec![point(0, true)]);
+        oracle(&c);
+        let old = c.static_source_classification();
+        c.set_portrayal_origin_from(0, crate::PortrayalOrigin::CoverageExempt);
+        c.remove_coverage_exempt_instructions();
+        assert!(!Arc::ptr_eq(&old, &c.static_source_classification()));
+        oracle(&c);
+        c.add_instruction(point(1, true));
+        let old = c.static_source_classification();
+        c.clear_instructions();
+        assert!(!Arc::ptr_eq(&old, &c.static_source_classification()));
+        oracle(&c);
+    }
+    #[test]
+    fn rotation_and_tangent_require_fresh_view_even_without_fixed_sources() {
+        let mut p = crate::PointInstruction::new("test".into(), crate::WorldPoint::new(0., 0.));
+        p.rotation_crs = crate::RotationCrs::Geographic;
+        let mut c = RenderContext::new(Viewport::new(1., 1.));
+        c.add_instruction(DrawingInstruction::Point(p));
+        assert!(c
+            .static_source_classification()
+            .requires_view_reprojection());
+        oracle(&c);
+    }
+}
+
+#[cfg(test)]
+mod static_instruction_order_identity_controls {
+    use super::*;
+    use std::sync::Arc;
+    fn point(priority: i32) -> DrawingInstruction {
+        let mut p = crate::PointInstruction::new("A".into(), crate::WorldPoint::new(0., 0.));
+        p.priority = crate::DisplayPriority(priority);
+        DrawingInstruction::Point(p)
+    }
+    #[test]
+    fn sort_insert_truncate_replace_clear_cannot_reuse_token() {
+        let mut c = RenderContext::new(Viewport::new(10., 10.));
+        let old = c.static_instruction_order_identity();
+        c.add_instruction(point(3));
+        assert!(!Arc::ptr_eq(&old, &c.static_instruction_order_identity()));
+        c.add_instruction(point(1));
+        let old = c.static_instruction_order_identity();
+        let revision = c.geometry_revision();
+        c.get_sorted_instructions();
+        assert_eq!(revision, c.geometry_revision());
+        assert!(!Arc::ptr_eq(&old, &c.static_instruction_order_identity()));
+        let old = c.static_instruction_order_identity();
+        c.truncate_instructions(1);
+        assert!(!Arc::ptr_eq(&old, &c.static_instruction_order_identity()));
+        let old = c.static_instruction_order_identity();
+        c.set_instructions_from_cache(vec![point(1)]);
+        assert!(!Arc::ptr_eq(&old, &c.static_instruction_order_identity()));
+        let old = c.static_instruction_order_identity();
+        c.clear_instructions();
+        assert!(!Arc::ptr_eq(&old, &c.static_instruction_order_identity()));
+    }
+    #[test]
+    fn camera_settings_keep_identity_but_palette_retires_without_classification() {
+        let mut c = RenderContext::new(Viewport::new(10., 10.));
+        c.add_instruction(point(1));
+        c.get_sorted_instructions();
+        let old = c.static_instruction_order_identity();
+        assert!(c.static_source_classification.get().is_none());
+        c.set_bounds(GeoBounds::new(-1., -1., 1., 1.));
+        c.set_viewport(20., 20.);
+        c.settings.safety_depth = 12.;
+        c.invalidate_coverage_view();
+        assert!(Arc::ptr_eq(&old, &c.static_instruction_order_identity()));
+        c.remap_colors(&|_| Color::WHITE);
+        assert!(!Arc::ptr_eq(&old, &c.static_instruction_order_identity()));
+        assert!(c.static_source_classification.get().is_none());
+        assert!(!Arc::ptr_eq(
+            &old,
+            &c.empty_for_rebuild().static_instruction_order_identity()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod palette_admission_identity_controls {
+    use super::*;
+    #[test]
+    fn alpha_remapping_changes_admission_token_not_geometry_or_order() {
+        let mut c = RenderContext::new(Viewport::new(10., 10.));
+        let mut line = crate::LineInstruction::new(vec![
+            crate::WorldPoint::new(-0., 1.),
+            crate::WorldPoint::new(2., 3.),
+        ]);
+        line.color_token = Some("LINE".into());
+        c.add_instruction(DrawingInstruction::Line(line));
+        c.get_sorted_instructions();
+        let geometry = c.geometry_revision();
+        let relation = c.static_line_relation_epoch();
+        let area = c.static_area_geometry_epoch();
+        for alpha in [1., 0., -1., f32::NAN, f32::INFINITY, 1.] {
+            let old = c.static_instruction_order_identity();
+            c.remap_colors(&|_| Color::rgba(0., 0., 0., alpha));
+            assert!(!std::sync::Arc::ptr_eq(
+                &old,
+                &c.static_instruction_order_identity()
+            ));
+            assert_eq!(c.geometry_revision(), geometry);
+            assert_eq!(c.static_line_relation_epoch(), relation);
+            assert_eq!(c.static_area_geometry_epoch(), area);
+            assert!(c.instructions_are_sorted());
+            if let DrawingInstruction::Line(line) = &c.raw_instructions()[0] {
+                assert_eq!(line.points[0].x.to_bits(), (-0f64).to_bits());
+                assert_eq!(
+                    line.style.has_visible_stroke(),
+                    alpha.is_finite() && alpha > 0.
+                );
+            } else {
+                panic!("original line preserved");
+            }
+        }
+    }
+    #[test]
+    fn failed_color_lookup_already_retired_old_admission_identity() {
+        let mut c = RenderContext::new(Viewport::new(10., 10.));
+        let mut line = crate::LineInstruction::new(vec![]);
+        line.color_token = Some("LINE".into());
+        c.add_instruction(DrawingInstruction::Line(line));
+        let old = c.static_instruction_order_identity();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.remap_colors(&|_| panic!("injected lookup failure"))
+        }));
+        assert!(result.is_err());
+        assert!(!std::sync::Arc::ptr_eq(
+            &old,
+            &c.static_instruction_order_identity()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod empty_overlay_presence_tests {
+    use super::*;
+    use crate::{DrawingInstruction, PointInstruction, PortrayalOrigin, WorldPoint};
+    fn command(id: i64, exempt: bool) -> DrawingInstruction {
+        let mut c = DrawingInstruction::Point(
+            PointInstruction::new("ACHBRT07".into(), WorldPoint::new(0., 0.)).with_feature_id(id),
+        );
+        c.set_portrayal_origin(if exempt {
+            PortrayalOrigin::CoverageExempt
+        } else {
+            PortrayalOrigin::NonPoint
+        });
+        c
+    }
+    fn check(c: &RenderContext) {
+        assert!(
+            c.may_have_coverage_exempt_instructions()
+                || !c
+                    .raw_instructions()
+                    .iter()
+                    .any(|p| matches!(p.portrayal_origin(), PortrayalOrigin::CoverageExempt))
+        );
+    }
+    #[test]
+    fn verified_empty_repeated_removal_preserves_bytes_revision_and_sorted_identity() {
+        let mut c = RenderContext::new(Viewport::new(64., 40.));
+        c.coverage_exempt_empty_fast_path = true;
+        for i in 0..256 {
+            c.add_instruction(command(i, false));
+        }
+        c.get_sorted_instructions();
+        let before = bincode::serialize(c.raw_instructions()).unwrap();
+        let revision = c.geometry_revision();
+        let identity = c.static_instruction_order_identity();
+        assert!(!c.may_have_coverage_exempt_instructions());
+        for _ in 0..8 {
+            c.remove_coverage_exempt_instructions();
+            check(&c);
+        }
+        assert_eq!(before, bincode::serialize(c.raw_instructions()).unwrap());
+        assert_eq!(revision, c.geometry_revision());
+        assert!(c.instructions_are_sorted());
+        assert!(std::sync::Arc::ptr_eq(
+            &identity,
+            &c.static_instruction_order_identity()
+        ));
+    }
+    #[test]
+    fn original_opt_out_and_candidate_paths_are_exact_for_all_mutation_routes() {
+        let mut original = RenderContext::new(Viewport::new(64., 40.));
+        let mut candidate = original.empty_for_rebuild();
+        original.coverage_exempt_empty_fast_path = false;
+        candidate.coverage_exempt_empty_fast_path = true;
+        for c in [&mut original, &mut candidate] {
+            c.add_instruction(command(1, false));
+            c.add_instruction(command(2, true));
+            c.get_sorted_instructions();
+            c.remove_coverage_exempt_instructions();
+            c.set_portrayal_origin_from(0, PortrayalOrigin::CoverageExempt);
+            c.remove_coverage_exempt_instructions();
+            c.set_instructions_from_cache(vec![command(3, false)]);
+            c.remove_coverage_exempt_instructions();
+            c.add_instruction(command(4, true));
+            c.truncate_instructions(1);
+            c.remove_coverage_exempt_instructions();
+        }
+        assert_eq!(
+            bincode::serialize(original.raw_instructions()).unwrap(),
+            bincode::serialize(candidate.raw_instructions()).unwrap()
+        );
+        assert!(original.may_have_coverage_exempt_instructions());
+        assert!(!candidate.may_have_coverage_exempt_instructions());
+    }
+    #[test]
+    fn added_retagged_imported_and_truncated_overlay_cannot_escape_removal() {
+        let mut c = RenderContext::new(Viewport::new(64., 40.));
+        c.coverage_exempt_empty_fast_path = true;
+        c.add_instruction(command(1, false));
+        c.add_instruction(command(2, true));
+        check(&c);
+        c.get_sorted_instructions();
+        c.remove_coverage_exempt_instructions();
+        assert_eq!(
+            c.raw_instructions()
+                .iter()
+                .map(|i| i.feature_id())
+                .collect::<Vec<_>>(),
+            vec![Some(1)]
+        );
+        check(&c);
+        c.set_portrayal_origin_from(0, PortrayalOrigin::CoverageExempt);
+        check(&c);
+        c.remove_coverage_exempt_instructions();
+        assert_eq!(c.instruction_count(), 0);
+        c.set_instructions_from_cache(vec![command(3, true), command(4, false)]);
+        check(&c);
+        c.remove_coverage_exempt_instructions();
+        assert_eq!(c.instruction_count(), 1);
+        check(&c);
+        c.add_instruction(command(5, true));
+        c.truncate_instructions(1);
+        check(&c);
+        let rev = c.geometry_revision();
+        c.remove_coverage_exempt_instructions();
+        assert_eq!(c.geometry_revision(), rev);
+        check(&c);
+        let child = c.empty_for_rebuild();
+        assert!(!child.may_have_coverage_exempt_instructions());
+        assert!(child.coverage_exempt_empty_fast_path);
+        c.clear_instructions();
+        check(&c);
+        assert!(!c.may_have_coverage_exempt_instructions());
+    }
+}
+
+#[cfg(test)]
+mod emission_fork_tests {
+    use super::*;
+    use crate::{LineInstruction, WorldPoint};
+    fn line(priority: i32) -> DrawingInstruction {
+        DrawingInstruction::Line(
+            LineInstruction::new(vec![WorldPoint::new(0., 0.), WorldPoint::new(1., 1.)])
+                .with_priority(priority),
+        )
+    }
+    #[test]
+    fn fork_shares_geometry_and_identities_without_copying() {
+        let mut context = RenderContext::new(Viewport::new(1000., 1000.));
+        context.add_instruction(line(2));
+        context.add_instruction(line(1));
+        context.get_sorted_instructions();
+        let order = context.static_instruction_order_identity();
+        let fork = context.fork_for_emission();
+        assert!(fork.shares_instructions_with(&context));
+        assert!(fork.instructions_are_sorted());
+        assert_eq!(fork.geometry_revision, context.geometry_revision);
+        assert_eq!(
+            fork.static_line_relation_epoch(),
+            context.static_line_relation_epoch()
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &fork.static_instruction_order_identity(),
+            &order
+        ));
+    }
+    #[test]
+    fn mutation_after_fork_copies_and_retires_identity_on_that_owner_only() {
+        let mut context = RenderContext::new(Viewport::new(1000., 1000.));
+        context.add_instruction(line(1));
+        let fork = context.fork_for_emission();
+        let revision = fork.geometry_revision;
+        context.add_instruction(line(3));
+        assert!(!fork.shares_instructions_with(&context));
+        assert_eq!(fork.raw_instructions().len(), 1);
+        assert_eq!(context.raw_instructions().len(), 2);
+        assert_eq!(fork.geometry_revision, revision);
+        assert_ne!(context.geometry_revision, revision);
     }
 }

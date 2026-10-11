@@ -37,6 +37,28 @@ impl DrawRangeIndex {
         })
     }
 
+    /// Retained-plan construction only; original public construction is unchanged.
+    pub(crate) fn retained_charge_bound(total: usize) -> Option<usize> {
+        let bytes = total.checked_mul(std::mem::size_of::<DrawRef>())?;
+        (bytes <= Self::BUDGET).then_some(bytes)
+    }
+    pub(crate) fn try_new_retained(total: usize) -> Option<Self> {
+        Self::retained_charge_bound(total)?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(total).ok()?;
+        if entries
+            .capacity()
+            .checked_mul(std::mem::size_of::<DrawRef>())?
+            > Self::BUDGET
+        {
+            return None;
+        }
+        Some(Self { entries })
+    }
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<DrawRef>()
+    }
+
     pub(crate) fn push(&mut self, kind: DrawKind, key: Key, original_index: usize) {
         // Construction supplies exactly the counted ranges, including empty ones.
         assert!(self.entries.len() < self.entries.capacity());

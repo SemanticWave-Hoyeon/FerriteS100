@@ -7,6 +7,11 @@ use std::{
     sync::Arc,
 };
 
+/// An operational session cannot downgrade authentication through UI settings.
+pub(crate) fn verification_enabled(ui: Option<bool>, requested: bool, operational: bool) -> bool {
+    operational || ui.unwrap_or(requested)
+}
+
 pub(crate) fn dataset_snapshot(
     report: &AuthorizedDatasets,
     path: &Path,
@@ -67,6 +72,18 @@ mod tests {
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn operational_policy_cannot_be_downgraded_by_ui_or_default() {
+        for requested in [false, true] {
+            for ui in [None, Some(false), Some(true)] {
+                assert!(verification_enabled(ui, requested, true));
+                assert_eq!(
+                    verification_enabled(ui, requested, false),
+                    ui.unwrap_or(requested)
+                );
+            }
         }
     }
     #[test]

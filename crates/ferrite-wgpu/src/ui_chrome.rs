@@ -115,9 +115,40 @@ pub(crate) enum Icon {
     Plus,
     Minus,
     Fit,
+    File,
+    Folder,
+    Layers,
+    Inspect,
+    Select,
+    Clock,
+    Status,
+    Logs,
+    Settings,
+    Debug,
+    Ruler,
+    Route,
+    Plugin,
+    Mcp,
 }
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
-    let response = ui.add(egui::Button::new("").min_size(egui::vec2(34., 30.)));
+    icon_toggle(ui, icon, label, false)
+}
+pub(crate) fn icon_toggle(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
+    icon_toggle_with_badge(ui, icon, label, selected, None)
+}
+/// Icon toggle with an optional status dot in its top-right corner.
+pub(crate) fn icon_toggle_with_badge(
+    ui: &mut Ui,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+    badge: Option<Color32>,
+) -> Response {
+    let response = ui.add(
+        egui::Button::new("")
+            .selected(selected)
+            .min_size(egui::vec2(30., 30.)),
+    );
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
@@ -132,6 +163,115 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
                 p.line_segment([pos(0., -6.), pos(0., 6.)], stroke);
             }
         }
+        Icon::File => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(pos(-5., -7.), pos(5., 7.)),
+                0.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment([pos(-2., -2.), pos(3., -2.)], stroke);
+            p.line_segment([pos(-2., 2.), pos(3., 2.)], stroke);
+        }
+        Icon::Folder => {
+            p.line_segment([pos(-7., -4.), pos(-2., -4.)], stroke);
+            p.line_segment([pos(-2., -4.), pos(0., -2.)], stroke);
+            p.rect_stroke(
+                egui::Rect::from_min_max(pos(-7., -2.), pos(7., 6.)),
+                0.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        Icon::Layers => {
+            for y in [-4., 0., 4.] {
+                p.line_segment([pos(-7., y), pos(7., y)], stroke);
+            }
+        }
+        Icon::Select => {
+            p.line_segment([pos(-5., -7.), pos(-5., 5.)], stroke);
+            p.line_segment([pos(-5., -7.), pos(6., 1.)], stroke);
+            p.line_segment([pos(6., 1.), pos(0., 2.)], stroke);
+            p.line_segment([pos(0., 2.), pos(3., 7.)], stroke);
+        }
+        Icon::Inspect => {
+            p.circle_stroke(pos(-2., -2.), 5., stroke);
+            p.line_segment([pos(2., 2.), pos(7., 7.)], stroke);
+        }
+        Icon::Clock => {
+            p.circle_stroke(center, 7., stroke);
+            p.line_segment([center, pos(0., -4.)], stroke);
+            p.line_segment([center, pos(4., 2.)], stroke);
+        }
+        Icon::Status => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(pos(-7., -6.), pos(7., 6.)),
+                0.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment([pos(-4., 1.), pos(4., 1.)], stroke);
+            p.line_segment([pos(-4., -2.), pos(0., -2.)], stroke);
+        }
+        Icon::Logs => {
+            for y in [-5., 0., 5.] {
+                p.line_segment([pos(-4., y), pos(7., y)], stroke);
+                p.circle_filled(pos(-7., y), 1., stroke.color);
+            }
+        }
+        Icon::Settings => {
+            p.circle_stroke(center, 4., stroke);
+            for (x, y) in [(0., -7.), (7., 0.), (0., 7.), (-7., 0.)] {
+                p.line_segment([pos(x * 0.65, y * 0.65), pos(x, y)], stroke);
+            }
+        }
+        Icon::Debug => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(pos(-4., -5.), pos(4., 5.)),
+                0.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for y in [-3., 0., 3.] {
+                p.line_segment([pos(-7., y), pos(-4., y)], stroke);
+                p.line_segment([pos(4., y), pos(7., y)], stroke);
+            }
+        }
+        Icon::Ruler => {
+            // Top and left scales, as drawn along the chart edges.
+            p.line_segment([pos(-7., -6.), pos(7., -6.)], stroke);
+            p.line_segment([pos(-7., -6.), pos(-7., 7.)], stroke);
+            for i in 0..4 {
+                let t = -3. + 3. * i as f32;
+                p.line_segment([pos(t, -6.), pos(t, -3.)], stroke);
+                p.line_segment([pos(-7., t), pos(-4., t)], stroke);
+            }
+        }
+        Icon::Route => {
+            p.circle_stroke(pos(-6., 5.), 2., stroke);
+            p.circle_stroke(pos(6., -5.), 2., stroke);
+            p.line_segment([pos(-4.5, 3.5), pos(0., 2.)], stroke);
+            p.line_segment([pos(0., 2.), pos(1., -2.)], stroke);
+            p.line_segment([pos(1., -2.), pos(4.5, -3.5)], stroke);
+        }
+        Icon::Plugin => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(pos(-6., -4.), pos(4., 6.)),
+                1.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            p.circle_stroke(pos(-1., -6.), 2., stroke);
+            p.circle_stroke(pos(6., 1.), 2., stroke);
+        }
+        Icon::Mcp => {
+            // A service node linked to two clients.
+            p.circle_stroke(pos(-4., 0.), 3., stroke);
+            p.circle_filled(pos(5., -5.), 2., stroke.color);
+            p.circle_filled(pos(5., 5.), 2., stroke.color);
+            p.line_segment([pos(-1.5, -1.5), pos(3.5, -4.)], stroke);
+            p.line_segment([pos(-1.5, 1.5), pos(3.5, 4.)], stroke);
+        }
         Icon::Fit => {
             for (x, y, dx, dy) in [
                 (-6., -6., 1., 1.),
@@ -143,6 +283,11 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
                 p.line_segment([pos(x, y), pos(x, y + 4. * dy)], stroke);
             }
         }
+    }
+    if let Some(color) = badge {
+        let dot = response.rect.right_top() + egui::vec2(-6., 6.);
+        p.circle_filled(dot, 3.5, ui.visuals().panel_fill);
+        p.circle_filled(dot, 2.5, color);
     }
     response.on_hover_text(label)
 }

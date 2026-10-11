@@ -220,8 +220,8 @@ pub enum HAlign {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum VAlign {
     Top,
-    #[default]
     Middle,
+    #[default]
     Bottom,
 }
 
@@ -290,7 +290,7 @@ pub struct PointInstruction {
     #[serde(default)]
     pub portrayal_origin: crate::PortrayalOrigin,
     /// Sounding depth value (meters) - for sounding symbols only
-    /// Used to select the shallowest sounding when decluttering
+    /// Original sample metadata; general PointInstructions are not host-thinned
     /// NaN = no depth (saves 8 bytes vs Option<f64>)
     depth: f64,
 }
@@ -980,6 +980,51 @@ impl AreaInstruction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextFontWeight {
+    Light,
+    #[default]
+    Medium,
+    Bold,
+}
+impl TextFontWeight {
+    pub fn from_lua(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "Light" => Ok(Self::Light),
+            "Medium" => Ok(Self::Medium),
+            "Bold" => Ok(Self::Bold),
+            _ => Err(format!("Unsupported FontWeight: {value}")),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextFontProportion {
+    MonoSpaced,
+    #[default]
+    Proportional,
+}
+impl TextFontProportion {
+    pub fn from_lua(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "MonoSpaced" => Ok(Self::MonoSpaced),
+            "Proportional" => Ok(Self::Proportional),
+            _ => Err(format!("Unsupported FontProportion: {value}")),
+        }
+    }
+}
+
+/// Complete authored font characteristics, reference and decorations.
+/// S-100 9-12.6.2 and Part9a Table9a-10; references remain PC-owned identifiers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextFontStyle {
+    pub weight: TextFontWeight,
+    pub proportion: TextFontProportion,
+    pub serifs: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub upperline: bool,
+    pub reference: Option<String>,
+}
 /// Text instruction - renders text label
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextInstruction {
@@ -991,6 +1036,8 @@ pub struct TextInstruction {
     pub font_size: f32,
     /// Font family (optional)
     pub font_family: Option<String>,
+    #[serde(default)]
+    pub font_style: TextFontStyle,
     /// Font weight (bold)
     pub bold: bool,
     /// Font style (italic)
@@ -1054,6 +1101,7 @@ impl TextInstruction {
             position,
             font_size: 10.0,
             font_family: None,
+            font_style: TextFontStyle::default(),
             bold: false,
             italic: false,
             color: Color::BLACK,
@@ -1062,7 +1110,7 @@ impl TextInstruction {
             background_color_token: None,
             background_opacity: 1.,
             h_align: HAlign::Left,
-            v_align: VAlign::Middle,
+            v_align: VAlign::Bottom,
             rotation: 0.0,
             rotation_crs: crate::RotationCrs::Portrayal,
             curve_tangent_bearing: None,
@@ -1536,24 +1584,66 @@ pub struct ScreenRay {
     pub length_mm: f64,
     pub geographic_direction: bool,
 }
-/// Ordinary world lines borrow their original points without heap allocation.
+/// A source borrow or immutable shared viewport resolution; ordinary lines remain allocation-free.
+pub enum ResolvedLinePath<'a> {
+    Original(std::borrow::Cow<'a, [WorldPoint]>),
+    Shared(std::sync::Arc<[WorldPoint]>),
+}
+impl std::ops::Deref for ResolvedLinePath<'_> {
+    type Target = [WorldPoint];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Original(p) => p.as_ref(),
+            Self::Shared(p) => p.as_ref(),
+        }
+    }
+}
+impl AsRef<[WorldPoint]> for ResolvedLinePath<'_> {
+    fn as_ref(&self) -> &[WorldPoint] {
+        self
+    }
+}
+impl ResolvedLinePath<'_> {
+    pub fn into_owned(self) -> Vec<WorldPoint> {
+        match self {
+            Self::Original(p) => p.into_owned(),
+            Self::Shared(p) => p.to_vec(),
+        }
+    }
+}
 pub enum ResolvedLinePaths<'a> {
     Single(Option<std::borrow::Cow<'a, [WorldPoint]>>),
     Multiple(std::vec::IntoIter<Vec<WorldPoint>>),
+    Shared {
+        runs: std::sync::Arc<[std::sync::Arc<[WorldPoint]>]>,
+        next: usize,
+    },
 }
 impl<'a> Iterator for ResolvedLinePaths<'a> {
-    type Item = std::borrow::Cow<'a, [WorldPoint]>;
+    type Item = ResolvedLinePath<'a>;
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Single(p) => p.take(),
-            Self::Multiple(p) => p.next().map(std::borrow::Cow::Owned),
+            Self::Single(p) => p.take().map(ResolvedLinePath::Original),
+            Self::Multiple(p) => p
+                .next()
+                .map(|p| ResolvedLinePath::Original(std::borrow::Cow::Owned(p))),
+            Self::Shared { runs, next } => {
+                let result = runs.get(*next).cloned();
+                *next += usize::from(result.is_some());
+                result.map(ResolvedLinePath::Shared)
+            }
         }
     }
 }
 impl LineInstruction {
     pub fn render_paths<'a>(&'a self, scaler: &crate::Scaler) -> ResolvedLinePaths<'a> {
-        if let (Some(path @ crate::PortrayalPath::Group(_)), Some(&origin)) =
-            (&self.portrayal_path, self.points.first())
+        if let (
+            Some(
+                path @ (crate::PortrayalPath::Group(_)
+                | crate::PortrayalPath::GeographicAnnulus { .. }),
+            ),
+            Some(&origin),
+        ) = (&self.portrayal_path, self.points.first())
         {
             ResolvedLinePaths::Multiple(path.world_paths(origin, scaler).into_iter())
         } else {
@@ -1608,6 +1698,22 @@ impl LineInstruction {
 #[cfg(test)]
 mod authored_opacity_tests {
     use super::*;
+    #[test]
+    fn text_initial_alignment_and_font_state_match_s100_table9a10() {
+        let text = TextInstruction::new("depth".into(), WorldPoint::new(1., 2.));
+        assert_eq!(text.h_align, HAlign::Left);
+        assert_eq!(text.v_align, VAlign::Bottom);
+        assert_eq!(VAlign::default(), VAlign::Bottom);
+        assert_eq!(text.font_style.weight, TextFontWeight::Medium);
+        assert_eq!(text.font_style.proportion, TextFontProportion::Proportional);
+        assert!(!text.font_style.serifs);
+        assert!(!text.font_style.underline);
+        assert!(!text.font_style.strikethrough);
+        assert!(!text.font_style.upperline);
+        assert!(text.font_style.reference.is_none());
+        assert!(!text.bold && !text.italic);
+    }
+
     #[test]
     fn palette_switch_preserves_authored_fill_glyph_and_background_alpha() {
         let mut area = DrawingInstruction::Area(

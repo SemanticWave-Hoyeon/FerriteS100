@@ -37,15 +37,45 @@ impl RuntimeVersion {
     }
 }
 
-/// Construct only the interpreter. Product-specific policy is applied by the
-/// caller before any catalogue code is evaluated.
+/// Construct an interpreter without process or filesystem capabilities.
+/// Product-specific module resolution is further restricted by the caller.
+/// `ALL_SAFE` means Rust FFI safety, not a sandbox: it includes `os` and `io`.
 pub fn new_vm() -> mlua::Lua {
-    mlua::Lua::new()
+    let libraries = mlua::StdLib::TABLE
+        | mlua::StdLib::STRING
+        | mlua::StdLib::MATH
+        | mlua::StdLib::UTF8
+        | mlua::StdLib::COROUTINE
+        | mlua::StdLib::PACKAGE;
+    mlua::Lua::new_with(libraries, mlua::LuaOptions::default())
+        .expect("Restricted standard libraries must initialize")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vm_never_exposes_process_or_filesystem_libraries_through_globals_or_require() {
+        let lua = new_vm();
+        let restricted: bool = lua
+            .load(
+                r#"
+            local os_ok = pcall(require, "os")
+            local io_ok = pcall(require, "io")
+            return os == nil and io == nil and debug == nil
+                and package.loaded.os == nil and package.loaded.io == nil
+                and not os_ok and not io_ok
+        "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(restricted);
+        let sum: i64 = lua
+            .load("return math.floor(3.5) + string.len('ENC')")
+            .eval()
+            .unwrap();
+        assert_eq!(sum, 6);
+    }
     #[test]
     fn compiled_backend_matches_the_actual_interpreter() {
         let lua = new_vm();

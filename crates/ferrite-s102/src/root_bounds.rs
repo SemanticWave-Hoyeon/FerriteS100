@@ -120,7 +120,7 @@ impl RootBounds {
                 a.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U4),
                 "S102 root bbox requires float32 {n}"
             );
-            encoded[i] = a.read_scalar::<f32>()?;
+            encoded[i] = crate::singleton::read::<f32>(&a)?;
         }
         ensure!(
             encoded.iter().all(|v| v.is_finite()),
@@ -158,7 +158,7 @@ impl RootBounds {
             InstanceDomain::FullGrid => {
                 let mut b = [0.; 4];
                 for (i, n) in NAMES.iter().enumerate() {
-                    b[i] = f64::from(instance.attr(n)?.read_scalar::<f32>()?);
+                    b[i] = f64::from(crate::singleton::read::<f32>(&instance.attr(n)?)?);
                 }
                 b
             }

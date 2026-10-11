@@ -123,6 +123,8 @@ impl PortrayalCatalogue {
         if bytes.len() as u64 > Self::MAX_XML_SIZE {
             return Err(PCError::InvalidValue("PC XML byte limit exceeded".into()));
         }
+        // Scan every element, including subtrees skipped by semantic helpers.
+        preflight_pc_metadata_xml(bytes.as_ref(), PC_XML_MAX_DEPTH, PC_XML_MAX_NODES)?;
         let reader = BufReader::new(bytes.as_ref());
         let mut xml_reader = Reader::from_reader(reader);
         xml_reader.config_mut().trim_text(true);
@@ -204,8 +206,14 @@ impl PortrayalCatalogue {
         }
 
         let xml = crate::context_validation::decode_metadata_xml(bytes.as_ref().to_vec())?;
-        let doc = roxmltree::Document::parse(&xml)
-            .map_err(|e| PCError::InvalidValue(format!("PC metadata XML: {e}")))?;
+        let doc = roxmltree::Document::parse_with_options(
+            &xml,
+            roxmltree::ParsingOptions {
+                allow_dtd: false,
+                nodes_limit: PC_XML_MAX_NODES,
+            },
+        )
+        .map_err(|e| PCError::InvalidValue(format!("PC metadata XML: {e}")))?;
         crate::context_validation::read_metadata_document(
             &doc,
             &mut self.rules.context_parameters,
@@ -1067,5 +1075,109 @@ mod line_metadata_xml_tests {
             ))
             .is_err());
         }
+    }
+}
+
+// Receiver admission policy. These are not S-100 catalogue conformance limits.
+const PC_XML_MAX_DEPTH: usize = 128;
+const PC_XML_MAX_NODES: u32 = 200_000;
+pub(crate) fn preflight_pc_metadata_xml(
+    bytes: &[u8],
+    max_depth: usize,
+    max_nodes: u32,
+) -> Result<()> {
+    let invalid = |message: &str| PCError::InvalidValue(message.into());
+    // Existing bounded CatalogueSources buffer is scanned without another whole-file copy.
+    let mut reader = Reader::from_reader(bytes);
+    let mut buffer = Vec::new();
+    let mut depth = 0usize;
+    let mut nodes = 1u32; // Include the document root represented by the DOM.
+    if max_nodes == 0 || max_depth == 0 {
+        return Err(invalid("PC XML invalid receiver budget"));
+    }
+    loop {
+        let event = reader.read_event_into(&mut buffer)?;
+        let is_node = match event {
+            Event::DocType(_) => return Err(invalid("PC XML DTD is not permitted")),
+            Event::Start(_) => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("PC XML depth overflow"))?;
+                if depth > max_depth {
+                    return Err(invalid("PC XML receiver depth budget exceeded"));
+                }
+                true
+            }
+            Event::Empty(_) => {
+                if depth.checked_add(1).is_none_or(|d| d > max_depth) {
+                    return Err(invalid("PC XML receiver depth budget exceeded"));
+                }
+                true
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid("PC XML unmatched closing tag"))?;
+                false
+            }
+            Event::Text(_) | Event::CData(_) | Event::Comment(_) | Event::PI(_) => true,
+            Event::Eof => {
+                if depth != 0 {
+                    return Err(invalid("PC XML unclosed element"));
+                }
+                return Ok(());
+            }
+            _ => false,
+        };
+        if is_node {
+            nodes = nodes
+                .checked_add(1)
+                .ok_or_else(|| invalid("PC XML node count overflow"))?;
+            if nodes > max_nodes {
+                return Err(invalid("PC XML receiver node budget exceeded"));
+            }
+        }
+        buffer.clear();
+    }
+}
+#[cfg(test)]
+mod xml_receiver_budget_tests {
+    use super::*;
+    #[test]
+    fn metadata_depth_admits_boundary_and_rejects_one_more() {
+        let exact = format!("{}{}", "<x>".repeat(4), "</x>".repeat(4));
+        assert!(preflight_pc_metadata_xml(exact.as_bytes(), 4, 100).is_ok());
+        let excess = format!("<x>{exact}</x>");
+        assert!(preflight_pc_metadata_xml(excess.as_bytes(), 4, 100).is_err());
+        assert!(preflight_pc_metadata_xml(b"<x><x><x><x><x/></x></x></x></x>", 4, 100).is_err());
+    }
+    #[test]
+    fn metadata_counts_broad_unknown_subtrees_before_semantic_skipping() {
+        assert!(
+            preflight_pc_metadata_xml(b"<pc><ignored><x/><x/><x/><x/></ignored></pc>", 128, 5)
+                .is_err()
+        );
+        assert!(preflight_pc_metadata_xml(b"<pc><ignored><x/></ignored></pc>", 128, 4).is_ok());
+    }
+    #[test]
+    fn metadata_dtd_is_rejected_without_entity_evaluation() {
+        assert!(preflight_pc_metadata_xml(
+            b"<!DOCTYPE pc [<!ENTITY harmless 'a'>]><pc/>",
+            128,
+            200_000
+        )
+        .is_err());
+        assert!(preflight_pc_metadata_xml(
+            b"<!-- <!DOCTYPE is text only --><?example value?><pc/>",
+            128,
+            200_000
+        )
+        .is_ok());
+    }
+    #[test]
+    fn metadata_text_cdata_and_comments_consume_budget_and_malformed_xml_fails() {
+        assert!(preflight_pc_metadata_xml(b"<pc>a<![CDATA[b]]><!--c--></pc>", 128, 4).is_err());
+        assert!(preflight_pc_metadata_xml(b"<pc><x></pc>", 128, 100).is_err());
+        assert!(preflight_pc_metadata_xml(b"<pc>", 128, 100).is_err());
     }
 }

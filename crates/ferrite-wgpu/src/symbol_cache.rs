@@ -245,6 +245,7 @@ impl<'a> PreparedLatticeKeys<'a> {
 /// Symbol cache for efficient symbol rendering
 #[derive(Debug)]
 pub struct SymbolCache {
+    fonts: crate::font_asset_cache::FontAssetCache,
     shallow_pattern_contract: Option<ferrite_render::ShallowPatternContract>,
     /// Cached symbol geometry (keyed by symbol ID)
     symbols: HashMap<String, SymbolGeometry>,
@@ -282,6 +283,25 @@ fn next_symbol_resource_revision() -> u64 {
 }
 
 impl SymbolCache {
+    /// OVERSC01 is resolved only from the active immutable PC snapshot.
+    /// A filename-only cache cannot authorize a standards annotation.
+    pub(crate) fn overscale_pattern_definition(
+        &self,
+    ) -> Result<ferrite_portrayal_catalog::OverscalePatternDefinition, String> {
+        let sources = self
+            .sources
+            .as_ref()
+            .ok_or("OVERSC01 requires immutable active-PC sources")?;
+        let root = self
+            .symbols_path
+            .parent()
+            .ok_or("Missing PC symbol directory parent")?;
+        ferrite_portrayal_catalog::OverscalePatternDefinition::from_sources(
+            sources,
+            &root.join("AreaFills/OVERSC01.xml"),
+        )
+        .map_err(|e| e.to_string())
+    }
     pub fn resource_revision(&self) -> u64 {
         self.resource_revision
     }
@@ -314,10 +334,29 @@ impl SymbolCache {
             resource_revision: next_symbol_resource_revision(),
             symbols_path: symbols_path.as_ref().to_path_buf(),
             sources: None,
+            fonts: Default::default(),
             render_scale: BASE_PX_PER_MM * RENDER_QUALITY_MULTIPLIER,
         }
     }
 
+    pub(crate) fn resolve_font_reference(
+        &mut self,
+        reference: &str,
+    ) -> crate::Result<ferrite_portrayal_catalog::BoundFontReference> {
+        let sources = self.sources.clone().ok_or_else(|| {
+            crate::WgpuError::Render("FontReference requires captured PC sources".into())
+        })?;
+        self.fonts.resolve(sources, reference)
+    }
+    // Exact retained capture identity, never a digest-only permission comparison.
+    pub(crate) fn has_exact_source_owner(
+        &self,
+        sources: &std::sync::Arc<ferrite_portrayal_catalog::CatalogueSources>,
+    ) -> bool {
+        self.sources
+            .as_ref()
+            .is_some_and(|own| std::sync::Arc::ptr_eq(own, sources))
+    }
     pub fn new_with_sources<P: AsRef<Path>>(
         symbols_path: P,
         sources: std::sync::Arc<ferrite_portrayal_catalog::CatalogueSources>,

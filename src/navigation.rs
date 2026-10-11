@@ -2,7 +2,7 @@
 use winit::event::MouseScrollDelta;
 
 pub const MIN_ZOOM: f64 = 0.005;
-pub const MAX_ZOOM: f64 = 200.;
+pub const MAX_ZOOM: f64 = 500.;
 
 pub fn bounded_zoom(zoom: f64) -> Option<f64> {
     (zoom.is_finite() && zoom > 0.).then(|| zoom.clamp(MIN_ZOOM, MAX_ZOOM))
@@ -113,25 +113,26 @@ mod tests {
         }
     }
     #[test]
-    fn requested_two_hundred_times_limit_is_reachable_from_all_zoom_inputs() {
+    fn requested_five_hundred_times_limit_is_reachable_from_all_zoom_inputs() {
         assert_eq!(bounded_zoom(200.), Some(200.));
-        assert_eq!(bounded_zoom(250.), Some(200.));
-        assert_eq!(zoom_by_steps(150., 1., 1.5), Some(200.));
+        assert_eq!(bounded_zoom(500.), Some(500.));
+        assert_eq!(bounded_zoom(600.), Some(500.));
+        assert_eq!(zoom_by_steps(400., 1., 1.5), Some(500.));
         assert_eq!(
-            scroll_zoom_target(150., MouseScrollDelta::LineDelta(0., 5.), 1.),
-            Some(200.)
+            scroll_zoom_target(400., MouseScrollDelta::LineDelta(0., 5.), 1.),
+            Some(500.)
         );
         for density in [1., 1.25, 1.5, 2., 3.] {
             assert_eq!(
                 scroll_zoom_target(
-                    150.,
+                    400.,
                     MouseScrollDelta::PixelDelta(PhysicalPosition::new(0., 250. * density)),
                     density
                 ),
-                Some(200.)
+                Some(500.)
             );
         }
-        assert!(zoom_by_steps(200., -1., 1.5).unwrap() < 200.);
+        assert!(zoom_by_steps(500., -1., 1.5).unwrap() < 500.);
     }
 }
 

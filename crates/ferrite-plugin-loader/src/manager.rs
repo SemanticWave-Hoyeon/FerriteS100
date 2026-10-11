@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::PluginLibrary;
 use abi_stable::std_types::RBox;
-use libloading::Library;
 use tracing::{debug, info, warn};
 
 use ferrite_plugin_api::Plugin_TO;
@@ -22,7 +22,7 @@ use crate::PluginManifest;
 struct ActivePlugin {
     manifest: PluginManifest,
     instance: Plugin_TO<'static, RBox<()>>,
-    _library: Library, // Keep library alive
+    _library: PluginLibrary, // Keep library alive
 }
 
 /// Plugin manager handles plugin lifecycle

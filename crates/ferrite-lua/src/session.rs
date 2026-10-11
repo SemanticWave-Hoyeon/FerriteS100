@@ -23,12 +23,19 @@ pub struct LuaSession {
     sources: Option<Arc<ferrite_portrayal_catalog::CatalogueSources>>,
     initialized: bool,
     chunk_cache: ferrite_lua_runtime::ChunkCache,
+    resources: crate::resource_limits::LuaResources,
 }
 
 impl LuaSession {
     /// Create new Lua session with sandboxed environment
     pub fn new() -> Result<Self> {
+        Self::new_with_resource_limits(crate::LuaResourceLimits::default())
+    }
+
+    pub fn new_with_resource_limits(limits: crate::LuaResourceLimits) -> Result<Self> {
         let lua = ferrite_lua_runtime::new_vm();
+        let resources = crate::resource_limits::LuaResources::new(limits)?;
+        resources.attach(&lua)?;
 
         // Sandbox: Disable dangerous package library functions
         // This prevents loading arbitrary C modules or searching system paths
@@ -46,6 +53,7 @@ impl LuaSession {
             sources: None,
             initialized: false,
             chunk_cache: Default::default(),
+            resources,
         })
     }
 
@@ -257,43 +265,48 @@ impl LuaSession {
     /// Security: verifies the script file is a direct child of `rules_path`
     /// (no traversal via symlinks or `..`).
     pub fn load_main(&mut self) -> Result<()> {
-        let main_path = self.rules_path.join("main.lua");
+        let resources = self.resources.clone();
+        resources.run(|| {
+            let main_path = self.rules_path.join("main.lua");
 
-        if !self.main_available(&main_path) {
-            return Err(LuaError::ScriptNotFound(main_path.display().to_string()));
-        }
-
-        // Verify parent directory matches rules_path (catches symlink escapes)
-        if let Some(parent) = main_path.parent() {
-            if parent != self.rules_path {
-                return Err(LuaError::ScriptNotFound(format!(
-                    "Security: script parent {} != rules_path {}",
-                    parent.display(),
-                    self.rules_path.display()
-                )));
+            if !self.main_available(&main_path) {
+                return Err(LuaError::ScriptNotFound(main_path.display().to_string()));
             }
-        }
 
-        let script = self.read_main_source(&main_path)?;
+            // Verify parent directory matches rules_path (catches symlink escapes)
+            if let Some(parent) = main_path.parent() {
+                if parent != self.rules_path {
+                    return Err(LuaError::ScriptNotFound(format!(
+                        "Security: script parent {} != rules_path {}",
+                        parent.display(),
+                        self.rules_path.display()
+                    )));
+                }
+            }
 
-        self.chunk_cache
-            .compile(&self.lua, &script, &main_path.to_string_lossy())?
-            .call::<()>(())?;
+            let script = self.read_main_source(&main_path)?;
 
-        self.install_decimal_equality_compatibility()?;
-        self.initialized = true;
-        tracing::info!("Loaded main portrayal script: {}", main_path.display());
+            self.chunk_cache
+                .compile(&self.lua, &script, &main_path.to_string_lossy())?
+                .call::<()>(())?;
 
-        Ok(())
+            self.install_decimal_equality_compatibility()?;
+            self.initialized = true;
+            tracing::info!("Loaded main portrayal script: {}", main_path.display());
+
+            Ok(())
+        })
     }
 
     /// Lua 5.1 only invokes table equality when both operands share __eq.
     /// Lua 5.4 invokes either operand's method. Legacy PC compares a scaled
     /// decimal with the unknown-value sentinel and assumes the 5.1 behavior.
     fn install_decimal_equality_compatibility(&self) -> Result<()> {
-        self.lua
-            .load(
-                r#"
+        let resources = self.resources.clone();
+        resources.run(|| {
+            self.lua
+                .load(
+                    r#"
             if CreateScaledDecimal then
                 local sample = CreateScaledDecimal(0, 0)
                 local mt = getmetatable(sample)
@@ -310,10 +323,11 @@ impl LuaSession {
                 end
             end
         "#,
-            )
-            .set_name("@host-decimal-compatibility")
-            .exec()?;
-        Ok(())
+                )
+                .set_name("@host-decimal-compatibility")
+                .exec()?;
+            Ok(())
+        })
     }
 
     /// Set feature and spatial data for the session
@@ -349,131 +363,147 @@ impl LuaSession {
     /// Initialize the portrayal context with context parameters
     /// Context parameters are now dynamically loaded from PC XML via ContextParameters::from_pc_context()
     pub fn initialize_context(&mut self, params: &ContextParameters) -> Result<()> {
-        // Get PortrayalCreateContextParameter function to properly convert values
-        // This function calls ConvertEncodedValue which creates ScaledDecimal for "real" types
-        let create_param_func: mlua::Function = self
-            .lua
-            .globals()
-            .get("PortrayalCreateContextParameter")
-            .map_err(|_| {
-                LuaError::FunctionNotFound("PortrayalCreateContextParameter".to_string())
-            })?;
+        let resources = self.resources.clone();
+        resources.run(|| {
+            // Get PortrayalCreateContextParameter function to properly convert values
+            // This function calls ConvertEncodedValue which creates ScaledDecimal for "real" types
+            let create_param_func: mlua::Function = self
+                .lua
+                .globals()
+                .get("PortrayalCreateContextParameter")
+                .map_err(|_| {
+                    LuaError::FunctionNotFound("PortrayalCreateContextParameter".to_string())
+                })?;
 
-        // Create context parameters array for Lua
-        let context_params = self.lua.create_table()?;
+            // Create context parameters array for Lua
+            let context_params = self.lua.create_table()?;
 
-        // Use to_lua_params() to get parameters dynamically (from PC XML)
-        // This removes hardcoded parameter names and follows S-100 standard pattern
-        for (name, param_type, value_str) in params.to_lua_params() {
-            let param: mlua::Table =
-                create_param_func.call((name.as_str(), param_type.as_str(), value_str.as_str()))?;
-            context_params.push(param)?;
-        }
+            // Use to_lua_params() to get parameters dynamically (from PC XML)
+            // This removes hardcoded parameter names and follows S-100 standard pattern
+            for (name, param_type, value_str) in params.to_lua_params() {
+                let param: mlua::Table = create_param_func.call((
+                    name.as_str(),
+                    param_type.as_str(),
+                    value_str.as_str(),
+                ))?;
+                context_params.push(param)?;
+            }
 
-        // Call PortrayalInitializeContextParameters
-        let init_func: mlua::Function = self
-            .lua
-            .globals()
-            .get("PortrayalInitializeContextParameters")
-            .map_err(|_| {
-                LuaError::FunctionNotFound("PortrayalInitializeContextParameters".to_string())
-            })?;
+            // Call PortrayalInitializeContextParameters
+            let init_func: mlua::Function = self
+                .lua
+                .globals()
+                .get("PortrayalInitializeContextParameters")
+                .map_err(|_| {
+                    LuaError::FunctionNotFound("PortrayalInitializeContextParameters".to_string())
+                })?;
 
-        init_func.call::<()>(context_params)?;
+            init_func.call::<()>(context_params)?;
 
-        tracing::debug!(
-            "Portrayal context initialized with {} parameters",
-            params.to_lua_params().len()
-        );
-        Ok(())
+            tracing::debug!(
+                "Portrayal context initialized with {} parameters",
+                params.to_lua_params().len()
+            );
+            Ok(())
+        })
     }
 
     /// Reset the Lua state for a new cell
     /// This clears all caches (feature, information, spatial) to prevent cross-cell contamination
     pub fn reset_for_new_cell(&mut self) -> Result<()> {
-        // Create fresh Lua state
-        self.lua = ferrite_lua_runtime::new_vm();
+        let resources = self.resources.clone();
+        resources.run(|| {
+            // Create fresh Lua state
+            self.lua = ferrite_lua_runtime::new_vm();
+            self.resources.attach(&self.lua)?;
 
-        // Apply sandbox to new Lua state
-        Self::sandbox_lua(&self.lua)?;
+            // Apply sandbox to new Lua state
+            Self::sandbox_lua(&self.lua)?;
 
-        self.host = HostFunctions::new();
+            self.host = HostFunctions::new();
 
-        // Re-register host functions
-        self.host.register(&self.lua)?;
+            // Re-register host functions
+            self.host.register(&self.lua)?;
 
-        // Reset initialized flag
-        self.initialized = false;
+            // Reset initialized flag
+            self.initialized = false;
 
-        // Re-install safe searcher
-        if !self.rules_path.as_os_str().is_empty() {
-            Self::install_safe_searcher(
-                &self.lua,
-                &self.rules_path.clone(),
-                self.chunk_cache.clone(),
-                self.sources.clone(),
-            )?;
-        }
+            // Re-install safe searcher
+            if !self.rules_path.as_os_str().is_empty() {
+                Self::install_safe_searcher(
+                    &self.lua,
+                    &self.rules_path.clone(),
+                    self.chunk_cache.clone(),
+                    self.sources.clone(),
+                )?;
+            }
 
-        // Re-load main script
-        let main_path = self.rules_path.join("main.lua");
-        if self.main_available(&main_path) {
-            let script = self.read_main_source(&main_path)?;
+            // Re-load main script
+            let main_path = self.rules_path.join("main.lua");
+            if self.main_available(&main_path) {
+                let script = self.read_main_source(&main_path)?;
 
-            self.chunk_cache
-                .compile(&self.lua, &script, &main_path.to_string_lossy())?
-                .call::<()>(())?;
+                self.chunk_cache
+                    .compile(&self.lua, &script, &main_path.to_string_lossy())?
+                    .call::<()>(())?;
 
-            self.install_decimal_equality_compatibility()?;
-            self.initialized = true;
-        }
+                self.install_decimal_equality_compatibility()?;
+                self.initialized = true;
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Execute portrayal for all features
     pub fn execute_portrayal(&mut self) -> Result<Vec<PortrayalResult>> {
-        if !self.initialized {
-            return Err(LuaError::Portrayal("Session not initialized".to_string()));
-        }
+        let resources = self.resources.clone();
+        resources.run(|| {
+            if !self.initialized {
+                return Err(LuaError::Portrayal("Session not initialized".to_string()));
+            }
 
-        // Clear previous results
-        self.host.clear_results();
+            // Clear previous results
+            self.host.clear_results();
 
-        // Call PortrayalMain()
-        let portrayal_main: mlua::Function = self
-            .lua
-            .globals()
-            .get("PortrayalMain")
-            .map_err(|_| LuaError::FunctionNotFound("PortrayalMain".to_string()))?;
+            // Call PortrayalMain()
+            let portrayal_main: mlua::Function = self
+                .lua
+                .globals()
+                .get("PortrayalMain")
+                .map_err(|_| LuaError::FunctionNotFound("PortrayalMain".to_string()))?;
 
-        let result = portrayal_main.call::<bool>(mlua::Value::Nil);
-        self.completed_results(result)
+            let result = portrayal_main.call::<bool>(mlua::Value::Nil);
+            self.completed_results(result)
+        })
     }
 
     /// Execute portrayal for specific feature IDs
     pub fn execute_portrayal_for(&mut self, feature_ids: Vec<i64>) -> Result<Vec<PortrayalResult>> {
-        if !self.initialized {
-            return Err(LuaError::Portrayal("Session not initialized".to_string()));
-        }
+        let resources = self.resources.clone();
+        resources.run(|| {
+            if !self.initialized {
+                return Err(LuaError::Portrayal("Session not initialized".to_string()));
+            }
 
-        self.host.clear_results();
+            self.host.clear_results();
 
-        // Create Lua table with feature IDs
-        let ids_table = self.lua.create_table()?;
-        for (i, id) in feature_ids.iter().enumerate() {
-            ids_table.set(i + 1, *id)?;
-        }
+            // Create Lua table with feature IDs
+            let ids_table = self.lua.create_table()?;
+            for (i, id) in feature_ids.iter().enumerate() {
+                ids_table.set(i + 1, *id)?;
+            }
 
-        // Call PortrayalMain(featureIDs)
-        let portrayal_main: mlua::Function = self
-            .lua
-            .globals()
-            .get("PortrayalMain")
-            .map_err(|_| LuaError::FunctionNotFound("PortrayalMain".to_string()))?;
+            // Call PortrayalMain(featureIDs)
+            let portrayal_main: mlua::Function = self
+                .lua
+                .globals()
+                .get("PortrayalMain")
+                .map_err(|_| LuaError::FunctionNotFound("PortrayalMain".to_string()))?;
 
-        let result = portrayal_main.call::<bool>(ids_table);
-        self.completed_results(result)
+            let result = portrayal_main.call::<bool>(ids_table);
+            self.completed_results(result)
+        })
     }
 
     /// S-100 9a-14.1.1: false means terminated, never a completed portrayal.
@@ -495,27 +525,31 @@ impl LuaSession {
 
     /// Execute a simple Lua expression
     pub fn eval<T: mlua::FromLuaMulti>(&self, expr: &str) -> Result<T> {
-        Ok(self.lua.load(expr).eval()?)
+        let resources = self.resources.clone();
+        resources.run(|| Ok(self.lua.load(expr).eval()?))
     }
 
     /// Load and execute a Lua file
     pub fn load_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-        let script = match &self.sources {
-            Some(s) => s
-                .read_path(path.as_ref())
-                .map(|b| b.to_vec())
-                .map_err(|e| std::io::Error::other(e.to_string())),
-            None => std::fs::read(path),
-        }
-        .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
+        let resources = self.resources.clone();
+        resources.run(|| {
+            let path = path.as_ref();
+            let script = match &self.sources {
+                Some(s) => s
+                    .read_path(path.as_ref())
+                    .map(|b| b.to_vec())
+                    .map_err(|e| std::io::Error::other(e.to_string())),
+                None => std::fs::read(path),
+            }
+            .map_err(|e| LuaError::ScriptNotFound(format!("{}: {}", path.display(), e)))?;
 
-        self.lua
-            .load(script.as_slice())
-            .set_name(path.to_string_lossy())
-            .exec()?;
+            self.lua
+                .load(script.as_slice())
+                .set_name(path.to_string_lossy())
+                .exec()?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Call a Lua function by name
@@ -524,13 +558,16 @@ impl LuaSession {
         name: &str,
         args: impl mlua::IntoLuaMulti,
     ) -> Result<T> {
-        let func: mlua::Function = self
-            .lua
-            .globals()
-            .get(name)
-            .map_err(|_| LuaError::FunctionNotFound(name.to_string()))?;
+        let resources = self.resources.clone();
+        resources.run(|| {
+            let func: mlua::Function = self
+                .lua
+                .globals()
+                .get(name)
+                .map_err(|_| LuaError::FunctionNotFound(name.to_string()))?;
 
-        Ok(func.call(args)?)
+            Ok(func.call(args)?)
+        })
     }
 
     /// Check if a function exists

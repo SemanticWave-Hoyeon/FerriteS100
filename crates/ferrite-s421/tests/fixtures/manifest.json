@@ -1,0 +1,98 @@
+{
+  "scope": "Six unmodified public adjunct GMLs; expected parser outcomes, not full schema validation. No paid IEC body copied.",
+  "source_urls": [
+    "https://cirm.org/api/documents/download/61?documents%2FOctober2022%2FV9K4aBiqzUzMf97u0qr9.zip=",
+    "https://cirm.org/api/documents/download/80?documents%2FJuly2026%2FS-421.zip="
+  ],
+  "fixtures": [
+    {
+      "file": "v1-GMIN.gml",
+      "original": "Standards/S-421/1.0-published-support/selected-public-adjuncts/TestData/RTE-TEST-GMIN.s421.gml",
+      "sha256": "0ad859539e91daa115d338519854c3eb3c628d36a752dab5c4b8234a77580632",
+      "bytes": 3397,
+      "profile": "Published1",
+      "waypoint_nodes": 2,
+      "dangling_refs": [],
+      "expected": "success",
+      "reason": "supported native route subset"
+    },
+    {
+      "file": "v1-GBASIC.gml",
+      "original": "Standards/S-421/1.0-published-support/selected-public-adjuncts/TestData/RTE-TEST-GBASIC.s421.gml",
+      "sha256": "d66590c81c5f91d953152a8f76e043b19e7e4f198e64b5211efdaee268a7f0f2",
+      "bytes": 22001,
+      "profile": "Published1",
+      "waypoint_nodes": 10,
+      "dangling_refs": [
+        "ROUTE.0dc2e440-2614-4be5-a290-deff75dcea39",
+        "#RTE.WPTS.WP.1",
+        "#RTE.WPTS.WP.2",
+        "#RTE.WPTS.WP.3",
+        "#RTE.WPTS.WP.4",
+        "#RTE.WPTS.WP.5",
+        "#RTE.WPTS.WP.6",
+        "#RTE.WPTS.WP.7",
+        "#RTE.WPTS.WP.8",
+        "#RTE.WPTS.WP.9",
+        "#RTE.WPTS.WP.10"
+      ],
+      "expected": "reject",
+      "reason": "dangling local xlink references"
+    },
+    {
+      "file": "v1-GFULL.gml",
+      "original": "Standards/S-421/1.0-published-support/selected-public-adjuncts/TestData/RTE-TEST-GFULL.s421.gml",
+      "sha256": "93e2fc722f8e85635d3ce7f985dbbec4b601fc536fbf47b4665387f4cb831619",
+      "bytes": 48503,
+      "profile": "Published1",
+      "waypoint_nodes": 10,
+      "dangling_refs": [
+        "#RTE.WPTS.WPT.1",
+        "#RTE.WPTS.WPT.2",
+        "#RTE.WPTS.WPT.3",
+        "#RTE.WPTS.WPT.4",
+        "#RTE.WPTS.WPT.5",
+        "#RTE.WPTS.WPT.6",
+        "#RTE.WPTS.WPT.8",
+        "#RTE.WPTS.WPT.9",
+        "#RTE.WPTS.WPT.10",
+        "#RTE.WPT.7"
+      ],
+      "expected": "reject",
+      "reason": "dangling local xlink references"
+    },
+    {
+      "file": "v2-GMIN.gml",
+      "original": "Standards/S-421/2.0-CDV-support/selected-public-adjuncts/S-421/RTE-TEST-GMIN.gml",
+      "sha256": "66e81be5507a76b6604ff645dc04c8f7324cdf30d3e610bc74484ebd5841ccd2",
+      "bytes": 4206,
+      "profile": "Candidate2 CDV; not published2",
+      "waypoint_nodes": 0,
+      "dangling_refs": [],
+      "expected": "success",
+      "reason": "metadata-only route; zero waypoints"
+    },
+    {
+      "file": "v2-GBASIC.gml",
+      "original": "Standards/S-421/2.0-CDV-support/selected-public-adjuncts/S-421/RTE-TEST-GBASIC.gml",
+      "sha256": "25bd213e920a0c533f659295a76c10a692c7270b6993fab108352c3dfa694927",
+      "bytes": 30418,
+      "profile": "Candidate2 CDV; not published2",
+      "waypoint_nodes": 10,
+      "dangling_refs": [],
+      "expected": "success",
+      "reason": "supported native route subset"
+    },
+    {
+      "file": "v2-GFULL.gml",
+      "original": "Standards/S-421/2.0-CDV-support/selected-public-adjuncts/S-421/RTE-TEST-GFULL.gml",
+      "sha256": "931d799790e4f8820cf3bea61d842babc57f93832a5afabfdfb8393e3f667814",
+      "bytes": 36102,
+      "profile": "Candidate2 CDV; not published2",
+      "waypoint_nodes": 10,
+      "dangling_refs": [],
+      "expected": "reject",
+      "reason": "missing Point/ancestor CRS; Envelope is not inherited"
+    }
+  ]
+}

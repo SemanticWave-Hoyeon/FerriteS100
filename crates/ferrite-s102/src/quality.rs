@@ -52,6 +52,69 @@ fn column<T: H5Type, const N: usize>(d: &hdf5::Dataset) -> Result<Vec<T>> {
         .map(|v| v.value)
         .collect())
 }
+// Receiver resource limits, not S-102 encoding requirements. The terminating
+// NUL is included in the HDF5 allocation forecast.
+const QUALITY_STRING_LIMIT: u64 = 16_384;
+const QUALITY_STRING_PAYLOAD_BUDGET: u64 = 64 * 1024 * 1024;
+
+fn forecast_string_column<T: H5Type, const N: usize>(
+    table: &hdf5::Dataset,
+    remaining: u64,
+) -> Result<u64> {
+    let ty = hdf5::Datatype::from_type::<Column<T, N>>()?;
+    let space = table.space()?;
+    let mut size = 0;
+    // HDF5 may allocate internal temporary buffers even during this query.
+    // This bounds accepted output payload, NOT peak RSS or HDF5 internals.
+    // The application therefore keeps decoding in its isolated worker.
+    let status = hdf5::sync::sync(|| unsafe {
+        hdf5_sys::h5d::H5Dvlen_get_buf_size(table.id(), ty.id(), space.id(), &mut size)
+    });
+    ensure!(
+        status >= 0,
+        "Cannot forecast quality string column {}",
+        FIELDS[N]
+    );
+    let row_budget = (table.size() as u64)
+        .checked_mul(QUALITY_STRING_LIMIT + 1)
+        .context("Quality string row budget overflow")?;
+    ensure!(
+        size <= row_budget.min(remaining),
+        "Quality string payload exceeds supported budget before column decode: {}",
+        FIELDS[N]
+    );
+    Ok(size)
+}
+
+fn forecast_quality_strings(
+    table: &hdf5::Dataset,
+    fields: &HashMap<String, TypeDescriptor>,
+    budget: u64,
+) -> Result<u64> {
+    let mut used = 0;
+    macro_rules! forecast {
+        ($n:literal) => {
+            if let Some(ty) = fields.get(FIELDS[$n]) {
+                let size = match ty {
+                    TypeDescriptor::VarLenAscii => {
+                        forecast_string_column::<VarLenAscii, $n>(table, budget - used)?
+                    }
+                    TypeDescriptor::VarLenUnicode => {
+                        forecast_string_column::<VarLenUnicode, $n>(table, budget - used)?
+                    }
+                    _ => anyhow::bail!("Unsupported quality string type {}", FIELDS[$n]),
+                };
+                used += size; // Each projection has already checked the remaining budget.
+            }
+        };
+    }
+    forecast!(10);
+    forecast!(11);
+    forecast!(12);
+    forecast!(13);
+    Ok(used)
+}
+
 fn decode_string_bytes(bytes: &[u8], declared_ascii: bool) -> (String, Option<String>) {
     match std::str::from_utf8(bytes) {
         Ok(value) if !declared_ascii || bytes.is_ascii() => (value.into(),None),
@@ -60,7 +123,7 @@ fn decode_string_bytes(bytes: &[u8], declared_ascii: bool) -> (String, Option<St
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct QualityRecord {
     pub id: u32,
     /// Original bytes for fields whose declared character set was inconsistent.
@@ -82,6 +145,67 @@ pub struct QualityRecord {
     pub uncertainty_type: Option<u8>,
 }
 impl QualityRecord {
+    pub fn validate_worker_record(&self) -> Result<()> {
+        self.validate_semantics()?;
+        ensure!(
+            self.data_assessment.is_none_or(|v| v <= 3),
+            "Unknown data assessment code"
+        );
+        ensure!(
+            self.uncertainty_type.is_none_or(|v| v <= 4),
+            "Unknown bathymetric uncertainty code"
+        );
+        for value in [
+            self.size_of_features_detected,
+            self.feature_size_variation,
+            self.horizontal_uncertainty_fixed,
+            self.horizontal_uncertainty_variable_factor,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(value.is_finite(), "Non-finite quality attribute");
+        }
+        ensure!(
+            self.raw_string_bytes.len() <= 4,
+            "Too many original quality string fields"
+        );
+        ensure!(
+            self.encoding_warnings.len() <= 4,
+            "Too many quality encoding warnings"
+        );
+        for (key, bytes) in &self.raw_string_bytes {
+            ensure!(
+                FIELDS[10..14].contains(&key.as_str()),
+                "Unknown original quality string field"
+            );
+            ensure!(bytes.len() <= 16_384, "Quality raw string exceeds 16KiB");
+        }
+        for warning in &self.encoding_warnings {
+            ensure!(
+                warning.len() <= 512,
+                "Quality encoding warning exceeds limit"
+            );
+        }
+        for (name, value) in [
+            (FIELDS[10], &self.survey_date_start),
+            (FIELDS[11], &self.survey_date_end),
+            (FIELDS[12], &self.source_survey_id),
+            (FIELDS[13], &self.survey_authority),
+        ] {
+            if let Some(value) = value {
+                // Invalid UTF-8 has a one-codepoint-per-byte display fallback;
+                // UTF-8 encoding can double its original byte length.
+                let limit = if self.raw_string_bytes.contains_key(name) {
+                    32_768
+                } else {
+                    16_384
+                };
+                ensure!(value.len() <= limit, "Quality display string exceeds limit");
+            }
+        }
+        Ok(())
+    }
     fn validate_semantics(&self) -> Result<()> {
         ensure!(
             !(self.full_seafloor_coverage == Some(false)
@@ -206,13 +330,30 @@ pub struct QualityCoverage {
     records: HashMap<u32, QualityRecord>,
 }
 impl QualityCoverage {
+    #[cfg(test)]
     pub(crate) fn open_optional(
         file: &hdf5::File,
         grids: &[GridGeometry],
     ) -> Result<Option<Arc<Self>>> {
+        Self::open_optional_with_records(file, grids, None)
+    }
+
+    pub(crate) fn open_optional_with_records(
+        file: &hdf5::File,
+        grids: &[GridGeometry],
+        worker_records: Option<Option<Vec<QualityRecord>>>,
+    ) -> Result<Option<Arc<Self>>> {
         if !file.link_exists("QualityOfBathymetryCoverage") {
+            ensure!(
+                worker_records.is_none_or(|r| r.is_none()),
+                "Worker reported quality attributes for a product without quality coverage"
+            );
             return Ok(None);
         }
+        ensure!(
+            !matches!(worker_records.as_ref(), Some(None)),
+            "Worker omitted quality attributes for a product with quality coverage"
+        );
         let q = file.group("QualityOfBathymetryCoverage")?;
         // S-1023.0.0 section10.2.8 inherits Table10-4 attributes. Quality remains
         // one shared instance even when bathymetry has several vertical datums.
@@ -339,140 +480,160 @@ impl QualityCoverage {
             fields.get("id") == Some(&TypeDescriptor::Unsigned(IntSize::U4)),
             "Quality id must be unsigned 32-bit"
         );
-        let mut rows: Vec<_> = column::<u32, 0>(&table)?
-            .into_iter()
-            .map(|id| QualityRecord {
-                id,
-                ..Default::default()
-            })
-            .collect();
-        macro_rules! num {
-            ($n:literal,$ty:ty,$field:ident,$desc:expr) => {
-                if let Some(t) = fields.get(FIELDS[$n]) {
-                    ensure!(*t == $desc, "Invalid quality column {} type", FIELDS[$n]);
-                    for (row, value) in rows.iter_mut().zip(column::<$ty, $n>(&table)?) {
-                        row.$field = Some(value);
-                    }
-                }
-            };
-        }
-        macro_rules! boolean {
-            ($n:literal,$field:ident) => {
-                if let Some(t) = fields.get(FIELDS[$n]) {
-                    ensure!(
-                        *t == TypeDescriptor::Unsigned(IntSize::U1),
-                        "Invalid quality boolean type"
-                    );
-                    for (row, value) in rows.iter_mut().zip(column::<u8, $n>(&table)?) {
-                        ensure!(value <= 1, "Invalid quality boolean {}", FIELDS[$n]);
-                        row.$field = Some(value == 1);
-                    }
-                }
-            };
-        }
-        num!(
-            1,
-            u8,
-            data_assessment,
-            TypeDescriptor::Unsigned(IntSize::U1)
-        );
-        boolean!(2, least_depth_measurement_capability);
-        boolean!(3, significant_feature_detection_capability);
-        num!(
-            4,
-            f32,
-            size_of_features_detected,
-            TypeDescriptor::Float(FloatSize::U4)
-        );
-        num!(
-            5,
-            f32,
-            feature_size_variation,
-            TypeDescriptor::Float(FloatSize::U4)
-        );
-        boolean!(6, full_seafloor_coverage);
-        boolean!(7, bathymetry_observed);
-        num!(
-            8,
-            f32,
-            horizontal_uncertainty_fixed,
-            TypeDescriptor::Float(FloatSize::U4)
-        );
-        num!(
-            9,
-            f32,
-            horizontal_uncertainty_variable_factor,
-            TypeDescriptor::Float(FloatSize::U4)
-        );
-        macro_rules! string {
-            ($n:literal,$field:ident) => {
-                if let Some(t) = fields.get(FIELDS[$n]) {
-                    // Validate bytes before invoking any HDF5 string as_str/Display.
-                    // Delivered files can contradict their UTF-8/ASCII declarations.
-                    let values: Vec<Vec<u8>> = match t {
-                        TypeDescriptor::VarLenAscii => column::<VarLenAscii, $n>(&table)?
-                            .into_iter()
-                            .map(|v| v.as_bytes().to_vec())
-                            .collect(),
-                        TypeDescriptor::VarLenUnicode => column::<VarLenUnicode, $n>(&table)?
-                            .into_iter()
-                            .map(|v| v.as_bytes().to_vec())
-                            .collect(),
-                        _ => anyhow::bail!("Unsupported quality string type {}", FIELDS[$n]),
-                    };
-                    for (row, bytes) in rows.iter_mut().zip(values) {
-                        ensure!(bytes.len() <= 16_384, "Quality string exceeds 16KiB");
-                        let (value, warning) =
-                            decode_string_bytes(&bytes, *t == TypeDescriptor::VarLenAscii);
-                        if let Some(warning) = warning {
-                            row.encoding_warnings
-                                .push(format!("{}: {warning}", FIELDS[$n]));
-                            row.raw_string_bytes.insert(FIELDS[$n].into(), bytes);
+        let records = if let Some(Some(rows)) = worker_records {
+            ensure!(
+                rows.len() == table.size(),
+                "Worker quality row count differs from table"
+            );
+            let mut records = HashMap::with_capacity(rows.len());
+            for row in rows {
+                row.validate_worker_record()?;
+                let id = row.id;
+                ensure!(
+                    records.insert(id, row).is_none(),
+                    "Duplicate quality record id {id}"
+                );
+            }
+            records
+        } else {
+            // Forecast every consumed string column before materializing any rows.
+            forecast_quality_strings(&table, &fields, QUALITY_STRING_PAYLOAD_BUDGET)?;
+            let mut rows: Vec<_> = column::<u32, 0>(&table)?
+                .into_iter()
+                .map(|id| QualityRecord {
+                    id,
+                    ..Default::default()
+                })
+                .collect();
+            macro_rules! num {
+                ($n:literal,$ty:ty,$field:ident,$desc:expr) => {
+                    if let Some(t) = fields.get(FIELDS[$n]) {
+                        ensure!(*t == $desc, "Invalid quality column {} type", FIELDS[$n]);
+                        for (row, value) in rows.iter_mut().zip(column::<$ty, $n>(&table)?) {
+                            row.$field = Some(value);
                         }
-                        row.$field = (!value.is_empty()).then_some(value);
                     }
+                };
+            }
+            macro_rules! boolean {
+                ($n:literal,$field:ident) => {
+                    if let Some(t) = fields.get(FIELDS[$n]) {
+                        ensure!(
+                            *t == TypeDescriptor::Unsigned(IntSize::U1),
+                            "Invalid quality boolean type"
+                        );
+                        for (row, value) in rows.iter_mut().zip(column::<u8, $n>(&table)?) {
+                            ensure!(value <= 1, "Invalid quality boolean {}", FIELDS[$n]);
+                            row.$field = Some(value == 1);
+                        }
+                    }
+                };
+            }
+            num!(
+                1,
+                u8,
+                data_assessment,
+                TypeDescriptor::Unsigned(IntSize::U1)
+            );
+            boolean!(2, least_depth_measurement_capability);
+            boolean!(3, significant_feature_detection_capability);
+            num!(
+                4,
+                f32,
+                size_of_features_detected,
+                TypeDescriptor::Float(FloatSize::U4)
+            );
+            num!(
+                5,
+                f32,
+                feature_size_variation,
+                TypeDescriptor::Float(FloatSize::U4)
+            );
+            boolean!(6, full_seafloor_coverage);
+            boolean!(7, bathymetry_observed);
+            num!(
+                8,
+                f32,
+                horizontal_uncertainty_fixed,
+                TypeDescriptor::Float(FloatSize::U4)
+            );
+            num!(
+                9,
+                f32,
+                horizontal_uncertainty_variable_factor,
+                TypeDescriptor::Float(FloatSize::U4)
+            );
+            macro_rules! string {
+                ($n:literal,$field:ident) => {
+                    if let Some(t) = fields.get(FIELDS[$n]) {
+                        // Validate bytes before invoking any HDF5 string as_str/Display.
+                        // Delivered files can contradict their UTF-8/ASCII declarations.
+                        let values: Vec<Vec<u8>> = match t {
+                            TypeDescriptor::VarLenAscii => column::<VarLenAscii, $n>(&table)?
+                                .into_iter()
+                                .map(|v| v.as_bytes().to_vec())
+                                .collect(),
+                            TypeDescriptor::VarLenUnicode => column::<VarLenUnicode, $n>(&table)?
+                                .into_iter()
+                                .map(|v| v.as_bytes().to_vec())
+                                .collect(),
+                            _ => anyhow::bail!("Unsupported quality string type {}", FIELDS[$n]),
+                        };
+                        for (row, bytes) in rows.iter_mut().zip(values) {
+                            ensure!(bytes.len() <= 16_384, "Quality string exceeds 16KiB");
+                            let (value, warning) =
+                                decode_string_bytes(&bytes, *t == TypeDescriptor::VarLenAscii);
+                            if let Some(warning) = warning {
+                                row.encoding_warnings
+                                    .push(format!("{}: {warning}", FIELDS[$n]));
+                                row.raw_string_bytes.insert(FIELDS[$n].into(), bytes);
+                            }
+                            row.$field = (!value.is_empty()).then_some(value);
+                        }
+                    }
+                };
+            }
+            string!(10, survey_date_start);
+            string!(11, survey_date_end);
+            string!(12, source_survey_id);
+            string!(13, survey_authority);
+            if let Some(t) = fields.get(FIELDS[14]) {
+                ensure!(
+                    matches!(t,TypeDescriptor::Enum(e) if e.size==IntSize::U1)
+                        || *t == TypeDescriptor::Unsigned(IntSize::U1),
+                    "Invalid uncertainty type column"
+                );
+                for (row, value) in rows.iter_mut().zip(column::<u8, 14>(&table)?) {
+                    ensure!(value <= 4, "Unknown bathymetric uncertainty code {value}");
+                    row.uncertainty_type = Some(value);
                 }
-            };
-        }
-        string!(10, survey_date_start);
-        string!(11, survey_date_end);
-        string!(12, source_survey_id);
-        string!(13, survey_authority);
-        if let Some(t) = fields.get(FIELDS[14]) {
-            ensure!(
-                matches!(t,TypeDescriptor::Enum(e) if e.size==IntSize::U1)
-                    || *t == TypeDescriptor::Unsigned(IntSize::U1),
-                "Invalid uncertainty type column"
-            );
-            for (row, value) in rows.iter_mut().zip(column::<u8, 14>(&table)?) {
-                ensure!(value <= 4, "Unknown bathymetric uncertainty code {value}");
-                row.uncertainty_type = Some(value);
             }
-        }
-        let mut records = HashMap::with_capacity(rows.len());
-        for row in rows {
-            row.validate_semantics()?;
-            ensure!(
-                row.data_assessment.is_none_or(|v| v <= 3),
-                "Unknown data assessment code"
-            );
-            for v in [
-                row.size_of_features_detected,
-                row.feature_size_variation,
-                row.horizontal_uncertainty_fixed,
-                row.horizontal_uncertainty_variable_factor,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                ensure!(v.is_finite(), "Non-finite quality attribute");
+            let mut records = HashMap::with_capacity(rows.len());
+            for row in rows {
+                row.validate_semantics()?;
+                ensure!(
+                    row.data_assessment.is_none_or(|v| v <= 3),
+                    "Unknown data assessment code"
+                );
+                for v in [
+                    row.size_of_features_detected,
+                    row.feature_size_variation,
+                    row.horizontal_uncertainty_fixed,
+                    row.horizontal_uncertainty_variable_factor,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    ensure!(v.is_finite(), "Non-finite quality attribute");
+                }
+                let id = row.id;
+                ensure!(
+                    records.insert(id, row).is_none(),
+                    "Duplicate quality record id {id}"
+                );
             }
-            let id = row.id;
-            ensure!(
-                records.insert(id, row).is_none(),
-                "Duplicate quality record id {id}"
-            );
-        }
+            records
+        };
         let domain = crate::InstanceDomain::read(&g, &geometry)?;
         // Standalone quality-adapter fixtures need not be whole products. The
         // BathymetryCoverage product entrypoint requires the root attributes.
@@ -588,6 +749,10 @@ mod tests {
     #[derive(H5Type, Clone, Copy)]
     #[repr(u8)]
     enum Uncertainty {
+        #[expect(
+            dead_code,
+            reason = "HDF5 enum descriptor retains standard unknown code 0; this fixture uses product code 3"
+        )]
         Unknown = 0,
         Product = 3,
     }
@@ -689,6 +854,100 @@ mod tests {
         )
     }
     use std::str::FromStr;
+    fn table_fields(table: &hdf5::Dataset) -> HashMap<String, TypeDescriptor> {
+        let TypeDescriptor::Compound(desc) = table.dtype().unwrap().to_descriptor().unwrap() else {
+            panic!("Expected compound table");
+        };
+        desc.fields.into_iter().map(|f| (f.name, f.ty)).collect()
+    }
+
+    #[test]
+    fn oversized_single_string_is_rejected_before_column_decode() {
+        let (path, geometry) = fixture(vec![1; 6], false, false);
+        let file = hdf5::File::open_rw(&path).unwrap();
+        let table = file
+            .dataset("QualityOfBathymetryCoverage/featureAttributeTable")
+            .unwrap();
+        let mut rows = table.read_raw::<Row>().unwrap();
+        rows[0].sourceSurveyID = VarLenAscii::from_ascii(&"x".repeat(1024 * 1024)).unwrap();
+        table.write_raw(&rows).unwrap();
+        drop(rows);
+        let error = QualityCoverage::open_optional(&file, &[geometry])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("before column decode: sourceSurveyID"),
+            "{error}"
+        );
+        drop(table);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn string_forecast_accumulates_columns_and_handles_empty_tables() {
+        let (path, _) = fixture(vec![1; 6], true, false);
+        let file = hdf5::File::open_rw(&path).unwrap();
+        let group = file.group("QualityOfBathymetryCoverage").unwrap();
+        let table = group.dataset("featureAttributeTable").unwrap();
+        let mut rows = table.read_raw::<Row>().unwrap();
+        for row in &mut rows {
+            row.sourceSurveyID = VarLenAscii::from_ascii(&"a".repeat(512)).unwrap();
+            row.surveyAuthority = VarLenUnicode::from_str(&"b".repeat(512)).unwrap();
+        }
+        table.write_raw(&rows).unwrap();
+        let fields = table_fields(&table);
+        let used = forecast_quality_strings(&table, &fields, 4096).unwrap();
+        assert_eq!(used, 2 * 2 * 513);
+        assert!(forecast_quality_strings(&table, &fields, 2048)
+            .unwrap_err()
+            .to_string()
+            .contains("before column decode: surveyAuthority"));
+        let empty = group.new_dataset::<Row>().shape(0).create("empty").unwrap();
+        assert_eq!(forecast_quality_strings(&empty, &fields, 0).unwrap(), 0);
+        drop(empty);
+        drop(table);
+        drop(group);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn worker_records_match_quality_table_and_do_not_decode_it_again() {
+        let (path, geometry) = fixture(vec![1; 6], false, false);
+        let file = hdf5::File::open_rw(&path).unwrap();
+        let original = QualityCoverage::open_optional(&file, &[geometry])
+            .unwrap()
+            .unwrap();
+        let rows = original.records().cloned().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        let injected = QualityCoverage::open_optional_with_records(
+            &file,
+            &[geometry],
+            Some(Some(rows.clone())),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(injected.record_count(), 1);
+        assert!(QualityCoverage::open_optional_with_records(
+            &file,
+            &[geometry],
+            Some(Some(Vec::new()))
+        )
+        .is_err());
+        let mut duplicate = rows.clone();
+        duplicate.push(rows[0].clone());
+        assert!(QualityCoverage::open_optional_with_records(
+            &file,
+            &[geometry],
+            Some(Some(duplicate))
+        )
+        .is_err());
+        drop(original);
+        drop(injected);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn missing_quality_metadata_and_wrong_precision_fail_before_values_loading() {
         for missing in [

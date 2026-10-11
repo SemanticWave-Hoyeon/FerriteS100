@@ -29,6 +29,7 @@ impl super::ChartApp {
         let mut ui = std::mem::take(&mut renderer.ui_state.s100_mcp);
         if ui.restart {
             ui.restart = false;
+            ui.error = false;
             self.s100_mcp.server = None;
             self.s100_mcp.signature.clear();
             self.s100_mcp.published = 0;
@@ -39,6 +40,7 @@ impl super::ChartApp {
                     Ok(s) => self.s100_mcp.server = Some(s),
                     Err(e) => {
                         ui.enabled = false;
+                        ui.error = true;
                         ui.status = format!("Could not start service: {e}");
                     }
                 }
@@ -148,10 +150,13 @@ impl super::ChartApp {
             };
             ui.approval_code = server.approval_code();
             ui.dataset_count = self.s100_mcp.published;
+            ui.preparing = self.s100_mcp.pending.is_some();
+            ui.error = self.s100_mcp.error.is_some();
         } else {
             ui.url.clear();
             ui.approval_code.clear();
             ui.dataset_count = 0;
+            ui.preparing = false;
             if !ui.enabled {
                 ui.status = "Service stopped".into();
             }

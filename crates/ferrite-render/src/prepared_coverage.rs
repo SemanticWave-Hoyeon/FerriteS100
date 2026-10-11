@@ -172,6 +172,14 @@ impl PreparedCoverage {
         }
         Ok(())
     }
+    /// Scale annotations depend on freshly selected coverage at the target
+    /// geographic view. An empty current OVERSC01 mask cannot authorize affine
+    /// navigation: panning or zooming may make a gap-selected region required.
+    pub fn requires_scale_selection_rebuild(&self) -> bool {
+        self.passes
+            .iter()
+            .any(|pass| pass.frame.scale_annotations().is_some())
+    }
     pub fn pass_count(&self) -> usize {
         self.passes.len()
     }
@@ -229,6 +237,81 @@ mod tests {
             uncovered: Region::from_polygons(vec![]).unwrap(),
         };
         Arc::new(CoverageFrame::new(&footprints, &selection, &region, [12, 12], 4096).unwrap())
+    }
+    #[test]
+    fn annotation_absence_at_current_scale_does_not_authorize_target_view_reuse() {
+        let region =
+            Region::from_rings(&[[0., 0.], [10., 0.], [10., 10.], [0., 10.], [0., 0.]], &[])
+                .unwrap();
+        let inventory = [
+            CoverageFootprint {
+                dataset_id: 0,
+                coverage_id: 0,
+                region: region.clone(),
+                scales: CoverageScaleRange {
+                    minimum_denominator: Some(45000),
+                    optimum_denominator: 22000,
+                    maximum_denominator: 12000,
+                },
+            },
+            CoverageFootprint {
+                dataset_id: 1,
+                coverage_id: 1,
+                region: Region::from_rings(
+                    &[[9., 0.], [10., 0.], [10., 10.], [9., 10.], [9., 0.]],
+                    &[],
+                )
+                .unwrap(),
+                scales: CoverageScaleRange {
+                    minimum_denominator: Some(40000),
+                    optimum_denominator: 20000,
+                    maximum_denominator: 10000,
+                },
+            },
+        ];
+        let selection = Selection {
+            display_band: 8,
+            coverages: vec![
+                SelectedCoverage {
+                    inventory_index: 0,
+                    selection_band: 7,
+                    selected_to_fill_gap: true,
+                },
+                SelectedCoverage {
+                    inventory_index: 1,
+                    selection_band: 8,
+                    selected_to_fill_gap: false,
+                },
+            ],
+            uncovered: Region::from_polygons(vec![]).unwrap(),
+        };
+        for scale in [12000., 11999.] {
+            let frame = Arc::new(
+                CoverageFrame::new_with_scale_annotations(
+                    &inventory,
+                    &selection,
+                    &region,
+                    [12, 12],
+                    4096,
+                    scale,
+                    [5., 5.],
+                )
+                .unwrap(),
+            );
+            let mask = frame
+                .scale_annotations()
+                .unwrap()
+                .overscale_pattern_mask(4096)
+                .unwrap();
+            assert_eq!(mask.is_some(), scale < 12000.);
+            let pass = PreparedCoveragePass::prepare_source_slots(frame, &[], &[]).unwrap();
+            let prepared = PreparedCoverage::new(1, 1, 0, vec![pass]).unwrap();
+            assert!(prepared.requires_scale_selection_rebuild());
+        }
+        let plain = PreparedCoveragePass::prepare_source_slots(frame(), &[], &[]).unwrap();
+        assert!(!PreparedCoverage::new(1, 1, 0, vec![plain])
+            .unwrap()
+            .requires_scale_selection_rebuild());
     }
     fn instructions() -> Vec<DrawingInstruction> {
         let mut a = DrawingInstruction::Point(PointInstruction::new(

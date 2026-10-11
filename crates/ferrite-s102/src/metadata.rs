@@ -287,12 +287,25 @@ mod tests {
             text(&f.1, "issueTime", t);
             assert!(IssueMetadata::read(&f.1).is_err(), "{t}");
         }
+        // A single-element array (UKHO 2026) is admitted as the scalar value;
+        // any other shape remains rejected.
         let f = file();
         f.1.new_attr::<VarLenAscii>()
             .shape(1)
             .create("issueDate")
             .unwrap()
             .write_raw(&[VarLenAscii::from_ascii("20240229").unwrap()])
+            .unwrap();
+        assert_eq!(IssueMetadata::read(&f.1).unwrap().date, "20240229");
+        let f = file();
+        f.1.new_attr::<VarLenAscii>()
+            .shape(2)
+            .create("issueDate")
+            .unwrap()
+            .write_raw(&[
+                VarLenAscii::from_ascii("20240229").unwrap(),
+                VarLenAscii::from_ascii("20240301").unwrap(),
+            ])
             .unwrap();
         assert!(IssueMetadata::read(&f.1).is_err());
     }

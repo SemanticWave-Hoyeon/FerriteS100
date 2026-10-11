@@ -34,6 +34,15 @@ pub enum PortrayalPath {
         sweep: f64,
         geographic_angle: bool,
     },
+    /// Centre X=longitude/Y=latitude; radii metres, clockwise true-north angles.
+    /// Appended variant preserves the existing bincode variant discriminants.
+    GeographicAnnulus {
+        center: (f64, f64),
+        outer: f64,
+        inner: f64,
+        start: f64,
+        sweep: f64,
+    },
 }
 impl PortrayalPath {
     /// Resolve connected segments as one run, keeping disjoint boundaries separate.
@@ -49,29 +58,44 @@ impl PortrayalPath {
                 stack.extend(children.iter().rev().map(|p| (p, depth + 1)));
                 continue;
             }
-            let points = path.world_points(origin, scaler);
-            if points.len() < 2 {
-                continue;
-            }
-            if let Some(previous) = runs.last_mut() {
-                // Part 9: a closed path ends the run even when the next
-                // segment starts at the same position.
-                if previous_closed || previous.first() == previous.last() {
-                    runs.push(points);
-                    previous_closed = matches!(path, Self::GeographicArc { sweep, .. } if sweep.rem_euclid(360.) == 0.);
+            let paths = if let Self::GeographicAnnulus {
+                center,
+                outer,
+                inner,
+                start,
+                sweep,
+            } = path
+            {
+                let paths =
+                    geographic_annulus_world_paths(*center, *outer, *inner, *start, *sweep, scaler);
+                if paths.is_empty() {
+                    return Vec::new();
+                }
+                paths
+            } else {
+                vec![path.world_points(origin, scaler)]
+            };
+            for points in paths {
+                if points.len() < 2 {
                     continue;
                 }
-                let a = scaler.world_to_screen(*previous.last().unwrap());
-                let b = scaler.world_to_screen(points[0]);
-                if (a.x - b.x).hypot(a.y - b.y) <= 0.001 {
-                    previous.extend(points.into_iter().skip(1));
-                    previous_closed = matches!(path, Self::GeographicArc { sweep, .. } if sweep.rem_euclid(360.) == 0.);
-                    continue;
+                let closed = points.first() == points.last()
+                    || matches!(path,Self::GeographicArc {sweep,..} if sweep.rem_euclid(360.) == 0.)
+                    || matches!(path, Self::GeographicAnnulus { .. });
+                if let Some(previous) = runs.last_mut() {
+                    if !previous_closed && previous.first() != previous.last() {
+                        let a = scaler.world_to_screen(*previous.last().unwrap());
+                        let b = scaler.world_to_screen(points[0]);
+                        if (a.x - b.x).hypot(a.y - b.y) <= 0.001 {
+                            previous.extend(points.into_iter().skip(1));
+                            previous_closed = closed;
+                            continue;
+                        }
+                    }
                 }
+                runs.push(points);
+                previous_closed = closed;
             }
-            runs.push(points);
-            previous_closed =
-                matches!(path, Self::GeographicArc { sweep, .. } if sweep.rem_euclid(360.) == 0.);
         }
         runs
     }
@@ -134,6 +158,21 @@ impl PortrayalPath {
                 sweep,
             } => {
                 return geographic_arc_world_points(*center, *radius_m, *start, *sweep, scaler);
+            }
+            Self::GeographicAnnulus {
+                center,
+                outer,
+                inner,
+                start,
+                sweep,
+            } => {
+                let mut paths =
+                    geographic_annulus_world_paths(*center, *outer, *inner, *start, *sweep, scaler);
+                return if paths.len() == 1 {
+                    paths.pop().unwrap()
+                } else {
+                    Vec::new()
+                };
             }
             Self::Group(_) => {
                 let mut p = self.world_paths(origin, scaler);
@@ -316,10 +355,301 @@ fn geographic_arc_world_points(
         }
     }
 }
+/// WGS84 annular boundaries, resolved only for the actual active viewport.
+/// Full rings have two disjoint runs; sectors have the two radial boundaries.
+fn geographic_annulus_world_paths(
+    center: (f64, f64),
+    outer: f64,
+    inner: f64,
+    start: f64,
+    sweep: f64,
+    scaler: &Scaler,
+) -> Vec<Vec<WorldPoint>> {
+    let resolve = || -> Result<Vec<Vec<WorldPoint>>, String> {
+        if ![outer, inner, start, sweep].iter().all(|v| v.is_finite())
+            || inner < 0.
+            || outer < inner
+            || sweep.abs() > 360.
+        {
+            return Err("Invalid geographic annulus parameters".into());
+        }
+        let mut outside = geographic_arc_world_points(center, outer, start, sweep, scaler);
+        if outside.len() < 2 {
+            return Err("Cannot resolve outer annulus boundary".into());
+        }
+        if sweep.abs() == 360. {
+            if inner == 0. {
+                return Ok(vec![outside]);
+            }
+            let inside = geographic_arc_world_points(center, inner, start, -sweep, scaler);
+            if inside.len() < 2 {
+                return Err("Cannot resolve inner annulus boundary".into());
+            }
+            return Ok(vec![outside, inside]);
+        }
+        let outer_start = outside[0];
+        let outer_end = *outside.last().unwrap();
+        let mut inside = if inner == 0. {
+            let c = ferrite_kernel::geodesy::GeographicPosition::new(center.1, center.0)
+                .map_err(|e| e.to_string())?;
+            vec![WorldPoint::new(
+                c.longitude_near(outer_end.x).map_err(|e| e.to_string())?,
+                c.latitude(),
+            )]
+        } else {
+            geographic_arc_world_points(center, inner, start + sweep, -sweep, scaler)
+        };
+        if inside.is_empty() {
+            return Err("Cannot resolve inner annulus boundary".into());
+        }
+        let shift = 360. * ((outer_end.x - inside[0].x) / 360.).round();
+        for p in &mut inside {
+            p.x += shift;
+        }
+        let inner_end = inside[0];
+        let inner_start = *inside.last().unwrap();
+        let mut end_ray = geographic_radial_world_points(
+            center,
+            outer,
+            inner,
+            start + sweep,
+            scaler,
+            outer_end.x,
+        )?;
+        end_ray[0] = outer_end;
+        *end_ray.last_mut().unwrap() = inner_end;
+        let mut start_ray =
+            geographic_radial_world_points(center, inner, outer, start, scaler, inner_start.x)?;
+        start_ray[0] = inner_start;
+        *start_ray.last_mut().unwrap() = outer_start;
+        outside.extend(end_ray.into_iter().skip(1));
+        outside.extend(inside.into_iter().skip(1));
+        outside.extend(start_ray.into_iter().skip(1));
+        Ok(vec![outside])
+    };
+    match resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::error!("Geographic portrayal annulus: {error}");
+            Vec::new()
+        }
+    }
+}
+/// Refine the geodesic radius against the active projection with the same
+/// quarter/midpoint chord policy as metric arcs. No longitude/latitude chord
+/// substitution and no silent vertex-budget cap.
+fn geographic_radial_world_points(
+    center: (f64, f64),
+    from: f64,
+    to: f64,
+    bearing: f64,
+    scaler: &Scaler,
+    reference: f64,
+) -> Result<Vec<WorldPoint>, String> {
+    use ferrite_kernel::geodesy::{direct, GeographicPosition};
+    let c = GeographicPosition::new(center.1, center.0).map_err(|e| e.to_string())?;
+    let at = |t: f64, reference: f64| -> Result<WorldPoint, String> {
+        let p = direct(c, bearing, from + (to - from) * t).map_err(|e| e.to_string())?;
+        Ok(WorldPoint::new(
+            p.longitude_near(reference).map_err(|e| e.to_string())?,
+            p.latitude(),
+        ))
+    };
+    let project = |p| -> Result<[f64; 2], String> {
+        let q = scaler.world_to_screen_f64(p);
+        if q.iter().all(|v| v.is_finite()) {
+            Ok(q)
+        } else {
+            Err("Non-finite annulus radius projection".into())
+        }
+    };
+    let a = at(0., reference)?;
+    let b = at(1., a.x)?;
+    let mut result = vec![a];
+    let mut stack = vec![(0., 1., a, b, 0usize)];
+    while let Some((ta, tb, a, b, depth)) = stack.pop() {
+        let pa = project(a)?;
+        let pb = project(b)?;
+        let mut error = 0f64;
+        let mut middle = a;
+        for f in [0.25, 0.5, 0.75] {
+            let p = at(ta + (tb - ta) * f, a.x + (b.x - a.x) * f)?;
+            let q = project(p)?;
+            error = error.max(
+                (q[0] - (pa[0] + (pb[0] - pa[0]) * f)).hypot(q[1] - (pa[1] + (pb[1] - pa[1]) * f)),
+            );
+            if f == 0.5 {
+                middle = p;
+            }
+        }
+        if error <= 0.125 {
+            if result.len() >= 4097 {
+                return Err("Annulus radius vertex budget exceeded".into());
+            }
+            result.push(b);
+        } else {
+            if depth >= 20 || result.len() + stack.len() + 2 > 4097 {
+                return Err("Annulus radius refinement budget exceeded".into());
+            }
+            let tm = (ta + tb) * 0.5;
+            stack.push((tm, tb, middle, b, depth + 1));
+            stack.push((ta, tm, a, middle, depth + 1));
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{GeoBounds, Viewport};
+    #[test]
+    fn geographic_annulus_rings_sectors_and_radial_boundaries_follow_metric_source() {
+        use ferrite_kernel::geodesy::{inverse, GeographicPosition};
+        let center = GeographicPosition::new(50., 179.9).unwrap();
+        for projection in [
+            crate::FlatProjection::LocalGeographic,
+            crate::FlatProjection::EllipsoidalMercator,
+        ] {
+            for zoom in [1., 500.] {
+                let mut scaler = Scaler::new(
+                    GeoBounds::new(
+                        179.9 - 1. / zoom,
+                        50. - 1. / zoom,
+                        179.9 + 1. / zoom,
+                        50. + 1. / zoom,
+                    ),
+                    Viewport::new(800., 600.),
+                );
+                scaler.set_projection(projection);
+                for sweep in [360., -360., 270., -270.] {
+                    for inner in [0., 25_000.] {
+                        let path = PortrayalPath::GeographicAnnulus {
+                            center: (179.9, 50.),
+                            outer: 50_000.,
+                            inner,
+                            start: 35.,
+                            sweep,
+                        };
+                        let runs = path.world_paths(WorldPoint::new(0., 0.), &scaler);
+                        assert_eq!(
+                            runs.len(),
+                            if sweep.abs() == 360. && inner > 0. {
+                                2
+                            } else {
+                                1
+                            }
+                        );
+                        for run in &runs {
+                            assert!((2..=16_388).contains(&run.len()));
+                            assert_eq!(run.first(), run.last());
+                            assert!(run.windows(2).all(|p| (p[0].x - p[1].x).abs() < 180.));
+                            for point in run {
+                                let position = GeographicPosition::new(
+                                    point.y,
+                                    (point.x + 180.).rem_euclid(360.) - 180.,
+                                )
+                                .unwrap();
+                                let metric = inverse(center, position).unwrap();
+                                let on_outer = (metric.distance_m - 50_000.).abs() < 1e-6;
+                                let on_inner = (metric.distance_m - inner).abs() < 1e-6;
+                                if sweep.abs() == 360. {
+                                    assert!(on_outer || on_inner);
+                                } else if !on_outer && !on_inner {
+                                    assert!(
+                                        metric.distance_m >= inner - 1e-6
+                                            && metric.distance_m <= 50_000. + 1e-6
+                                    );
+                                    let delta = |a: f64, b: f64| {
+                                        ((a - b + 180.).rem_euclid(360.) - 180.).abs()
+                                    };
+                                    assert!(
+                                        delta(metric.initial_azimuth_deg, 35.) < 1e-7
+                                            || delta(metric.initial_azimuth_deg, 35. + sweep)
+                                                < 1e-7
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn geographic_annulus_radial_projection_matches_dense_geodesic_reference() {
+        use ferrite_kernel::geodesy::{direct, GeographicPosition};
+        for projection in [
+            crate::FlatProjection::LocalGeographic,
+            crate::FlatProjection::EllipsoidalMercator,
+        ] {
+            let mut scaler = Scaler::new(
+                GeoBounds::new(178.8, 69.7, 181.2, 70.3),
+                Viewport::new(1600., 900.),
+            );
+            scaler.set_projection(projection);
+            let points = geographic_radial_world_points(
+                (179.9, 70.),
+                25_000.,
+                350_000.,
+                75.,
+                &scaler,
+                179.9,
+            )
+            .unwrap();
+            assert!(points.len() > 2);
+            let center = GeographicPosition::new(70., 179.9).unwrap();
+            let project = |p: WorldPoint| scaler.world_to_screen_f64(p);
+            for i in 0..=2000 {
+                let p = direct(center, 75., 25_000. + 325_000. * i as f64 / 2000.).unwrap();
+                let q = project(WorldPoint::new(
+                    p.longitude_near(179.9).unwrap(),
+                    p.latitude(),
+                ));
+                let distance = points
+                    .windows(2)
+                    .map(|ab| {
+                        let a = project(ab[0]);
+                        let b = project(ab[1]);
+                        let dx = b[0] - a[0];
+                        let dy = b[1] - a[1];
+                        let t = (((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / (dx * dx + dy * dy))
+                            .clamp(0., 1.);
+                        (q[0] - a[0] - t * dx).hypot(q[1] - a[1] - t * dy)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                assert!(
+                    distance < 0.25,
+                    "projection={projection:?} dense radius error={distance}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn invalid_geographic_annulus_never_returns_a_partial_group_or_invented_line() {
+        let scaler = Scaler::new(GeoBounds::new(-1., 49., 1., 51.), Viewport::new(800., 600.));
+        for (center, outer, inner, sweep) in [
+            ((0., 91.), 1000., 500., 360.),
+            ((0., 50.), 1000., 2000., 360.),
+            ((0., 50.), f64::NAN, 0., 270.),
+            ((0., 50.), 1000., 0., f64::INFINITY),
+        ] {
+            let path = PortrayalPath::Group(vec![
+                PortrayalPath::Polyline(vec![(0., 0.), (1., 1.)]),
+                PortrayalPath::GeographicAnnulus {
+                    center,
+                    outer,
+                    inner,
+                    start: 0.,
+                    sweep,
+                },
+            ]);
+            assert!(path
+                .world_paths(WorldPoint::new(0., 50.), &scaler)
+                .is_empty());
+        }
+    }
+
     #[test]
     fn geographic_metric_arc_refines_for_the_active_view_and_dense_reference() {
         use ferrite_kernel::geodesy::{inverse, GeodesicRadiusArc, GeographicPosition};

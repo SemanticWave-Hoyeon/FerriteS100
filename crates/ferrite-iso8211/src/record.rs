@@ -45,17 +45,26 @@ impl DDR {
         // Parse directory (starts after leader)
         let dir_start = Leader::SIZE;
         let dir_end = leader.base_address as usize;
-        let directory = Directory::parse(&data[dir_start..dir_end], &leader)?;
+        let record = data
+            .get(..leader.record_length as usize)
+            .ok_or(Iso8211Error::UnexpectedEof)?;
+        let directory_data = record
+            .get(dir_start..dir_end)
+            .ok_or_else(|| Iso8211Error::InvalidRecord("Directory outside record".into()))?;
+        let directory = Directory::parse(directory_data, &leader)?;
 
         // Parse field control field (first entry "0000")
         let mut field_control = None;
         let mut field_definitions = Vec::new();
 
         for entry in &directory.entries {
-            let field_start = leader.base_address as usize + entry.position as usize;
-            let field_end = field_start + entry.length as usize;
-
-            if field_end > data.len() {
+            let field_start = (leader.base_address as usize)
+                .checked_add(entry.position as usize)
+                .ok_or_else(|| Iso8211Error::InvalidField("Field position overflow".into()))?;
+            let field_end = field_start
+                .checked_add(entry.length as usize)
+                .ok_or_else(|| Iso8211Error::InvalidField("Field length overflow".into()))?;
+            if field_end > record.len() {
                 return Err(Iso8211Error::UnexpectedEof);
             }
 
@@ -156,16 +165,25 @@ impl DR {
         // Parse directory (starts after leader)
         let dir_start = Leader::SIZE;
         let dir_end = leader.base_address as usize;
-        let directory = Directory::parse(&data[dir_start..dir_end], &leader)?;
+        let record = data
+            .get(..leader.record_length as usize)
+            .ok_or(Iso8211Error::UnexpectedEof)?;
+        let directory_data = record
+            .get(dir_start..dir_end)
+            .ok_or_else(|| Iso8211Error::InvalidRecord("Directory outside record".into()))?;
+        let directory = Directory::parse(directory_data, &leader)?;
 
         // Parse fields
         let mut fields = Vec::new();
 
         for entry in &directory.entries {
-            let field_start = leader.base_address as usize + entry.position as usize;
-            let field_end = field_start + entry.length as usize;
-
-            if field_end > data.len() {
+            let field_start = (leader.base_address as usize)
+                .checked_add(entry.position as usize)
+                .ok_or_else(|| Iso8211Error::InvalidField("Field position overflow".into()))?;
+            let field_end = field_start
+                .checked_add(entry.length as usize)
+                .ok_or_else(|| Iso8211Error::InvalidField("Field length overflow".into()))?;
+            if field_end > record.len() {
                 return Err(Iso8211Error::UnexpectedEof);
             }
 
@@ -188,5 +206,33 @@ impl DR {
     /// Find all fields with given tag
     pub fn find_fields(&self, tag: &str) -> Vec<&RawField> {
         self.fields.iter().filter(|f| f.tag == tag).collect()
+    }
+}
+
+#[cfg(test)]
+mod malformed_record_bounds_tests {
+    use super::*;
+    #[test]
+    fn malformed_ddr_and_dr_offsets_return_errors_without_panicking() {
+        for identifier in [b'L', b'D'] {
+            for (length, base) in [(24, 0), (24, 23), (24, 25), (25, 26), (0, 0)] {
+                let mut bytes = *b"000243L 1 0900024   3304";
+                bytes[6] = identifier;
+                bytes[..5].copy_from_slice(format!("{length:05}").as_bytes());
+                bytes[12..17].copy_from_slice(format!("{base:05}").as_bytes());
+                let result = std::panic::catch_unwind(|| {
+                    if identifier == b'L' {
+                        DDR::parse(&bytes).map(|_| ())
+                    } else {
+                        DR::parse(&bytes).map(|_| ())
+                    }
+                });
+                assert!(
+                    result.is_ok(),
+                    "parser panicked for length={length}, base={base}"
+                );
+                assert!(result.unwrap().is_err());
+            }
+        }
     }
 }

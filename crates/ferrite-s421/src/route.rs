@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::haversine;
+use crate::{
+    navigation::{evaluate_leg, LegMetrics},
+    s421::LegGeometry,
+};
 
 /// A route consisting of waypoints
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -37,10 +40,14 @@ impl Route {
     }
 
     /// Get next waypoint ID and increment
-    pub fn next_id(&mut self) -> u32 {
+    pub fn next_id(&mut self) -> Option<u32> {
         let id = self.next_id;
-        self.next_id += 1;
-        id
+        if id == 0 {
+            return None;
+        }
+        let next = id.checked_add(1)?;
+        self.next_id = next;
+        Some(id)
     }
 
     /// Set the next ID counter (used after import)
@@ -74,27 +81,34 @@ impl Route {
         self.next_id = 1;
     }
 
-    /// Calculate total route distance in nautical miles
-    pub fn total_distance(&self) -> f64 {
-        if self.waypoints.len() < 2 {
-            return 0.0;
-        }
-
+    /// Metrics from each explicitly declared incoming leg. Unknown is not a geodesic default.
+    pub fn leg_metrics(&self) -> Vec<Option<LegMetrics>> {
         self.waypoints
             .windows(2)
-            .map(|pair| haversine::distance(pair[0].lat, pair[0].lon, pair[1].lat, pair[1].lon))
-            .sum()
+            .map(|pair| {
+                let geometry = pair[1].incoming_geometry?;
+                evaluate_leg(
+                    [pair[0].lon, pair[0].lat],
+                    [pair[1].lon, pair[1].lat],
+                    geometry,
+                )
+                .ok()
+            })
+            .collect()
     }
 
-    /// Get leg distances
-    pub fn leg_distances(&self) -> Vec<f64> {
-        if self.waypoints.len() < 2 {
-            return Vec::new();
-        }
+    /// WGS84 nautical miles, unavailable if any leg is undeclared or cannot be evaluated.
+    pub fn total_distance(&self) -> Option<f64> {
+        self.leg_metrics().iter().try_fold(0.0, |sum, metric| {
+            let sum = sum + metric.as_ref()?.distance_nm;
+            sum.is_finite().then_some(sum)
+        })
+    }
 
-        self.waypoints
-            .windows(2)
-            .map(|pair| haversine::distance(pair[0].lat, pair[0].lon, pair[1].lat, pair[1].lon))
+    pub fn leg_distances(&self) -> Vec<Option<f64>> {
+        self.leg_metrics()
+            .into_iter()
+            .map(|metric| metric.map(|m| m.distance_nm))
             .collect()
     }
 
@@ -122,6 +136,9 @@ pub struct Waypoint {
     pub name: Option<String>,
     /// Turn radius (nautical miles)
     pub turn_radius: Option<f64>,
+    /// Original declared geometry of the leg arriving at this waypoint.
+    #[serde(default)]
+    pub incoming_geometry: Option<LegGeometry>,
 }
 
 impl Waypoint {
@@ -132,6 +149,7 @@ impl Waypoint {
             lat,
             name: None,
             turn_radius: None,
+            incoming_geometry: None,
         }
     }
 
@@ -162,9 +180,17 @@ fn format_dms(decimal_degrees: f64, is_lat: bool) -> String {
     let seconds = (minutes_full - minutes as f64) * 60.0;
 
     let dir = if is_lat {
-        if decimal_degrees >= 0.0 { "N" } else { "S" }
+        if decimal_degrees >= 0.0 {
+            "N"
+        } else {
+            "S"
+        }
     } else {
-        if decimal_degrees >= 0.0 { "E" } else { "W" }
+        if decimal_degrees >= 0.0 {
+            "E"
+        } else {
+            "W"
+        }
     };
 
     if is_lat {
@@ -183,12 +209,14 @@ mod tests {
         let mut route = Route::new(1);
         assert!(route.is_empty());
 
-        route.add_waypoint(Waypoint::new(route.next_id(), 129.0, 35.0));
-        route.add_waypoint(Waypoint::new(route.next_id(), 129.1, 35.1));
+        let first = route.next_id().unwrap();
+        route.add_waypoint(Waypoint::new(first, 129.0, 35.0));
+        let second = route.next_id().unwrap();
+        route.add_waypoint(Waypoint::new(second, 129.1, 35.1));
         assert_eq!(route.len(), 2);
 
         let dist = route.total_distance();
-        assert!(dist > 0.0);
+        assert_eq!(dist, None); // Coordinates alone do not declare the route curve.
 
         route.clear();
         assert!(route.is_empty());

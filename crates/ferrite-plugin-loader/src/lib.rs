@@ -9,12 +9,14 @@ mod error;
 mod host_impl;
 mod loader;
 mod manager;
+mod snapshot;
 mod verifier;
 
 pub use error::PluginError;
 pub use host_impl::{create_host_api, HostContext, SharedHostContext};
 pub use loader::PluginLoader;
 pub use manager::PluginManager;
+pub use snapshot::PluginLibrary;
 pub use verifier::PluginVerifier;
 
 use serde::{Deserialize, Serialize};

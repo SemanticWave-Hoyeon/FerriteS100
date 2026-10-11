@@ -66,7 +66,10 @@ impl From<&CatalogueStatus> for CatalogueStatusUi {
                 loaded: false,
                 message: "Loading...".to_string(),
             },
-            CatalogueStatus::Loaded { version, feature_count } => Self {
+            CatalogueStatus::Loaded {
+                version,
+                feature_count,
+            } => Self {
                 loaded: true,
                 message: format!("v{} ({} items)", version, feature_count),
             },
@@ -89,6 +92,11 @@ pub struct WaypointUi {
     pub position: String,
     /// Distance to next waypoint (if applicable)
     pub leg_distance: Option<String>,
+    pub leg_geometry: Option<crate::s421::LegGeometry>,
+    /// Encoded/local explicit nautical miles; absence stays unentered.
+    pub turn_radius_nm: Option<f64>,
+    pub initial_bearing_deg: Option<f64>,
+    pub final_bearing_deg: Option<f64>,
 }
 
 /// Action button
@@ -127,6 +135,12 @@ pub enum UiEvent {
     RenameWaypoint { id: u32, name: String },
     /// Toggle rendering on/off
     ToggleRendering,
+    /// Explicit nautical-mile decimal; preserved as text until published validation.
+    SetTurnRadius { id: u32, radius_nm: String },
+    SetLegGeometry {
+        id: u32,
+        geometry: crate::s421::LegGeometry,
+    },
 }
 
 /// Build UI data from route state
@@ -139,15 +153,32 @@ pub fn build_ui_data(
     fc_status: &CatalogueStatus,
     pc_status: &CatalogueStatus,
 ) -> UiData {
+    // One numerical evaluation per leg per UI publication, shared by route totals and rows.
+    let metrics: Vec<_> = routes.iter().map(Route::leg_metrics).collect();
+    let totals: Vec<Option<f64>> = metrics
+        .iter()
+        .map(|legs| {
+            legs.iter().try_fold(0.0, |sum, leg| {
+                let sum = sum + leg.as_ref()?.distance_nm;
+                sum.is_finite().then_some(sum)
+            })
+        })
+        .collect();
     // Build route list
     let routes_ui: Vec<RouteUi> = routes
         .iter()
         .enumerate()
         .map(|(idx, route)| RouteUi {
             id: route.id,
-            name: route.name.clone().unwrap_or_else(|| format!("Route {}", route.id)),
+            name: route
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Route {}", route.id)),
             waypoint_count: route.waypoints.len(),
-            total_distance: format_distance(route.total_distance(), settings.distance_unit),
+            total_distance: totals[idx].map_or_else(
+                || "Unavailable (leg geometry unspecified or unsupported)".into(),
+                |d| format_distance(d, settings.distance_unit),
+            ),
             active: active_route_index == Some(idx),
         })
         .collect();
@@ -156,22 +187,26 @@ pub fn build_ui_data(
     let active_route = active_route_index.and_then(|i| routes.get(i));
 
     let (waypoints, total_distance, waypoint_count) = if let Some(route) = active_route {
-        let distances = route.leg_distances();
+        let active_metrics = &metrics[active_route_index.unwrap()];
+        let distances: Vec<_> = active_metrics
+            .iter()
+            .map(|m| m.map(|m| m.distance_nm))
+            .collect();
 
         let waypoints: Vec<WaypointUi> = route
             .waypoints
             .iter()
             .enumerate()
             .map(|(i, wp)| {
-                let name = wp
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("WP {}", i + 1));
+                let name = wp.name.clone().unwrap_or_else(|| format!("WP {}", i + 1));
 
                 // Show distance FROM previous waypoint (not TO next)
                 // First waypoint has no incoming distance
                 let leg_distance = if i > 0 {
-                    Some(format_distance(distances[i - 1], settings.distance_unit))
+                    Some(distances[i - 1].map_or_else(
+                        || "Unavailable".into(),
+                        |d| format_distance(d, settings.distance_unit),
+                    ))
                 } else {
                     None
                 };
@@ -181,11 +216,24 @@ pub fn build_ui_data(
                     name,
                     position: wp.format_dms(),
                     leg_distance,
+                    leg_geometry: wp.incoming_geometry,
+                    turn_radius_nm: wp.turn_radius,
+                    initial_bearing_deg: i
+                        .checked_sub(1)
+                        .and_then(|i| active_metrics[i])
+                        .and_then(|m| m.initial_bearing_deg),
+                    final_bearing_deg: i
+                        .checked_sub(1)
+                        .and_then(|i| active_metrics[i])
+                        .and_then(|m| m.final_bearing_deg),
                 }
             })
             .collect();
 
-        let total_distance = format_distance(route.total_distance(), settings.distance_unit);
+        let total_distance = totals[active_route_index.unwrap()].map_or_else(
+            || "Unavailable (leg geometry unspecified or unsupported)".into(),
+            |d| format_distance(d, settings.distance_unit),
+        );
         let waypoint_count = route.len();
 
         (waypoints, total_distance, waypoint_count)
@@ -230,7 +278,11 @@ pub fn build_ui_data(
     });
 
     UiData {
-        title: if editing { "Route Plan (Editing)".to_string() } else { "Route Plan".to_string() },
+        title: if editing {
+            "Route Plan (Editing)".to_string()
+        } else {
+            "Route Plan".to_string()
+        },
         rendering_enabled,
         editing,
         routes: routes_ui,

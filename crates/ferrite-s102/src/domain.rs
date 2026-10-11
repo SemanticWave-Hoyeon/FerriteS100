@@ -175,7 +175,7 @@ impl InstanceDomain {
                 a.dtype()?.to_descriptor()? == TypeDescriptor::Float(FloatSize::U4),
                 "Instance bbox must use float32"
             );
-            encoded[i] = a.read_scalar::<f32>()?;
+            encoded[i] = crate::singleton::read::<f32>(&a)?;
         }
         ensure!(
             encoded.iter().all(|v| v.is_finite())

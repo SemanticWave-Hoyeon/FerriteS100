@@ -4,8 +4,9 @@
 
 use std::path::Path;
 
+use crate::snapshot::{canonical_root, capture_regular, PrivateSnapshot, MAX_PLUGIN_BYTES};
+use crate::PluginLibrary;
 use abi_stable::std_types::RBox;
-use libloading::Library;
 use tracing::{debug, info, warn};
 
 use ferrite_plugin_api::{
@@ -35,18 +36,12 @@ impl PluginLoader {
     pub fn load_plugin(
         &self,
         plugin_dir: &Path,
-    ) -> Result<(PluginManifest, Library, Plugin_TO<'static, RBox<()>>), PluginError> {
-        // Load manifest
-        let manifest_path = plugin_dir.join("manifest.json");
-        if !manifest_path.exists() {
-            return Err(PluginError::ManifestNotFound(
-                manifest_path.display().to_string(),
-            ));
-        }
-
-        let manifest_content = std::fs::read_to_string(&manifest_path)?;
-        let manifest: PluginManifest = serde_json::from_str(&manifest_content)
-            .map_err(|e| PluginError::InvalidManifest(e.to_string()))?;
+    ) -> Result<(PluginManifest, PluginLibrary, Plugin_TO<'static, RBox<()>>), PluginError> {
+        self.verifier.ensure_loading_allowed()?;
+        let plugin_dir = canonical_root(plugin_dir)?;
+        let manifest_bytes = capture_regular(&plugin_dir, "manifest.json", 64 * 1024)?;
+        let manifest: PluginManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| PluginError::InvalidManifest(error.to_string()))?;
 
         info!("Loading plugin: {} v{}", manifest.name, manifest.version);
 
@@ -58,25 +53,18 @@ impl PluginLoader {
             });
         }
 
-        // Locate DLL
-        let dll_path = plugin_dir.join(&manifest.dll_file);
-        if !dll_path.exists() {
-            return Err(PluginError::LoadError(format!(
-                "DLL not found: {}",
-                dll_path.display()
-            )));
-        }
-
-        // Verify hash
-        self.verifier.verify_hash(&dll_path, &manifest.dll_hash)?;
-
-        // Verify signature (if required)
-        self.verifier.verify_signature(&dll_path)?;
-
-        // Load DLL
-        debug!("Loading DLL: {}", dll_path.display());
-        let library = unsafe { Library::new(&dll_path) }
-            .map_err(|e| PluginError::LoadError(e.to_string()))?;
+        // Capture once; hash/signature authorize this exact owned byte sequence.
+        let captured = capture_regular(&plugin_dir, &manifest.dll_file, MAX_PLUGIN_BYTES)?;
+        self.verifier
+            .verify_hash_bytes(&captured, &manifest.dll_hash)?;
+        let signature = self
+            .verifier
+            .capture_signature(&plugin_dir, &manifest.dll_file)?;
+        self.verifier
+            .verify_signature_bytes(&captured, signature.as_deref())?;
+        let snapshot = PrivateSnapshot::new(&manifest.dll_file, &captured)?;
+        debug!("Loading verified private plugin snapshot");
+        let library = unsafe { PluginLibrary::load(snapshot) }?;
 
         // Get plugin module
         let get_module: GetPluginModuleFn = unsafe {
@@ -120,10 +108,13 @@ impl PluginLoader {
         // Simple semver comparison (major.minor.patch)
         let parse_version = |v: &str| -> Option<(u32, u32, u32)> {
             let parts: Vec<&str> = v.split('.').collect();
-            if parts.len() >= 2 {
+            if matches!(parts.len(), 2 | 3) {
                 let major = parts[0].parse().ok()?;
                 let minor = parts[1].parse().ok()?;
-                let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+                let patch = match parts.get(2) {
+                    Some(p) => p.parse().ok()?,
+                    None => 0,
+                };
                 Some((major, minor, patch))
             } else {
                 None
@@ -144,7 +135,7 @@ impl PluginLoader {
                     "Could not parse versions: host={}, required={}",
                     self.host_version, min_version
                 );
-                true // Allow if version parsing fails
+                false // Invalid minimum versions do not authorize loading
             }
         }
     }
@@ -162,5 +153,8 @@ mod tests {
         assert!(loader.check_version_compatibility("0.2.0"));
         assert!(!loader.check_version_compatibility("0.3.0"));
         assert!(!loader.check_version_compatibility("1.0.0"));
+        for invalid in ["invalid", "0.2.bad", "0.2.0.4", "", "0"] {
+            assert!(!loader.check_version_compatibility(invalid));
+        }
     }
 }
