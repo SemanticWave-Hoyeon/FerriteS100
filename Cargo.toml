@@ -36,7 +36,7 @@ nom = "8"
 bytes = "1"
 encoding_rs = "0.8"
 quick-xml = { version = "0.37", features = ["serialize"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 
 # Geometry
 geo-types = "0.7"
@@ -172,6 +172,12 @@ hdf5 = { package = "hdf5-metno", version = "=0.14.1", features = ["static", "zli
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# ARMv8 SHA-256 instructions (runtime-detected, software fallback) for cache and
+# signature hashing; x86 already selects SHA-NI at runtime. sha2-asm does not
+# build for MSVC, so Windows on ARM keeps the portable code.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
 
 # Windows system APIs (for debug info)
 [target.'cfg(windows)'.dependencies]

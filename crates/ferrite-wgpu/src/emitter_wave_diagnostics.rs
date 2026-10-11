@@ -471,7 +471,7 @@ mod ordered_line_controls {
         let c = collector_with_ordered_lines(None, Some("1".as_ref())).unwrap();
         let first = line();
         let mut second = line();
-        second.style.width = first.style.width + 1.;
+        second.style_mut().width = first.style.width + 1.;
         assert_ne!(first.style.width.to_bits(), second.style.width.to_bits());
         {
             let mut call = Call::new(&c, [0; 5]);
@@ -498,7 +498,7 @@ mod ordered_line_controls {
                 .begin_ordinary_line(0, &original, false, 1, true, [0; 4])
                 .is_none());
             let mut styled = line();
-            styled.style.offset_mm = 1.;
+            styled.style_mut().offset_mm = 1.;
             assert!(call
                 .begin_ordinary_line(1, &styled, true, 1, true, [0; 4])
                 .is_none());
@@ -551,7 +551,7 @@ mod ordered_line_boundary_controls {
             for ordinal in 0..3 {
                 let mut l = ordinary();
                 if ordinal == 1 {
-                    l.style.offset_mm = 1.;
+                    l.style_mut().offset_mm = 1.;
                 }
                 if let Some(t) = call.begin_ordinary_line(ordinal, &l, true, 1, true, [0; 4]) {
                     call.finish_ordinary_line(t, [4, 6, 0, 0], true);

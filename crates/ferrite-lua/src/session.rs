@@ -647,7 +647,11 @@ impl PortrayalEngine {
 
     /// Set type catalogue (from Feature Catalogue)
     pub fn set_type_catalogue(&mut self, catalogue: TypeCatalogue) {
-        let catalogue = Arc::new(catalogue);
+        self.set_shared_type_catalogue(Arc::new(catalogue));
+    }
+
+    /// Share one immutable type catalogue between engines (e.g. one per thread).
+    pub fn set_shared_type_catalogue(&mut self, catalogue: Arc<TypeCatalogue>) {
         self.type_catalogue = Some(Arc::clone(&catalogue));
         self.session.host.set_shared_type_catalogue(catalogue);
     }

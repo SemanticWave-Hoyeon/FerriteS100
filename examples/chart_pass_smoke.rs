@@ -79,18 +79,18 @@ impl ApplicationHandler for Smoke {
         std::fs::create_dir_all(&self.output).unwrap();
         let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         ctx.set_bounds(GeoBounds::new(0., 0., 10., 10.));
-        ctx.add_instruction(DrawingInstruction::Area(rectangle(
+        ctx.add_instruction(DrawingInstruction::Area(Box::new(rectangle(
             2.,
             2.,
             6.,
             6.,
             Color::rgb(1., 0., 0.),
             8,
-        )));
-        ctx.add_instruction(DrawingInstruction::Area(
+        ))));
+        ctx.add_instruction(DrawingInstruction::Area(Box::new(
             rectangle(4., 2., 2., 6., Color::rgb(1., 1., 0.), 0)
                 .with_display_plane(DisplayPlane::OverRadar),
-        ));
+        )));
         for (y, color, priority, width) in [
             (5., Color::rgb(0., 0., 1.), 2, 20.),
             (4., Color::rgb(0., 1., 0.), 9, 8.),
@@ -137,22 +137,22 @@ impl ApplicationHandler for Smoke {
         renderer.clear_raster_layers();
         let mut wrapped = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         wrapped.set_bounds(GeoBounds::new(0., 0., 1080., 10.));
-        wrapped.add_instruction(DrawingInstruction::Area(rectangle(
+        wrapped.add_instruction(DrawingInstruction::Area(Box::new(rectangle(
             100.,
             1.,
             100.,
             8.,
             Color::rgb(1., 0., 0.),
             2,
-        )));
-        wrapped.add_instruction(DrawingInstruction::Area(rectangle(
+        ))));
+        wrapped.add_instruction(DrawingInstruction::Area(Box::new(rectangle(
             460.,
             1.,
             100.,
             8.,
             Color::rgb(0., 0., 1.),
             8,
-        )));
+        ))));
         check(
             &mut renderer,
             &mut wrapped,
@@ -201,20 +201,20 @@ impl ApplicationHandler for Smoke {
         clipped.set_bounds(GeoBounds::new(0., 0., 10., 10.));
         renderer.set_world_map(vec![vec![[-100., 5.], [100., 5.]]]);
         renderer.set_world_map_chart_boxes(Vec::new());
-        clipped.add_instruction(DrawingInstruction::Area(rectangle(
+        clipped.add_instruction(DrawingInstruction::Area(Box::new(rectangle(
             -1.,
             -1.,
             12.,
             12.,
             Color::rgb(0., 1., 1.),
             0,
-        )));
-        clipped.add_instruction(DrawingInstruction::Text(
+        ))));
+        clipped.add_instruction(DrawingInstruction::Text(Box::new(
             ferrite_render::TextInstruction::new("EDGE".into(), WorldPoint::new(0., 8.))
                 .with_font_size(36.)
                 .with_color(Color::BLACK)
                 .with_priority(1),
-        ));
+        )));
         clipped.add_instruction(DrawingInstruction::Line(
             LineInstruction::new(vec![WorldPoint::new(-100., 2.), WorldPoint::new(100., 2.)])
                 .with_style(LineStyle::solid(Color::BLACK, 30.))

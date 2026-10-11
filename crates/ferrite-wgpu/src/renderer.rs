@@ -341,13 +341,13 @@ mod area_retention_tests {
     use super::*;
     fn context() -> RenderContext {
         let mut c = RenderContext::new(ferrite_render::Viewport::new(800., 600.));
-        c.set_instructions_from_cache(vec![ferrite_render::DrawingInstruction::Area(
+        c.set_instructions_from_cache(vec![ferrite_render::DrawingInstruction::Area(Box::new(
             ferrite_render::AreaInstruction::new(vec![
                 WorldPoint::new(0., 0.),
                 WorldPoint::new(1., 0.),
                 WorldPoint::new(0., 1.),
             ]),
-        )]);
+        ))]);
         c.get_sorted_instructions();
         c
     }
@@ -1863,6 +1863,8 @@ impl WgpuRenderer {
                     "FERRITE_STATIC_SOURCE_CLASSIFICATION",
                 )
                 .map_or(true, |v| v != "0"),
+                cell_culling_enabled: std::env::var("FERRITE_CELL_CULLING")
+                    .map_or(true, |v| v != "0"),
                 suppression_tail: suppression_tail_enabled
                     .then(crate::suppression_tail::Collector::default),
                 symbol_class_cache: FxHashMap::with_capacity_and_hasher(256, Default::default()),
@@ -2151,8 +2153,24 @@ impl WgpuRenderer {
 
     /// Pre-compute triangulations for all area instructions.
     /// Call after chart load to avoid cold-path stalls during first render frame.
-    pub fn precompute_triangulations(&mut self, context: &RenderContext) {
+    /// Triangulate this context's areas on several threads (no emission).
+    /// Calling it before the first scene keeps that scene off the cold path.
+    pub fn prefill_area_triangulations(&mut self, context: &RenderContext) {
         self.bind_triangulation_context(context);
+        let areas: Vec<_> = context
+            .raw_instructions()
+            .iter()
+            .filter_map(|i| match i {
+                ferrite_render::DrawingInstruction::Area(area) => Some(&**area),
+                _ => None,
+            })
+            .collect();
+        self.vector_emission
+            .prefill_triangulations(&areas, context.scaler.projection());
+    }
+
+    pub fn precompute_triangulations(&mut self, context: &RenderContext) {
+        self.prefill_area_triangulations(context);
         let mut count = 0;
         for instr in context.raw_instructions() {
             if let ferrite_render::DrawingInstruction::Area(area) = instr {
@@ -7496,6 +7514,8 @@ struct VectorEmissionOwned {
     dense_area_candidates_baseline: bool,
     static_line_bounds: crate::static_line_bounds::Cache,
     static_source_classification_enabled: bool,
+    /// Skip cells outside the view; `FERRITE_CELL_CULLING=0` visits all.
+    cell_culling_enabled: bool,
     suppression_tail: Option<crate::suppression_tail::Collector>,
     symbol_class_cache: FxHashMap<SymbolId, u8>,
     symbol_textures: HashMap<(u64, ferrite_render::SymbolId), SymbolTexture>,
@@ -8933,10 +8953,26 @@ impl VectorEmissionOwned {
             wave.begin_dispatch();
         }
         let cpu_dispatch_start = profiling.then(std::time::Instant::now);
-        for inst_idx in crate::compact_owner_admission::Ordinals::new(
-            instructions.len(),
-            compact_frame.as_ref(),
-        ) {
+        // Visit only cells whose source bounds meet the view (same 50% margin
+        // and longitude copies as the per-instruction culling below); their
+        // ordinals are merged in ascending order, so drawing order is kept.
+        let culled = (compact_frame.is_none() && self.cell_culling_enabled)
+            .then(|| {
+                let bounds = self.vector_frame.viewport_world_bounds;
+                let wrapping = self.vector_frame.lon_wrap_screen_px > 0.;
+                context
+                    .cell_ordinal_index()
+                    .visible_ordinals(|b| longitude_bounds_visible(b, bounds, wrapping))
+            })
+            .flatten();
+        let ordinals = match culled {
+            Some(list) => crate::compact_owner_admission::Ordinals::Culled(list.into_iter()),
+            None => crate::compact_owner_admission::Ordinals::new(
+                instructions.len(),
+                compact_frame.as_ref(),
+            ),
+        };
+        for inst_idx in ordinals {
             let instruction = &instructions[inst_idx];
             if let Some(wave) = &mut emitter_wave {
                 wave.visit(instruction);
@@ -9717,6 +9753,30 @@ impl VectorEmissionOwned {
                 .cold_evaluations
                 .saturating_add(1);
         }
+        let cached = match Self::triangulate_area(area, projection) {
+            Ok(cached) => cached,
+            Err(error) => {
+                self.triangulation_failures.insert(cache_key);
+                tracing::warn!("Area fill rejected without exterior fallback: {error}");
+                return None;
+            }
+        };
+
+        self.triangulation_cache.insert(
+            cache_key,
+            if self.area_triangulation_reuse_enabled {
+                TriangulationStorage::Shared(Arc::new(cached))
+            } else {
+                TriangulationStorage::Owned(cached)
+            },
+        );
+        Some(cache_key)
+    }
+    /// Pure, thread-safe triangulation of one area in the flat projection.
+    fn triangulate_area(
+        area: &ferrite_render::AreaInstruction,
+        projection: ferrite_render::FlatProjection,
+    ) -> std::result::Result<CachedTriangulation, String> {
         let triangulated = (|| -> std::result::Result<(Vec<f64>, Vec<usize>), String> {
             let project_ring = |ring: &[WorldPoint]| {
                 let points: Vec<_> = ring
@@ -9735,7 +9795,7 @@ impl VectorEmissionOwned {
                 .map_err(|e| e.to_string())?;
             Ok((vertices, indices))
         })();
-        let (mut vertices, indices) = match triangulated.and_then(|(vertices, indices)| {
+        let (mut vertices, indices) = triangulated.and_then(|(vertices, indices)| {
             // Exact-size u32 copy; GPU index buffers are u32 as well.
             let indices = indices
                 .into_iter()
@@ -9743,14 +9803,7 @@ impl VectorEmissionOwned {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|_| "Area triangulation exceeds u32 indices".to_string())?;
             Ok((vertices, indices))
-        }) {
-            Ok(result) => result,
-            Err(error) => {
-                self.triangulation_failures.insert(cache_key);
-                tracing::warn!("Area fill rejected without exterior fallback: {error}");
-                return None;
-            }
-        };
+        })?;
 
         // Compute world AABB for frustum culling
         let mut aabb_min_x = f64::MAX;
@@ -9776,7 +9829,7 @@ impl VectorEmissionOwned {
         }
 
         vertices.shrink_to_fit();
-        let cached = CachedTriangulation {
+        Ok(CachedTriangulation {
             indices,
             world_vertices: vertices,
             world_aabb: (
@@ -9785,17 +9838,75 @@ impl VectorEmissionOwned {
                 aabb_max_x,
                 projection.unproject_y(aabb_max_y),
             ),
-        };
+        })
+    }
 
-        self.triangulation_cache.insert(
-            cache_key,
+    /// Triangulate every not-yet-cached distinct area geometry on several
+    /// threads, then record results (and rejections) in source order, so the
+    /// cache contents are exactly those of sequential `ensure_triangulated`.
+    fn prefill_triangulations(
+        &mut self,
+        areas: &[&ferrite_render::AreaInstruction],
+        projection: ferrite_render::FlatProjection,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        let pending: Vec<_> = areas
+            .iter()
+            .map(|area| (WgpuRenderer::area_geometry_key(area, projection), *area))
+            .filter(|(key, _)| {
+                !self.triangulation_cache.contains_key(key)
+                    && !self.triangulation_failures.contains(key)
+                    && seen.insert(*key)
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(8)
+            .min(pending.len());
+        let chunk = pending.len().div_ceil(workers);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = pending
+                .chunks(chunk)
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|(_, area)| Self::triangulate_area(area, projection))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("triangulation worker panicked"))
+                .collect()
+        });
+        for ((key, _), result) in pending.into_iter().zip(results) {
             if self.area_triangulation_reuse_enabled {
-                TriangulationStorage::Shared(Arc::new(cached))
-            } else {
-                TriangulationStorage::Owned(cached)
-            },
-        );
-        Some(cache_key)
+                self.retained_area_triangulations.cold_evaluations = self
+                    .retained_area_triangulations
+                    .cold_evaluations
+                    .saturating_add(1);
+            }
+            match result {
+                Ok(cached) => {
+                    self.triangulation_cache.insert(
+                        key,
+                        if self.area_triangulation_reuse_enabled {
+                            TriangulationStorage::Shared(Arc::new(cached))
+                        } else {
+                            TriangulationStorage::Owned(cached)
+                        },
+                    );
+                }
+                Err(error) => {
+                    self.triangulation_failures.insert(key);
+                    tracing::warn!("Area fill rejected without exterior fallback: {error}");
+                }
+            }
+        }
     }
     fn add_area_cached(
         &mut self,
@@ -10923,6 +11034,7 @@ impl VectorEmissionOwned {
             dense_area_candidates_baseline: self.dense_area_candidates_baseline,
             static_line_bounds: self.static_line_bounds.fork_cold(),
             static_source_classification_enabled: self.static_source_classification_enabled,
+            cell_culling_enabled: self.cell_culling_enabled,
             suppression_tail: None,
             symbol_class_cache: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             symbol_textures: HashMap::with_capacity(100),
@@ -11471,6 +11583,7 @@ mod private_vector_emitter_ownership_tests {
             dense_area_candidates_baseline: false,
             static_line_bounds: crate::static_line_bounds::Cache::new(None),
             static_source_classification_enabled: false,
+            cell_culling_enabled: false,
             suppression_tail: None,
             symbol_class_cache: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             symbol_textures: HashMap::with_capacity(100),

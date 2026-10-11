@@ -361,8 +361,8 @@ mod light_line_tests {
                     length_mm: 25.,
                     geographic_direction: true,
                 });
-                line.style = LineStyle::solid_mm(Color::BLACK, 0.32);
-                line.style.dash_pattern = vec![3.6, 1.8];
+                line.style = std::sync::Arc::new(LineStyle::solid_mm(Color::BLACK, 0.32));
+                line.style_mut().dash_pattern = vec![3.6, 1.8];
                 let p = line.render_points(&scaler);
                 let a = scaler.world_to_screen(p[0]);
                 let b = scaler.world_to_screen(p[1]);
@@ -434,8 +434,8 @@ mod explicit_cycle_tests {
                 s.screen_to_world(ScreenPoint::new(a.x + (mm * s.pixels_per_mm()) as f32, a.y))
             };
             let mut line = LineInstruction::new(vec![origin, point(3.), point(25.)]);
-            line.style = LineStyle::solid_mm(Color::BLACK, 0.32);
-            line.style.dash_cycle = Some(DashCycle::new(10., [(2., 2.), (6., 1.)]).unwrap());
+            line.style = std::sync::Arc::new(LineStyle::solid_mm(Color::BLACK, 0.32));
+            line.style_mut().dash_cycle = Some(DashCycle::new(10., [(2., 2.), (6., 1.)]).unwrap());
             let inst = DrawingInstruction::Line(line);
             for (x, hit) in [
                 (1., false),

@@ -37,8 +37,8 @@ impl ApplicationHandler for App {
             length_mm: 25.,
             geographic_direction: true,
         });
-        line.style = LineStyle::solid_mm(Color::rgb(0., 0., 1.), 0.32);
-        line.style.dash_pattern = vec![3.6, 1.8];
+        line.style = std::sync::Arc::new(LineStyle::solid_mm(Color::rgb(0., 0., 1.), 0.32));
+        line.style_mut().dash_pattern = vec![3.6, 1.8];
         c.add_instruction(DrawingInstruction::Line(line));
         r.begin_frame();
         r.add_instructions(&mut c);

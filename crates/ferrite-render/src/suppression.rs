@@ -820,9 +820,15 @@ impl LineSuppressionCache {
                 })
                 .sum::<usize>();
             let mut staged_index = None;
+            // Fixed floors keep small charts unchanged; large chart sets get
+            // budgets in proportion to their instruction list instead of
+            // silently falling back to per-frame planning.
+            let scaled = |floor: usize| floor.max(instructions.len().saturating_mul(128));
+            let (transform_budget, compiler_budget) =
+                (scaled(64 * 1024 * 1024), scaled(32 * 1024 * 1024));
             let compiled = if base
                 .saturating_add(points.saturating_mul(std::mem::size_of::<WorldPoint>()))
-                <= 64 * 1024 * 1024
+                <= transform_budget
             {
                 let projection_start = self
                     .growth_child_work
@@ -884,7 +890,7 @@ impl LineSuppressionCache {
                                     .map(|(_, _, _, index)| index);
                                 PreparedLineSuppression::compile_growth_with_index_blocks(
                                     &transformed,
-                                    32 * 1024 * 1024,
+                                    compiler_budget,
                                     previous,
                                     covered,
                                     &prepared,
@@ -912,7 +918,7 @@ impl LineSuppressionCache {
                             compiled.as_ref().and_then(|previous| {
                                 PreparedLineSuppression::compile_growth_with_unchanged_targets(
                                     &transformed,
-                                    32 * 1024 * 1024,
+                                    compiler_budget,
                                     previous,
                                     covered,
                                     self.growth_child_work.as_mut(),
@@ -924,7 +930,7 @@ impl LineSuppressionCache {
                     None
                 };
                 incremental
-                    .or_else(|| PreparedLineSuppression::compile(&transformed, 32 * 1024 * 1024))
+                    .or_else(|| PreparedLineSuppression::compile(&transformed, compiler_budget))
             } else {
                 None
             };
@@ -2798,7 +2804,7 @@ mod prepared_relation_tests {
             l.suppressible = false;
         }
         if let DrawingInstruction::Line(l) = &mut items[5] {
-            l.style.width = 0.;
+            l.style_mut().width = 0.;
         }
         let prepared = PreparedLineSuppression::compile(&items, 1024 * 1024).unwrap();
         assert!(prepared.retained_bytes() <= 1024 * 1024);
@@ -2900,7 +2906,7 @@ mod immutable_projected_tests {
             }
         }
         if let DrawingInstruction::Line(l) = &mut items[1] {
-            l.style.color.a = 0.;
+            l.style_mut().color.a = 0.;
         }
         let cold = LineSuppressionCache::default().plan_projected_with_visibility(
             &items,
@@ -2923,7 +2929,7 @@ mod immutable_projected_tests {
             )
         );
         if let DrawingInstruction::Line(l) = &mut items[1] {
-            l.style.color.a = 1.;
+            l.style_mut().color.a = 1.;
             l.points[0].x = 1.;
         }
         let cold = LineSuppressionCache::default().plan_projected_with_visibility(
@@ -3108,7 +3114,7 @@ mod static_prewarm_contract_tests {
             }
         }
         if let DrawingInstruction::Line(l) = &mut items[1] {
-            l.style.color.a = 0.;
+            l.style_mut().color.a = 0.;
         }
         compare(
             &mut cache,

@@ -37,7 +37,7 @@ impl ApplicationHandler for App {
             median: (25., 0.),
             end: (0., -25.),
         });
-        line.style = LineStyle::solid_mm(Color::rgb(0., 0., 1.), 0.32);
+        line.style = std::sync::Arc::new(LineStyle::solid_mm(Color::rgb(0., 0., 1.), 0.32));
         c.add_instruction(DrawingInstruction::Line(line));
         r.begin_frame();
         r.add_instructions(&mut c);

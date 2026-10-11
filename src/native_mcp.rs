@@ -46,6 +46,12 @@ impl super::ChartApp {
                 }
             }
         }
+        if self.s100_mcp.server.is_some() {
+            // The index reads every cell; released records come back first.
+            if let Err(error) = self.hydrate_all_cells() {
+                tracing::warn!("MCP index cannot re-materialize released cells: {error:#}");
+            }
+        }
         if let Some(server) = &self.s100_mcp.server {
             // The tree contains only committed loaded datasets; it changes on load/unload or catalogue switch.
             let layers = self

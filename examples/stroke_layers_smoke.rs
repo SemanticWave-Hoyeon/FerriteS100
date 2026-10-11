@@ -67,7 +67,7 @@ impl ApplicationHandler for App {
             alpha.push(line.style.color.a);
             line.color_token = None;
             let a = line.style.color.a;
-            line.style.color = if i == 0 {
+            line.style_mut().color = if i == 0 {
                 Color::BLUE.with_alpha(a)
             } else {
                 Color::RED.with_alpha(a)

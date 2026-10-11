@@ -432,7 +432,7 @@ impl InteroperabilityPlan {
                 }
                 (Some(Substitute::LineStyle { reference, style }), DrawingInstruction::Line(l)) => {
                     l.style_ref = Some(reference.clone());
-                    l.style = (**style).clone();
+                    l.style = std::sync::Arc::new((**style).clone());
                 }
                 (Some(Substitute::AreaFill(template)), DrawingInstruction::Area(a)) => {
                     a.fill = template.fill.clone();
@@ -1075,16 +1075,16 @@ mod tests {
                 "<viewingGroup>11010</viewingGroup><substituteSymbolization><colorFill><color transparency=\"0.5\">DEPDW</color></colorFill><textPoint horizontalAlignment=\"End\" verticalAlignment=\"Center\" rotation=\"15\"><element><text>WK</text><bodySize>11</bodySize><foreground>CHBLK</foreground></element></textPoint></substituteSymbolization></S100_IC_DrawingInstruction>",
             );
         let catalogue = Catalogue::parse(&xml).unwrap();
-        let area = DrawingInstruction::Area(
+        let area = DrawingInstruction::Area(Box::new(
             AreaInstruction::new(vec![WorldPoint::new(0., 0.); 3])
                 .with_cell_index(0)
                 .with_feature_id(1),
-        );
-        let text = DrawingInstruction::Text(
+        ));
+        let text = DrawingInstruction::Text(Box::new(
             TextInstruction::new("old".into(), WorldPoint::new(0., 0.))
                 .with_cell_index(0)
                 .with_feature_id(1),
-        );
+        ));
         let original = vec![area, text];
         let mut pc = crate::hatch_resource_tests::catalogue();
         let mut day = ColorProfile::new("Day".into(), "Day".into());

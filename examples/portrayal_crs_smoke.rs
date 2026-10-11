@@ -74,14 +74,14 @@ impl ApplicationHandler for App {
                                     .with_rotation(30.)
                                     .with_rotation_crs(rotation_crs),
                             ),
-                            "text" => DrawingInstruction::Text(
+                            "text" => DrawingInstruction::Text(Box::new(
                                 TextInstruction::new("Device mm".into(), anchor)
                                     .with_font_size(24.)
                                     .with_offset(1., -2.)
                                     .with_rotation(30.)
                                     .with_rotation_crs(rotation_crs)
                                     .with_alignment(HAlign::Center, VAlign::Middle),
-                            ),
+                            )),
                             _ => unreachable!(),
                         };
                         command.set_portrayal_origin(if fixed {

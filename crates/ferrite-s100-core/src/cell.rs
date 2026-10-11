@@ -1462,6 +1462,23 @@ impl S101Cell {
     }
 
     /// Get cell statistics
+    /// Release the record maps (features, spatial and information records),
+    /// keeping identification, code mappings, coordinate factors and display
+    /// scales. Returns the statistics before release. Callers that released a
+    /// cell must re-materialize it from its source before reading records.
+    pub fn release_records(&mut self) -> CellStatistics {
+        let statistics = self.statistics();
+        self.points = HashMap::new();
+        self.multi_points = HashMap::new();
+        self.curves = HashMap::new();
+        self.composite_curves = HashMap::new();
+        self.surfaces = HashMap::new();
+        self.features = HashMap::new();
+        self.information = HashMap::new();
+        self.spatial_information_associations = HashMap::new();
+        statistics
+    }
+
     pub fn statistics(&self) -> CellStatistics {
         CellStatistics {
             features: self.features.len(),
@@ -1603,7 +1620,7 @@ impl S101Cell {
 }
 
 /// Cell statistics summary
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellStatistics {
     pub features: usize,
     pub information: usize,

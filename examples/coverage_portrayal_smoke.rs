@@ -66,7 +66,7 @@ fn instruction(kind: &str) -> DrawingInstruction {
         ])
     };
     match kind {
-        "area" => DrawingInstruction::Area(rect().with_solid_fill(Color::RED)),
+        "area" => DrawingInstruction::Area(Box::new(rect().with_solid_fill(Color::RED))),
         "line" => DrawingInstruction::Line(LineInstruction::new(vec![
             WorldPoint::new(0.05, 0.05),
             WorldPoint::new(0.95, 0.95),
@@ -74,16 +74,16 @@ fn instruction(kind: &str) -> DrawingInstruction {
         "symbol" => DrawingInstruction::Point(
             PointInstruction::new("ACHBRT07".into(), WorldPoint::new(0.5, 0.5)).with_scale(4.),
         ),
-        "pattern" => DrawingInstruction::Area(rect().with_pattern_fill(
+        "pattern" => DrawingInstruction::Area(Box::new(rect().with_pattern_fill(
             "FOULAR01P".into(),
             (5., 0.),
             (2., 6.),
-        )),
-        "text" => DrawingInstruction::Text(
+        ))),
+        "text" => DrawingInstruction::Text(Box::new(
             TextInstruction::new("Coverage MASK".into(), WorldPoint::new(0.5, 0.5))
                 .with_font_size(32.)
                 .with_alignment(HAlign::Center, VAlign::Middle),
-        ),
+        )),
         _ => unreachable!(),
     }
 }

@@ -18,12 +18,12 @@ fn main() -> anyhow::Result<()> {
                         WorldPoint::new(x + 0.5, y + 0.5),
                     ]))
                 } else {
-                    DrawingInstruction::Area(AreaInstruction::new(vec![
+                    DrawingInstruction::Area(Box::new(AreaInstruction::new(vec![
                         WorldPoint::new(0., 0.),
                         WorldPoint::new(64., 0.),
                         WorldPoint::new(64., 64.),
                         WorldPoint::new(0., 64.),
-                    ]))
+                    ])))
                 }
             })
             .collect();

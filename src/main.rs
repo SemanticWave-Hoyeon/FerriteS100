@@ -700,6 +700,79 @@ struct ChartLoadResult {
     input_paths: Vec<PathBuf>,
     cell: S101Cell,
     source_identity: CellSourceIdentity,
+    hydration: Option<CellHydrationSource>,
+}
+
+/// How to re-materialize a cell whose records were released: the exact load
+/// plan (retained authenticated inputs) and the feature codes it was
+/// normalized with, in order (load, then each catalogue change).
+#[derive(Clone)]
+struct CellHydrationSource {
+    plan: Arc<s101_update_plan::Plan>,
+    codes: Vec<Arc<Vec<String>>>,
+}
+struct CellHydration {
+    source: CellHydrationSource,
+    /// Statistics of a released cell (None while its records are resident).
+    released: Option<ferrite_s100_core::CellStatistics>,
+    /// `FERRITE_HYDRATION_VERIFY=1`: canonical digest taken before release,
+    /// compared after re-materialization.
+    verify: Option<Vec<[u8; 32]>>,
+}
+
+const CANONICAL_CELL_PARTS: [&str; 10] = [
+    "fields",
+    "code_mappings",
+    "points",
+    "multi_points",
+    "curves",
+    "composite_curves",
+    "surfaces",
+    "features",
+    "information",
+    "spatial_information_associations",
+];
+
+/// Order-independent digests of every cell field (maps sorted by key), one
+/// per `CANONICAL_CELL_PARTS` entry.
+fn canonical_cell_digest(cell: &S101Cell) -> Vec<[u8; 32]> {
+    fn sorted<K: Ord + std::fmt::Debug, V: std::fmt::Debug>(
+        map: &std::collections::HashMap<K, V>,
+    ) -> String {
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        format!("{entries:?}")
+    }
+    let mut shell = cell.clone();
+    shell.release_records();
+    shell.code_mappings = Default::default();
+    let m = &cell.code_mappings;
+    let mappings = [
+        &m.attributes,
+        &m.information_types,
+        &m.feature_types,
+        &m.information_associations,
+        &m.feature_associations,
+        &m.association_roles,
+    ]
+    .iter()
+    .map(|c| sorted(&c.num_to_str) + &sorted(&c.str_to_num))
+    .collect::<String>();
+    [
+        format!("{shell:?}"),
+        mappings,
+        sorted(&cell.points),
+        sorted(&cell.multi_points),
+        sorted(&cell.curves),
+        sorted(&cell.composite_curves),
+        sorted(&cell.surfaces),
+        sorted(&cell.features),
+        sorted(&cell.information),
+        sorted(&cell.spatial_information_associations),
+    ]
+    .iter()
+    .map(|part| Sha256::digest(part.as_bytes()).into())
+    .collect()
 }
 
 enum ChartPublicationResult {
@@ -1002,6 +1075,12 @@ struct ChartApp {
     /// Revision of the stand-in cache while a single-catalogue background
     /// build owns `symbol_cache`; the build returns it unless replaced.
     symbol_cache_lent: Option<u64>,
+    /// Cells whose instructions are resident (None: all, residency inactive).
+    resident_cells: Option<Vec<bool>>,
+    /// Camera bits of the last residency check (checked again once settled).
+    residency_camera: Option<[u64; 12]>,
+    /// Rebuild picking once the background build of a new portrayal installs.
+    hit_test_after_scene_build: bool,
     cell_resources: Option<ferrite_wgpu::CellPortrayalResources>,
     /// Current color profile name (Day, Dusk, Night)
     pending_portrayal_change: Option<PortrayalChangeRequest>,
@@ -1055,6 +1134,17 @@ struct ChartApp {
     >,
     cancellation_history_path: PathBuf,
     coverage_inventory: Option<Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>>,
+    /// Coverage inventory keyed by the loaded cells' identities, reused by
+    /// re-portrayals (residency, palette) instead of re-extracting every cell.
+    coverage_memo: Option<(
+        u64,
+        Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>,
+    )>,
+    /// Re-materialization sources by loaded source identity (SHA-256).
+    cell_hydration: std::collections::HashMap<[u8; 32], CellHydration>,
+    /// Set by each publication; non-resident records are released once the
+    /// app is idle, after the publishing operation has finished reading cells.
+    cell_release_pending: bool,
 
     ic: Option<Arc<ferrite_interoperability::AuthenticatedCatalogue>>,
     ic_combination: Option<String>,
@@ -1242,6 +1332,9 @@ impl ChartApp {
             loaded_discovery: Default::default(),
             cancellation_history_path: chart_publication::default_history_path(),
             coverage_inventory: None,
+            coverage_memo: None,
+            cell_hydration: std::collections::HashMap::new(),
+            cell_release_pending: false,
 
             ic: None,
             ic_combination: None,
@@ -1371,6 +1464,9 @@ impl ChartApp {
             ),
             scene_build: None,
             symbol_cache_lent: None,
+            resident_cells: None,
+            residency_camera: None,
+            hit_test_after_scene_build: false,
             // Background builds are only shown through the motion preview;
             // without it they would add settle work and no smoother frames.
             background_scene_builds: std::env::var_os("FERRITE_BACKGROUND_SCENE_BUILD")
@@ -1908,6 +2004,8 @@ impl ChartApp {
         }
     }
     fn load_bathymetry_transaction(&mut self, paths: &[PathBuf]) -> Result<()> {
+        // Chart bounds read every cell's geometry.
+        self.hydrate_all_cells()?;
         self.ensure_navigation_scene()?;
         if let Some(gate) = &mut self.s102_journal_gate {
             let mut seen = std::collections::BTreeSet::new();
@@ -2420,6 +2518,8 @@ impl ChartApp {
         fc: Arc<BoundFeatureCatalogue>,
         pc: Arc<BoundPortrayalCatalogue>,
     ) -> Result<()> {
+        // Every cell is re-normalized with the new feature catalogue.
+        self.hydrate_all_cells()?;
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
             self.loading_state.is_none(),
@@ -2447,7 +2547,7 @@ impl ChartApp {
             .iter()
             .map(CatalogueNormalization::capture)
             .collect();
-        let codes = fc.feature_type_codes();
+        let codes = Arc::new(fc.feature_type_codes());
         for cell in &mut self.cells {
             cell.normalize_feature_codes(&codes);
         }
@@ -2473,6 +2573,9 @@ impl ChartApp {
             }
         };
         // Staging validated the capsule. Only infallible owner moves follow.
+        for hydration in self.cell_hydration.values_mut() {
+            hydration.source.codes.push(Arc::clone(&codes));
+        }
         self.fc = fc;
         self.pc = pc;
         self.fc_status = fc_status;
@@ -2567,6 +2670,19 @@ impl ChartApp {
             CataloguePreparation::RetainedView => (true, false),
             CataloguePreparation::Loaded { preserve_view } => (preserve_view, true),
         };
+        // Coverage for view residency, resolved before borrowing the renderer.
+        let residency_inventory = if self.cells.is_empty() {
+            None
+        } else {
+            Some(self.memo_coverage_inventory()?)
+        };
+        // Portrayal changes and per-catalogue owners honour view residency.
+        let resident = residency_inventory
+            .as_deref()
+            .and_then(|inventory| self.residency_for_view(inventory, preserve_view));
+        let interoperating = request.settings.interoperability_enabled && self.ic.is_some();
+        self.hydrate_for_portrayal(resident.as_deref(), interoperating)?;
+        self.resident_cells = resident;
         let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
         anyhow::ensure!(
             request.settings.show_shallow_pattern || symbols.shallow_pattern_contract().is_some(),
@@ -2585,7 +2701,7 @@ impl ChartApp {
         validated_lua_context(pc, Some(&request.settings))?;
         ferrite_s101::validate_catalogue_pair(fc, pc)?;
         if preflight_resources {
-            for cell in &self.cells {
+            for (index, cell) in self.cells.iter().enumerate() {
                 let owner = catalogue_registry
                     .owner_for(&Self::catalogue_dataset_key(&cell.dsid)?)
                     .context("Missing validated cell catalogue owner")?;
@@ -2595,11 +2711,22 @@ impl ChartApp {
                     &owner.pc().product_id,
                     &owner.pc().version,
                 )?;
-                ferrite_s101::coverage_scale::dataset_reference_scale(cell)?;
+                // A released cell was validated before release, and
+                // re-materialization checks its source bytes are unchanged.
+                if !self.cell_is_released(index) {
+                    ferrite_s101::coverage_scale::dataset_reference_scale(cell)?;
+                }
             }
         }
         let mut next = self.render_context.empty_for_rebuild();
         if !self.cells.is_empty() {
+            if let Some(resident) = &self.resident_cells {
+                info!(
+                    "Residency: portraying {} of {} cells",
+                    resident.iter().filter(|r| **r).count(),
+                    resident.len()
+                );
+            }
             if owned {
                 self.portray_cells_with_owners(&catalogue_registry, &mut next, &request)?;
             } else {
@@ -2610,6 +2737,10 @@ impl ChartApp {
                     &mut next,
                     &request.profile,
                     Some(&request.settings),
+                    CellPortrayalSelection {
+                        caches: None,
+                        resident: self.resident_cells.as_deref(),
+                    },
                 )?;
             }
         }
@@ -2682,11 +2813,14 @@ impl ChartApp {
             next.set_viewport_rect(x, y, w, h);
             next.zoom_to_fit(self.bounds);
         }
-        let coverage = Arc::new(
-            ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(
-                &self.cells,
-            )?,
-        );
+        let coverage = match residency_inventory {
+            Some(inventory) => inventory,
+            None => Arc::new(
+                ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(
+                    &self.cells,
+                )?,
+            ),
+        };
         prepare_flat_coverage(
             Some(coverage.as_ref()),
             &mut next,
@@ -3579,7 +3713,7 @@ impl ChartApp {
                     "Edition {} · update {} · {} features",
                     cell.dsid.edition_number,
                     cell.dsid.update_number,
-                    cell.features.len()
+                    self.cell_feature_count(index)
                 ),
             });
         }
@@ -3693,6 +3827,7 @@ impl ChartApp {
     }
 
     fn unload_dataset(&mut self, id: ferrite_wgpu::DatasetLayerId) -> Result<()> {
+        self.hydrate_all_cells()?;
         anyhow::ensure!(
             self.loading_state.is_none()
                 && self.dataset_open_discovery.is_none()
@@ -4259,9 +4394,12 @@ impl ChartApp {
 
             // Retain all authenticated snapshots throughout owned parsing.
             let _authorization = authorization;
-            for plan in plans {
+            let fc_codes = Arc::new(fc_feature_codes.clone());
+            let load = |plan: &Arc<crate::s101_update_plan::Plan>| {
+                let plan_arc = Arc::clone(plan);
+                let plan: &crate::s101_update_plan::Plan = plan;
                 let path = plan.base.original.clone();
-                let result = (|| -> Result<_> {
+                (|| -> Result<_> {
                     let key = Self::catalogue_dataset_key(&plan.base.id)?;
                     let owner = worker_registry
                         .as_ref()
@@ -4312,9 +4450,10 @@ impl ChartApp {
                         format!("Nonconformant S-101 spatial scales {}", path.display())
                     })?;
                     // Normalize feature codes
-                    cell.normalize_feature_codes(
-                        plan_feature_codes.as_ref().unwrap_or(&fc_feature_codes),
-                    );
+                    let codes = plan_feature_codes
+                        .map(Arc::new)
+                        .unwrap_or_else(|| Arc::clone(&fc_codes));
+                    cell.normalize_feature_codes(&codes);
 
                     #[cfg(debug_assertions)]
                     {
@@ -4331,15 +4470,54 @@ impl ChartApp {
                         input_paths: plan.input_paths(),
                         cell,
                         source_identity,
+                        hydration: Some(CellHydrationSource {
+                            plan: plan_arc,
+                            codes: vec![codes],
+                        }),
                     })))
-                })();
-
-                // Send result (even None to track progress)
-                if tx.send(result).is_err() {
-                    // Receiver dropped, stop loading
-                    break;
+                })()
+            };
+            // Independent cells parse on several threads; results are sent in
+            // plan order (reorder buffer), exactly as the sequential loop did.
+            let plans: Vec<_> = plans.into_iter().map(Arc::new).collect();
+            let workers = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(8)
+                .min(plans.len())
+                .max(1);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let (done_tx, done_rx) = mpsc::channel();
+                for _ in 0..workers {
+                    let done_tx = done_tx.clone();
+                    let (plans, next, stop, load) = (&plans, &next, &stop, &load);
+                    scope.spawn(move || loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= plans.len() || stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if done_tx.send((i, load(&plans[i]))).is_err() {
+                            break;
+                        }
+                    });
                 }
-            }
+                drop(done_tx);
+                let mut pending = std::collections::BTreeMap::new();
+                let mut sent = 0;
+                for (i, result) in done_rx {
+                    pending.insert(i, result);
+                    while let Some(result) = pending.remove(&sent) {
+                        // Send result (even None to track progress)
+                        if tx.send(result).is_err() {
+                            // Receiver dropped, stop loading
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        sent += 1;
+                    }
+                }
+            });
             for cancellation in cancellations {
                 if tx
                     .send(cancellation.load().map(ChartPublicationResult::Cancel))
@@ -4613,6 +4791,11 @@ impl ChartApp {
         candidate_catalogues: Option<CandidateCatalogues>,
         candidate_registry: Option<s101_catalogue_selection::DatasetCatalogueRegistry>,
     ) {
+        // Publication merges, bounds and validation read every loaded cell.
+        if let Err(error) = self.hydrate_all_cells() {
+            self.load_error(error);
+            return;
+        }
         if let Err(error) = self.ensure_navigation_scene() {
             self.restore_load_checkpoint(checkpoint);
             self.load_error(error);
@@ -4667,6 +4850,18 @@ impl ChartApp {
                 return;
             }
             next_metadata.insert(key, result.metadata.clone());
+        }
+        for result in &incoming {
+            if let Some(source) = &result.hydration {
+                self.cell_hydration.insert(
+                    *result.source_identity.sha256(),
+                    CellHydration {
+                        source: source.clone(),
+                        released: None,
+                        verify: None,
+                    },
+                );
+            }
         }
         let transaction = match chart_publication::CellPublication::stage_changes(
             &mut self.cells,
@@ -5175,43 +5370,24 @@ impl ChartApp {
     /// directories — e.g. `cargo run` vs running the exe from `target/release/`
     /// — yields the same cache hash. Without canonicalization, every distinct
     /// CWD spawned a parallel cache file for identical chart content.
-    fn instruction_cache_path(&self) -> Option<PathBuf> {
-        if self.cells.is_empty() || std::env::var_os("FERRITE_NO_CACHE").is_some() {
-            return None;
-        }
-        // Cache trust comes from the app-private root, never delivered sidecars.
-        let cache_dir = secure_instruction_cache::root()?;
-
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (cell_index, cell) in self.cells.iter().enumerate() {
-            let canonical =
-                std::fs::canonicalize(&cell.file_path).unwrap_or_else(|_| cell.file_path.clone());
-            // Lowercase on Windows: NTFS is case-insensitive but path strings
-            // can vary in case, which would otherwise produce different hashes.
-            #[cfg(windows)]
-            let key = canonical.to_string_lossy().to_lowercase();
-            #[cfg(not(windows))]
-            let key = canonical.to_string_lossy().into_owned();
-            key.hash(&mut hasher);
-            // Use the exact bytes parsed into this loaded Cell, including authenticated
-            // private snapshots. Reopening a later-modified live path could key old
-            // portrayal output by new bytes. Missing loaded identity disables caching.
-            self.loaded_source_identities
-                .hash_for_cell(cell_index, &mut hasher)?;
-        }
+    /// Everything except the charts that determines portrayal output.
+    fn hash_portrayal_cache_inputs(
+        &self,
+        hasher: &mut std::collections::hash_map::DefaultHasher,
+    ) -> Option<()> {
+        use std::hash::Hash;
         // Catalogue rules and context parameters determine the generated output.
         // Hash their bytes and current settings rather than only chart paths.
-        Self::CACHE_SCHEMA_VERSION.hash(&mut hasher);
+        Self::CACHE_SCHEMA_VERSION.hash(&mut *hasher);
         // Fail closed if the linked runtime cannot identify itself. A major/minor
         // label alone cannot invalidate output from another Lua patch or build.
-        ferrite_lua::runtime_identity()?.hash(&mut hasher);
-        hash_bound_catalogue_inputs(&self.fc, &self.pc, &mut hasher);
+        ferrite_lua::runtime_identity()?.hash(&mut *hasher);
+        hash_bound_catalogue_inputs(&self.fc, &self.pc, &mut *hasher);
         if let Some(renderer) = &self.renderer {
             let mut pc_settings = renderer.settings().clone();
             pc_settings.interoperability_enabled = true; // IC composition is outside the ordinary PC cache.
-            primary_viewing_layers::hash_identity(&pc_settings, &mut hasher);
-            format!("{:?}", pc_settings).hash(&mut hasher);
+            primary_viewing_layers::hash_identity(&pc_settings, &mut *hasher);
+            format!("{:?}", pc_settings).hash(&mut *hasher);
         }
         let mut group_identity = self
             .pc
@@ -5220,34 +5396,42 @@ impl ChartApp {
             .iter()
             .collect::<Vec<_>>();
         group_identity.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        group_identity.hash(&mut hasher);
-        self.current_profile_name.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        Some(cache_dir.join(format!(".ferrite_cache_{:016x}.bin", hash)))
+        group_identity.hash(&mut *hasher);
+        self.current_profile_name.hash(&mut *hasher);
+        Some(())
     }
 
-    /// Check if instruction cache is valid (newer than all chart files)
-    fn is_cache_valid(&self, cache_path: &Path) -> bool {
-        let cache_meta = match fs::metadata(cache_path) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        let cache_mtime = match cache_meta.modified() {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-        // Cache must be newer than all chart files
-        for cell in &self.cells {
-            if let Ok(meta) = fs::metadata(&cell.file_path) {
-                if let Ok(chart_mtime) = meta.modified() {
-                    if chart_mtime > cache_mtime {
-                        return false;
-                    }
-                }
-            }
+    /// Per-cell portrayal cache files, by global cell index. A cell's output
+    /// depends only on its own bytes plus the shared portrayal inputs, so a
+    /// changed scene reuses every unchanged cell instead of re-running Lua.
+    fn cell_instruction_cache_paths(&self) -> Option<Vec<Option<PathBuf>>> {
+        if self.cells.is_empty() || std::env::var_os("FERRITE_NO_CACHE").is_some() {
+            return None;
         }
-        true
+        let cache_dir = secure_instruction_cache::root()?;
+        use std::hash::{Hash, Hasher};
+        let mut common = std::collections::hash_map::DefaultHasher::new();
+        "cell-portrayal-v1".hash(&mut common);
+        self.hash_portrayal_cache_inputs(&mut common)?;
+        Some(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(cell_index, cell)| {
+                    let mut hasher = common.clone();
+                    let canonical = std::fs::canonicalize(&cell.file_path)
+                        .unwrap_or_else(|_| cell.file_path.clone());
+                    #[cfg(windows)]
+                    let key = canonical.to_string_lossy().to_lowercase();
+                    #[cfg(not(windows))]
+                    let key = canonical.to_string_lossy().into_owned();
+                    key.hash(&mut hasher);
+                    self.loaded_source_identities
+                        .hash_for_cell(cell_index, &mut hasher)?;
+                    Some(cache_dir.join(format!(".ferrite_cell_{:016x}.bin", hasher.finish())))
+                })
+                .collect(),
+        )
     }
 
     /// Cache file format:
@@ -5360,18 +5544,19 @@ impl ChartApp {
                 .map(|change| change.portrayal);
         }
         ferrite_s101::validate_catalogue_pair(&self.fc, &self.pc)?;
-        let coverage_inventory =
-            ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(
-                &self.cells,
-            )?;
-        for cell in &self.cells {
+        let coverage_inventory = self.memo_coverage_inventory()?;
+        for (index, cell) in self.cells.iter().enumerate() {
             ferrite_s101::validate_dataset_catalogues(
                 &cell.dsid,
                 &self.fc,
                 &self.pc.product_id,
                 &self.pc.version,
             )?;
-            // Validate mandatory producer scale metadata even on portrayal-cache hits.
+            // Validate mandatory producer scale metadata even on portrayal-cache
+            // hits. A released cell was validated before release.
+            if self.cell_is_released(index) {
+                continue;
+            }
             ferrite_s101::coverage_scale::dataset_reference_scale(cell).with_context(|| {
                 format!(
                     "Invalid DataCoverage scale metadata: {}",
@@ -5384,90 +5569,35 @@ impl ChartApp {
         validated_lua_context(&self.pc, current_settings.as_ref())?; // Also validate cache hits.
         let mut next = self.render_context.empty_for_rebuild();
         next.set_bounds(self.bounds);
-
-        // Try to load instructions from binary cache
-        let cache_path = self.instruction_cache_path();
-        let mut cache_loaded = false;
-
-        if let Some(ref cp) = cache_path {
-            if self.is_cache_valid(cp) {
-                let cache_start = std::time::Instant::now();
-                match secure_instruction_cache::read(cp) {
-                    Ok(data) => match Self::verify_and_deserialize_cache(&data) {
-                        Ok(instructions) => {
-                            let count = instructions.len();
-                            next.set_instructions_from_cache(instructions);
-                            cache_loaded = true;
-                            info!(
-                                "Loaded {} instructions from cache in {:.1}ms: {}",
-                                count,
-                                cache_start.elapsed().as_secs_f64() * 1000.0,
-                                cp.display()
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Cache rejected: {}. Regenerating.", e);
-                            // A disposable rejection regenerates without deleting a live path.
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Cache read failed: {}. Regenerating.", e);
-                    }
-                }
-            }
+        // Large chart sets keep instructions only for cells that can be drawn
+        // near the view at this display scale (see `residency_for_view`).
+        let resident = self.residency_for_view(&coverage_inventory, preserve_view);
+        self.hydrate_for_portrayal(resident.as_deref(), self.active_ic().is_some())?;
+        self.resident_cells = resident;
+        if let Some(resident) = &self.resident_cells {
+            info!(
+                "Residency: portraying {} of {} cells",
+                resident.iter().filter(|r| **r).count(),
+                resident.len()
+            );
         }
 
-        if !cache_loaded {
-            // Get current settings from renderer
-            let current_settings = self.renderer.as_ref().map(|r| r.settings().clone());
-
-            // Try Lua portrayal with current color profile and settings
-            try_lua_portrayal(
-                &self.cells,
-                &self.fc,
-                &self.pc,
-                &mut next,
-                &self.current_profile_name,
-                current_settings.as_ref(),
-            )?;
-
-            // Save instruction cache for next load
-            if let Some(ref cp) = cache_path {
-                let cache_start = std::time::Instant::now();
-                let instructions = next.raw_instructions();
-                // Oversized scenes still portray correctly; only their disk cache is skipped.
-                let bounded =
-                    if instructions.len() as u64 > secure_instruction_cache::MAX_INSTRUCTIONS {
-                        Err(Box::new(bincode::ErrorKind::Custom(
-                            "cache instruction budget exceeded".into(),
-                        )))
-                    } else {
-                        use bincode::Options;
-                        bincode::DefaultOptions::new()
-                            .with_fixint_encoding()
-                            .with_limit(secure_instruction_cache::MAX_CACHE_BYTES - 40)
-                            .serialize(instructions)
-                    };
-                match bounded {
-                    Ok(payload) => {
-                        let signed = Self::wrap_cache(&payload);
-                        let size_kb = signed.len() / 1024;
-                        match secure_instruction_cache::write_atomic(cp, &signed) {
-                            Ok(_) => {
-                                info!(
-                                    "Saved instruction cache ({}KB) in {:.1}ms: {}",
-                                    size_kb,
-                                    cache_start.elapsed().as_secs_f64() * 1000.0,
-                                    cp.display()
-                                );
-                            }
-                            Err(e) => warn!("Failed to save instruction cache: {}", e),
-                        }
-                    }
-                    Err(e) => warn!("Failed to serialize instructions: {}", e),
-                }
-            }
-        }
+        // Portray every cell; unchanged cells are reused from their per-cell
+        // caches. (A whole-scene cache keyed by every cell was removed: it
+        // missed on any change of the open set and accumulated without bound.)
+        let cell_caches = self.cell_instruction_cache_paths();
+        try_lua_portrayal(
+            &self.cells,
+            &self.fc,
+            &self.pc,
+            &mut next,
+            &self.current_profile_name,
+            current_settings.as_ref(),
+            CellPortrayalSelection {
+                caches: cell_caches.as_deref(),
+                resident: self.resident_cells.as_deref(),
+            },
+        )?;
 
         let ic_changed = if let Some(ic) = self.active_ic() {
             let level2 = self.ic_level2(&ic)?;
@@ -5482,7 +5612,6 @@ impl ChartApp {
         } else {
             0
         };
-        let coverage_inventory = Arc::new(coverage_inventory);
         if let Some(renderer) = &self.renderer {
             let size = renderer.window().inner_size();
             next.set_viewport(size.width as f32, size.height as f32);
@@ -5701,11 +5830,13 @@ impl ChartApp {
         }
         let mut ordered = std::collections::BTreeMap::<u32, Vec<DrawingInstruction>>::new();
         for (digests, owner) in owners {
-            let indexed = self.cells.iter().enumerate().filter(|(_, cell)| {
-                Self::catalogue_dataset_key(&cell.dsid)
-                    .ok()
-                    .and_then(|key| registry.binding_identity(&key))
-                    .is_some_and(|b| (b.1, b.2) == digests)
+            let resident = self.resident_cells.as_deref();
+            let indexed = self.cells.iter().enumerate().filter(|(index, cell)| {
+                resident.is_none_or(|r| r.get(*index).copied().unwrap_or(true))
+                    && Self::catalogue_dataset_key(&cell.dsid)
+                        .ok()
+                        .and_then(|key| registry.binding_identity(&key))
+                        .is_some_and(|b| (b.1, b.2) == digests)
             });
             let mut staged = next.empty_for_rebuild();
             try_lua_portrayal_for_cells(
@@ -5715,6 +5846,7 @@ impl ChartApp {
                 &mut staged,
                 &request.profile,
                 Some(&request.settings),
+                None,
             )?;
             for instruction in staged.raw_instructions() {
                 let index = instruction
@@ -5732,6 +5864,36 @@ impl ChartApp {
     }
 
     fn publish_instructions(&mut self, prepared: PreparedPortrayal) {
+        let raster_scene = self.install_prepared_portrayal(prepared);
+        self.emit_published_scene(raster_scene);
+    }
+
+    /// Install a prepared portrayal and let a background build draw it while
+    /// the current scene stays on screen (used when residency changes). Falls
+    /// back to a synchronous publish when a background build cannot start.
+    fn publish_instructions_in_background(&mut self, prepared: PreparedPortrayal) {
+        if prepared.raster_scene.is_some() || !self.background_scene_builds {
+            return self.publish_instructions(prepared);
+        }
+        let raster_scene = self.install_prepared_portrayal(prepared);
+        // Picking must not read the old scene against the new instruction list.
+        self.rendered_symbols.clear();
+        self.pending_hit_test = None;
+        if self.try_start_scene_build() {
+            self.hit_test_after_scene_build = true;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else {
+            self.emit_published_scene(raster_scene);
+        }
+    }
+
+    /// Replace App portrayal owners with `prepared`; returns its raster scene.
+    fn install_prepared_portrayal(
+        &mut self,
+        prepared: PreparedPortrayal,
+    ) -> Option<ferrite_wgpu::PreparedRasterScenePublication> {
         self.poll_scene_build(true);
         let PreparedPortrayal {
             context: mut next,
@@ -5758,10 +5920,19 @@ impl ChartApp {
         self.render_context = next;
         self.coverage_inventory = Some(coverage);
         self.ic_assigned_vectors = ic_changed;
+        self.cell_release_pending = true;
         self.base_instruction_count = self.render_context.instruction_count();
         if let Some(renderer) = &self.renderer {
             self.applied_settings = renderer.settings().clone();
         }
+        raster_scene
+    }
+
+    /// Draw the installed portrayal synchronously (the original publication).
+    fn emit_published_scene(
+        &mut self,
+        raster_scene: Option<ferrite_wgpu::PreparedRasterScenePublication>,
+    ) {
         let color_profile = self
             .pc
             .color_profiles
@@ -5769,6 +5940,8 @@ impl ChartApp {
             .get(&self.current_profile_name);
         let visible_vgs = self.get_visible_viewing_groups();
         if let Some(renderer) = &mut self.renderer {
+            // Parallel area triangulation before the first (sequential) scene.
+            renderer.prefill_area_triangulations(&self.render_context);
             renderer.begin_frame();
             if let Some(scene) = raster_scene {
                 renderer.commit_raster_scene_publication(scene);
@@ -8895,6 +9068,315 @@ impl ChartApp {
         fs::write(output.join("coverage-scope.json"), b"{\"mode\":\"2D\",\"scope\":\"actual Flat coverage and picking; no removed 3D geometry cache claim\"}")?;
         Ok(())
     }
+    fn cell_identity_sha(&self, index: usize) -> Option<[u8; 32]> {
+        self.loaded_source_identities
+            .get(index)
+            .map(|identity| *identity.sha256())
+    }
+
+    fn cell_is_released(&self, index: usize) -> bool {
+        self.cell_identity_sha(index)
+            .and_then(|key| self.cell_hydration.get(&key))
+            .is_some_and(|h| h.released.is_some())
+    }
+
+    /// Feature count, also for a released cell.
+    fn cell_feature_count(&self, index: usize) -> usize {
+        self.cell_identity_sha(index)
+            .and_then(|key| self.cell_hydration.get(&key))
+            .and_then(|h| h.released.as_ref())
+            .map_or_else(
+                || self.cells.get(index).map_or(0, |c| c.features.len()),
+                |stats| stats.features,
+            )
+    }
+
+    /// Records may be released only while nothing needs every cell: no MCP
+    /// index, no interoperability composition and no diagnostic audit.
+    fn cell_release_allowed(&self) -> bool {
+        self.resident_cells.is_some()
+            && self.s100_mcp.server.is_none()
+            && self.active_ic().is_none()
+            && !std::env::vars_os().any(|(name, _)| {
+                name.to_str()
+                    .is_some_and(|n| n.starts_with("FERRITE_") && n.ends_with("_AUDIT"))
+            })
+    }
+
+    /// Release the records of cells that are not resident.
+    fn release_nonresident_cells(&mut self) {
+        if !self.cell_release_allowed() {
+            return;
+        }
+        let Some(resident) = self.resident_cells.clone() else {
+            return;
+        };
+        let mut released = 0;
+        for (index, keep) in resident.iter().enumerate() {
+            if *keep || self.cell_is_released(index) {
+                continue;
+            }
+            let Some(key) = self.cell_identity_sha(index) else {
+                continue;
+            };
+            if !self.cell_hydration.contains_key(&key) {
+                continue;
+            }
+            let verify = std::env::var("FERRITE_HYDRATION_VERIFY")
+                .is_ok_and(|v| v == "1")
+                .then(|| canonical_cell_digest(&self.cells[index]));
+            let stats = self.cells[index].release_records();
+            if let Some(h) = self.cell_hydration.get_mut(&key) {
+                h.released = Some(stats);
+                h.verify = verify;
+            }
+            released += 1;
+        }
+        if released > 0 {
+            info!("Released records of {released} non-resident cell(s)");
+        }
+    }
+
+    /// Re-materialize released cells from their retained load plans, in
+    /// parallel. The parsed bytes must match the identity recorded at load;
+    /// the cell is then normalized with the codes used at load.
+    fn hydrate_cells(&mut self, indices: &[usize]) -> Result<()> {
+        let jobs: Vec<(usize, [u8; 32], CellHydrationSource)> = indices
+            .iter()
+            .filter(|i| self.cell_is_released(**i))
+            .filter_map(|i| {
+                let key = self.cell_identity_sha(*i)?;
+                Some((*i, key, self.cell_hydration.get(&key)?.source.clone()))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let results: Vec<Result<S101Cell>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .iter()
+                .map(|(_, key, source)| {
+                    scope.spawn(move || -> Result<S101Cell> {
+                        let (mut cell, identity) = source.plan.load()?;
+                        anyhow::ensure!(
+                            identity.sha256() == key,
+                            "Released S-101 cell source changed; reopen it"
+                        );
+                        source.plan.validate_materialized(&cell)?;
+                        for codes in &source.codes {
+                            cell.normalize_feature_codes(codes);
+                        }
+                        Ok(cell)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Hydration panicked")))
+                })
+                .collect()
+        });
+        for ((index, key, _), result) in jobs.iter().zip(results) {
+            let mut cell = result?;
+            cell.file_path = std::mem::take(&mut self.cells[*index].file_path);
+            if let Some(expected) = self.cell_hydration.get(key).and_then(|h| h.verify.as_ref()) {
+                let actual = canonical_cell_digest(&cell);
+                let differing: Vec<_> = CANONICAL_CELL_PARTS
+                    .iter()
+                    .zip(actual.iter().zip(expected))
+                    .filter(|(_, (a, e))| a != e)
+                    .map(|(name, _)| *name)
+                    .collect();
+                anyhow::ensure!(
+                    differing.is_empty(),
+                    "Re-materialized cell differs from the released one in {differing:?}: {}",
+                    cell.file_path.display()
+                );
+                info!("Hydration verified: {}", cell.file_path.display());
+            }
+            self.cells[*index] = cell;
+            if let Some(h) = self.cell_hydration.get_mut(key) {
+                h.released = None;
+                h.verify = None;
+            }
+        }
+        info!(
+            "Re-materialized {} released cell(s) in {:.1} ms",
+            jobs.len(),
+            started.elapsed().as_secs_f64() * 1000.
+        );
+        Ok(())
+    }
+
+    /// Bring back the released cells a portrayal reads: the resident ones, or
+    /// all of them without residency or under interoperability.
+    fn hydrate_for_portrayal(&mut self, resident: Option<&[bool]>, all: bool) -> Result<()> {
+        match resident {
+            Some(resident) if !all => {
+                let wanted: Vec<usize> = (0..self.cells.len())
+                    .filter(|i| resident.get(*i).copied().unwrap_or(true))
+                    .collect();
+                self.hydrate_cells(&wanted)
+            }
+            _ => self.hydrate_all_cells(),
+        }
+    }
+
+    fn hydrate_all_cells(&mut self) -> Result<()> {
+        let all: Vec<usize> = (0..self.cells.len()).collect();
+        self.hydrate_cells(&all)
+    }
+
+    /// Drop sources of cells that are no longer loaded.
+    fn prune_cell_hydration(&mut self) {
+        let loaded: std::collections::HashSet<[u8; 32]> = (0..self.loaded_source_identities.len())
+            .filter_map(|i| self.cell_identity_sha(i))
+            .collect();
+        self.cell_hydration.retain(|key, _| loaded.contains(key));
+    }
+
+    /// The coverage inventory of the loaded cells, extracted once per exact
+    /// cell set (order, paths and source bytes).
+    fn memo_coverage_inventory(
+        &mut self,
+    ) -> Result<Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>> {
+        use std::hash::{Hash, Hasher};
+        let key = (|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.cells.len().hash(&mut hasher);
+            for (index, cell) in self.cells.iter().enumerate() {
+                cell.file_path.hash(&mut hasher);
+                self.loaded_source_identities
+                    .hash_for_cell(index, &mut hasher)?;
+            }
+            Some(hasher.finish())
+        })();
+        if let (Some(key), Some((memo_key, inventory))) = (key, &self.coverage_memo) {
+            if key == *memo_key {
+                return Ok(Arc::clone(inventory));
+            }
+        }
+        // Coverage is extracted from every cell's records.
+        self.hydrate_all_cells()?;
+        let inventory = Arc::new(
+            ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(
+                &self.cells,
+            )?,
+        );
+        self.coverage_memo = key.map(|key| (key, Arc::clone(&inventory)));
+        Ok(inventory)
+    }
+
+    /// Residency activates only for chart sets whose instruction lists would be
+    /// large (estimated at ~5 instructions per feature). `FERRITE_RESIDENCY_THRESHOLD`
+    /// overrides the estimate threshold (0 always activates it).
+    fn residency_threshold() -> usize {
+        std::env::var("FERRITE_RESIDENCY_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_500_000)
+    }
+
+    /// Cells to portray for the view this preparation will show: the S-98
+    /// selected datasets within one extra viewport on every side. Cells left
+    /// out are fully hidden by coverage there, so the drawn scene is unchanged.
+    fn residency_for_view(
+        &self,
+        inventory: &ferrite_s101::coverage_projection::GeographicCoverageInventory,
+        preserve_view: bool,
+    ) -> Option<Vec<bool>> {
+        let estimate: usize = (0..self.cells.len())
+            .map(|i| self.cell_feature_count(i) * 5)
+            .sum();
+        if estimate < Self::residency_threshold() {
+            return None;
+        }
+        let renderer = self.renderer.as_ref()?;
+        let size = renderer.window().inner_size();
+        let mut probe = self.render_context.empty_for_rebuild();
+        probe.set_bounds(self.bounds);
+        probe.set_viewport(size.width as f32, size.height as f32);
+        if preserve_view {
+            probe.scaler = self.render_context.scaler.clone();
+        } else {
+            probe.zoom_to_fit(self.bounds);
+        }
+        probe
+            .scaler
+            .set_pixel_ratio(renderer.window().scale_factor());
+        match inventory.visible_datasets(&probe.scaler, true, 1.0) {
+            Ok(visible) => Some(visible),
+            Err(error) => {
+                warn!("Residency unavailable, portraying every cell: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// Once the camera is still, re-check residency if it moved since the last
+    /// check (any path: gestures, reset, programmatic jumps).
+    fn check_residency_when_settled(&mut self) {
+        let moving = self.is_dragging
+            || self.pan_velocity != (0., 0.)
+            || self.zoom_animating
+            || self.zoom_rebuild_phase != 0
+            || self.pan_rebuild_phase != 0
+            || self.scene_build.is_some();
+        if moving || self.loading_state.is_some() {
+            return;
+        }
+        if std::mem::take(&mut self.cell_release_pending) {
+            self.prune_cell_hydration();
+            self.release_nonresident_cells();
+        }
+        if self.resident_cells.is_none() {
+            return;
+        }
+        let camera = self.navigation_camera_bits();
+        if self.residency_camera != Some(camera) {
+            self.residency_camera = Some(camera);
+            self.update_residency();
+        }
+    }
+
+    /// Re-portray if the resident cells for the current view changed.
+    fn update_residency(&mut self) {
+        if self.resident_cells.is_none() || self.loading_state.is_some() {
+            return;
+        }
+        let Some(inventory) = self.coverage_inventory.clone() else {
+            return;
+        };
+        let desired = self.residency_for_view(&inventory, true);
+        if desired == self.resident_cells {
+            return;
+        }
+        let count =
+            |r: &Option<Vec<bool>>| r.as_ref().map_or(0, |v| v.iter().filter(|b| **b).count());
+        info!(
+            "Residency: {} -> {} of {} cells",
+            count(&self.resident_cells),
+            count(&desired),
+            self.cells.len()
+        );
+        let started = std::time::Instant::now();
+        match self.prepare_instructions(true) {
+            Ok(prepared) => {
+                let prepared_ms = started.elapsed().as_secs_f64() * 1000.;
+                self.publish_instructions_in_background(prepared);
+                info!(
+                    "Residency update: prepare {:.1} ms, publish {:.1} ms",
+                    prepared_ms,
+                    started.elapsed().as_secs_f64() * 1000. - prepared_ms
+                );
+            }
+            Err(error) => warn!("Residency update failed: {error:#}"),
+        }
+    }
+
     fn regenerate_coverage_lifecycle(&mut self) -> Result<()> {
         let prepared = self.prepare_instructions(true)?;
         self.publish_instructions(prepared);
@@ -10893,6 +11375,12 @@ impl ChartApp {
             .renderer
             .as_ref()
             .and_then(|r| r.ui_state.selected_feature.clone());
+        if let Some(index) = selected.as_ref().and_then(|f| f.cell_index) {
+            // A selection kept across a residency change may name a released cell.
+            if let Err(error) = self.hydrate_cells(&[index as usize]) {
+                tracing::warn!("Selected cell cannot be re-materialized: {error:#}");
+            }
+        }
         if let Some(feature) = &selected {
             // Check actual retained source first; numeric cell ID is not identity.
             let cell = feature
@@ -11342,6 +11830,10 @@ impl ChartApp {
             return;
         }
         tracing::debug!("Background scene installed after {build_time:?}");
+        if std::mem::take(&mut self.hit_test_after_scene_build) {
+            self.build_rendered_symbols();
+            self.refresh_selected_symbol_preview();
+        }
         // Show the newer scene through the current camera, starting the next
         // build if the camera already left its drift budget. Only an exact
         // blocker leaves a UI-thread rebuild.
@@ -13455,6 +13947,8 @@ impl ApplicationHandler for ChartApp {
                     }
                 }
 
+                self.check_residency_when_settled();
+
                 // Poll for background loading completion
                 if self.loading_state.is_some() {
                     self.poll_loading();
@@ -15476,15 +15970,87 @@ fn try_lua_portrayal(
     render_context: &mut RenderContext,
     profile_name: &str,
     settings: Option<&SettingsState>,
+    selection: CellPortrayalSelection<'_>,
 ) -> Result<()> {
+    let CellPortrayalSelection {
+        caches: cell_caches,
+        resident,
+    } = selection;
     try_lua_portrayal_for_cells(
-        cells.iter().enumerate(),
+        cells
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| resident.is_none_or(|r| r.get(*index).copied().unwrap_or(true))),
         fc,
         pc,
         render_context,
         profile_name,
         settings,
+        cell_caches,
     )
+}
+
+/// Which cells to portray (None: all) and where their caches live (None: none).
+#[derive(Default, Clone, Copy)]
+struct CellPortrayalSelection<'a> {
+    caches: Option<&'a [Option<PathBuf>]>,
+    resident: Option<&'a [bool]>,
+}
+
+/// A per-cell portrayal: fresh Lua results, or instructions from the cache.
+enum CellPortrayal {
+    Fresh(Vec<ferrite_lua::PortrayalResult>),
+    Cached(Vec<DrawingInstruction>),
+}
+
+/// Read a cell cache written for the same inputs, if it is not older than
+/// the cell's file; any rejection simply portrays the cell again.
+fn read_cell_cache(path: &Path, cell: &S101Cell) -> Option<Vec<DrawingInstruction>> {
+    let cache_time = fs::metadata(path).ok()?.modified().ok()?;
+    if fs::metadata(&cell.file_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .is_some_and(|t| t > cache_time)
+    {
+        return None;
+    }
+    let data = secure_instruction_cache::read(path).ok()?;
+    match ChartApp::verify_and_deserialize_cache(&data) {
+        Ok(instructions) => {
+            secure_instruction_cache::mark_used(path);
+            Some(instructions)
+        }
+        Err(error) => {
+            warn!("Cell cache rejected: {error}. Regenerating.");
+            None
+        }
+    }
+}
+
+fn write_cell_cache(path: &Path, instructions: &[DrawingInstruction]) -> bool {
+    use bincode::Options;
+    if instructions.len() as u64 > secure_instruction_cache::MAX_INSTRUCTIONS {
+        return false;
+    }
+    match bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(secure_instruction_cache::MAX_CACHE_BYTES - 40)
+        .serialize(instructions)
+    {
+        Ok(payload) => {
+            match secure_instruction_cache::write_atomic(path, &ChartApp::wrap_cache(&payload)) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!("Cell cache write failed: {error}");
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            warn!("Cell cache not written: {error}");
+            false
+        }
+    }
 }
 
 /// A catalogue owner may process a subset of the scene without renumbering
@@ -15497,6 +16063,7 @@ fn try_lua_portrayal_for_cells<'a>(
     render_context: &mut RenderContext,
     profile_name: &str,
     settings: Option<&SettingsState>,
+    cell_caches: Option<&[Option<PathBuf>]>,
 ) -> Result<()> {
     let context = validated_lua_context(pc, settings)?;
 
@@ -15513,55 +16080,158 @@ fn try_lua_portrayal_for_cells<'a>(
         ));
     }
 
-    info!("Initializing Lua portrayal engine...");
-
-    // Create portrayal engine
-    let mut engine = PortrayalEngine::new_with_sources(pc.sources())
-        .context("Failed to create portrayal engine")?;
-
-    // Set type catalogue from FC
-    let type_catalogue = TypeCatalogue::from_feature_catalogue(fc);
-    engine.set_type_catalogue(type_catalogue);
+    info!("Initializing Lua portrayal engines...");
+    let type_catalogue = Arc::new(TypeCatalogue::from_feature_catalogue(fc));
     info!(
         "  Type catalogue loaded: {} feature types, {} attributes",
         fc.feature_types.len(),
         fc.simple_attributes.len()
     );
+    let new_engine = || -> Result<PortrayalEngine> {
+        let mut engine = PortrayalEngine::new_with_sources(pc.sources())
+            .context("Failed to create portrayal engine")?;
+        engine.set_shared_type_catalogue(Arc::clone(&type_catalogue));
+        engine
+            .initialize()
+            .context("Failed to initialize portrayal engine")?;
+        Ok(engine)
+    };
 
-    // Initialize engine (load main.lua)
-    engine
-        .initialize()
-        .context("Failed to initialize portrayal engine")?;
-    info!("  Lua engine initialized");
-
+    // Cells are portrayed independently (each in its own engine state, as
+    // before), so they run on several threads; results are converted strictly
+    // in cell order, as soon as the next cell is ready, so instruction order
+    // and the first reported error are unchanged and few results are held.
+    // Cells are not split by feature: portrayal rules keep state across the
+    // features of one run (e.g. text offsets of co-located lights), and a
+    // split changes their output.
+    let cells: Vec<(usize, &S101Cell)> = cells.into_iter().collect();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8)
+        .min(cells.len())
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let abort = std::sync::atomic::AtomicBool::new(false);
     let mut total_results = 0;
-
-    // Process each cell separately to avoid feature ID collisions
-    for (cell_index, cell) in cells {
-        debug!(
-            "Processing cell {}: {}",
-            cell_index,
-            cell.file_path.display()
-        );
-
-        // Build the owned host input directly; fresh private context metadata
-        // was immediately discarded here and cannot affect Lua initialization.
-        let cell_data = ferrite_lua::CellData::from_cell(cell);
-
-        let results = engine
-            .process_owned_cell(cell_data, context.clone())
-            .with_context(|| {
-                format!(
-                    "Cell {} portrayal failed: {}",
+    let mut cached_cells = 0;
+    let mut written_cells = false;
+    std::thread::scope(|scope| -> Result<()> {
+        let (sender, receiver) = mpsc::channel::<(usize, Result<CellPortrayal>)>();
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let (cells, next, abort, context) = (&cells, &next, &abort, &context);
+            let new_engine = &new_engine;
+            scope.spawn(move || {
+                let mut engine = None;
+                loop {
+                    let position = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if position >= cells.len() || abort.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let (cell_index, cell) = cells[position];
+                    let cache = cell_caches
+                        .and_then(|paths| paths.get(cell_index))
+                        .and_then(Option::as_deref);
+                    if let Some(instructions) = cache.and_then(|path| read_cell_cache(path, cell)) {
+                        if sender
+                            .send((position, Ok(CellPortrayal::Cached(instructions))))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    let result = (|| {
+                        if engine.is_none() {
+                            engine = Some(new_engine()?);
+                        }
+                        let engine = engine.as_mut().expect("created above");
+                        engine
+                            .process_owned_cell(
+                                ferrite_lua::CellData::from_cell(cell),
+                                context.clone(),
+                            )
+                            .map(CellPortrayal::Fresh)
+                            .with_context(|| {
+                                format!(
+                                    "Cell {} portrayal failed: {}",
+                                    cell_index,
+                                    cell.file_path.display()
+                                )
+                            })
+                    })();
+                    if sender.send((position, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        let mut pending = std::collections::BTreeMap::new();
+        let mut converted = 0;
+        for (position, result) in receiver {
+            pending.insert(position, result);
+            while let Some(result) = pending.remove(&converted) {
+                let (cell_index, cell) = cells[converted];
+                let results = match result {
+                    Ok(CellPortrayal::Cached(mut instructions)) => {
+                        // Renumber exactly as convert_lua_results_for_cell would:
+                        // the cell index, and the S-101 dependency namespace.
+                        let index = u32::try_from(cell_index).ok();
+                        for instruction in &mut instructions {
+                            instruction.set_cell_index(index);
+                            if let Some(dependency) = instruction.dependency_mut() {
+                                dependency.namespace = cell_index as u64;
+                            }
+                        }
+                        cached_cells += 1;
+                        render_context.append_converted(instructions);
+                        converted += 1;
+                        continue;
+                    }
+                    Ok(CellPortrayal::Fresh(results)) => results,
+                    Err(error) => {
+                        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
+                total_results += results.len();
+                let start = render_context.instruction_count();
+                if let Err(error) = convert_lua_results_for_cell(
+                    &results,
+                    cell,
+                    pc,
+                    render_context,
                     cell_index,
-                    cell.file_path.display()
-                )
-            })?;
-        total_results += results.len();
-        convert_lua_results_for_cell(&results, cell, pc, render_context, cell_index, profile_name)?;
-    }
+                    profile_name,
+                ) {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(error);
+                }
+                if let Some(path) = cell_caches
+                    .and_then(|paths| paths.get(cell_index))
+                    .and_then(Option::as_deref)
+                {
+                    written_cells |=
+                        write_cell_cache(path, &render_context.raw_instructions()[start..]);
+                }
+                converted += 1;
+            }
+        }
+        anyhow::ensure!(
+            converted == cells.len(),
+            "Lua portrayal worker stopped early"
+        );
+        Ok(())
+    })?;
 
-    info!("Lua portrayal complete: {} total results", total_results);
+    info!(
+        "Lua portrayal complete: {} total results, {} cell(s) from cache",
+        total_results, cached_cells
+    );
+    if written_cells {
+        secure_instruction_cache::prune_root();
+    }
     Ok(())
 }
 
@@ -16227,7 +16897,7 @@ mod instruction_cache_schema_tests {
         };
         let style = text.font_style.clone();
         let mut wrapped = ChartApp::wrap_cache(
-            &bincode::serialize(&vec![DrawingInstruction::Text(text)]).unwrap(),
+            &bincode::serialize(&vec![DrawingInstruction::Text(Box::new(text))]).unwrap(),
         );
         let restored = ChartApp::verify_and_deserialize_cache(&wrapped).unwrap();
         let DrawingInstruction::Text(text) = &restored[0] else {
@@ -16249,7 +16919,7 @@ mod instruction_cache_schema_tests {
         .with_pattern_fill("DIAMOND1P".into(), (22.5, 0.), (0., 43.13));
         area.fill_ref = Some("DIAMOND1".into());
         let mut wrapped = ChartApp::wrap_cache(
-            &bincode::serialize(&vec![DrawingInstruction::Area(area)]).unwrap(),
+            &bincode::serialize(&vec![DrawingInstruction::Area(Box::new(area))]).unwrap(),
         );
         let decoded = ChartApp::verify_and_deserialize_cache(&wrapped).unwrap();
         let DrawingInstruction::Area(area) = &decoded[0] else {
@@ -16267,7 +16937,7 @@ mod instruction_cache_schema_tests {
         let instructions: Vec<_> = [true, false]
             .into_iter()
             .map(|clip| {
-                DrawingInstruction::Area(
+                DrawingInstruction::Area(Box::new(
                     AreaInstruction::new(vec![
                         WorldPoint::new(0., 0.),
                         WorldPoint::new(1., 0.),
@@ -16279,7 +16949,7 @@ mod instruction_cache_schema_tests {
                     .with_pattern_clip_symbols(clip)
                     .with_feature_id(42)
                     .with_cell_index(3),
-                )
+                ))
             })
             .collect();
         let payload = bincode::serialize(&instructions).unwrap();
@@ -16631,6 +17301,54 @@ mod manual_catalogue_normalization_tests {
             information: Default::default(),
             spatial_information_associations: Default::default(),
         }
+    }
+    #[test]
+    fn canonical_cell_digest_ignores_map_order_and_detects_changes() {
+        let mut a = cell();
+        let mut b = cell();
+        for code in 0..64u16 {
+            a.code_mappings
+                .feature_types
+                .insert(code, format!("F{code}"));
+            b.code_mappings
+                .feature_types
+                .insert(63 - code, format!("F{}", 63 - code));
+        }
+        assert_eq!(canonical_cell_digest(&a), canonical_cell_digest(&b));
+        b.code_mappings.feature_types.insert(5, "Changed".into());
+        assert_ne!(canonical_cell_digest(&a), canonical_cell_digest(&b));
+        a.normalize_feature_codes(&["F1".into()]);
+        assert_ne!(canonical_cell_digest(&a), canonical_cell_digest(&b));
+    }
+    /// A released cell re-materialized from its plan, with the same code
+    /// normalizations, equals the cell as originally loaded.
+    #[test]
+    fn released_cell_rematerializes_identically() {
+        let path = PathBuf::from(
+            "TestData/UKHO-S100-2026/ExchangeSets/S-101_GB_Apr26/S100_ROOT/S-101/DATASET_FILES/101GB004DEVQK.000",
+        );
+        if !path.exists() {
+            eprintln!("skipped: {} not present", path.display());
+            return;
+        }
+        let candidates = s101_update_plan::expand_candidates(&[path], &[]).unwrap();
+        let authorization = dataset_signature_policy::unchecked_datasets(&candidates).unwrap();
+        let plan = s101_update_plan::authorized_plans(candidates, &authorization, false)
+            .unwrap()
+            .remove(0);
+        let codes = vec!["CardinalBuoy".to_string(), "LateralBuoy".to_string()];
+        let (mut original, identity) = plan.load().unwrap();
+        original.normalize_feature_codes(&codes);
+        let expected = canonical_cell_digest(&original);
+        let stats = original.statistics();
+        assert!(stats.features > 0);
+        assert_eq!(original.release_records(), stats);
+        assert!(original.features.is_empty() && original.curves.is_empty());
+        let (mut again, again_identity) = plan.load().unwrap();
+        assert_eq!(identity.sha256(), again_identity.sha256());
+        plan.validate_materialized(&again).unwrap();
+        again.normalize_feature_codes(&codes);
+        assert_eq!(canonical_cell_digest(&again), expected);
     }
     #[test]
     fn normalization_rollback_restores_both_mapping_directions_and_source() {

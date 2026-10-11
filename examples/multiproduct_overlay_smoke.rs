@@ -25,7 +25,7 @@ fn rect(
     p: i32,
     plane: DisplayPlane,
 ) -> DrawingInstruction {
-    DrawingInstruction::Area(
+    DrawingInstruction::Area(Box::new(
         AreaInstruction::new(vec![
             WorldPoint::new(x, y),
             WorldPoint::new(x + w, y),
@@ -35,7 +35,7 @@ fn rect(
         .with_solid_fill(c)
         .with_priority(p)
         .with_display_plane(plane),
-    )
+    ))
 }
 fn raster(order: RasterDrawOrder, rgba: Vec<u8>, name: &str) -> RasterLayer {
     RasterLayer {

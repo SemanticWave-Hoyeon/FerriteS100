@@ -210,6 +210,8 @@ pub struct RenderContext {
     coverage_scaler_signature: Option<[u64; 15]>,
     scene_spatial: std::sync::OnceLock<std::sync::Arc<crate::SceneSpatialIndex>>,
     static_source_classification: std::sync::OnceLock<std::sync::Arc<StaticSourceClassification>>,
+    /// Per-cell ordinals for view culling; same lifetime as the classification.
+    cell_ordinals: std::sync::OnceLock<std::sync::Arc<crate::cell_ordinals::CellOrdinalIndex>>,
     static_instruction_order: std::sync::OnceLock<std::sync::Arc<StaticInstructionOrderIdentity>>,
     temporal_indices: Vec<usize>,
     temporal_index_dirty: bool,
@@ -252,6 +254,7 @@ impl RenderContext {
             coverage_scaler_signature: None,
             scene_spatial: std::sync::OnceLock::new(),
             static_source_classification: std::sync::OnceLock::new(),
+            cell_ordinals: std::sync::OnceLock::new(),
             static_instruction_order: std::sync::OnceLock::new(),
             temporal_indices: Vec::new(),
             temporal_index_dirty: false,
@@ -308,6 +311,7 @@ impl RenderContext {
             coverage_scaler_signature: self.coverage_scaler_signature,
             scene_spatial: self.scene_spatial.clone(),
             static_source_classification: self.static_source_classification.clone(),
+            cell_ordinals: self.cell_ordinals.clone(),
             static_instruction_order: self.static_instruction_order.clone(),
             temporal_indices: self.temporal_indices.clone(),
             temporal_index_dirty: self.temporal_index_dirty,
@@ -382,6 +386,38 @@ impl RenderContext {
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.static_source_classification.take();
+        self.cell_ordinals.take();
+        self.static_instruction_order.take();
+        self.temporal_index_dirty = true;
+    }
+
+    /// Append instructions previously produced by `add_instruction` for the
+    /// same viewing-group state (a per-cell portrayal cache). Bookkeeping is
+    /// identical to adding them one by one; the group filter already ran.
+    pub fn append_converted(&mut self, instructions: Vec<DrawingInstruction>) {
+        if instructions.is_empty() {
+            return;
+        }
+        self.sorted = false;
+        for instruction in &instructions {
+            if let Some(feature_id) = instruction.feature_id() {
+                self.feature_ids.insert(feature_id);
+            }
+            if matches!(
+                instruction.portrayal_origin(),
+                crate::PortrayalOrigin::CoverageExempt
+            ) {
+                self.coverage_exempt_presence = CoverageExemptPresence::Unknown;
+            }
+        }
+        self.instructions_mut().extend(instructions);
+        self.geometry_revision = next_geometry_revision();
+        self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
+        self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
+        self.dependency_graph.take();
+        self.scene_spatial.take();
+        self.static_source_classification.take();
+        self.cell_ordinals.take();
         self.static_instruction_order.take();
         self.temporal_index_dirty = true;
     }
@@ -408,8 +444,13 @@ impl RenderContext {
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.static_source_classification.take();
+            self.cell_ordinals.take();
             self.static_instruction_order.take();
-            self.instructions_mut().sort_by_key(|i| i.render_order());
+            // Keys (area extents scan every vertex) are computed once per
+            // instruction; sort_by_cached_key is stable like sort_by_key.
+            self.instructions_mut()
+                .sort_by_cached_key(|i| i.render_order());
+            crate::intern_line_styles(self.instructions_mut());
             self.sorted = true;
         }
         if self.temporal_index_dirty {
@@ -434,6 +475,7 @@ impl RenderContext {
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.static_source_classification.take();
+        self.cell_ordinals.take();
         self.static_instruction_order.take();
         self.temporal_indices.clear();
         self.temporal_index_dirty = false;
@@ -453,6 +495,7 @@ impl RenderContext {
         self.static_line_relation_epoch = crate::StaticLineRelationEpoch::fresh();
         self.static_area_geometry_epoch = crate::StaticAreaGeometryEpoch::fresh();
         self.static_source_classification.take();
+        self.cell_ordinals.take();
         self.static_instruction_order.take();
         for instruction in self.instructions_mut().iter_mut().skip(start) {
             instruction.set_portrayal_origin(origin.clone());
@@ -472,6 +515,7 @@ impl RenderContext {
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.static_source_classification.take();
+            self.cell_ordinals.take();
             self.static_instruction_order.take();
         }
         for instruction in self.instructions_mut().iter_mut().skip(start) {
@@ -792,6 +836,7 @@ impl RenderContext {
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.static_source_classification.take();
+            self.cell_ordinals.take();
             self.static_instruction_order.take();
             self.temporal_index_dirty = true;
             self.sorted = false;
@@ -822,6 +867,7 @@ impl RenderContext {
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.static_source_classification.take();
+            self.cell_ordinals.take();
             self.static_instruction_order.take();
             self.temporal_index_dirty = true;
             self.sorted = false;
@@ -838,6 +884,8 @@ impl RenderContext {
         for inst in self.instructions_mut().iter_mut() {
             inst.remap_colors(lookup);
         }
+        // Recoloured lines received private copies; share them again.
+        crate::intern_line_styles(self.instructions_mut());
     }
 
     /// Independent immutable area topology identity; never geometry ownership.
@@ -912,6 +960,7 @@ impl RenderContext {
             self.dependency_graph.take();
             self.scene_spatial.take();
             self.static_source_classification.take();
+            self.cell_ordinals.take();
             self.static_instruction_order.take();
         }
     }
@@ -928,6 +977,17 @@ impl RenderContext {
 
     /// Caller must sort before borrowing this ordinal classification for emission.
     /// Unsorted callers still receive the exact current order; a subsequent sort invalidates it.
+    /// Per-cell ordinals and bounds in the current sorted order (cached).
+    pub fn cell_ordinal_index(&self) -> std::sync::Arc<crate::cell_ordinals::CellOrdinalIndex> {
+        self.cell_ordinals
+            .get_or_init(|| {
+                std::sync::Arc::new(crate::cell_ordinals::CellOrdinalIndex::compile(
+                    &self.instructions,
+                ))
+            })
+            .clone()
+    }
+
     pub fn static_source_classification(&self) -> std::sync::Arc<StaticSourceClassification> {
         self.static_source_classification
             .get_or_init(|| {
@@ -1041,6 +1101,7 @@ impl RenderContext {
         self.dependency_graph.take();
         self.scene_spatial.take();
         self.static_source_classification.take();
+        self.cell_ordinals.take();
         self.static_instruction_order.take();
         self.temporal_index_dirty = true;
         self.sorted = false;
@@ -1160,13 +1221,13 @@ mod temporal_binding_tests {
             p,
         )));
         ctx.add_instruction(DrawingInstruction::Line(LineInstruction::new(vec![p, p])));
-        ctx.add_instruction(DrawingInstruction::Area(AreaInstruction::new(vec![
-            p, p, p,
-        ])));
-        ctx.add_instruction(DrawingInstruction::Text(TextInstruction::new(
+        ctx.add_instruction(DrawingInstruction::Area(Box::new(AreaInstruction::new(
+            vec![p, p, p],
+        ))));
+        ctx.add_instruction(DrawingInstruction::Text(Box::new(TextInstruction::new(
             "T".into(),
             p,
-        )));
+        ))));
         ctx.set_time_intervals_from(start, std::slice::from_ref(&condition));
         assert!(ctx.raw_instructions()[0].time_intervals().is_empty());
         for inst in &ctx.raw_instructions()[start..] {
@@ -1496,13 +1557,13 @@ mod dependency_tests {
             p,
         )));
         c.add_instruction(DrawingInstruction::Line(LineInstruction::new(vec![p, p])));
-        c.add_instruction(DrawingInstruction::Area(AreaInstruction::new(vec![
-            p, p, p,
-        ])));
-        c.add_instruction(DrawingInstruction::Text(TextInstruction::new(
+        c.add_instruction(DrawingInstruction::Area(Box::new(AreaInstruction::new(
+            vec![p, p, p],
+        ))));
+        c.add_instruction(DrawingInstruction::Text(Box::new(TextInstruction::new(
             "label".into(),
             p,
-        )));
+        ))));
         let dependency =
             DrawingDependency::new(7, Some("child-id"), Some("root-id"), true).unwrap();
         c.set_dependency_from(start, Some(dependency.clone()));
@@ -1654,11 +1715,11 @@ mod scene_spatial_tests {
     use super::*;
     use crate::{AreaInstruction, DrawingInstruction, WorldPoint};
     fn area(x: f64) -> DrawingInstruction {
-        DrawingInstruction::Area(AreaInstruction::new(vec![
+        DrawingInstruction::Area(Box::new(AreaInstruction::new(vec![
             WorldPoint::new(x, 0.),
             WorldPoint::new(x + 1., 0.),
             WorldPoint::new(x + 1., 1.),
-        ]))
+        ])))
     }
     #[test]
     fn camera_and_palette_reuse_but_order_and_content_invalidate() {
@@ -1691,7 +1752,9 @@ mod scene_spatial_tests {
     fn malformed_area_is_not_silently_indexed_or_discarded() {
         let mut c = RenderContext::new(Viewport::new(800., 600.));
         c.add_instruction(area(f64::NAN));
-        c.add_instruction(DrawingInstruction::Area(AreaInstruction::new(vec![])));
+        c.add_instruction(DrawingInstruction::Area(Box::new(AreaInstruction::new(
+            vec![],
+        ))));
         assert_eq!(c.scene_spatial_index().areas.ids().count(), 0);
         assert_eq!(c.instruction_count(), 2);
     }
@@ -1717,12 +1780,12 @@ mod origin_binding_tests {
         context.add_instruction(DrawingInstruction::Line(
             LineInstruction::new(vec![p, WorldPoint::new(128., 35.)]).with_priority(1),
         ));
-        context.add_instruction(DrawingInstruction::Area(
+        context.add_instruction(DrawingInstruction::Area(Box::new(
             AreaInstruction::new(vec![p, p, p]).with_priority(2),
-        ));
-        context.add_instruction(DrawingInstruction::Text(
+        )));
+        context.add_instruction(DrawingInstruction::Text(Box::new(
             TextInstruction::new("expanded".into(), p).with_priority(3),
-        ));
+        )));
         context.set_portrayal_origin_from(start, source.clone());
         assert_eq!(
             context.raw_instructions()[0].portrayal_origin(),
@@ -2515,5 +2578,60 @@ mod emission_fork_tests {
         assert_eq!(context.raw_instructions().len(), 2);
         assert_eq!(fork.geometry_revision, revision);
         assert_ne!(context.geometry_revision, revision);
+    }
+}
+
+#[cfg(test)]
+mod line_style_sharing_tests {
+    use super::*;
+    use crate::{Color, DrawingInstruction, LineInstruction, LineStyle, WorldPoint};
+    use std::sync::Arc;
+    fn line(style: LineStyle, token: &str) -> DrawingInstruction {
+        let mut l = LineInstruction::new(vec![WorldPoint::new(0., 0.), WorldPoint::new(1., 1.)])
+            .with_style(style);
+        l.color_token = Some(token.into());
+        DrawingInstruction::Line(l)
+    }
+    fn styles(c: &RenderContext) -> Vec<Arc<LineStyle>> {
+        c.raw_instructions()
+            .iter()
+            .filter_map(|i| match i {
+                DrawingInstruction::Line(l) => Some(l.style.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Equal styles share one allocation after sorting and after a palette
+    /// change; distinct styles stay distinct and values are unchanged.
+    #[test]
+    fn equal_line_styles_are_shared_after_sort_and_recolour() {
+        let mut c = RenderContext::new(crate::Viewport::new(10., 10.));
+        let a = LineStyle::solid(Color::RED, 1.);
+        let b = LineStyle::solid(Color::BLUE, 2.);
+        for _ in 0..3 {
+            c.add_instruction(line(a.clone(), "A"));
+            c.add_instruction(line(b.clone(), "B"));
+        }
+        c.get_sorted_instructions();
+        let s = styles(&c);
+        let distinct = |s: &[Arc<LineStyle>]| {
+            let mut p: Vec<_> = s.iter().map(|x| Arc::as_ptr(x) as usize).collect();
+            p.sort_unstable();
+            p.dedup();
+            p.len()
+        };
+        assert_eq!(distinct(&s), 2);
+        assert!(s.iter().all(|x| **x == a || **x == b));
+        c.remap_colors(&|token| {
+            if token == "A" {
+                Color::GREEN
+            } else {
+                Color::BLACK
+            }
+        });
+        let s = styles(&c);
+        assert_eq!(distinct(&s), 2);
+        assert!(s.iter().any(|x| x.color == Color::GREEN && x.width == 1.));
+        assert!(s.iter().any(|x| x.color == Color::BLACK && x.width == 2.));
     }
 }

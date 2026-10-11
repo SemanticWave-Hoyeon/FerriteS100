@@ -7,6 +7,7 @@
 //!
 //! Based on S-100 standard rendering architecture, adapted for Rust/wgpu.
 
+pub mod cell_ordinals;
 mod color;
 mod context;
 mod error;

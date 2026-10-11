@@ -562,6 +562,7 @@ pub(crate) mod tests {
             cell,
             source_identity,
             input_paths: vec![format!("{name}.{update:03}").into()],
+            hydration: None,
         }
     }
     fn state() -> (Vec<S101Cell>, LoadedSourceIdentities, Vec<Vec<PathBuf>>) {

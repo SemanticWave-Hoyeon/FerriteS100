@@ -38,8 +38,8 @@ impl ApplicationHandler for App {
             PortrayalPath::Polyline(vec![(20., 0.), (24., 0.)]),
             PortrayalPath::Polyline(vec![(24., 0.), (30., 0.)]),
         ]));
-        line.style = LineStyle::solid_mm(Color::rgb(0., 0., 1.), 0.32);
-        line.style.dash_pattern = vec![3.6, 1.8];
+        line.style = std::sync::Arc::new(LineStyle::solid_mm(Color::rgb(0., 0., 1.), 0.32));
+        line.style_mut().dash_pattern = vec![3.6, 1.8];
         c.add_instruction(DrawingInstruction::Line(line));
         let mut ring = LineInstruction::new(vec![WorldPoint::new(0., 0.), WorldPoint::new(0., 0.)]);
         ring.portrayal_path = Some(PortrayalPath::Group(
@@ -54,7 +54,7 @@ impl ApplicationHandler for App {
                 })
                 .collect(),
         ));
-        ring.style = LineStyle::solid_mm(Color::rgb(0., 1., 0.), 0.32);
+        ring.style = std::sync::Arc::new(LineStyle::solid_mm(Color::rgb(0., 1., 0.), 0.32));
         c.add_instruction(DrawingInstruction::Line(ring));
         r.begin_frame();
         r.add_instructions(&mut c);

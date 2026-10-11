@@ -171,7 +171,7 @@ mod shared_path_tests {
             start: 0.,
             sweep,
         });
-        line.style.dash_pattern = vec![8., 5.];
+        line.style_mut().dash_pattern = vec![8., 5.];
         c.add_instruction(DrawingInstruction::Line(line));
         c
     }

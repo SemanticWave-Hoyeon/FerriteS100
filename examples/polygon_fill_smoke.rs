@@ -66,7 +66,7 @@ impl ApplicationHandler for App {
                     area.interiors[0].reverse();
                 }
                 area.fill = AreaFillType::Solid(Color::rgb(0., 1., 0.));
-                ctx.add_instruction(DrawingInstruction::Area(area));
+                ctx.add_instruction(DrawingInstruction::Area(Box::new(area)));
                 renderer.begin_frame();
                 renderer.add_instructions(&mut ctx);
                 assert_eq!(renderer.rejected_area_fill_count(), 0);
@@ -124,7 +124,7 @@ impl ApplicationHandler for App {
                 invalid
                     .interiors
                     .push(ring(&[[1., 61.], [1., 61.], [1., 61.]]));
-                ctx.add_instruction(DrawingInstruction::Area(invalid));
+                ctx.add_instruction(DrawingInstruction::Area(Box::new(invalid)));
                 for _ in 0..2 {
                     renderer.begin_frame();
                     renderer.add_instructions(&mut ctx);

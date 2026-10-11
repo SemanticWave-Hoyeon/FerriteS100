@@ -125,9 +125,9 @@ mod tests {
             WorldPoint::new(2., 1.),
             WorldPoint::new(1., 2.),
         ]];
-        vec![DrawingInstruction::Area(
+        vec![DrawingInstruction::Area(Box::new(
             a.with_feature_id(10).with_cell_index(1),
-        )]
+        ))]
     }
     fn ctx(v: Vec<DrawingInstruction>) -> RenderContext {
         let mut c = RenderContext::new(Viewport::new(800., 600.));
@@ -218,11 +218,13 @@ mod tests {
         assert!(!same_area_inputs(&a, &b));
         let old = ctx(a.clone());
         let mut b = a;
-        b.push(DrawingInstruction::Area(AreaInstruction::new(vec![
-            WorldPoint::new(0., 0.),
-            WorldPoint::new(1., 0.),
-            WorldPoint::new(0., 1.),
-        ])));
+        b.push(DrawingInstruction::Area(Box::new(AreaInstruction::new(
+            vec![
+                WorldPoint::new(0., 0.),
+                WorldPoint::new(1., 0.),
+                WorldPoint::new(0., 1.),
+            ],
+        ))));
         let new = ctx(b);
         assert_ne!(
             old.static_area_geometry_epoch(),

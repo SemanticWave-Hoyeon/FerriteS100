@@ -87,11 +87,11 @@ mod bounded_scene_tests {
         (0..n)
             .map(|i| {
                 let x = i as f64;
-                DrawingInstruction::Area(AreaInstruction::new(vec![
+                DrawingInstruction::Area(Box::new(AreaInstruction::new(vec![
                     WorldPoint::new(x, 0.),
                     WorldPoint::new(x + 1., 0.),
                     WorldPoint::new(x, 1.),
-                ]))
+                ])))
             })
             .collect()
     }

@@ -62,14 +62,14 @@ impl ApplicationHandler for Smoke {
         ] {
             let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
             ctx.set_bounds(bounds);
-            ctx.add_instruction(DrawingInstruction::Text(
+            ctx.add_instruction(DrawingInstruction::Text(Box::new(
                 TextInstruction::new("ABCD".into(), WorldPoint::new(source, 5.))
                     .with_font_size(24.)
                     .with_color(Color::rgb(1., 0., 0.))
                     .with_alignment(HAlign::Center, VAlign::Middle)
                     .with_rotation(15.)
                     .with_offset(1.2, 0.8),
-            ));
+            )));
             r.set_lon_wrap_pixels(360. * ctx.scaler.scale_x() as f32);
             for zoom in [0.5f32, 1., 2.] {
                 r.reset_pan_offset();

@@ -191,8 +191,8 @@ mod tests {
             (1., 1., Some(20), Some(10)),
         ] {
             let mut l = LineInstruction::new(vec![]);
-            l.style.width = width;
-            l.style.color = Color::rgba(0., 0., 0., alpha);
+            l.style_mut().width = width;
+            l.style_mut().color = Color::rgba(0., 0., 0., alpha);
             l.scale_range = ScaleRange {
                 scale_maximum: lower,
                 scale_minimum: upper,

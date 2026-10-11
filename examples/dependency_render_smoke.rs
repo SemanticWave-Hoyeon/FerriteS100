@@ -197,9 +197,9 @@ impl ApplicationHandler for App {
                     c.add_instruction(line(4, Some("suppressor"), Some("a"), 9, 8.));
                 }
                 "empty-area" => {
-                    root = DrawingInstruction::Area(
+                    root = DrawingInstruction::Area(Box::new(
                         AreaInstruction::new(Vec::new()).with_feature_id(1),
-                    );
+                    ));
                     root.set_dependency(DrawingDependency::new(1, Some("a"), None, false));
                 }
                 "visible-text-parent" | "text-collision" | "whitespace-text" => {
@@ -208,25 +208,25 @@ impl ApplicationHandler for App {
                     } else {
                         "Parent label"
                     };
-                    root = DrawingInstruction::Text(
+                    root = DrawingInstruction::Text(Box::new(
                         TextInstruction::new(text.into(), WorldPoint::new(3., 4.))
                             .with_feature_id(1)
                             .with_priority(5),
-                    );
+                    ));
                     root.set_dependency(DrawingDependency::new(1, Some("a"), None, false));
                     if case == "text-collision" {
-                        c.add_instruction(DrawingInstruction::Text(
+                        c.add_instruction(DrawingInstruction::Text(Box::new(
                             TextInstruction::new(text.into(), WorldPoint::new(3., 4.))
                                 .with_feature_id(5)
                                 .with_priority(10),
-                        ));
+                        )));
                     }
                 }
                 "empty-text" => {
-                    root = DrawingInstruction::Text(
+                    root = DrawingInstruction::Text(Box::new(
                         TextInstruction::new(String::new(), WorldPoint::new(3., 4.))
                             .with_feature_id(1),
-                    );
+                    ));
                     root.set_dependency(DrawingDependency::new(1, Some("a"), None, false));
                 }
                 _ => {}

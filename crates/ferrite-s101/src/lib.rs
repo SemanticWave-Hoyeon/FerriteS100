@@ -1302,7 +1302,9 @@ pub fn convert_lua_results_for_cell(
                                             .with_feature_id(feature_id.unwrap_or(0))
                                             .with_cell_index(cell_index);
                                         context.add_instruction(
-                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                            ferrite_render::DrawingInstruction::Area(Box::new(
+                                                area_inst,
+                                            )),
                                         );
                                     }
                                 }
@@ -1391,7 +1393,9 @@ pub fn convert_lua_results_for_cell(
                                         };
 
                                         context.add_instruction(
-                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                            ferrite_render::DrawingInstruction::Area(Box::new(
+                                                area_inst,
+                                            )),
                                         );
                                     }
                                 }
@@ -1477,7 +1481,9 @@ pub fn convert_lua_results_for_cell(
                                         };
 
                                         context.add_instruction(
-                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                            ferrite_render::DrawingInstruction::Area(Box::new(
+                                                area_inst,
+                                            )),
                                         );
                                     }
                                 }
@@ -1526,7 +1532,9 @@ pub fn convert_lua_results_for_cell(
                                             .with_feature_id(feature_id.unwrap_or(0))
                                             .with_cell_index(cell_index);
                                         context.add_instruction(
-                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                            ferrite_render::DrawingInstruction::Area(Box::new(
+                                                area_inst,
+                                            )),
                                         );
                                     }
                                 }
@@ -1592,7 +1600,9 @@ pub fn convert_lua_results_for_cell(
                                             .with_feature_id(feature_id.unwrap_or(0))
                                             .with_cell_index(cell_index);
                                         context.add_instruction(
-                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                            ferrite_render::DrawingInstruction::Area(Box::new(
+                                                area_inst,
+                                            )),
                                         );
                                     }
                                 }
@@ -1685,7 +1695,7 @@ pub fn convert_lua_results_for_cell(
                                 );
                             }
                             context.add_instruction(ferrite_render::DrawingInstruction::Text(
-                                text_inst,
+                                Box::new(text_inst),
                             ));
                         } else if let Some(feature) = feature {
                             // Place text at feature geometry:
@@ -1734,7 +1744,7 @@ pub fn convert_lua_results_for_cell(
                                         );
                                     }
                                     context.add_instruction(
-                                        ferrite_render::DrawingInstruction::Text(ti),
+                                        ferrite_render::DrawingInstruction::Text(Box::new(ti)),
                                     );
                                     placed = true;
                                 }
@@ -1810,7 +1820,9 @@ pub fn convert_lua_results_for_cell(
                                                 );
                                             }
                                             context.add_instruction(
-                                                ferrite_render::DrawingInstruction::Text(ti),
+                                                ferrite_render::DrawingInstruction::Text(Box::new(
+                                                    ti,
+                                                )),
                                             );
                                             break; // One text label per feature
                                         }
@@ -1847,7 +1859,9 @@ pub fn convert_lua_results_for_cell(
                                             .with_feature_id(feature_id.unwrap_or(0))
                                             .with_cell_index(cell_index);
                                         context.add_instruction(
-                                            ferrite_render::DrawingInstruction::Area(area_inst),
+                                            ferrite_render::DrawingInstruction::Area(Box::new(
+                                                area_inst,
+                                            )),
                                         );
                                     }
                                 }
@@ -2137,17 +2151,20 @@ fn add_line_strokes(
     if lines.is_empty() {
         return;
     }
+    // One shared style per stroke for every piece of the feature.
     for style in &strokes[..strokes.len() - 1] {
+        let shared = std::sync::Arc::new(style.clone());
         for line in &lines {
             let mut part = line.clone();
-            part.style = style.clone();
+            part.style = shared.clone();
             part.color_token = style.color_token.clone();
             context.add_instruction(ferrite_render::DrawingInstruction::Line(part));
         }
     }
     let style = strokes.last().unwrap();
+    let shared = std::sync::Arc::new(style.clone());
     for mut line in lines {
-        line.style = style.clone();
+        line.style = shared.clone();
         line.color_token = style.color_token.clone();
         context.add_instruction(ferrite_render::DrawingInstruction::Line(line));
     }
@@ -3070,7 +3087,7 @@ mod hatch_resource_tests {
         assert_eq!(result[0].style.color_token.as_deref(), Some("A"));
         let mut area = ferrite_render::AreaInstruction::new(vec![]).with_hatch_strokes(result);
         area.fill_opacity = 0.4;
-        let mut instruction = ferrite_render::DrawingInstruction::Area(area);
+        let mut instruction = ferrite_render::DrawingInstruction::Area(Box::new(area));
         instruction.remap_colors(&|token| {
             if token == "A" {
                 Color::rgba(1., 0., 0., 0.8)
@@ -3347,7 +3364,7 @@ mod shallow_pattern_catalogue_tests {
             a.fill_ref = Some(fill.into());
             a.viewing_group.0 = group;
             a.portrayal_origin = ferrite_render::PortrayalOrigin::NonPoint;
-            let item = ferrite_render::DrawingInstruction::Area(a);
+            let item = ferrite_render::DrawingInstruction::Area(Box::new(a));
             assert_eq!(raw.is_optional(&item), optional);
             assert_eq!(
                 ferrite_render::pattern_display_allows(&item, false, Some(&raw)),

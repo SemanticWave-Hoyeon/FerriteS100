@@ -65,7 +65,7 @@ impl ApplicationHandler for App {
             let mut c = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
             c.set_bounds(GeoBounds::new(0., 0., 10., 10.));
             let rect = |x, w, color, order| {
-                DrawingInstruction::Area(
+                DrawingInstruction::Area(Box::new(
                     AreaInstruction::new(vec![
                         WorldPoint::new(x, 0.),
                         WorldPoint::new(x + w, 0.),
@@ -75,7 +75,7 @@ impl ApplicationHandler for App {
                     .with_solid_fill(color)
                     .with_priority(99)
                     .with_display_plane(plane(order)),
-                )
+                ))
             };
             for i in (0..500).rev() {
                 c.add_instruction(rect(
@@ -107,7 +107,7 @@ impl ApplicationHandler for App {
                 .with_priority(point_assignment.priority)
                 .with_viewing_group(point_assignment.viewing_group);
             text.background = Some(Color::RED);
-            c.add_instruction(DrawingInstruction::Text(text));
+            c.add_instruction(DrawingInstruction::Text(Box::new(text)));
             r.begin_frame();
             r.add_instructions_with_symbols(&mut c, Some(&mut cache), Some(profile), None);
             assert_eq!(r.missing_symbol_count(), 0);

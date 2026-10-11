@@ -30,13 +30,13 @@ fn instructions(c: &mut RenderContext, width: f32, height: f32) {
         ]
         .map(|p| c.scaler.screen_to_world(ScreenPoint::new(p[0], p[1])))
         .to_vec();
-        c.add_instruction(DrawingInstruction::Area(
+        c.add_instruction(DrawingInstruction::Area(Box::new(
             AreaInstruction::new(points).with_pattern_fill(
                 "FOULAR01P".into(),
                 (w, 0.),
                 (2., height),
             ),
-        ));
+        )));
     }
 }
 impl ApplicationHandler for App {

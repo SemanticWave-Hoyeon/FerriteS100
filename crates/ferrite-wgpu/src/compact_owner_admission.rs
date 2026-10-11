@@ -81,6 +81,8 @@ impl Frame {
 pub(crate) enum Ordinals<'a> {
     Legacy(std::ops::Range<usize>),
     Scheduled(std::slice::Iter<'a, u32>),
+    /// Ascending ordinals of view-intersecting cells (see `CellOrdinalIndex`).
+    Culled(std::vec::IntoIter<u32>),
 }
 impl<'a> Ordinals<'a> {
     pub(crate) fn new(n: usize, frame: Option<&'a Frame>) -> Self {
@@ -96,6 +98,7 @@ impl Iterator for Ordinals<'_> {
         match self {
             Self::Legacy(r) => r.next(),
             Self::Scheduled(i) => i.next().map(|i| *i as usize),
+            Self::Culled(i) => i.next().map(|i| i as usize),
         }
     }
 }
@@ -284,7 +287,7 @@ mod tests {
         for width in [0., -1., f32::NAN, f32::INFINITY, 1.] {
             let mut l =
                 LineInstruction::new(vec![WorldPoint::new(0., 0.), WorldPoint::new(1., 1.)]);
-            l.style.width = width;
+            l.style_mut().width = width;
             l.viewing_group = ViewingGroup(1);
             c.add_instruction(DrawingInstruction::Line(l));
         }

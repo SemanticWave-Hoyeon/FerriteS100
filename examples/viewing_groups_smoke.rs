@@ -71,7 +71,7 @@ impl ApplicationHandler for App {
         let mut c = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         c.set_bounds(GeoBounds::new(0., 0., 10., 10.));
         let groups = [27070, 90020];
-        c.add_instruction(DrawingInstruction::Area(
+        c.add_instruction(DrawingInstruction::Area(Box::new(
             AreaInstruction::new(vec![
                 WorldPoint::new(1., 6.),
                 WorldPoint::new(2., 6.),
@@ -80,7 +80,7 @@ impl ApplicationHandler for App {
             ])
             .with_solid_fill(Color::GREEN)
             .with_viewing_groups(&groups),
-        ));
+        )));
         c.add_instruction(DrawingInstruction::Line(
             LineInstruction::new(vec![WorldPoint::new(3., 7.), WorldPoint::new(4., 7.)])
                 .with_style(LineStyle::solid(Color::RED, 8.))
@@ -90,12 +90,12 @@ impl ApplicationHandler for App {
             PointInstruction::new("INFORM01".into(), WorldPoint::new(5.5, 7.))
                 .with_viewing_groups(&groups),
         ));
-        c.add_instruction(DrawingInstruction::Text(
+        c.add_instruction(DrawingInstruction::Text(Box::new(
             TextInstruction::new("TEST".into(), WorldPoint::new(7.5, 7.))
                 .with_font_size(24.)
                 .with_color(Color::BLACK)
                 .with_viewing_groups(&groups),
-        ));
+        )));
         let mut cache = SymbolCache::new(self.pc.join("Symbols"));
         let profile = pc.color_profiles.profiles.get("Day").unwrap();
         r.add_raster_layer(

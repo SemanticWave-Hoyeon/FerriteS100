@@ -216,7 +216,9 @@ impl PluginSystem {
                     .with_color(text_color)
                     .with_priority(priority);
                     text_instr.viewing_group = ViewingGroup(21010); // Always displayed
-                    instructions.push(ferrite_render::DrawingInstruction::Text(text_instr));
+                    instructions.push(ferrite_render::DrawingInstruction::Text(Box::new(
+                        text_instr,
+                    )));
                 }
                 DrawingInstruction::Circle {
                     center,

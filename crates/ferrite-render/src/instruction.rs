@@ -455,7 +455,7 @@ pub enum StrokeUnit {
 }
 
 /// Line style definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LineStyle {
     /// Color
     pub color: Color,
@@ -580,7 +580,7 @@ pub struct LineInstruction {
     /// Line style reference ID (from PC) or inline style
     pub style_ref: Option<String>,
     /// Inline style (used if style_ref is None)
-    pub style: LineStyle,
+    pub style: std::sync::Arc<LineStyle>,
     /// Color token for line color remapping
     pub color_token: Option<String>,
     /// Line vertices in world coordinates
@@ -615,6 +615,50 @@ pub struct LineInstruction {
     pub suppressible: bool,
 }
 
+/// Make equal line styles share one allocation. Charts repeat a few dozen
+/// styles across ~10^5 lines; equality is the derived `PartialEq`, so only
+/// identical styles are merged and drawing is unchanged.
+pub fn intern_line_styles(instructions: &mut [DrawingInstruction]) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::Arc;
+    fn key(s: &LineStyle) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        [
+            s.color.r, s.color.g, s.color.b, s.color.a, s.width, s.opacity,
+        ]
+        .map(f32::to_bits)
+        .hash(&mut h);
+        [s.offset_mm, s.interval_length_mm]
+            .map(f64::to_bits)
+            .hash(&mut h);
+        s.color_token.hash(&mut h);
+        s.dash_pattern.len().hash(&mut h);
+        s.authored_symbols.len().hash(&mut h);
+        h.finish()
+    }
+    let mut pool: std::collections::HashMap<u64, Vec<Arc<LineStyle>>> =
+        std::collections::HashMap::new();
+    for instruction in instructions {
+        let DrawingInstruction::Line(line) = instruction else {
+            continue;
+        };
+        let bucket = pool.entry(key(&line.style)).or_default();
+        match bucket.iter().find(|s| ***s == *line.style) {
+            Some(shared) if !Arc::ptr_eq(shared, &line.style) => line.style = shared.clone(),
+            Some(_) => {}
+            None => bucket.push(line.style.clone()),
+        }
+    }
+}
+
+/// One shared default style, so constructing a line allocates no style.
+fn default_line_style() -> std::sync::Arc<LineStyle> {
+    static DEFAULT: std::sync::OnceLock<std::sync::Arc<LineStyle>> = std::sync::OnceLock::new();
+    DEFAULT
+        .get_or_init(|| std::sync::Arc::new(LineStyle::default()))
+        .clone()
+}
+
 impl LineInstruction {
     #[inline]
     pub fn new(points: Vec<WorldPoint>) -> Self {
@@ -622,7 +666,7 @@ impl LineInstruction {
             style_ref: None,
             screen_ray: None,
             portrayal_path: None,
-            style: LineStyle::default(),
+            style: default_line_style(),
             color_token: None,
             points,
             priority: DisplayPriority::default(),
@@ -656,8 +700,14 @@ impl LineInstruction {
 
     #[inline]
     pub fn with_style(mut self, style: LineStyle) -> Self {
-        self.style = style;
+        self.style = std::sync::Arc::new(style);
         self
+    }
+
+    /// Copy-on-write access; styles are shared between lines.
+    #[inline]
+    pub fn style_mut(&mut self) -> &mut LineStyle {
+        std::sync::Arc::make_mut(&mut self.style)
     }
 
     #[inline]
@@ -1249,8 +1299,10 @@ impl TextInstruction {
 pub enum DrawingInstruction {
     Point(PointInstruction),
     Line(LineInstruction),
-    Area(AreaInstruction),
-    Text(TextInstruction),
+    /// Boxed: areas and texts are few but large, and every element of an
+    /// instruction list is sized by the largest variant.
+    Area(Box<AreaInstruction>),
+    Text(Box<TextInstruction>),
 }
 
 impl DrawingInstruction {
@@ -1303,6 +1355,23 @@ impl DrawingInstruction {
                 i.viewing_group = ViewingGroup(viewing_group);
                 i.additional_viewing_groups = Box::default();
             }
+        }
+    }
+    pub fn dependency_mut(&mut self) -> Option<&mut crate::DrawingDependency> {
+        match self {
+            Self::Point(i) => i.dependency.as_deref_mut(),
+            Self::Line(i) => i.dependency.as_deref_mut(),
+            Self::Area(i) => i.dependency.as_deref_mut(),
+            Self::Text(i) => i.dependency.as_deref_mut(),
+        }
+    }
+    /// Renumber the source cell (cached portrayal reused at another index).
+    pub fn set_cell_index(&mut self, index: Option<u32>) {
+        match self {
+            Self::Point(i) => i.cell_index = index,
+            Self::Line(i) => i.cell_index = index,
+            Self::Area(i) => i.cell_index = index,
+            Self::Text(i) => i.cell_index = index,
         }
     }
     pub fn cell_index(&self) -> Option<u32> {
@@ -1479,8 +1548,12 @@ impl DrawingInstruction {
             }
             DrawingInstruction::Line(line) => {
                 if let Some(token) = &line.color_token {
-                    line.style.color = lookup(token);
-                    line.style.color.a *= line.style.opacity;
+                    let mut color = lookup(token);
+                    color.a *= line.style.opacity;
+                    // Shared styles are copied only when the colour changes.
+                    if line.style.color != color {
+                        line.style_mut().color = color;
+                    }
                 }
             }
             DrawingInstruction::Text(text) => {
@@ -1524,12 +1597,12 @@ impl FeatureInstructions {
 
     pub fn add_area(&mut self, instruction: AreaInstruction) {
         self.instructions
-            .push(DrawingInstruction::Area(instruction));
+            .push(DrawingInstruction::Area(Box::new(instruction)));
     }
 
     pub fn add_text(&mut self, instruction: TextInstruction) {
         self.instructions
-            .push(DrawingInstruction::Text(instruction));
+            .push(DrawingInstruction::Text(Box::new(instruction)));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1718,14 +1791,14 @@ mod authored_opacity_tests {
 
     #[test]
     fn palette_switch_preserves_authored_fill_glyph_and_background_alpha() {
-        let mut area = DrawingInstruction::Area(
+        let mut area = DrawingInstruction::Area(Box::new(
             AreaInstruction::new(vec![]).with_solid_fill_token_opacity(Color::RED, "FILL", 0.5),
-        );
-        let mut text = DrawingInstruction::Text(
+        ));
+        let mut text = DrawingInstruction::Text(Box::new(
             TextInstruction::new("label".into(), WorldPoint::new(0., 0.))
                 .with_color_token_opacity(Color::BLACK, "GLYPH", 0.25)
                 .with_background_token_opacity(Color::WHITE, "BG", 0.75),
-        );
+        ));
         for rgb in [Color::BLUE, Color::GREEN, Color::RED] {
             let lookup = |_: &str| rgb.with_alpha(0.8);
             area.remap_colors(&lookup);
@@ -1808,13 +1881,13 @@ mod multiple_group_tests {
                 LineInstruction::new(vec![p, WorldPoint::new(1., 1.)])
                     .with_viewing_groups(&[27070, 90020]),
             ),
-            DrawingInstruction::Area(
+            DrawingInstruction::Area(Box::new(
                 AreaInstruction::new(vec![p, WorldPoint::new(1., 0.), WorldPoint::new(1., 1.)])
                     .with_viewing_groups(&[27070, 90020]),
-            ),
-            DrawingInstruction::Text(
+            )),
+            DrawingInstruction::Text(Box::new(
                 TextInstruction::new("X".into(), p).with_viewing_groups(&[27070, 90020]),
-            ),
+            )),
         ];
         let primary = HashSet::from([27070]);
         let both = HashSet::from([27070, 90020]);

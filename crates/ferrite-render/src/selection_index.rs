@@ -255,10 +255,10 @@ mod tests {
         area.interiors.push(ring(-2., 2.));
         let mut line =
             LineInstruction::new(vec![WorldPoint::new(-9., 0.), WorldPoint::new(9., 0.)]);
-        line.style = LineStyle::solid(Color::BLACK, 1.);
-        line.style.dash_pattern = vec![7., 5.];
+        line.style = std::sync::Arc::new(LineStyle::solid(Color::BLACK, 1.));
+        line.style_mut().dash_pattern = vec![7., 5.];
         let instructions = vec![
-            DrawingInstruction::Area(area),
+            DrawingInstruction::Area(Box::new(area)),
             DrawingInstruction::Line(line),
             DrawingInstruction::Line(LineInstruction::new(vec![
                 WorldPoint::new(7., 7.),
@@ -381,7 +381,9 @@ mod tests {
             let a = n as f64 / 10_000. * std::f64::consts::TAU;
             points.push(WorldPoint::new(a.cos(), a.sin()));
         }
-        let i = vec![DrawingInstruction::Area(AreaInstruction::new(points))];
+        let i = vec![DrawingInstruction::Area(Box::new(AreaInstruction::new(
+            points,
+        )))];
         let mut index = SelectionIndex::default();
         let mut payload = None;
         for z in [0.005, 1., 25., 200.] {
@@ -401,12 +403,12 @@ mod tests {
         let s = scaler();
         let mut instructions: Vec<_> = (0..64)
             .map(|_| {
-                DrawingInstruction::Area(AreaInstruction::new(vec![
+                DrawingInstruction::Area(Box::new(AreaInstruction::new(vec![
                     WorldPoint::new(-1., -1.),
                     WorldPoint::new(1., -1.),
                     WorldPoint::new(1., 1.),
                     WorldPoint::new(-1., 1.),
-                ]))
+                ])))
             })
             .collect();
         instructions.push(DrawingInstruction::Line(LineInstruction::new(vec![

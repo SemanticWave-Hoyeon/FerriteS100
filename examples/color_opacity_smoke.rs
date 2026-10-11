@@ -60,7 +60,7 @@ impl ApplicationHandler for App {
             .iter()
             .find_map(|i| {
                 if let DrawingInstruction::Area(a) = i {
-                    Some(a.clone())
+                    Some((**a).clone())
                 } else {
                     None
                 }
@@ -92,7 +92,7 @@ impl ApplicationHandler for App {
             WorldPoint::new(-6., 1.),
         ];
         area.interiors.clear();
-        let mut ghost: TextInstruction = glyph.clone();
+        let mut ghost: TextInstruction = (*glyph).clone();
         ghost.color_opacity = 0.;
         ghost.priority = DisplayPriority(99);
         let mut cases = Vec::new();
@@ -105,9 +105,9 @@ impl ApplicationHandler for App {
                 for zoom in [0.5, 1., 2.] {
                     c.clear_instructions();
                     for mut inst in [
-                        DrawingInstruction::Area(area.clone()),
+                        DrawingInstruction::Area(Box::new(area.clone())),
                         DrawingInstruction::Text(background.clone()),
-                        DrawingInstruction::Text(ghost.clone()),
+                        DrawingInstruction::Text(Box::new(ghost.clone())),
                         DrawingInstruction::Text(glyph.clone()),
                     ] {
                         inst.remap_colors(&|_| palette);

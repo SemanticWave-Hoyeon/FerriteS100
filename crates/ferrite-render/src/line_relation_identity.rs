@@ -292,8 +292,8 @@ mod tests {
         let old = context(fixture());
         let mut changed = fixture();
         if let DrawingInstruction::Line(l) = &mut changed[1] {
-            l.style.color = Color::TRANSPARENT;
-            l.style.width = 0.;
+            l.style_mut().color = Color::TRANSPARENT;
+            l.style_mut().width = 0.;
             l.viewing_group = crate::ViewingGroup(999);
         }
         let mut next = context(changed);
@@ -458,7 +458,7 @@ mod tests {
         let mut a = fixture();
         a.insert(
             1,
-            DrawingInstruction::Area(
+            DrawingInstruction::Area(Box::new(
                 crate::AreaInstruction::new(vec![
                     WorldPoint::new(0., 0.),
                     WorldPoint::new(1., 0.),
@@ -466,7 +466,7 @@ mod tests {
                 ])
                 .with_feature_id(30)
                 .with_cell_index(1),
-            ),
+            )),
         );
         let mut b = a.clone();
         assert!(same_static_line_relation_inputs(&a, &b));

@@ -106,7 +106,11 @@ enum FlatSourceKey {
     Point(usize, usize),
 }
 impl FlatSourceBinding {
-    const MAX_LOGICAL_BYTES: usize = 32 * 1024 * 1024;
+    // 128 B per instruction is a generous logical bound (actual use is ~50 B,
+    // under the 280 B each instruction already occupies). 512 MiB admits ~4M
+    // instructions; a 32 MiB cap disabled the binding at ~262k instructions,
+    // i.e. around 30 ENC cells, and every scene then reprojected all sources.
+    const MAX_LOGICAL_BYTES: usize = 512 * 1024 * 1024;
     fn admitted(count: usize, exemptions: usize) -> bool {
         count
             .checked_mul(128)
@@ -487,6 +491,55 @@ impl GeographicCoverageInventory {
             .filter(|c| c.surfaces.iter().any(|s| surface_contains(s, position)))
             .map(|c| c.scales.optimum_denominator)
             .min()
+    }
+
+    /// Datasets whose instructions can appear in the view grown by `margin`
+    /// (fraction of the viewport on each side) at the current display scale:
+    /// those with S-98 Appendix E / 4.6 selected coverage there, and every
+    /// dataset without a current coverage model. Unselected datasets are fully
+    /// hidden by coverage, so a scene without them draws the same pixels.
+    pub fn visible_datasets(
+        &self,
+        scaler: &Scaler,
+        wrapping: bool,
+        margin: f64,
+    ) -> Result<Vec<bool>> {
+        let mut visible: Vec<bool> = self.datasets.iter().map(Option::is_none).collect();
+        if self.current_dataset_count() == 0 {
+            return Ok(visible);
+        }
+        let inventory = self.project(scaler, wrapping)?;
+        let v = scaler.viewport;
+        let (mx, my) = (v.width as f64 * margin, v.height as f64 * margin);
+        let [x, y, right, bottom] = [
+            v.x as f64 - mx,
+            v.y as f64 - my,
+            (v.x + v.width) as f64 + mx,
+            (v.y + v.height) as f64 + my,
+        ];
+        let viewport = Region::from_rings(
+            &[[x, y], [right, y], [right, bottom], [x, bottom], [x, y]],
+            &[],
+        )?;
+        let affine = scaler.flat_affine();
+        let retained = self
+            .plane_coverage(&affine, wrapping)?
+            .retention(scaler.display_scale)
+            .iter()
+            .map(|(index, region)| Ok((*index, region.map_affine(|p| affine.screen(p))?)))
+            .collect::<Result<Vec<_>>>()?;
+        let plan = crate::coverage_loading::display_plan_with_retention(
+            &inventory,
+            scaler.display_scale,
+            &viewport,
+            &retained,
+        )?;
+        for selected in &plan.selection.coverages {
+            if let Some(slot) = visible.get_mut(inventory[selected.inventory_index].dataset_id) {
+                *slot = true;
+            }
+        }
+        Ok(visible)
     }
 
     pub fn current_dataset_count(&self) -> usize {
@@ -1201,6 +1254,37 @@ mod projected_view_tests {
             .project_with(|_, _, _| anyhow::bail!("horizon projection failed"))
             .unwrap_err();
         assert!(error.to_string().contains("horizon projection failed"));
+    }
+    /// Only datasets whose selected coverage meets the grown view are visible;
+    /// a dataset without a current coverage model always is.
+    #[test]
+    fn visible_datasets_keep_nearby_selected_and_unmodelled_datasets() {
+        let near = coverage(7);
+        let mut far = coverage(9);
+        for p in &mut far.surfaces[0].exterior {
+            p[0] += 40.;
+        }
+        for p in &mut far.surfaces[0].holes[0] {
+            p[0] += 40.;
+        }
+        let inventory = GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
+            datasets: vec![Some(vec![near]), Some(vec![far]), None],
+        };
+        let mut c = RenderContext::new(Viewport::new(800., 600.));
+        c.set_bounds(GeoBounds::new(0., 0., 2., 2.));
+        let visible = inventory.visible_datasets(&c.scaler, true, 1.0).unwrap();
+        assert_eq!(visible, vec![true, false, true]);
+        c.set_bounds(GeoBounds::new(-1., -1., 45., 3.));
+        let visible = inventory.visible_datasets(&c.scaler, true, 1.0).unwrap();
+        assert!(
+            visible[1],
+            "far dataset is selected once the view reaches it"
+        );
     }
     /// The plane cache must match validating and unioning every surface in
     /// screen space, across projections, zooms, pans and longitude copies.

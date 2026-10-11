@@ -57,7 +57,7 @@ fn main() -> Result<()> {
                     p[0], p[1],
                 ))?);
                 probes.push(command);
-                let mut command = DrawingInstruction::Area(
+                let mut command = DrawingInstruction::Area(Box::new(
                     AreaInstruction::new(
                         surface
                             .exterior
@@ -66,7 +66,7 @@ fn main() -> Result<()> {
                             .collect(),
                     )
                     .with_cell_index(cell_id),
-                );
+                ));
                 command.set_portrayal_origin(PortrayalOrigin::NonPoint);
                 probes.push(command);
             }

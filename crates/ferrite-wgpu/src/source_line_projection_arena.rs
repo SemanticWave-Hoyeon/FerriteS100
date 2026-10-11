@@ -693,10 +693,10 @@ mod tests {
         };
         let mut l = line.clone();
         assert!(eligible(&l));
-        l.style.offset_mm = 1.;
+        l.style_mut().offset_mm = 1.;
         assert!(!eligible(&l));
-        l.style.offset_mm = 0.;
-        l.style.dash_pattern.push(1.);
+        l.style_mut().offset_mm = 0.;
+        l.style_mut().dash_pattern.push(1.);
         assert!(!eligible(&l));
         assert!(!Cache::new(None).enabled);
         assert!(!Cache::new(Some("true".as_ref())).enabled);
@@ -1023,8 +1023,8 @@ mod source_bounds_controls {
                 panic!("line")
             };
             match mode {
-                0 => l.style.offset_mm = 1.,
-                1 => l.style.dash_pattern.push(1.),
+                0 => l.style_mut().offset_mm = 1.,
+                1 => l.style_mut().dash_pattern.push(1.),
                 2 => {
                     l.screen_ray = Some(ferrite_render::ScreenRay {
                         direction: 0.,

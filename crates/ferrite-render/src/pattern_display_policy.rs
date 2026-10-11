@@ -161,7 +161,7 @@ mod tests {
         area.fill_ref = Some(fill.into());
         area.viewing_group.0 = group;
         area.portrayal_origin = PortrayalOrigin::NonPoint;
-        DrawingInstruction::Area(area)
+        DrawingInstruction::Area(Box::new(area))
     }
     #[test]
     fn optional_selector_does_not_hide_dredged_restriction_or_unknown_patterns() {

@@ -64,12 +64,12 @@ fn command(kind: &str, anchor: WorldPoint, mm: [f32; 2]) -> DrawingInstruction {
                 .with_scale(4.)
                 .with_offset(mm[0], mm[1]),
         ),
-        "text" => DrawingInstruction::Text(
+        "text" => DrawingInstruction::Text(Box::new(
             TextInstruction::new("Local mm".into(), anchor)
                 .with_font_size(24.)
                 .with_offset(mm[0], mm[1])
                 .with_alignment(HAlign::Center, VAlign::Middle),
-        ),
+        )),
         _ => unreachable!(),
     }
 }

@@ -111,7 +111,7 @@ mod tests {
         let ring = |a, b| vec![world(a, a), world(b, a), world(b, b), world(a, b)];
         let mut area = AreaInstruction::new(ring(0., 10.));
         area.interiors.push(ring(4., 6.));
-        let area = DrawingInstruction::Area(area);
+        let area = DrawingInstruction::Area(Box::new(area));
         assert!(hit_geometry(&area, &scaler, scaler.world_to_screen(world(2., 2.)), 5.).is_some());
         assert!(hit_geometry(&area, &scaler, scaler.world_to_screen(world(5., 5.)), 5.).is_none());
         assert!(
@@ -210,7 +210,7 @@ mod wrapped_tests {
         };
         let mut area = AreaInstruction::new(ring(0., 10.));
         area.interiors.push(ring(4., 6.));
-        let a = DrawingInstruction::Area(area);
+        let a = DrawingInstruction::Area(Box::new(area));
         let q = scaler.world_to_screen(WorldPoint::new(362., 2.));
         assert!(hit_geometry_visible(&a, &scaler, q, 3., None).is_none());
         let h = hit_geometry_wrapped_visible(&a, &scaler, q, 3., None, true).unwrap();
@@ -267,8 +267,8 @@ mod invisible_stroke_tests {
         let low = LineInstruction::new(pts.clone()).with_priority(1);
         for (width, alpha) in [(1., 0.), (0., 1.), (1., f32::NAN)] {
             let mut high = LineInstruction::new(pts.clone()).with_priority(99);
-            high.style.width = width;
-            high.style.color.a = alpha;
+            high.style_mut().width = width;
+            high.style_mut().color.a = alpha;
             let q = s.world_to_screen(WorldPoint::new(5., 5.));
             assert!(hit_geometry(&DrawingInstruction::Line(high.clone()), &s, q, 1.).is_none());
             let instructions = [
@@ -289,8 +289,8 @@ mod stroke_profile_tests {
     fn authored_opacity_survives_repeated_profile_changes() {
         let mut line = LineInstruction::new(vec![WorldPoint::new(0., 0.), WorldPoint::new(1., 1.)]);
         line.color_token = Some("CHBLK".into());
-        line.style.opacity = 0.5;
-        line.style.color = Color::BLACK.with_alpha(0.5);
+        line.style_mut().opacity = 0.5;
+        line.style_mut().color = Color::BLACK.with_alpha(0.5);
         let mut inst = DrawingInstruction::Line(line);
         for color in [Color::BLUE, Color::GREEN, Color::RED] {
             inst.remap_colors(&|_| color);

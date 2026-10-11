@@ -16,7 +16,7 @@ struct Smoke {
     out: PathBuf,
 }
 fn area(x: f64, priority: i32, plane: DisplayPlane) -> DrawingInstruction {
-    DrawingInstruction::Area(
+    DrawingInstruction::Area(Box::new(
         AreaInstruction::new(vec![
             WorldPoint::new(x - 2., 4.),
             WorldPoint::new(x + 2., 4.),
@@ -26,17 +26,17 @@ fn area(x: f64, priority: i32, plane: DisplayPlane) -> DrawingInstruction {
         .with_solid_fill(Color::rgb(0., 0., 1.))
         .with_priority(priority)
         .with_display_plane(plane),
-    )
+    ))
 }
 fn text(x: f64, color: Color, priority: i32, plane: DisplayPlane) -> DrawingInstruction {
-    DrawingInstruction::Text(
+    DrawingInstruction::Text(Box::new(
         TextInstruction::new("HH".into(), WorldPoint::new(x, 5.))
             .with_font_size(24.)
             .with_color(color)
             .with_alignment(HAlign::Center, VAlign::Middle)
             .with_priority(priority)
             .with_display_plane(plane),
-    )
+    ))
 }
 fn colored(image: &image::RgbImage, point: [f32; 2], channel: usize) -> usize {
     let mut count = 0;

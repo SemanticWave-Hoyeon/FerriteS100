@@ -32,11 +32,11 @@ impl ApplicationHandler for Smoke {
         renderer.background_color = Color::WHITE;
         let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         ctx.set_bounds(GeoBounds::new(0., 0., 10., 10.));
-        ctx.add_instruction(DrawingInstruction::Text(
+        ctx.add_instruction(DrawingInstruction::Text(Box::new(
             TextInstruction::new("TEXT EXPORT 12.3".into(), WorldPoint::new(2., 5.))
                 .with_color(Color::BLACK)
                 .with_font_size(40.),
-        ));
+        )));
         renderer.begin_frame();
         renderer.add_instructions(&mut ctx);
         std::fs::create_dir_all(&self.output).unwrap();

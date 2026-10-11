@@ -882,8 +882,8 @@ mod compact_admission_registry_controls {
                 LineInstruction::new(vec![WorldPoint::new(0., 0.), WorldPoint::new(1., 1.)]);
             l.cell_index = Some(0);
             l.viewing_group = ferrite_render::ViewingGroup(1);
-            l.style.width = width;
-            l.style.color.a = alpha;
+            l.style_mut().width = width;
+            l.style_mut().color.a = alpha;
             c.add_instruction(DrawingInstruction::Line(l));
         }
         c.get_sorted_instructions();
@@ -1107,7 +1107,7 @@ mod compact_admission_registry_controls {
                 .with_viewing_groups(&[2])
                 .with_scale_range(range),
         ));
-        c.add_instruction(DrawingInstruction::Area(
+        c.add_instruction(DrawingInstruction::Area(Box::new(
             AreaInstruction::new(vec![
                 WorldPoint::new(0., 0.),
                 WorldPoint::new(1., 0.),
@@ -1116,13 +1116,13 @@ mod compact_admission_registry_controls {
             .with_cell_index(0)
             .with_viewing_groups(&[1])
             .with_scale_range(range),
-        ));
-        c.add_instruction(DrawingInstruction::Text(
+        )));
+        c.add_instruction(DrawingInstruction::Text(Box::new(
             TextInstruction::new("mandatory".into(), WorldPoint::new(5., 6.))
                 .with_cell_index(1)
                 .with_viewing_groups(&[2])
                 .with_scale_range(range),
-        ));
+        )));
         // Serialized full IR, including geometry bits/owner fields, must not be mutated by admission.
         let original = serde_json::to_vec(c.raw_instructions()).unwrap();
         for scale in [0, 9, 10, 20, 21, u32::MAX] {
@@ -1202,7 +1202,7 @@ mod compact_admission_registry_controls {
                 .with_cell_index(0)
                 .with_viewing_groups(&[1]);
         line.color_token = Some("LINE".into());
-        line.style.opacity = 0.5;
+        line.style_mut().opacity = 0.5;
         c.add_instruction(DrawingInstruction::Line(line));
         c.get_sorted_instructions();
         assert_eq!(

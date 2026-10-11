@@ -51,7 +51,7 @@ impl ApplicationHandler for Smoke {
                 .is_some_and(|prior| prior != shape);
             let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
             ctx.set_bounds(GeoBounds::new(0., 0., 10., 10.));
-            ctx.add_instruction(DrawingInstruction::Area(area));
+            ctx.add_instruction(DrawingInstruction::Area(Box::new(area)));
             renderer.precompute_triangulations(&ctx);
             let revision = ctx.geometry_revision();
             for warm in [false, true] {

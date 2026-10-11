@@ -91,7 +91,7 @@ fn fixture(case: Case, enabled: bool) -> RenderContext {
             WorldPoint::new(lon + 0.1, lat + 0.1),
         ];
     }
-    line.style.dash_pattern = vec![8., 5.];
+    line.style_mut().dash_pattern = vec![8., 5.];
     c.add_instruction(DrawingInstruction::Line(line));
     c
 }

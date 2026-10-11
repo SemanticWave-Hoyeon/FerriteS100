@@ -87,8 +87,8 @@ impl ApplicationHandler for App {
                                 .collect(),
                         )
                         .with_solid_fill(Color::rgb(0., 1., 0.));
-                        c.add_instruction(DrawingInstruction::Area(underlay));
-                        c.add_instruction(DrawingInstruction::Area(area));
+                        c.add_instruction(DrawingInstruction::Area(Box::new(underlay)));
+                        c.add_instruction(DrawingInstruction::Area(Box::new(area)));
                         r.reset_pan_offset();
                         r.begin_frame();
                         r.add_instructions_with_symbols(

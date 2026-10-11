@@ -1114,8 +1114,8 @@ mod grouped_path_tests {
                 assert_eq!(runs.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 3]);
                 let mut line = LineInstruction::new(vec![origin, origin]);
                 line.portrayal_path = Some(p);
-                line.style = LineStyle::solid_mm(Color::BLACK, 0.32);
-                line.style.dash_pattern = vec![3.6, 1.8];
+                line.style = std::sync::Arc::new(LineStyle::solid_mm(Color::BLACK, 0.32));
+                line.style_mut().dash_pattern = vec![3.6, 1.8];
                 let instruction = DrawingInstruction::Line(line);
                 let a = scaler.world_to_screen(origin);
                 for (x, hit) in [

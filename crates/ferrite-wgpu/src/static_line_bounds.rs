@@ -177,7 +177,7 @@ mod tests {
         assert!(legacy_finite_bounds(&[WorldPoint::new(f64::INFINITY, 2.)]).is_none());
         let c = context(vec![WorldPoint::new(1., 1.), WorldPoint::new(2., 2.)]);
         let mut l = line(&c).clone();
-        l.style.offset_mm = 1.;
+        l.style_mut().offset_mm = 1.;
         let mut cache = Cache::new(Some(std::ffi::OsStr::new("1")));
         cache.bind(c.static_line_relation_epoch(), 1);
         assert!(cache.prepare(0, &l).is_none());
