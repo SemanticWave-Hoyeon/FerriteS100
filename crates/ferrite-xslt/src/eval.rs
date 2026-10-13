@@ -548,7 +548,7 @@ fn core_function(name: &str, args: &[Value], ctx: &Context) -> Option<Result<Val
                 arity(name, args, 0, 1)?;
                 let s = string_arg(args, 0, ctx);
                 Value::string(
-                    s.split(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+                    s.split([' ', '\t', '\n', '\r'])
                         .filter(|w| !w.is_empty())
                         .collect::<Vec<_>>()
                         .join(" "),

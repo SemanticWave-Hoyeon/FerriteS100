@@ -1061,9 +1061,12 @@ struct Frame {
     variables: Vec<(QName, Value)>,
 }
 
+/// Global variables by (namespace, local name).
+type Globals = HashMap<(Option<Rc<str>>, Rc<str>), Value>;
+
 struct Exec<'s> {
     sheet: &'s Stylesheet,
-    globals: RefCell<HashMap<(Option<Rc<str>>, Rc<str>), Value>>,
+    globals: RefCell<Globals>,
     builders: RefCell<Vec<Builder>>,
     frames: RefCell<Vec<Frame>>,
     current: RefCell<Vec<NodeRef>>,
@@ -1260,7 +1263,7 @@ impl Stylesheet {
                 .borrow_mut()
                 .insert((name.namespace.clone(), Rc::clone(&name.local)), v);
         }
-        exec.apply(&[root.clone()], None, &[], &root, None)?;
+        exec.apply(std::slice::from_ref(&root), None, &[], &root, None)?;
         let builder = exec.builders.borrow_mut().pop().expect("result builder");
         Ok(Output {
             root: NodeRef::root_of(builder.finish()),
@@ -1589,9 +1592,8 @@ impl Exec<'_> {
         position: usize,
         size: usize,
     ) -> Result<String> {
-        match self.var_value(&VarValue::Content(body.to_vec()), node, position, size)? {
-            v => Ok(v.to_string_value()),
-        }
+        let v = self.var_value(&VarValue::Content(body.to_vec()), node, position, size)?;
+        Ok(v.to_string_value())
     }
 
     fn run(&self, body: &[Instr], node: &NodeRef, position: usize, size: usize) -> Result<()> {
@@ -1984,7 +1986,7 @@ pub fn format_number(
         let chars: Vec<char> = int.chars().collect();
         let mut grouped = String::new();
         for (i, c) in chars.iter().enumerate() {
-            if i > 0 && (chars.len() - i) % g == 0 {
+            if i > 0 && (chars.len() - i).is_multiple_of(g) {
                 grouped.push(f.grouping_separator);
             }
             grouped.push(*c);
