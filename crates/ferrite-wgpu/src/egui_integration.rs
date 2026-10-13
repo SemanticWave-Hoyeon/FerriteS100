@@ -262,6 +262,8 @@ pub struct AppUiState {
     pub open_catalogue_set_requested: bool,
     /// Request to save screenshot
     pub screenshot_requested: bool,
+    /// Request to save the chart area alone as a PNG without a dialog
+    pub chart_image_requested: bool,
     /// Request to zoom in
     pub zoom_in_requested: bool,
     /// Request to zoom out
@@ -1678,6 +1680,16 @@ impl EguiIntegration {
                 ui_state.screenshot_requested = true;
                 ui.close_menu();
             }
+            if ui
+                .add_enabled(
+                    ui_state.chart_count > 0,
+                    egui::Button::new("Save Chart Image"),
+                )
+                .clicked()
+            {
+                ui_state.chart_image_requested = true;
+                ui.close_menu();
+            }
             ui.separator();
             if ui.button("Exit").clicked() {
                 ui_state.close_requested = true;
@@ -1839,6 +1851,15 @@ impl EguiIntegration {
         }
         if icon_button(ui, Icon::Fit, "Fit to Chart").clicked() {
             ui_state.reset_view_requested = true;
+        }
+        if ui
+            .add_enabled_ui(ui_state.chart_count > 0, |ui| {
+                icon_button(ui, Icon::Camera, "Save Chart Image (PNG to Pictures)")
+            })
+            .inner
+            .clicked()
+        {
+            ui_state.chart_image_requested = true;
         }
         if icon_button(
             ui,

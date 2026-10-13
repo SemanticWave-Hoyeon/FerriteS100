@@ -130,6 +130,7 @@ pub(crate) enum Icon {
     Plugin,
     Mcp,
     Chat,
+    Camera,
 }
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     icon_toggle(ui, icon, label, false)
@@ -264,6 +265,19 @@ pub(crate) fn icon_toggle_with_badge(
             );
             p.circle_stroke(pos(-1., -6.), 2., stroke);
             p.circle_stroke(pos(6., 1.), 2., stroke);
+        }
+        Icon::Camera => {
+            // A camera body with a lens and a viewfinder bump.
+            p.rect_stroke(
+                egui::Rect::from_min_max(pos(-7., -4.), pos(7., 6.)),
+                2.,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment([pos(-3., -4.), pos(-2., -6.)], stroke);
+            p.line_segment([pos(-2., -6.), pos(2., -6.)], stroke);
+            p.line_segment([pos(2., -6.), pos(3., -4.)], stroke);
+            p.circle_stroke(pos(0., 1.), 3., stroke);
         }
         Icon::Chat => {
             // A speech bubble with a tail.

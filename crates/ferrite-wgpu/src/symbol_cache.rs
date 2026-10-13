@@ -659,6 +659,50 @@ impl SymbolCache {
         self.symbols.get(symbol_id)
     }
 
+    /// Rasterize symbols not cached yet on several threads; afterwards each
+    /// is cached (or known missing) exactly as `get_symbol` would leave it.
+    pub fn prefetch_symbols<'a>(
+        &mut self,
+        symbol_ids: impl IntoIterator<Item = &'a str>,
+        color_profile: &ColorProfile,
+    ) {
+        let mut wanted: Vec<&str> = symbol_ids
+            .into_iter()
+            .filter(|id| {
+                !id.is_empty()
+                    && !self.symbols.contains_key(*id)
+                    && !self.missing_symbols.contains(*id)
+            })
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let rendered: Vec<_> = {
+            use rayon::prelude::*;
+            let this = &*self;
+            wanted
+                .par_iter()
+                .map(|id| this.render_symbol(id, color_profile))
+                .collect()
+        };
+        for (id, result) in wanted.into_iter().zip(rendered) {
+            self.store_symbol(id, result);
+        }
+    }
+
+    /// None when the symbol has no SVG source.
+    fn render_symbol(
+        &self,
+        symbol_id: &str,
+        color_profile: &ColorProfile,
+    ) -> Option<Result<SymbolGeometry, String>> {
+        let svg_path = self.symbols_path.join(format!("{}.svg", symbol_id));
+        if !self.source_exists(&svg_path) {
+            tracing::debug!("Symbol SVG not found: {}", svg_path.display());
+            return None;
+        }
+        Some(self.render_svg(&svg_path, symbol_id, color_profile))
+    }
+
     /// Load a symbol from SVG file into cache (cold path, called once per symbol)
     #[cold]
     fn load_symbol(&mut self, symbol_id: &str, color_profile: &ColorProfile) {
@@ -667,15 +711,16 @@ impl SymbolCache {
             symbol_id,
             self.symbols_path.display()
         );
+        let result = self.render_symbol(symbol_id, color_profile);
+        self.store_symbol(symbol_id, result);
+    }
 
-        let svg_path = self.symbols_path.join(format!("{}.svg", symbol_id));
-        if !self.source_exists(&svg_path) {
-            tracing::debug!("Symbol SVG not found: {}", svg_path.display());
+    fn store_symbol(&mut self, symbol_id: &str, result: Option<Result<SymbolGeometry, String>>) {
+        let Some(result) = result else {
             self.missing_symbols.insert(symbol_id.to_string());
             return;
-        }
-
-        match self.render_svg(&svg_path, symbol_id, color_profile) {
+        };
+        match result {
             Ok(geometry) => {
                 tracing::debug!(
                     "Rendered symbol '{}': {}x{} pixels",

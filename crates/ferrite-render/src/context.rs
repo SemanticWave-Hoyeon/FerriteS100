@@ -276,6 +276,11 @@ impl RenderContext {
         next
     }
 
+    /// The instruction list, in insertion order (copied only if shared).
+    pub fn into_instructions(self) -> Vec<DrawingInstruction> {
+        std::sync::Arc::try_unwrap(self.instructions).unwrap_or_else(|shared| (*shared).clone())
+    }
+
     /// Copy-on-write access: clones the instruction list only while a
     /// `fork_for_emission` owner still shares it.
     fn instructions_mut(&mut self) -> &mut Vec<DrawingInstruction> {
@@ -446,10 +451,7 @@ impl RenderContext {
             self.static_source_classification.take();
             self.cell_ordinals.take();
             self.static_instruction_order.take();
-            // Keys (area extents scan every vertex) are computed once per
-            // instruction; sort_by_cached_key is stable like sort_by_key.
-            self.instructions_mut()
-                .sort_by_cached_key(|i| i.render_order());
+            crate::sort_by_render_order(self.instructions_mut());
             crate::intern_line_styles(self.instructions_mut());
             self.sorted = true;
         }

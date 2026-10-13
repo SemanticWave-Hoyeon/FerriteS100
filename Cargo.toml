@@ -159,6 +159,11 @@ sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mimalloc = "0.1"
+# mi_option_set: return freed pages to the OS immediately (purge delay 0).
+libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
+# Per-OS Pictures folder for chart image export (Windows Known Folder,
+# XDG user-dirs on Linux, ~/Pictures on macOS).
+dirs = "6"
 tempfile = "3"
 
 # HDF5 fixture authoring for end-to-end coverage examples only.

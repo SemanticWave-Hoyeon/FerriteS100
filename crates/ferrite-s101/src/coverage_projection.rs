@@ -13,7 +13,7 @@ use ferrite_render::{
 use ferrite_render::{PointOriginGeometry, PortrayalOrigin};
 use ferrite_s100_core::S101Cell;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
 };
@@ -595,7 +595,12 @@ impl GeographicCoverageInventory {
     ) -> Result<FlatSourceBinding> {
         let mut sources = Vec::new();
         let mut slots = Vec::with_capacity(context.instruction_count());
-        let mut lookup = HashMap::new();
+        // Slots are numbered in first-seen order. Exempt and per-dataset
+        // non-point keys are dense, so only point anchors need a hash map.
+        let mut exempt_slot = None;
+        let mut non_point_slots: Vec<Option<usize>> = vec![None; self.datasets.len()];
+        let mut point_slots: rustc_hash::FxHashMap<(usize, usize), usize> =
+            rustc_hash::FxHashMap::default();
         for (ordinal, command) in context.raw_instructions().iter().enumerate() {
             let (key, source) = if exempt.contains(&ordinal) {
                 (FlatSourceKey::Exempt, FlatBoundSource::Exempt)
@@ -633,10 +638,22 @@ impl GeographicCoverageInventory {
                     }
                 }
             };
-            let slot = *lookup.entry(key).or_insert_with(|| {
-                let i = sources.len();
+            let entry = match key {
+                FlatSourceKey::Exempt => &mut exempt_slot,
+                FlatSourceKey::NonPoint(cell) => &mut non_point_slots[cell],
+                FlatSourceKey::Point(cell, anchor) => {
+                    let next = sources.len();
+                    let slot = *point_slots.entry((cell, anchor)).or_insert(next);
+                    if slot == next {
+                        sources.push(source);
+                    }
+                    slots.push(slot);
+                    continue;
+                }
+            };
+            let slot = *entry.get_or_insert_with(|| {
                 sources.push(source);
-                i
+                sources.len() - 1
             });
             slots.push(slot);
         }
@@ -721,10 +738,19 @@ impl GeographicCoverageInventory {
         if let Some(cached) = cache.as_ref().filter(|c| c.key == key) {
             return Ok(cached.clone());
         }
-        let mut footprints = Vec::new();
-        for (dataset_id, coverages) in self.datasets.iter().enumerate() {
-            let Some(coverages) = coverages else { continue };
-            for coverage in coverages {
+        // Each coverage's region is independent: build them in parallel, then
+        // keep dataset/coverage order (and the first error in that order).
+        let jobs: Vec<_> = self
+            .datasets
+            .iter()
+            .enumerate()
+            .filter_map(|(dataset_id, coverages)| Some((dataset_id, coverages.as_ref()?)))
+            .flat_map(|(dataset_id, coverages)| coverages.iter().map(move |c| (dataset_id, c)))
+            .collect();
+        let footprints = {
+            use rayon::prelude::*;
+            jobs.par_iter()
+                .map(|&(dataset_id, coverage)| -> Result<_> {
                 let mut region: Option<Region> = None;
                 for (surface_index, surface) in coverage.surfaces.iter().enumerate() {
                     for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
@@ -755,14 +781,17 @@ impl GeographicCoverageInventory {
                         });
                     }
                 }
-                footprints.push(CoverageFootprint {
+                Ok(CoverageFootprint {
                     dataset_id,
                     coverage_id: coverage.feature_key,
                     scales: coverage.scales,
                     region: region.context("Empty S-101 DataCoverage surface")?,
-                });
-            }
-        }
+                })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+        };
         let plane = Arc::new(PlaneCoverage {
             key,
             footprints,
@@ -841,13 +870,20 @@ impl GeographicCoverageInventory {
             .as_ref()
             .and_then(|binding| binding.northings(scaler));
         let planes = binding.as_ref().and_then(|binding| binding.planes(&affine));
+        let shifts = &[0., -360., 360.][..if wrapping { 3 } else { 1 }];
         let mut passes = Vec::new();
-        for &shift in &[0., -360., 360.][..if wrapping { 3 } else { 1 }] {
-            if let Some(binding) = binding.as_ref() {
-                // Project unique immutable source metadata in THIS actual view.
-                let sources = binding
+        if let Some(binding) = binding.as_ref() {
+            // The longitude copies are independent: prepare them in parallel
+            // and keep their order (and the first error in that order).
+            use rayon::prelude::*;
+            let prepared: Vec<Result<_>> = shifts
+                .par_iter()
+                .map(|&shift| -> Result<_> {
+                    // Project unique immutable source metadata in THIS actual view.
+                    let sources = binding
                     .sources
-                    .iter()
+                    .par_iter()
+                    .with_min_len(4096)
                     .enumerate()
                     .map(
                         |(source_index, source)| -> ferrite_render::Result<(CoverageSource, bool)> {
@@ -914,14 +950,23 @@ impl GeographicCoverageInventory {
                             })
                         },
                     )
+                    // In order, so the first failing source is reported.
+                    .collect::<Vec<_>>()
+                    .into_iter()
                     .collect::<ferrite_render::Result<Vec<_>>>()?;
-                passes.push(PreparedCoveragePass::prepare_source_slots(
-                    frame.clone(),
-                    &sources,
-                    &binding.slots,
-                )?);
-                continue;
+                    Ok(PreparedCoveragePass::prepare_source_slots(
+                        frame.clone(),
+                        &sources,
+                        &binding.slots,
+                    )?)
+                })
+                .collect();
+            for pass in prepared {
+                passes.push(pass?);
             }
+        }
+        // Without a binding, each pass classifies every instruction in order.
+        for &shift in shifts.iter().filter(|_| binding.is_none()) {
             let mut ordinal = 0;
             let pass = PreparedCoveragePass::prepare(
                 context.raw_instructions(),

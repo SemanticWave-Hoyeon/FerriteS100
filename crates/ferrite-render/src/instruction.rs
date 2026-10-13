@@ -618,6 +618,52 @@ pub struct LineInstruction {
 /// Make equal line styles share one allocation. Charts repeat a few dozen
 /// styles across ~10^5 lines; equality is the derived `PartialEq`, so only
 /// identical styles are merged and drawing is unchanged.
+/// Stable sort by `render_order`, identical to `sort_by_key`. Keys (area
+/// extents scan every vertex) are computed once, in parallel; the stable sort
+/// merges already-ordered runs (per-cell lists arrive pre-sorted), and the
+/// instructions are then moved once each into their sorted positions.
+pub fn sort_by_render_order(instructions: &mut Vec<DrawingInstruction>) {
+    use rayon::prelude::*;
+    let Ok(count) = u32::try_from(instructions.len()) else {
+        instructions.sort_by_cached_key(DrawingInstruction::render_order);
+        return;
+    };
+    let keys: Vec<RenderOrder> = instructions
+        .par_iter()
+        .with_min_len(4096)
+        .map(DrawingInstruction::render_order)
+        .collect();
+    let mut order: Vec<u32> = (0..count).collect();
+    order.sort_by_key(|&i| keys[i as usize]);
+    if order
+        .iter()
+        .enumerate()
+        .all(|(position, i)| position == *i as usize)
+    {
+        return;
+    }
+    struct Source(*const DrawingInstruction);
+    // SAFETY: only read through shared access below, each element once.
+    unsafe impl Sync for Source {}
+    let mut source = std::mem::ManuallyDrop::new(std::mem::take(instructions));
+    let from = Source(source.as_ptr());
+    let from = &from;
+    // `order` is a permutation, so every element is moved out exactly once;
+    // the source buffer is then freed without dropping any element.
+    let sorted: Vec<DrawingInstruction> = order
+        .par_iter()
+        .with_min_len(4096)
+        // SAFETY: i < len, and no index repeats.
+        .map(|&i| unsafe { std::ptr::read(from.0.add(i as usize)) })
+        .collect();
+    // SAFETY: every element was moved into `sorted` above.
+    unsafe {
+        source.set_len(0);
+        std::mem::ManuallyDrop::drop(&mut source);
+    }
+    *instructions = sorted;
+}
+
 pub fn intern_line_styles(instructions: &mut [DrawingInstruction]) {
     use std::hash::{Hash, Hasher};
     use std::sync::Arc;
@@ -638,15 +684,34 @@ pub fn intern_line_styles(instructions: &mut [DrawingInstruction]) {
     }
     let mut pool: std::collections::HashMap<u64, Vec<Arc<LineStyle>>> =
         std::collections::HashMap::new();
+    // Most lines already share an allocation: resolve each allocation once.
+    // The source Arc is held, so its address cannot be reused meanwhile.
+    let mut resolved: std::collections::HashMap<
+        *const LineStyle,
+        (Arc<LineStyle>, Arc<LineStyle>),
+    > = std::collections::HashMap::new();
     for instruction in instructions {
         let DrawingInstruction::Line(line) = instruction else {
             continue;
         };
+        let address = Arc::as_ptr(&line.style);
+        if let Some((_, shared)) = resolved.get(&address) {
+            if !Arc::ptr_eq(shared, &line.style) {
+                line.style = shared.clone();
+            }
+            continue;
+        }
         let bucket = pool.entry(key(&line.style)).or_default();
-        match bucket.iter().find(|s| ***s == *line.style) {
-            Some(shared) if !Arc::ptr_eq(shared, &line.style) => line.style = shared.clone(),
-            Some(_) => {}
-            None => bucket.push(line.style.clone()),
+        let shared = match bucket.iter().find(|s| ***s == *line.style) {
+            Some(shared) => shared.clone(),
+            None => {
+                bucket.push(line.style.clone());
+                line.style.clone()
+            }
+        };
+        resolved.insert(address, (line.style.clone(), shared.clone()));
+        if !Arc::ptr_eq(&shared, &line.style) {
+            line.style = shared;
         }
     }
 }
@@ -849,6 +914,19 @@ pub struct AreaInstruction {
     /// Source geometry for coverage visibility; independent of portrayal offsets.
     #[serde(default)]
     pub portrayal_origin: crate::PortrayalOrigin,
+    /// Triangle indices computed once for this exact geometry (carried through
+    /// the instruction cache); used only while projection and fingerprint match.
+    #[serde(default)]
+    pub triangulation: Option<std::sync::Arc<AreaTriangulation>>,
+}
+
+/// Earcut indices of an area's projected, normalized rings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AreaTriangulation {
+    pub projection: crate::FlatProjection,
+    /// `AreaInstruction::geometry_fingerprint` of the triangulated rings.
+    pub geometry: u64,
+    pub indices: std::sync::Arc<[u32]>,
 }
 
 fn default_pattern_clip_symbols() -> bool {
@@ -887,7 +965,32 @@ impl AreaInstruction {
             time_intervals: None,
             dependency: None,
             portrayal_origin: crate::PortrayalOrigin::Unspecified,
+            triangulation: None,
         }
+    }
+
+    /// FNV-1a over every ring vertex's exact bits and the ring lengths.
+    pub fn geometry_fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        let mut mix = |value: u64| {
+            hash = (hash ^ value).wrapping_mul(0x0100_0000_01b3);
+        };
+        for ring in std::iter::once(&self.exterior).chain(&self.interiors) {
+            mix(ring.len() as u64);
+            for point in ring {
+                mix(point.x.to_bits());
+                mix(point.y.to_bits());
+            }
+        }
+        hash
+    }
+
+    /// Stored indices for exactly this geometry in `projection`.
+    pub fn triangulation_for(&self, projection: crate::FlatProjection) -> Option<&[u32]> {
+        self.triangulation
+            .as_deref()
+            .filter(|t| t.projection == projection && t.geometry == self.geometry_fingerprint())
+            .map(|t| &*t.indices)
     }
 
     pub fn with_pattern_crs(mut self, crs: crate::PatternCrs) -> Self {
@@ -1963,5 +2066,54 @@ mod catalogue_plane_tests {
         }
         assert!(planes.windows(2).all(|p| p[0] < p[1]));
         assert!(serde_json::from_str::<DisplayPlane>(r#"{"Catalogue":0}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod render_order_sort_tests {
+    use super::*;
+    /// Same order as the standard stable sort, for shuffled input and for
+    /// concatenated per-cell runs that were each sorted first.
+    #[test]
+    fn matches_stable_sort_including_presorted_runs() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut items = Vec::new();
+        for i in 0..5000 {
+            let r = next();
+            let mut point = PointInstruction::new(format!("S{}", i), WorldPoint::new(i as f64, 0.));
+            point.priority = DisplayPriority((r % 5) as i32);
+            items.push(DrawingInstruction::Point(point));
+            if r % 3 == 0 {
+                let mut area = AreaInstruction::new(vec![
+                    WorldPoint::new(0., 0.),
+                    WorldPoint::new((r % 4) as f64, 0.),
+                    WorldPoint::new(0., 1.),
+                ]);
+                area.priority = DisplayPriority((r % 5) as i32);
+                items.push(DrawingInstruction::Area(Box::new(area)));
+            }
+        }
+        let label = |v: &[DrawingInstruction]| -> Vec<String> {
+            v.iter().map(|i| format!("{:?}", i)).collect()
+        };
+        let mut expected = items.clone();
+        expected.sort_by_cached_key(DrawingInstruction::render_order);
+        let mut shuffled = items.clone();
+        sort_by_render_order(&mut shuffled);
+        assert_eq!(label(&shuffled), label(&expected));
+        let mut runs: Vec<DrawingInstruction> = Vec::new();
+        for block in items.chunks(700) {
+            let mut block = block.to_vec();
+            block.sort_by_cached_key(DrawingInstruction::render_order);
+            runs.extend(block);
+        }
+        sort_by_render_order(&mut runs);
+        assert_eq!(label(&runs), label(&expected));
     }
 }

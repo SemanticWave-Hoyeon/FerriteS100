@@ -834,9 +834,11 @@ impl LineSuppressionCache {
                     .growth_child_work
                     .as_ref()
                     .map(|_| std::time::Instant::now());
+                use rayon::prelude::*;
                 let transformed: Vec<_> = instructions
-                    .iter()
+                    .par_iter()
                     .zip(&prepared)
+                    .with_min_len(1024)
                     .map(|(item, enabled)| {
                         // Ineligible candidates need no projected point allocation.
                         // Newly eligible curves trigger bounded preparation above.
@@ -1888,8 +1890,56 @@ impl rstar::RTreeObject for IndexedSegment {
         rstar::RTreeObject::envelope(&self.segment)
     }
 }
+/// Segments split into x-ordered strips, each bulk-loaded on its own thread.
+/// A query visits every strip whose bounds meet it, so it finds exactly the
+/// segments one tree over all of them would (in a different order).
+struct SegmentForest {
+    trees: Vec<rstar::RTree<IndexedSegment>>,
+}
+impl SegmentForest {
+    const STRIP: usize = 32 * 1024;
+    fn build(mut segments: Vec<IndexedSegment>, strip: usize) -> Self {
+        use rayon::prelude::*;
+        let strips = (segments.len() / strip.max(1)).clamp(1, rayon::current_num_threads() * 2);
+        if strips == 1 {
+            return Self {
+                trees: vec![rstar::RTree::bulk_load(segments)],
+            };
+        }
+        let center = |s: &IndexedSegment| s.segment.a.x + s.segment.b.x;
+        segments.par_sort_unstable_by(|a, b| center(a).total_cmp(&center(b)));
+        let size = segments.len().div_ceil(strips);
+        Self {
+            trees: segments
+                .par_chunks(size)
+                .map(|strip| rstar::RTree::bulk_load(strip.to_vec()))
+                .collect(),
+        }
+    }
+    fn for_each_intersecting(
+        &self,
+        envelope: &rstar::AABB<[f64; 2]>,
+        mut visit: impl FnMut(&IndexedSegment),
+    ) {
+        use rstar::Envelope;
+        for tree in &self.trees {
+            if tree.size() > 0 && tree.root().envelope().intersects(envelope) {
+                tree.locate_in_envelope_intersecting(envelope)
+                    .for_each(&mut visit);
+            }
+        }
+    }
+}
 impl PreparedLineSuppression {
-    pub fn compile<S: SuppressionInput>(instructions: &[S], budget: usize) -> Option<Self> {
+    pub fn compile<S: SuppressionInput + Sync>(instructions: &[S], budget: usize) -> Option<Self> {
+        Self::compile_with_strip(instructions, budget, SegmentForest::STRIP)
+    }
+    fn compile_with_strip<S: SuppressionInput + Sync>(
+        instructions: &[S],
+        budget: usize,
+        strip: usize,
+    ) -> Option<Self> {
+        use rayon::prelude::*;
         use rstar::RTreeObject;
         let selected: Vec<_> = instructions
             .iter()
@@ -1923,65 +1973,83 @@ impl PreparedLineSuppression {
                 }
             }
         }
-        let tree = rstar::RTree::bulk_load(segments);
+        let forest = SegmentForest::build(segments, strip);
+        // Each line's relations are independent: compute them in parallel,
+        // then replay the original sequential byte accounting in line order.
+        // Within one line the accounted bytes only grow, so checking its final
+        // total is the same as checking after every step.
+        struct LineRelations {
+            index: usize,
+            full_higher: Vec<usize>,
+            segments: Vec<PreparedSegment>,
+            changed: bool,
+            /// Bytes the sequential compiler adds while preparing this line.
+            bytes: usize,
+        }
+        let relations: Vec<Option<LineRelations>> = selected
+            .par_iter()
+            .filter(|(_, line, _)| line.suppressible)
+            .map(|(i, line, curve)| {
+                let priority = (line.plane, line.priority);
+                let full_higher: Vec<_> = groups[curve]
+                    .iter()
+                    .filter(|(_, p)| *p > priority)
+                    .map(|(i, _)| *i)
+                    .collect();
+                let mut bytes = full_higher.capacity() * std::mem::size_of::<usize>();
+                let mut prepared = Vec::new();
+                let mut changed = !full_higher.is_empty();
+                for (index, pair) in line.points.windows(2).enumerate() {
+                    let Some(segment) = Segment::new(pair[0], pair[1]) else {
+                        continue;
+                    };
+                    let mut higher = Vec::new();
+                    forest.for_each_intersecting(&segment.envelope(), |other| {
+                        if other.priority <= priority || full_higher.contains(&other.index) {
+                            return;
+                        }
+                        if let Some((start, end)) = segment.overlap(other.segment) {
+                            higher.push((other.index, start, end));
+                        }
+                    });
+                    bytes = bytes.checked_add(
+                        higher.capacity() * std::mem::size_of::<(usize, f64, f64)>(),
+                    )?;
+                    changed |= !higher.is_empty();
+                    // Filtering this list by eligibility preserves the original
+                    // planner's endpoint sort, including exact signed-zero ordering.
+                    // Entries tied on both endpoints give the same plan in any order.
+                    higher.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)));
+                    let old_capacity = prepared.capacity();
+                    prepared.push(PreparedSegment { index, higher });
+                    bytes = bytes.checked_add(
+                        (prepared.capacity() - old_capacity)
+                            * std::mem::size_of::<PreparedSegment>(),
+                    )?;
+                }
+                Some(LineRelations {
+                    index: *i,
+                    full_higher,
+                    segments: prepared,
+                    changed,
+                    bytes,
+                })
+            })
+            .collect();
         let mut targets = Vec::new();
         let mut bytes = std::mem::size_of::<Self>();
-        for (i, line, curve) in selected {
-            if !line.suppressible {
-                continue;
-            }
-            let priority = (line.plane, line.priority);
-            let full_higher: Vec<_> = groups[&curve]
-                .iter()
-                .filter(|(_, p)| *p > priority)
-                .map(|(i, _)| *i)
-                .collect();
-            bytes = bytes.checked_add(full_higher.capacity() * std::mem::size_of::<usize>())?;
+        for relation in relations {
+            let relation = relation?;
+            bytes = bytes.checked_add(relation.bytes)?;
             if bytes > budget {
                 return None;
             }
-            let mut prepared = Vec::new();
-            let mut changed = !full_higher.is_empty();
-            for (index, pair) in line.points.windows(2).enumerate() {
-                let Some(segment) = Segment::new(pair[0], pair[1]) else {
-                    continue;
-                };
-                let mut higher = Vec::new();
-                for other in tree.locate_in_envelope_intersecting(&segment.envelope()) {
-                    if other.priority <= priority || full_higher.contains(&other.index) {
-                        continue;
-                    }
-                    if let Some((start, end)) = segment.overlap(other.segment) {
-                        let old_capacity = higher.capacity();
-                        higher.push((other.index, start, end));
-                        bytes = bytes.checked_add(
-                            (higher.capacity() - old_capacity)
-                                * std::mem::size_of::<(usize, f64, f64)>(),
-                        )?;
-                        if bytes > budget {
-                            return None;
-                        }
-                    }
-                }
-                changed |= !higher.is_empty();
-                // Filtering this list by eligibility preserves the original
-                // planner's endpoint sort, including exact signed-zero ordering.
-                higher.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)));
-                let old_capacity = prepared.capacity();
-                prepared.push(PreparedSegment { index, higher });
-                bytes = bytes.checked_add(
-                    (prepared.capacity() - old_capacity) * std::mem::size_of::<PreparedSegment>(),
-                )?;
-                if bytes > budget {
-                    return None;
-                }
-            }
-            if changed {
+            if relation.changed {
                 let old_capacity = targets.capacity();
                 targets.push(PreparedTarget {
-                    index: i,
-                    full_higher,
-                    segments: prepared,
+                    index: relation.index,
+                    full_higher: relation.full_higher,
+                    segments: relation.segments,
                 });
                 bytes = bytes.checked_add(
                     (targets.capacity() - old_capacity) * std::mem::size_of::<PreparedTarget>(),
@@ -1990,12 +2058,7 @@ impl PreparedLineSuppression {
                     return None;
                 }
             } else {
-                bytes -= full_higher.capacity() * std::mem::size_of::<usize>()
-                    + prepared.capacity() * std::mem::size_of::<PreparedSegment>()
-                    + prepared
-                        .iter()
-                        .map(|s| s.higher.capacity() * std::mem::size_of::<(usize, f64, f64)>())
-                        .sum::<usize>();
+                bytes -= relation.bytes;
             }
         }
         Some(Self {
@@ -2789,6 +2852,46 @@ mod prepared_relation_tests {
             LineInstruction::new(points.iter().map(|&(x, y)| WorldPoint::new(x, y)).collect());
         line.priority = DisplayPriority(priority);
         DrawingInstruction::Line(line)
+    }
+    /// Strip forests (parallel build and queries) give exactly the plans of
+    /// one tree, for shared, partial, reversed and differently sampled edges.
+    #[test]
+    fn strip_forest_compiles_the_same_relations_as_one_tree() {
+        let mut items = Vec::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for row in 0..60 {
+            let y = f64::from(row);
+            for col in 0..40 {
+                let x = f64::from(col) * 3.;
+                let r = next();
+                let priority = (r % 7) as i32;
+                let points: Vec<(f64, f64)> = match r % 4 {
+                    0 => vec![(x, y), (x + 3., y)],
+                    1 => vec![(x + 3., y), (x + 1.5, y), (x, y)],
+                    2 => vec![(x + 1., y), (x + 2., y)],
+                    _ => vec![(x, y), (x, y + 1.), (x + 3., y + 1.)],
+                };
+                items.push(line(&points, priority));
+            }
+        }
+        let single = PreparedLineSuppression::compile_with_strip(&items, usize::MAX, usize::MAX)
+            .expect("single tree");
+        let forest =
+            PreparedLineSuppression::compile_with_strip(&items, usize::MAX, 64).expect("forest");
+        assert!(forest.targets.len() > 100);
+        assert_eq!(single.bytes, forest.bytes);
+        for pattern in 0..4u64 {
+            let eligible: Vec<bool> = (0..items.len() as u64)
+                .map(|i| (i * 2_654_435_761 + pattern) % 5 != 0 || pattern == 0)
+                .collect();
+            assert_eq!(single.plan(&eligible), forest.plan(&eligible));
+        }
     }
     #[test]
     fn all_visibility_combinations_match_cold_exact_partial_and_parallel_suppression() {

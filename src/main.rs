@@ -10,6 +10,25 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` (mimalloc v2), the option between
+/// `eager_commit_delay` and `use_numa_nodes`; the sys crate names neither it.
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+const _: () = assert!(
+    libmimalloc_sys::mi_option_eager_commit_delay + 1 == MI_OPTION_PURGE_DELAY
+        && MI_OPTION_PURGE_DELAY + 1 == libmimalloc_sys::mi_option_use_numa_nodes
+);
+
+/// Return freed pages to the OS when they are freed. With the default delay,
+/// pages freed by threads that then go idle (load workers, the rayon pool)
+/// stay resident: about 300 MB after opening a 27-cell exchange set. Frame
+/// and load times are unchanged. `MIMALLOC_PURGE_DELAY` still overrides it.
+fn configure_allocator() {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        // SAFETY: setting a documented option value; no pointers involved.
+        unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) }
+    }
+}
+
 /// Application version (from Cargo.toml)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -250,6 +269,58 @@ const WORLD_MAP_GEOJSON: &str = include_str!("../assets/ne_110m_coastline.geojso
 
 /// Parse Natural Earth GeoJSON coastlines into line segments.
 /// Returns Vec of line strings, each being a list of [longitude, latitude] pairs.
+type PreparedCoastlines = std::result::Result<ferrite_render::BackgroundCoastlines, String>;
+static DETAILED_COASTLINES: std::sync::Mutex<Option<std::thread::JoinHandle<PreparedCoastlines>>> =
+    std::sync::Mutex::new(None);
+
+fn prepare_detailed_coastlines() -> PreparedCoastlines {
+    ferrite_render::BackgroundCoastlines::new(parse_world_map_coastlines(include_str!(
+        "../assets/ne_10m_coastline.geojson"
+    )))
+}
+
+/// Parse the 10 MB detailed coastline while the window and GPU initialize.
+fn start_detailed_coastlines() {
+    if let Ok(handle) = std::thread::Builder::new()
+        .name("ferrite-coastlines".into())
+        .spawn(prepare_detailed_coastlines)
+    {
+        if let Ok(mut slot) = DETAILED_COASTLINES.lock() {
+            *slot = Some(handle);
+        }
+    }
+}
+
+/// The started preparation's result, or a synchronous one.
+fn take_detailed_coastlines() -> PreparedCoastlines {
+    DETAILED_COASTLINES
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_else(prepare_detailed_coastlines)
+}
+
+/// `<Pictures>/FerriteS100/FerriteS100_YYYYMMDD_HHMMSS.png`, with `_2`, `_3`…
+/// when that name exists. Pictures is the OS folder (Windows Known Folder,
+/// Linux XDG user-dirs, macOS ~/Pictures); then the home folder; then the
+/// application folder. Names avoid characters Windows rejects (e.g. ':').
+fn chart_image_path(now: chrono::DateTime<chrono::Local>) -> Result<PathBuf> {
+    let base = dirs::picture_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(get_app_base_dir);
+    let folder = base.join("FerriteS100");
+    fs::create_dir_all(&folder).with_context(|| format!("Cannot create {}", folder.display()))?;
+    let stem = format!("FerriteS100_{}", now.format("%Y%m%d_%H%M%S"));
+    let mut path = folder.join(format!("{stem}.png"));
+    let mut index = 2;
+    while path.exists() {
+        path = folder.join(format!("{stem}_{index}.png"));
+        index += 1;
+    }
+    Ok(path)
+}
+
 fn parse_world_map_coastlines(data: &str) -> Vec<Vec<[f64; 2]>> {
     let parsed: serde_json::Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -1145,6 +1216,9 @@ struct ChartApp {
     /// Set by each publication; non-resident records are released once the
     /// app is idle, after the publishing operation has finished reading cells.
     cell_release_pending: bool,
+    /// Geographic bounds for one rebuild instead of zoom/pan (chart image
+    /// export renders the window-sized view with the current camera).
+    view_bounds_override: Option<GeoBounds>,
 
     ic: Option<Arc<ferrite_interoperability::AuthenticatedCatalogue>>,
     ic_combination: Option<String>,
@@ -1335,6 +1409,7 @@ impl ChartApp {
             coverage_memo: None,
             cell_hydration: std::collections::HashMap::new(),
             cell_release_pending: false,
+            view_bounds_override: None,
 
             ic: None,
             ic_combination: None,
@@ -5443,7 +5518,7 @@ impl ChartApp {
     const CACHE_MAGIC: &'static [u8; 4] = b"FRC\x01";
     /// Bump when instruction fields or conversion admission semantics change.
     /// Schema 42 rejects older caches that could silently omit augmented geometry.
-    const CACHE_SCHEMA_VERSION: u32 = 42;
+    const CACHE_SCHEMA_VERSION: u32 = 43;
 
     /// Wrap a bincode payload with magic + schema version + SHA-256 corruption-detection hash.
     /// NOTE: This is NOT cryptographic authentication — it detects accidental corruption only.
@@ -5489,24 +5564,108 @@ impl ChartApp {
         if computed_hash.as_slice() != stored_hash {
             return Err("SHA-256 integrity check failed (file tampered or corrupted)".into());
         }
+        Self::decode_cache_payload(payload)
+    }
+
+    /// Payloads are one bincode instruction sequence, or (for larger cells)
+    /// `SEGMENTED_CACHE`, a segment count, the segments' byte lengths and the
+    /// segments, each such a sequence, decoded in parallel and concatenated.
+    const SEGMENTED_CACHE: u64 = u64::MAX - 1;
+    const CACHE_SEGMENT_INSTRUCTIONS: usize = 8192;
+    const MAX_CACHE_SEGMENTS: u64 = 1 << 16;
+
+    fn encode_cache_payload(
+        instructions: &[DrawingInstruction],
+    ) -> std::result::Result<Vec<u8>, String> {
+        use bincode::Options;
+        use rayon::prelude::*;
+        let options = || {
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(secure_instruction_cache::MAX_CACHE_BYTES - 40)
+        };
+        if instructions.len() <= Self::CACHE_SEGMENT_INSTRUCTIONS {
+            return options().serialize(instructions).map_err(|e| e.to_string());
+        }
+        let segments = instructions
+            .par_chunks(Self::CACHE_SEGMENT_INSTRUCTIONS)
+            .map(|chunk| options().serialize(chunk).map_err(|e| e.to_string()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let total = 16 + 8 * segments.len() + segments.iter().map(Vec::len).sum::<usize>();
+        if total as u64 > secure_instruction_cache::MAX_CACHE_BYTES - 40 {
+            return Err("cache exceeds byte budget".into());
+        }
+        let mut payload = Vec::with_capacity(total);
+        payload.extend_from_slice(&Self::SEGMENTED_CACHE.to_le_bytes());
+        payload.extend_from_slice(&(segments.len() as u64).to_le_bytes());
+        for segment in &segments {
+            payload.extend_from_slice(&(segment.len() as u64).to_le_bytes());
+        }
+        for segment in &segments {
+            payload.extend_from_slice(segment);
+        }
+        Ok(payload)
+    }
+
+    fn decode_cache_payload(
+        payload: &[u8],
+    ) -> std::result::Result<Vec<ferrite_render::DrawingInstruction>, String> {
+        let word = |bytes: &[u8], at: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+        };
         // Reject byte/declared top-level count budgets before Vec allocation.
         // Nested collection allocation is constrained by the encoded byte budget,
         // not an exact heap cap; this disposable cache is app-private, not input data.
-        let count_bytes: [u8; 8] = payload
-            .get(..8)
-            .ok_or_else(|| "deserialization failed: missing instruction count".to_owned())?
-            .try_into()
-            .expect("eight-byte count");
-        if u64::from_le_bytes(count_bytes) > secure_instruction_cache::MAX_INSTRUCTIONS {
-            return Err("cache exceeds instruction budget".into());
+        let first = word(payload, 0)
+            .ok_or_else(|| "deserialization failed: missing instruction count".to_owned())?;
+        let decode = |bytes: &[u8]| -> std::result::Result<Vec<DrawingInstruction>, String> {
+            use bincode::Options;
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(secure_instruction_cache::MAX_CACHE_BYTES)
+                .reject_trailing_bytes()
+                .deserialize(bytes)
+                .map_err(|e| format!("deserialization failed: {}", e))
+        };
+        if first != Self::SEGMENTED_CACHE {
+            if first > secure_instruction_cache::MAX_INSTRUCTIONS {
+                return Err("cache exceeds instruction budget".into());
+            }
+            return decode(payload);
         }
-        use bincode::Options;
-        bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_limit(secure_instruction_cache::MAX_CACHE_BYTES)
-            .reject_trailing_bytes()
-            .deserialize(payload)
-            .map_err(|e| format!("deserialization failed: {}", e))
+        let malformed = || "deserialization failed: malformed segment table".to_owned();
+        let count = word(payload, 8).ok_or_else(malformed)?;
+        if count == 0 || count > Self::MAX_CACHE_SEGMENTS {
+            return Err(malformed());
+        }
+        let mut segments = Vec::with_capacity(count as usize);
+        let mut offset = 16 + 8 * count as usize;
+        let mut instructions = 0u64;
+        for index in 0..count as usize {
+            let length = word(payload, 16 + 8 * index).ok_or_else(malformed)? as usize;
+            let end = offset.checked_add(length).ok_or_else(malformed)?;
+            let segment = payload.get(offset..end).ok_or_else(malformed)?;
+            let declared = word(segment, 0)
+                .ok_or_else(|| "deserialization failed: missing instruction count".to_owned())?;
+            instructions = instructions.saturating_add(declared);
+            if instructions > secure_instruction_cache::MAX_INSTRUCTIONS {
+                return Err("cache exceeds instruction budget".into());
+            }
+            segments.push(segment);
+            offset = end;
+        }
+        if offset != payload.len() {
+            return Err(malformed());
+        }
+        use rayon::prelude::*;
+        let decoded: Vec<_> = segments.par_iter().map(|segment| decode(segment)).collect();
+        let mut all = Vec::with_capacity(instructions as usize);
+        for segment in decoded {
+            all.extend(segment?);
+        }
+        Ok(all)
     }
 
     fn prepare_instructions(&mut self, preserve_view: bool) -> Result<PreparedPortrayal> {
@@ -5598,6 +5757,7 @@ impl ChartApp {
                 resident: self.resident_cells.as_deref(),
             },
         )?;
+        let after_lua = std::time::Instant::now();
 
         let ic_changed = if let Some(ic) = self.active_ic() {
             let level2 = self.ic_level2(&ic)?;
@@ -5636,8 +5796,13 @@ impl ChartApp {
                 "Injected failure after Lua/IC/flat coverage preparation, before publication"
             );
         }
+        let catalogue_registry = self.prepare_catalogue_registry(&self.fc, &self.pc, true)?;
+        info!(
+            "Post-Lua preparation: {:.1} ms",
+            after_lua.elapsed().as_secs_f64() * 1e3
+        );
         Ok(PreparedPortrayal {
-            catalogue_registry: self.prepare_catalogue_registry(&self.fc, &self.pc, true)?,
+            catalogue_registry,
             cell_resources: None,
             context: next,
             coverage: coverage_inventory,
@@ -5864,7 +6029,12 @@ impl ChartApp {
     }
 
     fn publish_instructions(&mut self, prepared: PreparedPortrayal) {
+        let started = std::time::Instant::now();
         let raster_scene = self.install_prepared_portrayal(prepared);
+        info!(
+            "Install portrayal: {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
         self.emit_published_scene(raster_scene);
     }
 
@@ -5939,9 +6109,25 @@ impl ChartApp {
             .profiles
             .get(&self.current_profile_name);
         let visible_vgs = self.get_visible_viewing_groups();
+        if let (None, Some(profile)) = (&self.cell_resources, color_profile) {
+            // Rasterize the point symbols on several threads instead of one
+            // by one as emission first meets each of them.
+            self.symbol_cache.prefetch_symbols(
+                self.render_context
+                    .raw_instructions()
+                    .iter()
+                    .filter_map(|i| match i {
+                        DrawingInstruction::Point(point) => Some(point.symbol_ref.as_str()),
+                        _ => None,
+                    }),
+                profile,
+            );
+        }
         if let Some(renderer) = &mut self.renderer {
+            let started = std::time::Instant::now();
             // Parallel area triangulation before the first (sequential) scene.
             renderer.prefill_area_triangulations(&self.render_context);
+            let triangulated = started.elapsed();
             renderer.begin_frame();
             if let Some(scene) = raster_scene {
                 renderer.commit_raster_scene_publication(scene);
@@ -5976,7 +6162,14 @@ impl ChartApp {
                 }
                 return;
             }
+            let emitted = started.elapsed();
             self.build_rendered_symbols();
+            info!(
+                "Scene publication: triangulate {:.1} ms, emit {:.1} ms, symbols {:.1} ms",
+                triangulated.as_secs_f64() * 1e3,
+                (emitted - triangulated).as_secs_f64() * 1e3,
+                (started.elapsed() - emitted).as_secs_f64() * 1e3
+            );
         }
         if self.navigation_scene_pending.dirty()
             && self
@@ -5987,6 +6180,80 @@ impl ChartApp {
             self.navigation_scene_pending.authoritative_ready();
         }
         self.refresh_selected_symbol_preview();
+    }
+
+    /// Save the chart area alone as a PNG in the user's Pictures folder
+    /// (FerriteS100 subfolder), without a dialog, and report the path.
+    fn save_chart_image(&mut self) {
+        let result = (|| -> Result<PathBuf> {
+            self.ensure_navigation_scene()?;
+            let path = chart_image_path(chrono::Local::now())?;
+            self.export_chart_without_ui(&path)?;
+            Ok(path)
+        })();
+        let notice = match result {
+            Ok(path) => {
+                info!("Chart image saved to: {}", path.display());
+                format!("Chart image saved: {}", path.display())
+            }
+            Err(error) => {
+                error!("Failed to save chart image: {error:#}");
+                format!("Chart image not saved: {error:#}")
+            }
+        };
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.notice = Some(notice);
+        }
+    }
+
+    /// Render the chart as if no application UI covered the window: the chart
+    /// fills the whole window at the current display scale and centre, so the
+    /// areas behind panels are drawn too. Then restore the normal view.
+    fn export_chart_without_ui(&mut self, path: &Path) -> Result<()> {
+        let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
+        let size = renderer.window().inner_size();
+        let points = renderer.ui_pixels_per_point();
+        let saved_area = renderer.ui_state.chart_area;
+        // The window's corners under the current camera bound the export, so
+        // fitting them to the window keeps the scale and the centre.
+        let scaler = &self.render_context.scaler;
+        let top_left = scaler.screen_to_world(ferrite_render::ScreenPoint::new(0., 0.));
+        let bottom_right = scaler.screen_to_world(ferrite_render::ScreenPoint::new(
+            size.width as f32,
+            size.height as f32,
+        ));
+        let bounds = GeoBounds::new(top_left.x, bottom_right.y, bottom_right.x, top_left.y);
+        anyhow::ensure!(
+            [bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y]
+                .iter()
+                .all(|v| v.is_finite())
+                && bounds.min_x < bounds.max_x
+                && bounds.min_y < bounds.max_y,
+            "Current view has no exportable extent"
+        );
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.chart_area = (
+                0.,
+                0.,
+                size.width as f32 / points,
+                size.height as f32 / points,
+            );
+        }
+        self.view_bounds_override = Some(bounds);
+        let result = if self.rebuild_view_ex(false, true) {
+            self.renderer
+                .as_mut()
+                .context("Renderer not initialized")
+                .and_then(|r| Ok(r.save_screenshot(path)?))
+        } else {
+            Err(anyhow::anyhow!("Full-window chart could not be prepared"))
+        };
+        self.view_bounds_override = None;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.ui_state.chart_area = saved_area;
+        }
+        self.update_view();
+        result
     }
 
     /// Build rendered symbols list for hit testing
@@ -12643,11 +12910,13 @@ impl ChartApp {
         // the chart data. Combined with ±360° rendering copies, this enables
         // seamless infinite horizontal panning (Earth is round).
         let wrapped_pan_x = self.pan_offset.0 - (self.pan_offset.0 / 360.0).round() * 360.0;
-        let Some(new_bounds) = self.render_context.scaler.projection().view_bounds(
-            self.bounds,
-            self.zoom_level,
-            [wrapped_pan_x, self.pan_offset.1],
-        ) else {
+        let Some(new_bounds) = self.view_bounds_override.or_else(|| {
+            self.render_context.scaler.projection().view_bounds(
+                self.bounds,
+                self.zoom_level,
+                [wrapped_pan_x, self.pan_offset.1],
+            )
+        }) else {
             return false;
         };
 
@@ -13383,9 +13652,7 @@ impl ApplicationHandler for ChartApp {
                             // Load Natural Earth world map for background rendering
                             let coastlines = parse_world_map_coastlines(WORLD_MAP_GEOJSON);
                             renderer.set_world_map(coastlines);
-                            renderer.set_world_map_detailed(parse_world_map_coastlines(
-                                include_str!("../assets/ne_10m_coastline.geojson"),
-                            ));
+                            renderer.set_world_map_detailed_prepared(take_detailed_coastlines());
 
                             // Draw world map immediately (visible even without charts)
                             if !self.chart_loaded {
@@ -14360,6 +14627,14 @@ impl ApplicationHandler for ChartApp {
                             }
                         }
                     }
+                }
+
+                if self
+                    .renderer
+                    .as_mut()
+                    .is_some_and(|r| r.take_chart_image_request())
+                {
+                    self.save_chart_image();
                 }
 
                 for (requested, steps) in [(zoom_in, 1.), (zoom_out, -1.)] {
@@ -15610,6 +15885,7 @@ impl ApplicationHandler for ChartApp {
 }
 
 fn main() {
+    configure_allocator();
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(s102_trial_worker::FLAG))
     {
         if let Err(error) = s102_trial_worker::run_child() {
@@ -15627,6 +15903,7 @@ fn main() {
         }
         return;
     }
+    start_detailed_coastlines();
     // Install panic hook to show error dialog in release mode (no console window)
     #[cfg(all(windows, not(debug_assertions)))]
     {
@@ -15782,8 +16059,37 @@ fn run_app() -> Result<()> {
         None
     };
 
-    let fc = Arc::new(load_feature_catalogue(&config.fc_path)?);
-    let pc = Arc::new(load_portrayal_catalogue(&config.pc_path)?);
+    // The catalogues load on another thread while AppKit initializes the
+    // event loop on this one (tens of milliseconds each, independent).
+    let (fc, pc, event_loop) = std::thread::scope(|scope| -> Result<_> {
+        let catalogues = scope.spawn(|| -> Result<_> {
+            let fc = load_feature_catalogue(&config.fc_path)?;
+            let pc = load_portrayal_catalogue(&config.pc_path)?;
+            Ok((fc, pc))
+        });
+        let mut event_loop_builder = EventLoop::builder();
+        ferrite_wgpu::background_test::configure_event_loop(&mut event_loop_builder);
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            event_loop_builder.with_msg_hook(|raw| {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{GetMessageExtraInfo, MSG};
+                // The hook runs before dispatch, while extra info belongs to this
+                // MSG. Reading it later from a queued winit event is unreliable.
+                let message = unsafe { &*(raw as *const MSG) };
+                navigation::touch_promoted_mouse(message.message, unsafe { GetMessageExtraInfo() }
+                    as u64)
+            });
+        }
+        let event_loop = event_loop_builder
+            .build()
+            .context("Failed to create event loop")?;
+        event_loop.set_control_flow(ControlFlow::Wait); // Use Wait for lower CPU/GPU usage; request_redraw triggers frames on demand
+        let (fc, pc) = catalogues
+            .join()
+            .map_err(|_| anyhow::anyhow!("Catalogue loading panicked"))??;
+        Ok((Arc::new(fc), Arc::new(pc), event_loop))
+    })?;
     ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
     ferrite_s101::viewing_groups_for_layers(
         &pc,
@@ -15843,25 +16149,6 @@ fn run_app() -> Result<()> {
         );
         info!("Initial color profile: {}", initial_profile);
     }
-
-    let mut event_loop_builder = EventLoop::builder();
-    ferrite_wgpu::background_test::configure_event_loop(&mut event_loop_builder);
-    #[cfg(windows)]
-    {
-        use winit::platform::windows::EventLoopBuilderExtWindows;
-        event_loop_builder.with_msg_hook(|raw| {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{GetMessageExtraInfo, MSG};
-            // The hook runs before dispatch, while extra info belongs to this
-            // MSG. Reading it later from a queued winit event is unreliable.
-            let message = unsafe { &*(raw as *const MSG) };
-            navigation::touch_promoted_mouse(message.message, unsafe { GetMessageExtraInfo() }
-                as u64)
-        });
-    }
-    let event_loop = event_loop_builder
-        .build()
-        .context("Failed to create event loop")?;
-    event_loop.set_control_flow(ControlFlow::Wait); // Use Wait for lower CPU/GPU usage; request_redraw triggers frames on demand
 
     let mut app = ChartApp::new(
         symbol_cache,
@@ -15998,8 +16285,16 @@ struct CellPortrayalSelection<'a> {
 }
 
 /// A per-cell portrayal: fresh Lua results, or instructions from the cache.
+/// Smaller areas triangulate faster than their stored indices would load.
+const STORED_TRIANGULATION_MIN_VERTICES: usize = 32;
+
 enum CellPortrayal {
-    Fresh(Vec<ferrite_lua::PortrayalResult>),
+    /// Converted on the worker; `written` reports a new cell cache file.
+    Fresh {
+        instructions: Vec<DrawingInstruction>,
+        results: usize,
+        written: bool,
+    },
     Cached(Vec<DrawingInstruction>),
 }
 
@@ -16028,15 +16323,10 @@ fn read_cell_cache(path: &Path, cell: &S101Cell) -> Option<Vec<DrawingInstructio
 }
 
 fn write_cell_cache(path: &Path, instructions: &[DrawingInstruction]) -> bool {
-    use bincode::Options;
     if instructions.len() as u64 > secure_instruction_cache::MAX_INSTRUCTIONS {
         return false;
     }
-    match bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(secure_instruction_cache::MAX_CACHE_BYTES - 40)
-        .serialize(instructions)
-    {
+    match ChartApp::encode_cache_payload(instructions) {
         Ok(payload) => {
             match secure_instruction_cache::write_atomic(path, &ChartApp::wrap_cache(&payload)) {
                 Ok(()) => true,
@@ -16110,8 +16400,15 @@ fn try_lua_portrayal_for_cells<'a>(
         .min(8)
         .min(cells.len())
         .max(1);
+    // Largest cells start first so one big cell does not finish last on its
+    // own; results are still assembled strictly in cell order.
+    let mut schedule: Vec<usize> = (0..cells.len()).collect();
+    schedule.sort_by_key(|position| std::cmp::Reverse(cells[*position].1.features.len()));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let abort = std::sync::atomic::AtomicBool::new(false);
+    // Conversion only appends (filtered by viewing group), so each cell is
+    // converted on its worker into an empty context with the same settings.
+    let template = render_context.empty_for_rebuild();
     let mut total_results = 0;
     let mut cached_cells = 0;
     let mut written_cells = false;
@@ -16119,20 +16416,37 @@ fn try_lua_portrayal_for_cells<'a>(
         let (sender, receiver) = mpsc::channel::<(usize, Result<CellPortrayal>)>();
         for _ in 0..workers {
             let sender = sender.clone();
-            let (cells, next, abort, context) = (&cells, &next, &abort, &context);
+            let (cells, schedule, next, abort, context, template) =
+                (&cells, &schedule, &next, &abort, &context, &template);
             let new_engine = &new_engine;
             scope.spawn(move || {
                 let mut engine = None;
                 loop {
-                    let position = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if position >= cells.len() || abort.load(std::sync::atomic::Ordering::Relaxed) {
+                    let claimed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if claimed >= cells.len() || abort.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
+                    let position = schedule[claimed];
                     let (cell_index, cell) = cells[position];
                     let cache = cell_caches
                         .and_then(|paths| paths.get(cell_index))
                         .and_then(Option::as_deref);
-                    if let Some(instructions) = cache.and_then(|path| read_cell_cache(path, cell)) {
+                    if let Some(mut instructions) =
+                        cache.and_then(|path| read_cell_cache(path, cell))
+                    {
+                        // Renumber exactly as convert_lua_results_for_cell would:
+                        // the cell index, and the S-101 dependency namespace.
+                        let index = u32::try_from(cell_index).ok();
+                        for instruction in &mut instructions {
+                            instruction.set_cell_index(index);
+                            if let Some(dependency) = instruction.dependency_mut() {
+                                dependency.namespace = cell_index as u64;
+                            }
+                        }
+                        // Decoding gives every line its own style allocation;
+                        // sharing them here leaves the scene-wide interning
+                        // only a few distinct allocations per cell.
+                        ferrite_render::intern_line_styles(&mut instructions);
                         if sender
                             .send((position, Ok(CellPortrayal::Cached(instructions))))
                             .is_err()
@@ -16146,19 +16460,52 @@ fn try_lua_portrayal_for_cells<'a>(
                             engine = Some(new_engine()?);
                         }
                         let engine = engine.as_mut().expect("created above");
-                        engine
+                        let results = engine
                             .process_owned_cell(
                                 ferrite_lua::CellData::from_cell(cell),
                                 context.clone(),
                             )
-                            .map(CellPortrayal::Fresh)
                             .with_context(|| {
                                 format!(
                                     "Cell {} portrayal failed: {}",
                                     cell_index,
                                     cell.file_path.display()
                                 )
-                            })
+                            })?;
+                        let mut converted = template.empty_for_rebuild();
+                        convert_lua_results_for_cell(
+                            &results,
+                            cell,
+                            pc,
+                            &mut converted,
+                            cell_index,
+                            profile_name,
+                        )?;
+                        let mut instructions = converted.into_instructions();
+                        // Large areas carry their triangulation into the cell
+                        // cache, so later loads skip the earcut run.
+                        let projection = template.scaler.projection();
+                        for instruction in &mut instructions {
+                            if let DrawingInstruction::Area(area) = instruction {
+                                area.triangulation = ferrite_wgpu::compute_area_triangulation(
+                                    area,
+                                    projection,
+                                    STORED_TRIANGULATION_MIN_VERTICES,
+                                )
+                                .map(Arc::new);
+                            }
+                        }
+                        // Stable per-cell order by the global sort key: the
+                        // scene's stable sort then only merges cell runs.
+                        instructions.sort_by_cached_key(DrawingInstruction::render_order);
+                        ferrite_render::intern_line_styles(&mut instructions);
+                        let written =
+                            cache.is_some_and(|path| write_cell_cache(path, &instructions));
+                        Ok(CellPortrayal::Fresh {
+                            instructions,
+                            results: results.len(),
+                            written,
+                        })
                     })();
                     if sender.send((position, result)).is_err() {
                         break;
@@ -16172,50 +16519,27 @@ fn try_lua_portrayal_for_cells<'a>(
         for (position, result) in receiver {
             pending.insert(position, result);
             while let Some(result) = pending.remove(&converted) {
-                let (cell_index, cell) = cells[converted];
-                let results = match result {
-                    Ok(CellPortrayal::Cached(mut instructions)) => {
-                        // Renumber exactly as convert_lua_results_for_cell would:
-                        // the cell index, and the S-101 dependency namespace.
-                        let index = u32::try_from(cell_index).ok();
-                        for instruction in &mut instructions {
-                            instruction.set_cell_index(index);
-                            if let Some(dependency) = instruction.dependency_mut() {
-                                dependency.namespace = cell_index as u64;
-                            }
-                        }
+                match result {
+                    Ok(CellPortrayal::Cached(instructions)) => {
                         cached_cells += 1;
                         render_context.append_converted(instructions);
                         converted += 1;
-                        continue;
                     }
-                    Ok(CellPortrayal::Fresh(results)) => results,
+                    Ok(CellPortrayal::Fresh {
+                        instructions,
+                        results,
+                        written,
+                    }) => {
+                        total_results += results;
+                        written_cells |= written;
+                        render_context.append_converted(instructions);
+                        converted += 1;
+                    }
                     Err(error) => {
                         abort.store(true, std::sync::atomic::Ordering::Relaxed);
                         return Err(error);
                     }
-                };
-                total_results += results.len();
-                let start = render_context.instruction_count();
-                if let Err(error) = convert_lua_results_for_cell(
-                    &results,
-                    cell,
-                    pc,
-                    render_context,
-                    cell_index,
-                    profile_name,
-                ) {
-                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Err(error);
                 }
-                if let Some(path) = cell_caches
-                    .and_then(|paths| paths.get(cell_index))
-                    .and_then(Option::as_deref)
-                {
-                    written_cells |=
-                        write_cell_cache(path, &render_context.raw_instructions()[start..]);
-                }
-                converted += 1;
             }
         }
         anyhow::ensure!(
@@ -16839,6 +17163,58 @@ mod instruction_cache_schema_tests {
         );
     }
 
+    /// Large cells are written as segments decoded in parallel; the result
+    /// equals the input, and every count/length is checked before decoding.
+    #[test]
+    fn segmented_payload_round_trips_and_rejects_bad_tables() {
+        use ferrite_render::PointInstruction;
+        let instructions: Vec<_> = (0..20_000)
+            .map(|i| {
+                DrawingInstruction::Point(
+                    PointInstruction::new(format!("S{i}"), WorldPoint::new(i as f64, 1.))
+                        .with_cell_index(i % 7),
+                )
+            })
+            .collect();
+        let payload = ChartApp::encode_cache_payload(&instructions).unwrap();
+        assert_eq!(&payload[..8], &ChartApp::SEGMENTED_CACHE.to_le_bytes());
+        let decoded =
+            ChartApp::verify_and_deserialize_cache(&ChartApp::wrap_cache(&payload)).unwrap();
+        assert_eq!(
+            bincode::serialize(&decoded).unwrap(),
+            bincode::serialize(&instructions).unwrap()
+        );
+        // Small cells keep the single-sequence payload.
+        let small = ChartApp::encode_cache_payload(&instructions[..10]).unwrap();
+        assert_eq!(small, bincode::serialize(&instructions[..10]).unwrap());
+        // A truncated table, a wrong length and an excessive count all fail.
+        let decode = |p: &[u8]| ChartApp::verify_and_deserialize_cache(&ChartApp::wrap_cache(p));
+        assert!(decode(&payload[..20])
+            .unwrap_err()
+            .contains("segment table"));
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(decode(&longer).unwrap_err().contains("segment table"));
+        let mut forged = payload.clone();
+        let first_segment =
+            16 + 8 * u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+        forged[first_segment..first_segment + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            decode(&forged).unwrap_err(),
+            "cache exceeds instruction budget"
+        );
+    }
+
+    /// Schema 43 adds stored area triangulations; bincode is not
+    /// self-describing, so schema-42 caches must never be decoded.
+    #[test]
+    fn schema43_rejects_caches_without_stored_triangulations() {
+        let mut wrapped = ChartApp::wrap_cache(&[]);
+        wrapped[4..8].copy_from_slice(&42u32.to_le_bytes());
+        assert!(ChartApp::verify_and_deserialize_cache(&wrapped)
+            .unwrap_err()
+            .contains("schema version mismatch: file=42, expected=43"));
+    }
     #[test]
     fn schema42_rejects_geometry_omission_cache_before_hash_or_decode() {
         let mut wrapped = ChartApp::wrap_cache(&[]);
@@ -16846,7 +17222,7 @@ mod instruction_cache_schema_tests {
         wrapped[8] ^= 1;
         assert!(ChartApp::verify_and_deserialize_cache(&wrapped)
             .unwrap_err()
-            .contains("schema version mismatch: file=41, expected=42"));
+            .contains("schema version mismatch: file=41, expected=43"));
     }
 
     #[test]
@@ -16870,7 +17246,7 @@ mod instruction_cache_schema_tests {
         old[4..8].copy_from_slice(&40u32.to_le_bytes());
         assert!(ChartApp::verify_and_deserialize_cache(&old)
             .unwrap_err()
-            .contains("file=40, expected=42"));
+            .contains("file=40, expected=43"));
     }
     #[test]
     fn schema42_rejects_prior_unscoped_optional_policy_cache_before_decode() {
@@ -16879,7 +17255,7 @@ mod instruction_cache_schema_tests {
         wrapped[4..8].copy_from_slice(&39u32.to_le_bytes());
         assert!(ChartApp::verify_and_deserialize_cache(&wrapped)
             .unwrap_err()
-            .contains("schema version mismatch: file=39, expected=42"));
+            .contains("schema version mismatch: file=39, expected=43"));
     }
 
     #[test]
@@ -16907,7 +17283,7 @@ mod instruction_cache_schema_tests {
         wrapped[4..8].copy_from_slice(&38u32.to_le_bytes());
         assert!(ChartApp::verify_and_deserialize_cache(&wrapped)
             .unwrap_err()
-            .contains("schema version mismatch: file=38, expected=42"));
+            .contains("schema version mismatch: file=38, expected=43"));
     }
     #[test]
     fn schema42_retains_authored_fill_reference_and_rejects_37() {
@@ -16929,7 +17305,7 @@ mod instruction_cache_schema_tests {
         wrapped[4..8].copy_from_slice(&37u32.to_le_bytes());
         assert!(ChartApp::verify_and_deserialize_cache(&wrapped)
             .unwrap_err()
-            .contains("file=37, expected=42"));
+            .contains("file=37, expected=43"));
     }
 
     #[test]
@@ -16975,7 +17351,7 @@ mod instruction_cache_schema_tests {
         file[8] ^= 1; // Invalid hash must not bypass the schema gate.
         assert_eq!(
             ChartApp::verify_and_deserialize_cache(&file).unwrap_err(),
-            "schema version mismatch: file=36, expected=42"
+            "schema version mismatch: file=36, expected=43"
         );
         assert_eq!(
             ChartApp::verify_and_deserialize_cache(&file[..39]).unwrap_err(),
@@ -17011,7 +17387,7 @@ mod instruction_cache_schema_tests {
         old_file[4..8].copy_from_slice(&36u32.to_le_bytes());
         assert_eq!(
             ChartApp::verify_and_deserialize_cache(&old_file).unwrap_err(),
-            "schema version mismatch: file=36, expected=42"
+            "schema version mismatch: file=36, expected=43"
         );
         let current = std::fs::read(std::env::var("FERRITE_CACHE37_PAYLOAD").unwrap()).unwrap();
         let decoded =

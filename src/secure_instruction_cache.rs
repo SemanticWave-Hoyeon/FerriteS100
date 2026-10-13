@@ -112,11 +112,17 @@ fn invalid(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 fn open_regular(path: &Path) -> std::io::Result<fs::File> {
+    open_regular_with(path, false)
+}
+
+/// `write` opens without truncation; Windows needs write access to change
+/// the modification time.
+fn open_regular_with(path: &Path, write: bool) -> std::io::Result<fs::File> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(invalid("Cache is not a regular file"));
     }
     let mut options = fs::OpenOptions::new();
-    options.read(true);
+    options.read(true).write(write);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -243,7 +249,7 @@ fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Record a cache hit for least-recently-used pruning. Called only after the
 /// file was accepted, so it cannot make a stale cache look current.
 pub(crate) fn mark_used(path: &Path) {
-    if let Ok(file) = open_regular(path) {
+    if let Ok(file) = open_regular_with(path, true) {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
 }

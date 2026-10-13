@@ -435,6 +435,7 @@ fn authorized_inputs_with_budget(
     );
     let mut inputs = Vec::new();
     let mut cancellations = Vec::new();
+    let mut capture_cache = crate::s101_lifecycle_metadata::CaptureCache::default();
     for path in candidates {
         let authenticated = crate::dataset_signature_policy::dataset_snapshot(
             authorization,
@@ -479,7 +480,13 @@ fn authorized_inputs_with_budget(
             ferrite_s100_core::inspect_dataset_identification(&data)
                 .with_context(|| format!("Cannot inspect S-101 input {}", path.display()))?
         };
-        let metadata = match crate::s101_lifecycle_metadata::capture(&path, &data, authorization) {
+        let metadata = match crate::s101_lifecycle_metadata::capture_cached(
+            &path,
+            &data,
+            Some((data_length, data_sha256)),
+            authorization,
+            &mut capture_cache,
+        ) {
             Ok(value) => value,
             Err(error)
                 if !require_signature

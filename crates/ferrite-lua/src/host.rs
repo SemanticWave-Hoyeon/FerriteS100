@@ -1877,6 +1877,39 @@ impl HostFunctions {
             })?,
         )?;
 
+        // With DEBUG compiled out (release builds), the host's debug/trace
+        // logging is a no-op, so only calls that can warn reach Rust; the rest
+        // return in Lua without converting their arguments. Behaviour is the
+        // host's own: a non-string action means "trace", and only "trace"
+        // messages starting with "Error:" (and every unknown or
+        // first-chance-error action) are forwarded.
+        if tracing::level_filters::STATIC_MAX_LEVEL < tracing::level_filters::LevelFilter::DEBUG {
+            lua.load(
+                r#"
+                local host = HostDebuggerEntry
+                local silent = {
+                    ["break"] = true,
+                    start_performance = true,
+                    stop_performance = true,
+                    reset_performance = true,
+                }
+                local sub = string.sub
+                HostDebuggerEntry = function(action, message, ...)
+                    if type(action) ~= "string" or action == "trace" then
+                        if type(message) ~= "string" or sub(message, 1, 6) ~= "Error:" then
+                            return
+                        end
+                    elseif silent[action] then
+                        return
+                    end
+                    host(action, message, ...)
+                end
+                "#,
+            )
+            .set_name("=HostDebuggerEntry")
+            .exec()?;
+        }
+
         // Helper to create ScaledDecimal table for Lua
         // ScaledDecimal has: Type='ScaledDecimal', Value=int, Scale=int, ToNumber() method
         fn create_scaled_decimal(lua: &Lua, value: f64) -> mlua::Result<Value> {

@@ -10,6 +10,8 @@ lua54 = ["ferrite-lua/lua54"]
 lua55 = ["ferrite-lua/lua55"]
 
 [dependencies]
+rustc-hash.workspace = true
+rayon.workspace = true
 ferrite-s100-core.workspace = true
 ferrite-feature-catalog.workspace = true
 ferrite-lua.workspace = true

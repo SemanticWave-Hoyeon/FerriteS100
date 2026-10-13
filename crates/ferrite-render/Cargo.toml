@@ -22,6 +22,7 @@ ferrite-kernel.workspace = true
 sha2.workspace = true
 
 rstar = "0.12.2"
+rayon.workspace = true
 robust = "1.2.0"
 chrono.workspace = true
 

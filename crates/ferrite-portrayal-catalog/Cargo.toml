@@ -5,6 +5,7 @@ edition.workspace = true
 description = "S-100 Portrayal Catalogue XML parser"
 
 [dependencies]
+rayon.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
 thiserror.workspace = true

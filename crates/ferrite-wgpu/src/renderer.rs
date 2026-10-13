@@ -170,10 +170,21 @@ fn point_in_ring(px: f32, py: f32, ring: &[(f32, f32)]) -> bool {
 
 /// Cached triangulation result (world-coordinate earcut)
 /// Stores indices and cleaned world vertices so earcut runs only once per polygon shape.
+/// The triangulation the renderer would compute for `area` in `projection`,
+/// for areas with at least `min_vertices` ring vertices; stored on the area
+/// (and in instruction caches), it replaces later earcut runs.
+pub fn compute_area_triangulation(
+    area: &ferrite_render::AreaInstruction,
+    projection: ferrite_render::FlatProjection,
+    min_vertices: usize,
+) -> Option<ferrite_render::AreaTriangulation> {
+    VectorEmissionOwned::compute_area_triangulation(area, projection, min_vertices)
+}
+
 struct CachedTriangulation {
     /// Earcut triangle indices (into world_vertices), stored as u32 with no
-    /// spare capacity: a retained cache, not a growing buffer.
-    indices: Vec<u32>,
+    /// spare capacity; shared with the area's stored triangulation, if any.
+    indices: Arc<[u32]>,
     /// Cleaned world-coordinate vertices [x0, y0, x1, y1, ...] (exterior + holes)
     world_vertices: Vec<f64>,
     /// World-coordinate axis-aligned bounding box (min_x, min_y, max_x, max_y)
@@ -269,7 +280,7 @@ impl AreaTriangulationRetention {
                 .checked_mul(std::mem::size_of::<f64>())
                 .and_then(|n| {
                     v.indices
-                        .capacity()
+                        .len()
                         .checked_mul(std::mem::size_of::<u32>())
                         .and_then(|m| n.checked_add(m))
                 })
@@ -353,7 +364,7 @@ mod area_retention_tests {
     }
     fn value() -> Arc<CachedTriangulation> {
         Arc::new(CachedTriangulation {
-            indices: vec![2, 0, 1],
+            indices: Arc::from(vec![2, 0, 1]),
             world_vertices: vec![-0., 1., 2., 3., 4., 5.],
             world_aabb: (-0., 1., 4., 5.),
         })
@@ -438,11 +449,53 @@ mod area_retention_tests {
         assert!(r.retained_bytes <= 4096);
         assert!(!r.admit(record(AreaRetainedResult::Rejected), 4096, 1));
         assert_eq!(r.records.len(), 1);
-        assert_eq!(v.indices, [2, 0, 1]);
+        assert_eq!(*v.indices, [2, 0, 1]);
         r.reset();
         assert_eq!(r.retained_bytes, 0);
         assert!(r.records.is_empty());
         assert!(r.epoch.is_none());
+    }
+    /// Stored indices reproduce the fresh triangulation exactly, and are
+    /// ignored for other geometry or another projection.
+    #[test]
+    fn stored_area_triangulation_equals_fresh_and_is_bound_to_geometry() {
+        use ferrite_render::{AreaInstruction, FlatProjection, WorldPoint};
+        let ring = |cx: f64, cy: f64, r: f64, n: usize| -> Vec<WorldPoint> {
+            let mut points: Vec<_> = (0..n)
+                .map(|i| {
+                    let a = i as f64 / n as f64 * std::f64::consts::TAU;
+                    let wobble = 1. + 0.2 * (a * 5.).sin();
+                    WorldPoint::new(cx + r * wobble * a.cos(), cy + r * wobble * a.sin())
+                })
+                .collect();
+            points.push(points[0]);
+            points
+        };
+        let mut area = AreaInstruction::new(ring(-1.1, 50.7, 0.05, 90));
+        area.interiors
+            .push(ring(-1.1, 50.7, 0.01, 40).into_iter().rev().collect());
+        let projection = FlatProjection::EllipsoidalMercator;
+        let fresh = VectorEmissionOwned::triangulate_area(&area, projection).unwrap();
+        assert!(compute_area_triangulation(&area, projection, 1000).is_none());
+        let stored = compute_area_triangulation(&area, projection, 32).unwrap();
+        assert_eq!(*stored.indices, *fresh.indices);
+        area.triangulation = Some(Arc::new(stored.clone()));
+        let reused = VectorEmissionOwned::triangulate_area(&area, projection).unwrap();
+        assert!(Arc::ptr_eq(&reused.indices, &stored.indices));
+        assert_eq!(reused.world_vertices, fresh.world_vertices);
+        assert_eq!(reused.world_aabb, fresh.world_aabb);
+        // Wrong indices for other geometry or projection are never used.
+        let mut wrong = stored.clone();
+        wrong.indices = Arc::from(vec![0u32, 1, 2]);
+        area.triangulation = Some(Arc::new(wrong.clone()));
+        area.exterior[3].x += 1e-9;
+        let moved = VectorEmissionOwned::triangulate_area(&area, projection).unwrap();
+        assert!(moved.indices.len() > 3);
+        area.exterior[3].x -= 1e-9;
+        wrong.projection = FlatProjection::LocalGeographic;
+        area.triangulation = Some(Arc::new(wrong));
+        let other = VectorEmissionOwned::triangulate_area(&area, projection).unwrap();
+        assert_eq!(*other.indices, *fresh.indices);
     }
 }
 
@@ -3687,6 +3740,11 @@ impl WgpuRenderer {
     }
 
     #[inline]
+    pub fn take_chart_image_request(&mut self) -> bool {
+        std::mem::take(&mut self.ui_state.chart_image_requested)
+    }
+
+    #[inline]
     pub fn take_open_fc_request(&mut self) -> bool {
         let requested = self.ui_state.open_fc_requested;
         self.ui_state.open_fc_requested = false;
@@ -4432,14 +4490,20 @@ impl WgpuRenderer {
 
     /// More detailed reference coastlines for regional views; never used as ENC data.
     pub fn set_world_map_detailed(&mut self, coastlines: Vec<Vec<[f64; 2]>>) {
+        self.set_world_map_detailed_prepared(ferrite_render::BackgroundCoastlines::new(coastlines));
+    }
+
+    /// Install detailed coastlines built elsewhere (e.g. on a startup thread).
+    pub fn set_world_map_detailed_prepared(
+        &mut self,
+        coastlines: std::result::Result<ferrite_render::BackgroundCoastlines, String>,
+    ) {
         self.scene_generation = self.scene_generation.wrapping_add(1);
         self.vector_scene_epoch.advance();
-        self.world_map_detailed = Arc::new(
-            ferrite_render::BackgroundCoastlines::new(coastlines).unwrap_or_else(|e| {
-                tracing::warn!("{e}");
-                Default::default()
-            }),
-        );
+        self.world_map_detailed = Arc::new(coastlines.unwrap_or_else(|e| {
+            tracing::warn!("{e}");
+            Default::default()
+        }));
     }
 
     /// Set chart coverage bounding boxes so world map is masked
@@ -9777,7 +9841,22 @@ impl VectorEmissionOwned {
         area: &ferrite_render::AreaInstruction,
         projection: ferrite_render::FlatProjection,
     ) -> std::result::Result<CachedTriangulation, String> {
-        let triangulated = (|| -> std::result::Result<(Vec<f64>, Vec<usize>), String> {
+        let (vertices, indices) = Self::area_vertices_and_indices(area, projection)?;
+        Ok(Self::cached_triangulation(vertices, indices, projection))
+    }
+
+    /// Normalized projected ring vertices and their earcut indices; stored
+    /// indices for this exact geometry and projection replace the earcut run.
+    fn area_vertices_and_indices(
+        area: &ferrite_render::AreaInstruction,
+        projection: ferrite_render::FlatProjection,
+    ) -> std::result::Result<(Vec<f64>, Arc<[u32]>), String> {
+        let stored = area
+            .triangulation
+            .as_ref()
+            .filter(|t| t.projection == projection && t.geometry == area.geometry_fingerprint());
+        // None: the stored indices are valid for these vertices.
+        let triangulated = (|| -> std::result::Result<(Vec<f64>, Option<Vec<usize>>), String> {
             let project_ring = |ring: &[WorldPoint]| {
                 let points: Vec<_> = ring
                     .iter()
@@ -9791,20 +9870,56 @@ impl VectorEmissionOwned {
                 holes.push(vertices.len() / 2);
                 vertices.extend(project_ring(hole)?);
             }
+            if let Some(stored) = stored {
+                let count = vertices.len() / 2;
+                if stored.indices.len() % 3 == 0
+                    && stored.indices.iter().all(|i| (*i as usize) < count)
+                {
+                    return Ok((vertices, None));
+                }
+            }
             let indices = ferrite_kernel::triangulation::triangulate(&vertices, &holes)
                 .map_err(|e| e.to_string())?;
-            Ok((vertices, indices))
+            Ok((vertices, Some(indices)))
         })();
-        let (mut vertices, indices) = triangulated.and_then(|(vertices, indices)| {
-            // Exact-size u32 copy; GPU index buffers are u32 as well.
-            let indices = indices
-                .into_iter()
-                .map(u32::try_from)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|_| "Area triangulation exceeds u32 indices".to_string())?;
-            Ok((vertices, indices))
-        })?;
+        let (vertices, indices) = triangulated?;
+        let Some(indices) = indices else {
+            let stored = stored.expect("validated stored indices");
+            return Ok((vertices, Arc::clone(&stored.indices)));
+        };
+        // Exact-size u32 copy; GPU index buffers are u32 as well.
+        let indices = indices
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<std::result::Result<Arc<[u32]>, _>>()
+            .map_err(|_| "Area triangulation exceeds u32 indices".to_string())?;
+        Ok((vertices, indices))
+    }
 
+    /// The triangulation an area is given once (e.g. on a portrayal worker)
+    /// so later loads skip earcut; None for small or rejected areas.
+    fn compute_area_triangulation(
+        area: &ferrite_render::AreaInstruction,
+        projection: ferrite_render::FlatProjection,
+        min_vertices: usize,
+    ) -> Option<ferrite_render::AreaTriangulation> {
+        let total = area.exterior.len() + area.interiors.iter().map(Vec::len).sum::<usize>();
+        if total < min_vertices {
+            return None;
+        }
+        let (_, indices) = Self::area_vertices_and_indices(area, projection).ok()?;
+        Some(ferrite_render::AreaTriangulation {
+            projection,
+            geometry: area.geometry_fingerprint(),
+            indices,
+        })
+    }
+
+    fn cached_triangulation(
+        mut vertices: Vec<f64>,
+        indices: Arc<[u32]>,
+        projection: ferrite_render::FlatProjection,
+    ) -> CachedTriangulation {
         // Compute world AABB for frustum culling
         let mut aabb_min_x = f64::MAX;
         let mut aabb_min_y = f64::MAX;
@@ -9829,7 +9944,7 @@ impl VectorEmissionOwned {
         }
 
         vertices.shrink_to_fit();
-        Ok(CachedTriangulation {
+        CachedTriangulation {
             indices,
             world_vertices: vertices,
             world_aabb: (
@@ -9838,7 +9953,7 @@ impl VectorEmissionOwned {
                 aabb_max_x,
                 projection.unproject_y(aabb_max_y),
             ),
-        })
+        }
     }
 
     /// Triangulate every not-yet-cached distinct area geometry on several
@@ -9862,27 +9977,16 @@ impl VectorEmissionOwned {
         if pending.is_empty() {
             return;
         }
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(8)
-            .min(pending.len());
-        let chunk = pending.len().div_ceil(workers);
-        let results: Vec<_> = std::thread::scope(|scope| {
-            let handles: Vec<_> = pending
-                .chunks(chunk)
-                .map(|part| {
-                    scope.spawn(move || {
-                        part.iter()
-                            .map(|(_, area)| Self::triangulate_area(area, projection))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().expect("triangulation worker panicked"))
+        // Work stealing: a few very large polygons dominate, so fixed chunks
+        // leave most workers idle while one finishes them.
+        let results: Vec<_> = {
+            use rayon::prelude::*;
+            pending
+                .par_iter()
+                .with_max_len(1)
+                .map(|(_, area)| Self::triangulate_area(area, projection))
                 .collect()
-        });
+        };
         for ((key, _), result) in pending.into_iter().zip(results) {
             if self.area_triangulation_reuse_enabled {
                 self.retained_area_triangulations.cold_evaluations = self
@@ -9984,7 +10088,7 @@ impl VectorEmissionOwned {
                         .and_then(|n| {
                             owner
                                 .indices
-                                .capacity()
+                                .len()
                                 .checked_mul(std::mem::size_of::<u32>())
                                 .and_then(|i| n.checked_add(i))
                         })

@@ -139,7 +139,9 @@ impl Viewport {
 /// Internal flat-view coordinates are angular Mercator coordinates (metre
 /// coordinates divided by WGS84 a and converted to degrees). Geographic APIs
 /// still return longitude/latitude. The two axes share the same unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum FlatProjection {
     #[default]
     LocalGeographic,

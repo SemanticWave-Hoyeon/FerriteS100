@@ -346,10 +346,123 @@ fn capture_authenticated_rows(
     ))
 }
 
+/// Parsed unverified exchange catalogues of one input batch, keyed by the
+/// canonical XML path and the SHA-256 of the exact bytes read. Each capture
+/// still reads and hashes the live XML; only identical bytes reuse a parse.
+#[derive(Default)]
+pub(crate) struct CaptureCache {
+    catalogues: std::collections::HashMap<(PathBuf, [u8; 32]), Arc<UnverifiedCatalogue>>,
+}
+/// Per discovery entry, in document order: its resolved resource path, the
+/// leading fields and the coverage/product rows (each as the original error
+/// text when invalid), plus the shared retained XML bytes.
+struct UnverifiedCatalogue {
+    document: std::result::Result<Vec<UnverifiedEntry>, String>,
+    retained: std::sync::Mutex<Option<Arc<[u8]>>>,
+}
+struct UnverifiedEntry {
+    path: std::result::Result<PathBuf, String>,
+    head: std::result::Result<(DatasetPurpose, u32, Option<u32>, NaiveDate), String>,
+    rows: std::result::Result<
+        (
+            Vec<XcDataCoverage>,
+            Option<crate::s101_xc_consistency::XcProduct>,
+        ),
+        String,
+    >,
+}
+fn message(error: anyhow::Error) -> String {
+    format!("{error:#}")
+}
+fn parse_unverified(root: &Path, xml: &str) -> std::result::Result<Vec<UnverifiedEntry>, String> {
+    let document = Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 200_000,
+        },
+    )
+    .map_err(|e| message(e.into()))?;
+    let catalogue = document.root_element();
+    if !(catalogue.tag_name().namespace() == Some(XC)
+        && catalogue.tag_name().name() == "S100_ExchangeCatalogue")
+    {
+        return Err("Unsupported lifecycle catalogue namespace/type".into());
+    }
+    let mut entries = Vec::new();
+    for container in catalogue.children().filter(|n| {
+        n.is_element()
+            && n.tag_name().namespace() == Some(XC)
+            && n.tag_name().name() == "datasetDiscoveryMetadata"
+    }) {
+        for entry in container.children().filter(|n| {
+            n.is_element()
+                && n.tag_name().namespace() == Some(XC)
+                && n.tag_name().name() == "S100_DatasetDiscoveryMetadata"
+        }) {
+            let head = (|| -> Result<_> {
+                let purpose = purpose(text(child(entry, "purpose")?)?)?;
+                let edition = number(text(child(entry, "editionNumber")?)?)?;
+                ensure!(
+                    edition > 0,
+                    "Lifecycle catalogue target edition must be positive"
+                );
+                let mut updates = entry.children().filter(|n| {
+                    n.is_element()
+                        && n.tag_name().namespace() == Some(XC)
+                        && n.tag_name().name() == "updateNumber"
+                });
+                let update = updates.next().map(|n| number(text(n)?)).transpose()?;
+                ensure!(
+                    updates.next().is_none() && update.is_none_or(|n| n <= 999),
+                    "Lifecycle catalogue update is duplicate or exceeds999"
+                );
+                let issue_date = date(text(child(entry, "issueDate")?)?)?;
+                Ok((purpose, edition, update, issue_date))
+            })();
+            entries.push(UnverifiedEntry {
+                path: child(entry, "fileName")
+                    .and_then(text)
+                    .and_then(|name| resource_path(root, name))
+                    .map_err(message),
+                head: head.map_err(message),
+                rows: s101_xc_coverage::capture(entry)
+                    .and_then(|coverage| {
+                        Ok((
+                            coverage,
+                            crate::s101_xc_consistency::capture_product(entry)?,
+                        ))
+                    })
+                    .map_err(message),
+            });
+        }
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
 pub(crate) fn capture(
     original: &Path,
     retained_data: &Path,
     authorization: &AuthorizedDatasets,
+) -> Result<Option<MetadataEvidence>> {
+    capture_cached(
+        original,
+        retained_data,
+        None,
+        authorization,
+        &mut CaptureCache::default(),
+    )
+}
+
+/// `retained_fingerprint` is the (size, SHA-256) of `retained_data` already
+/// computed by the caller from the same retained snapshot.
+pub(crate) fn capture_cached(
+    original: &Path,
+    retained_data: &Path,
+    retained_fingerprint: Option<(u64, [u8; 32])>,
+    authorization: &AuthorizedDatasets,
+    cache: &mut CaptureCache,
 ) -> Result<Option<MetadataEvidence>> {
     let key = original.canonicalize()?;
     let authorization = authorization.checked_dataset_discovery(&key)?;
@@ -417,57 +530,56 @@ pub(crate) fn capture(
                 "Lifecycle catalogue grew beyond XML receiver budget"
             );
             let xml = std::str::from_utf8(&bytes)?;
-            let document = Document::parse_with_options(
-                xml,
-                ParsingOptions {
-                    allow_dtd: false,
-                    nodes_limit: 200_000,
-                },
-            )?;
-            let catalogue = document.root_element();
-            ensure!(
-                catalogue.tag_name().namespace() == Some(XC)
-                    && catalogue.tag_name().name() == "S100_ExchangeCatalogue",
-                "Unsupported lifecycle catalogue namespace/type"
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            let parsed = Arc::clone(
+                cache
+                    .catalogues
+                    .entry((xml_path.clone(), digest))
+                    .or_insert_with(|| {
+                        Arc::new(UnverifiedCatalogue {
+                            document: parse_unverified(&root, xml),
+                            retained: std::sync::Mutex::new(None),
+                        })
+                    }),
             );
+            let entries = parsed
+                .document
+                .as_ref()
+                .map_err(|m| anyhow::anyhow!("{m}"))?;
             let mut matched = None;
-            for container in catalogue.children().filter(|n| {
-                n.is_element()
-                    && n.tag_name().namespace() == Some(XC)
-                    && n.tag_name().name() == "datasetDiscoveryMetadata"
-            }) {
-                for entry in container.children().filter(|n| {
-                    n.is_element()
-                        && n.tag_name().namespace() == Some(XC)
-                        && n.tag_name().name() == "S100_DatasetDiscoveryMetadata"
-                }) {
-                    if resource_path(&root, text(child(entry, "fileName")?)?)? == key {
-                        ensure!(
-                            matched.replace(entry).is_none(),
-                            "Ambiguous lifecycle dataset discovery"
-                        );
-                    }
+            for entry in entries {
+                let path = entry.path.as_ref().map_err(|m| anyhow::anyhow!("{m}"))?;
+                if *path == key {
+                    ensure!(
+                        matched.replace(entry).is_none(),
+                        "Ambiguous lifecycle dataset discovery"
+                    );
                 }
             }
             let entry = matched.context("Dataset missing from lifecycle catalogue")?;
-            let purpose = purpose(text(child(entry, "purpose")?)?)?;
-            let edition = number(text(child(entry, "editionNumber")?)?)?;
-            ensure!(
-                edition > 0,
-                "Lifecycle catalogue target edition must be positive"
-            );
-            let mut updates = entry.children().filter(|n| {
-                n.is_element()
-                    && n.tag_name().namespace() == Some(XC)
-                    && n.tag_name().name() == "updateNumber"
-            });
-            let update = updates.next().map(|n| number(text(n)?)).transpose()?;
-            ensure!(
-                updates.next().is_none() && update.is_none_or(|n| n <= 999),
-                "Lifecycle catalogue update is duplicate or exceeds999"
-            );
-            let issue_date = date(text(child(entry, "issueDate")?)?)?;
-            let (raw_resource_sha256, _, _) = resource_digest(retained_data)?;
+            let (purpose, edition, update, issue_date) =
+                *entry.head.as_ref().map_err(|m| anyhow::anyhow!("{m}"))?;
+            let raw_resource_sha256 = match retained_fingerprint {
+                Some((size, sha256)) if size <= MAX_RESOURCE => sha256,
+                _ => resource_digest(retained_data)?.0,
+            };
+            let (data_coverage, product_specification) =
+                entry.rows.clone().map_err(|m| anyhow::anyhow!("{m}"))?;
+            let retained = {
+                let mut slot = parsed
+                    .retained
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("XC catalogue cache poisoned"))?;
+                match &*slot {
+                    Some(bytes) => Arc::clone(bytes),
+                    None => {
+                        let bytes =
+                            crate::s101_xc_capture_pool::retain_unverified(&xml_path, &bytes)?;
+                        *slot = Some(Arc::clone(&bytes));
+                        bytes
+                    }
+                }
+            };
             let evidence = MetadataEvidence {
                 purpose,
                 edition,
@@ -475,12 +587,12 @@ pub(crate) fn capture(
                 issue_date,
                 original_canonical_key: key,
                 raw_resource_sha256,
-                catalogue_xml_hash: CatalogueHash::UnverifiedSha256(Sha256::digest(&bytes).into()),
-                data_coverage: s101_xc_coverage::capture(entry)?,
-                product_specification: crate::s101_xc_consistency::capture_product(entry)?,
+                catalogue_xml_hash: CatalogueHash::UnverifiedSha256(digest),
+                data_coverage,
+                product_specification,
                 coverage_catalogue: Some(CapturedCoverageCatalogue::Unverified {
                     canonical_path: xml_path.clone(),
-                    bytes: crate::s101_xc_capture_pool::retain_unverified(&xml_path, &bytes)?,
+                    bytes: retained,
                 }),
                 provenance: Provenance::UnverifiedCatalogue,
             };
@@ -578,6 +690,60 @@ mod tests {
         assert!(b.same_operation(&c));
         c.catalogue_xml_hash = CatalogueHash::AuthenticatedSha384("signed-b".into());
         assert!(!b.same_operation(&c));
+    }
+    /// A batch cache gives every input exactly the evidence (or error) of an
+    /// uncached capture, and a changed catalogue is parsed again.
+    #[test]
+    fn batch_cache_matches_uncached_capture_and_follows_changed_xml() {
+        let f = Fixture::new();
+        let second = f.root.join("101AA00SECOND.000");
+        std::fs::write(&second, b"retained input B").unwrap();
+        let other = f
+            .entry()
+            .replace("101AA00TEST", "101AA00SECOND")
+            .replace("cancellation", "newDataset")
+            .replace("<xc:updateNumber>3</xc:updateNumber>", "");
+        f.xml(&(f.entry() + &other));
+        let authorization = crate::dataset_signature_policy::unchecked_datasets(&[
+            f.original.clone(),
+            second.clone(),
+        ])
+        .unwrap();
+        let summary = |e: &MetadataEvidence| {
+            (
+                e.purpose,
+                e.edition,
+                e.update,
+                e.issue_date,
+                e.original_canonical_key.clone(),
+                e.raw_resource_sha256,
+                e.data_coverage.clone(),
+                e.is_authenticated(),
+            )
+        };
+        let mut cache = CaptureCache::default();
+        for path in [&f.original, &second, &f.original] {
+            let fresh = capture(path, path, &authorization).unwrap().unwrap();
+            let fingerprint = {
+                let bytes = std::fs::read(path).unwrap();
+                (bytes.len() as u64, <[u8; 32]>::from(Sha256::digest(&bytes)))
+            };
+            let cached = capture_cached(path, path, Some(fingerprint), &authorization, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(summary(&fresh), summary(&cached));
+        }
+        assert_eq!(cache.catalogues.len(), 1);
+        // A duplicate entry is ambiguous in both; the changed bytes are reparsed.
+        f.xml(&(f.entry() + &f.entry()));
+        let fresh = capture(&f.original, &f.original, &authorization)
+            .err()
+            .unwrap();
+        let cached = capture_cached(&f.original, &f.original, None, &authorization, &mut cache)
+            .err()
+            .unwrap();
+        assert_eq!(format!("{fresh:#}"), format!("{cached:#}"));
+        assert_eq!(cache.catalogues.len(), 2);
     }
     #[test]
     fn off_captured_values_and_resource_survive_live_xml_change_without_trust_promotion() {

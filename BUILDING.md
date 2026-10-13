@@ -26,6 +26,19 @@ The usual executable locations are `target/debug/ferrite-s100`,
 on Windows). Cargo environment/configuration can override the target directory.
 Timing reports are written under `target/cargo-timings/`.
 
+For a distributable build that leaves only the application in `target/release`:
+
+```text
+python3 tools/package.py --lua 54
+```
+
+On macOS this produces `target/release/FerriteS100.app` (Catalogues, Trust and
+icons in `Contents/Resources`); on Windows `target/release/ferrite-s100.exe`,
+on Linux `target/release/ferrite-s100`. The compiler cache stays in
+`target/package-build`, so later builds only recompile what changed. Add
+`--fast` for a quick `release-fast` build while testing (distribute the default
+`release` build), or `--clean-cache` to remove the cache afterwards.
+
 Without Python, the equivalent frequent optimized build is:
 
 ```text

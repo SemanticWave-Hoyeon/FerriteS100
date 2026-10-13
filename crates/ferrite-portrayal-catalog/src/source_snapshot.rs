@@ -63,7 +63,26 @@ impl CatalogueSources {
                 children.push(entry?);
             }
             children.sort_by_key(|e| e.file_name());
-            for entry in children {
+            // Regular files of this directory are read in parallel (each up to
+            // the per-file cap); the cumulative budget and every check below
+            // are then applied in the original order with the same results.
+            let reads: Vec<Option<std::io::Result<Vec<u8>>>> = {
+                use rayon::prelude::*;
+                children
+                    .par_iter()
+                    .map(|entry| {
+                        let regular = entry.file_type().ok()?.is_file();
+                        regular.then(|| {
+                            let mut bytes = Vec::new();
+                            std::fs::File::open(entry.path())?
+                                .take((limits.file + 1) as u64)
+                                .read_to_end(&mut bytes)?;
+                            Ok(bytes)
+                        })
+                    })
+                    .collect()
+            };
+            for (entry, read) in children.into_iter().zip(reads) {
                 let rel = relative.join(entry.file_name());
                 let kind = entry.file_type()?;
                 if kind.is_symlink() {
@@ -83,10 +102,17 @@ impl CatalogueSources {
                     )));
                 }
                 let limit = limits.file.min(limits.total.saturating_sub(total));
-                let mut bytes = Vec::new();
-                std::fs::File::open(entry.path())?
-                    .take((limit + 1) as u64)
-                    .read_to_end(&mut bytes)?;
+                let bytes = match read {
+                    Some(read) => read?,
+                    // The type changed between the two reads: read it here, as before.
+                    None => {
+                        let mut bytes = Vec::new();
+                        std::fs::File::open(entry.path())?
+                            .take((limit + 1) as u64)
+                            .read_to_end(&mut bytes)?;
+                        bytes
+                    }
+                };
                 if bytes.len() > limit {
                     return Err(invalid(format!(
                         "PC snapshot byte limit exceeded: {} (file 50 MiB, total 512 MiB)",
