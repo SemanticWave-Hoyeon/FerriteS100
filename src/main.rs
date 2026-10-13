@@ -4132,14 +4132,16 @@ impl ChartApp {
             "Dataset loading is already in progress; wait until it finishes"
         );
         self.ensure_navigation_scene()?;
+        // Snapshot for exchange-set check S-158-129 19 (discovery is off-thread).
+        let on_system = self.gml_overlays.on_system();
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()
             .name("dataset-discovery".into())
             .spawn(move || {
                 let plan = if folder {
-                    dataset_open_plan::discover(&path)
+                    dataset_open_plan::discover(&path, &on_system)
                 } else {
-                    dataset_open_plan::single_file(&path)
+                    dataset_open_plan::single_file(&path, &on_system)
                 }
                 .map(|mut plan| {
                     plan.inspect_trials();
@@ -13822,7 +13824,7 @@ impl ApplicationHandler for ChartApp {
                             }
                             for path in std::mem::take(&mut self.pending_auto_overlays) {
                                 let paths = if path.is_dir() {
-                                    gml_overlay::discover(&path)
+                                    gml_overlay::discover(&path, &self.gml_overlays.on_system())
                                 } else {
                                     Ok(vec![path])
                                 };

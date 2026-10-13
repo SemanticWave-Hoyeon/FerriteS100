@@ -136,7 +136,11 @@ pub(crate) fn is_overlay_file(path: &Path) -> bool {
 /// Overlay datasets under a folder: S-124/S-129 GML and imported KML, GPX
 /// and extracted shapefiles. ZIP archives are opened only as explicit files
 /// (a folder may hold both an archive and its extracted copy).
-pub(crate) fn discover(root: &Path) -> Result<Vec<PathBuf>> {
+///
+/// `on_system` holds the file names of the S-124/S-129 datasets already
+/// loaded and not cancelled ([`GmlOverlays::on_system`]); exchange-set check
+/// S-158-129 19 (cancellation of a dataset not on the system) uses it.
+pub(crate) fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut catalogues = Vec::new();
     for (count, entry) in walkdir::WalkDir::new(root)
@@ -161,16 +165,30 @@ pub(crate) fn discover(root: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     found.sort();
-    if !found.is_empty() {
-        log_exchange_set_checks(catalogues);
-    }
+    // A cancellation-only exchange set holds no dataset files; it is still
+    // checked (S-101-only sets report no S-124/S-129 products and are skipped).
+    log_exchange_set_checks(exchange_set_reports(catalogues, &found, on_system));
     Ok(found)
 }
 
+/// Base file name of an S-100 file URI or path, as check 19 compares them.
+fn uri_base_name(uri: &str) -> &str {
+    uri.rsplit(['/', '\\', ':']).next().unwrap_or(uri)
+}
+
 /// Exchange-set validation (S-158-129 11, 17-20; S-124 9.5-9.8, 12) of the
-/// S-124 / S-129 exchange sets under an opened folder, logged like dataset
-/// validation. Check 19 needs the system state and is not evaluated here.
-fn log_exchange_set_checks(mut roots: Vec<PathBuf>) {
+/// exchange sets under an opened folder. Check 19 sees the datasets on the
+/// system: `on_system`, the S-124/S-129 files opened in the same batch from
+/// outside the exchange set, less those cancelled by an exchange set
+/// validated earlier in the batch.
+fn exchange_set_reports(
+    mut roots: Vec<PathBuf>,
+    found: &[PathBuf],
+    on_system: &HashSet<String>,
+) -> Vec<(
+    PathBuf,
+    Result<ferrite_s100_gml::exchange::ExchangeSetReport>,
+)> {
     roots.sort();
     let mut outer: Vec<PathBuf> = Vec::new();
     for root in roots {
@@ -179,8 +197,44 @@ fn log_exchange_set_checks(mut roots: Vec<PathBuf>) {
             outer.push(root);
         }
     }
+    let batch: Vec<&PathBuf> = found
+        .iter()
+        .filter(|p| sniff_product(p).is_some())
+        .collect();
+    let mut cancelled: HashSet<String> = HashSet::new();
+    let mut reports = Vec::new();
     for root in outer {
-        let report = match ferrite_s100_gml::exchange::validate_exchange_set(&root, None) {
+        let mut system = on_system.clone();
+        system.extend(
+            batch
+                .iter()
+                .filter(|p| !p.starts_with(&root))
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned()),
+        );
+        system.retain(|n| !cancelled.contains(&n.to_ascii_uppercase()));
+        let report = ferrite_s100_gml::exchange::validate_exchange_set(&root, Some(&system));
+        if let Ok(r) = &report {
+            for d in r.catalogue.iter().flat_map(|c| &c.datasets) {
+                if d.is_cancellation() {
+                    cancelled.insert(uri_base_name(&d.file_name).to_ascii_uppercase());
+                }
+            }
+        }
+        reports.push((root, report));
+    }
+    reports
+}
+
+/// Logs exchange-set validation like dataset validation.
+fn log_exchange_set_checks(
+    reports: Vec<(
+        PathBuf,
+        Result<ferrite_s100_gml::exchange::ExchangeSetReport>,
+    )>,
+) {
+    for (root, report) in reports {
+        let report = match report {
             Ok(r) if !r.products.is_empty() => r,
             Ok(_) => continue,
             Err(e) => {
@@ -503,6 +557,43 @@ impl GmlOverlays {
 
     pub fn dataset(&self, id: u32) -> Option<&OverlayDataset> {
         self.datasets.iter().find(|d| d.id == id)
+    }
+
+    /// The S-124/S-129 datasets on the system for exchange-set check
+    /// S-158-129 19: file name and datasetFileIdentifier of every
+    /// authoritative dataset (imported KML/GPX/shapefiles are excluded), except S-124 datasets whose
+    /// message status is Cancelled (any reason). S-129 has no cancelled
+    /// state in the overlay; an S-129 dataset stays on the system until
+    /// removed. Products share one set; their file names carry the product
+    /// prefix (124 / 129), so names do not collide in practice.
+    pub fn on_system(&mut self) -> HashSet<String> {
+        let cancelled: HashSet<u32> = if self.datasets.iter().any(|d| d.product() == Product::S124)
+        {
+            self.registry();
+            let registry = self.registry.as_ref().expect("evaluated");
+            registry
+                .messages
+                .iter()
+                .zip(&self.registry_ids)
+                .filter(|(m, _)| m.status.is_cancelled())
+                .map(|(_, id)| *id)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut names = HashSet::new();
+        for d in &self.datasets {
+            if d.dataset.imported || cancelled.contains(&d.id) {
+                continue;
+            }
+            if let Some(name) = d.dataset.source.as_ref().and_then(|p| p.file_name()) {
+                names.insert(name.to_string_lossy().into_owned());
+            }
+            if let Some(id) = d.dataset.identification.file_identifier() {
+                names.insert(id.to_owned());
+            }
+        }
+        names
     }
 
     /// Read an S-124/S-129 GML dataset (from `bytes_path`, the authenticated
@@ -2288,12 +2379,15 @@ mod tests {
             sniff_product(&root().join("Catalogues/FC/S-124/124_FC_2.0.0.xml")),
             None
         );
-        let found =
-            discover(&root().join("TestData/UKHO-S100-2026/ExchangeSets/S-124_GB")).unwrap();
+        let found = discover(
+            &root().join("TestData/UKHO-S100-2026/ExchangeSets/S-124_GB"),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(found.len(), 5);
         let shom = root().join("TestData/SHOM-PING-S124");
         if shom.exists() {
-            let found = discover(&shom).unwrap();
+            let found = discover(&shom, &HashSet::new()).unwrap();
             // 4 KML, 1 GPX, 1 extracted shapefile; the ZIP only when selected.
             assert_eq!(found.len(), 6, "{found:?}");
             assert!(is_overlay_file(&shom.join("shapefile/shapefiles.zip")));
@@ -2312,11 +2406,15 @@ mod tests {
         }
         let mut g = GmlOverlays::load(&base);
         assert!(g.catalogue_errors.is_empty(), "{:?}", g.catalogue_errors);
-        let mut paths = discover(&data.join("UKHO-S100-2026/ExchangeSets/S-124_GB")).unwrap();
-        paths.extend(discover(&data.join("IHO-S129-Test-Datasets")).unwrap());
+        let mut paths = discover(
+            &data.join("UKHO-S100-2026/ExchangeSets/S-124_GB"),
+            &HashSet::new(),
+        )
+        .unwrap();
+        paths.extend(discover(&data.join("IHO-S129-Test-Datasets"), &HashSet::new()).unwrap());
         let shom = data.join("SHOM-PING-S124");
         for dir in ["kml", "gpx"] {
-            paths.extend(discover(&shom.join(dir)).unwrap());
+            paths.extend(discover(&shom.join(dir), &HashSet::new()).unwrap());
         }
         paths.push(shom.join("shapefile/shapefiles.zip"));
         for path in &paths {
@@ -2460,7 +2558,7 @@ mod tests {
                 &std::fs::read(base.join("Trust/IHO-S100-5.2.pem")).unwrap(),
             )
             .unwrap();
-        let paths = discover(&dir).unwrap();
+        let paths = discover(&dir, &HashSet::new()).unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2795,5 +2893,77 @@ mod tests {
         // Listing selection zooms to the part and its area.
         assert!(g.focus_bounds(id, Some("P1")).is_some());
         assert_eq!(g.first_part(id).as_deref(), Some("P1"));
+    }
+
+    /// S-158-129 19 sees the overlay datasets already loaded: cancelling a
+    /// loaded dataset is clean, cancelling an unknown or already cancelled
+    /// one is reported, and a dataset opened in the same batch counts.
+    #[test]
+    fn exchange_set_cancellation_sees_loaded_datasets() {
+        let mut g = GmlOverlays::load(&root());
+        let mut loaded = s124_dataset(&g, 90, "", "");
+        loaded.source = Some(PathBuf::from("/charts/124GB00LOADED.GML"));
+        g.add(loaded, Provenance::Unverified).unwrap();
+        // cancellationDate passed: the message status is Cancelled.
+        let mut gone = s124_dataset(
+            &g,
+            91,
+            "<S124:cancellationDate>20200101T000000Z</S124:cancellationDate>",
+            "",
+        );
+        gone.source = Some(PathBuf::from("/charts/124GB00GONE.GML"));
+        g.add(gone, Provenance::Unverified).unwrap();
+        let on_system = g.on_system();
+        assert!(on_system.contains("124GB00LOADED.GML"));
+        assert!(!on_system.contains("124GB00GONE.GML"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let set = tmp.path().join("SET/S100_ROOT");
+        std::fs::create_dir_all(&set).unwrap();
+        let cancel = |name: &str| {
+            format!("<S100_DatasetDiscoveryMetadata><fileName>file:/S-124/DATASET_FILES/{name}</fileName><purpose>cancellation</purpose><editionNumber>0</editionNumber></S100_DatasetDiscoveryMetadata>")
+        };
+        let write_catalogue = |names: &[&str]| {
+            let entries: String = names.iter().map(|n| cancel(n)).collect();
+            std::fs::write(
+                set.join("CATALOG.XML"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><S100_ExchangeCatalogue xmlns=\"http://www.iho.int/s100/xc/5.2\">\
+                     <identifier><identifier>TEST</identifier><dateTime>2026-02-17T10:18:33Z</dateTime></identifier>\
+                     <datasetDiscoveryMetadata>{entries}</datasetDiscoveryMetadata></S100_ExchangeCatalogue>"
+                ),
+            )
+            .unwrap();
+        };
+        let unknown = |found: &[PathBuf]| -> Vec<String> {
+            let reports = exchange_set_reports(vec![set.clone()], found, &on_system);
+            assert_eq!(reports.len(), 1);
+            let report = reports[0].1.as_ref().unwrap();
+            assert_eq!(report.products, [Product::S124]);
+            let mut objects: Vec<String> = report
+                .issues
+                .iter()
+                .filter(|i| i.check == "S-124/exchange/cancellation-unknown")
+                .filter_map(|i| i.object.clone())
+                .collect();
+            objects.sort();
+            objects
+        };
+
+        write_catalogue(&["124GB00LOADED.GML"]);
+        assert!(unknown(&[]).is_empty());
+        write_catalogue(&["124GB00UNKNOWN.GML"]);
+        assert_eq!(unknown(&[]), ["124GB00UNKNOWN.GML"]);
+        write_catalogue(&["124GB00GONE.GML"]);
+        assert_eq!(unknown(&[]), ["124GB00GONE.GML"]);
+        // Opened in the same batch from outside the exchange set.
+        let other = tmp.path().join("124GB00UNKNOWN.GML");
+        std::fs::write(
+            &other,
+            "<S124:Dataset xmlns:S124=\"http://www.iho.int/S124/gml/2.0\"/>",
+        )
+        .unwrap();
+        write_catalogue(&["124GB00UNKNOWN.GML"]);
+        assert!(unknown(std::slice::from_ref(&other)).is_empty());
     }
 }

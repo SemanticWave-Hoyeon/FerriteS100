@@ -3,6 +3,7 @@
 //! DSID latest edition/reissue, complete chains, identical-operation merge and
 //! conflicting-operation rejection remain owned by s101_update_plan.
 use anyhow::{ensure, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
@@ -130,7 +131,8 @@ fn classify_rasters(plan: &mut Plan, files: Vec<PathBuf>) {
     }
 }
 
-pub(crate) fn discover(root: &Path) -> Result<Plan> {
+/// `on_system`: see [`crate::gml_overlay::discover`].
+pub(crate) fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Plan> {
     let (charts, rasters) = crate::dataset_discovery::discover_recursive_files(root)?;
     let mut plan = Plan {
         charts,
@@ -140,7 +142,7 @@ pub(crate) fn discover(root: &Path) -> Result<Plan> {
     let (routes, notices) = crate::s421_dataset_input::discover_routes(root)?;
     plan.routes = routes;
     plan.notices.extend(notices);
-    plan.overlays = crate::gml_overlay::discover(root)?;
+    plan.overlays = crate::gml_overlay::discover(root, on_system)?;
     if plan.charts.is_empty()
         && plan.rasters.is_empty()
         && plan.trials.is_empty()
@@ -180,7 +182,7 @@ pub(crate) fn discover(root: &Path) -> Result<Plan> {
     Ok(plan)
 }
 
-pub(crate) fn single_file(path: &Path) -> Result<Plan> {
+pub(crate) fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
     ensure!(
         std::fs::symlink_metadata(path)?.is_file(),
         "Selected dataset must be a real file"
@@ -189,7 +191,10 @@ pub(crate) fn single_file(path: &Path) -> Result<Plan> {
         .file_name()
         .is_some_and(|v| v.eq_ignore_ascii_case("CATALOG.XML"))
     {
-        return discover(path.parent().context("Catalogue has no parent directory")?);
+        return discover(
+            path.parent().context("Catalogue has no parent directory")?,
+            on_system,
+        );
     }
     if crate::s101_update_plan::is_chart_file(path) {
         // Existing load_charts expands siblings and verifies the original inputs.
@@ -263,7 +268,7 @@ mod tests {
             }
         }
         std::fs::write(a.join("._CELL.000"), []).unwrap();
-        let p = discover(tmp.path()).unwrap();
+        let p = discover(tmp.path(), &HashSet::new()).unwrap();
         assert_eq!(
             p.charts,
             vec![
@@ -275,10 +280,12 @@ mod tests {
         );
         assert!(p.rasters.is_empty());
         assert!(p.selected_charts.is_empty());
-        let selected = single_file(&a.join("CELL.001")).unwrap();
+        let selected = single_file(&a.join("CELL.001"), &HashSet::new()).unwrap();
         assert_eq!(selected.selected_charts, vec![a.join("CELL.001")]);
         assert_eq!(
-            single_file(&a.join("CATALOG.XML")).unwrap().charts,
+            single_file(&a.join("CATALOG.XML"), &HashSet::new())
+                .unwrap()
+                .charts,
             vec![a.join("CELL.000"), a.join("CELL.001")]
         );
     }
@@ -298,7 +305,7 @@ mod tests {
                     .write_scalar(&VarLenAscii::from_ascii(spec).unwrap())
                     .unwrap();
             }
-            let plan = single_file(&path).unwrap();
+            let plan = single_file(&path, &HashSet::new()).unwrap();
             // Inspection only: never queued as a depth raster.
             assert!(plan.rasters.is_empty());
             assert_eq!(plan.trials, vec![path.clone()]);
@@ -322,7 +329,7 @@ mod tests {
                 .unwrap();
         }
         std::fs::write(tmp.path().join("malformed.h5"), b"not hdf").unwrap();
-        let p = discover(tmp.path()).unwrap();
+        let p = discover(tmp.path(), &HashSet::new()).unwrap();
         assert_eq!(p.rasters, vec![tmp.path().join("s102.H5")]);
         assert_eq!(p.notices.len(), 3);
     }
@@ -380,15 +387,18 @@ mod tests {
     #[test]
     fn empty_and_unknown_inputs_produce_visible_diagnostics_not_guessed_products() {
         let tmp = TestDir::new();
-        assert_eq!(discover(tmp.path()).unwrap().notices.len(), 1);
+        assert_eq!(
+            discover(tmp.path(), &HashSet::new()).unwrap().notices.len(),
+            1
+        );
         let p = tmp.path().join("unknown.xml");
         std::fs::write(&p, []).unwrap();
-        assert!(single_file(&p)
+        assert!(single_file(&p, &HashSet::new())
             .unwrap_err()
             .to_string()
             .contains("Malformed S421/XML input"));
         std::fs::write(&p, b"<unrelated/>").unwrap();
-        let plan = single_file(&p).unwrap();
+        let plan = single_file(&p, &HashSet::new()).unwrap();
         assert!(plan.charts.is_empty() && plan.rasters.is_empty() && plan.routes.is_empty());
         assert_eq!(plan.notices.len(), 1);
     }
@@ -397,7 +407,7 @@ mod tests {
         let tmp = TestDir::new();
         std::fs::create_dir(tmp.path().join("Data")).unwrap();
         std::fs::write(tmp.path().join("Data/exchange.zip"), b"not parsed").unwrap();
-        let plan = discover(tmp.path()).unwrap();
+        let plan = discover(tmp.path(), &HashSet::new()).unwrap();
         assert!(plan.rasters.is_empty() && plan.charts.is_empty());
         assert_eq!(plan.notices.len(), 1);
         assert!(plan.notices[0].contains("ZIP archives"));
@@ -410,8 +420,11 @@ mod tests {
         let outside = TestDir::new();
         std::fs::write(outside.path().join("CELL.000"), []).unwrap();
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked")).unwrap();
-        assert!(discover(tmp.path()).unwrap().charts.is_empty());
-        assert!(discover(&tmp.path().join("linked")).is_err());
+        assert!(discover(tmp.path(), &HashSet::new())
+            .unwrap()
+            .charts
+            .is_empty());
+        assert!(discover(&tmp.path().join("linked"), &HashSet::new()).is_err());
     }
     /// Actual files are discovered read-only; full DSID/authorization/planner
     /// qualification remains the existing production loader's signed probes.
@@ -421,7 +434,7 @@ mod tests {
         let repo =
             std::path::Path::new("/Users/hoyeoncho/Desktop/Development/FerriteS100/TestData");
         for name in ["SHOM-S101", "UKHO-S101"] {
-            let p = discover(&repo.join(name)).unwrap();
+            let p = discover(&repo.join(name), &HashSet::new()).unwrap();
             assert!(!p.charts.is_empty());
             assert!(p.charts.iter().all(|v| v.starts_with(repo.join(name))));
             if name == "SHOM-S101" {
