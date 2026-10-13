@@ -37,6 +37,12 @@ pub enum SpatialPrimitive {
     Surface,
     Coverage,
     NoGeometry,
+    /// `pointSet` (S-100 5.x `S100_FC_SpatialPrimitiveType`)
+    PointSet,
+    /// `arcByCenterPoint`
+    ArcByCenterPoint,
+    /// `circleByCenterPoint`
+    CircleByCenterPoint,
 }
 
 /// Multiplicity specification
@@ -112,4 +118,16 @@ pub enum RoleType {
     Association,
     Aggregation,
     Composition,
+}
+
+impl RoleType {
+    /// Parse the `roleType` XML attribute value (`association`, `aggregation`, `composition`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "association" => Some(Self::Association),
+            "aggregation" => Some(Self::Aggregation),
+            "composition" => Some(Self::Composition),
+            _ => None,
+        }
+    }
 }

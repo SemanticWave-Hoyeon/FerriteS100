@@ -223,6 +223,12 @@ impl PortrayalCatalogue {
         self.viewing_group_layers = layers;
         self.foundation_mode = crate::viewing::read_foundation_mode(&doc, &self.viewing_groups)?;
         self.display_planes = crate::display_plane::read(&doc)?;
+        for rule in crate::rules::read_declared_rule_files(&doc) {
+            if rule.top_level && self.rules.main_file.is_none() {
+                self.rules.main_file = Some(rule.file_path.clone());
+            }
+            self.rules.rule_files.entry(rule.id.clone()).or_insert(rule);
+        }
 
         Ok(())
     }
@@ -865,16 +871,54 @@ impl PortrayalCatalogue {
                     self.rules.main_file = Some(file_name.clone());
                 }
 
+                let declared = self.rules.rule_files.get(&id);
                 let rule = RuleFile {
                     id: id.clone(),
+                    top_level: declared.is_some_and(|r| r.top_level && r.file_path == file_name),
+                    description: declared.and_then(|r| r.description.clone()),
                     file_path: file_name,
                     rule_type: RuleType::Lua,
-                    description: None,
                 };
                 self.rules.rule_files.insert(id, rule);
+            } else if path.extension().is_some_and(|e| e == "xsl" || e == "xslt") {
+                // XSLT rule files not declared in portrayal_catalogue.xml.
+                let id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let file_name = PathBuf::from(path.file_name().unwrap());
+                if self.rules.main_file.is_none() && id == "main" {
+                    self.rules.main_file = Some(file_name.clone());
+                }
+                if !self
+                    .rules
+                    .rule_files
+                    .values()
+                    .any(|r| r.file_path == file_name)
+                {
+                    self.rules.rule_files.entry(id.clone()).or_insert(RuleFile {
+                        id,
+                        file_path: file_name,
+                        rule_type: RuleType::Xslt,
+                        description: None,
+                        top_level: false,
+                    });
+                }
             }
         }
         Ok(())
+    }
+
+    /// Language of this catalogue's portrayal rules (XSLT for S-124/S-129,
+    /// Lua for S-101).
+    pub fn rule_type(&self) -> Option<RuleType> {
+        self.rules.rule_type()
+    }
+
+    /// Absolute path of the top-level rule file (e.g. `<PC>/Rules/main.xsl`).
+    pub fn main_rule_path(&self) -> Option<PathBuf> {
+        self.rules.get_main_path()
     }
 
     /// Get color by token from any profile

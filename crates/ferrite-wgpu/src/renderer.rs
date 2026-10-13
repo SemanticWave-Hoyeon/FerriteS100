@@ -92,6 +92,20 @@ type ChartTextShape = (
 );
 
 use rustc_hash::{FxHashMap, FxHashSet};
+/// Lines split from one multi-line overlay text (feature id and anchor bits).
+type TextLabelGroup = (i64, u64, u64);
+struct PlacedTextCopy {
+    wrap_pass: usize,
+    coverage_wrap_pass: u8,
+    origin: egui::Pos2,
+    angle: f32,
+    footprint: ferrite_render::TextFootprint,
+}
+struct MeasuredTextLabel {
+    galley: std::sync::Arc<egui::Galley>,
+    color: egui::Color32,
+    copies: Vec<PlacedTextCopy>,
+}
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -625,6 +639,9 @@ struct TextLabel {
     italic: bool,
     h_align: ferrite_render::HAlign,
     v_align: ferrite_render::VAlign,
+    /// Lines of one cell-less overlay text box share a group and are placed
+    /// together; None for every ENC label.
+    group: Option<TextLabelGroup>,
 }
 
 /// wgpu-based chart renderer
@@ -1110,8 +1127,16 @@ fn layout_chart_text_with_fonts(
         labels.sort_by_key(|&index| {
             std::cmp::Reverse((text_labels[index].plane, text_labels[index].priority))
         });
-        for label_index in labels {
-            let label = &text_labels[label_index];
+        // Lines of one multi-line overlay text box (same feature and anchor)
+        // are placed as one unit: all shown or all hidden. Ungrouped (all
+        // ENC) labels are placed one by one exactly as before.
+        let mut groups: FxHashMap<TextLabelGroup, Vec<usize>> = FxHashMap::default();
+        for &index in &labels {
+            if let Some(group) = text_labels[index].group {
+                groups.entry(group).or_default().push(index);
+            }
+        }
+        let measure = |label: &TextLabel| -> MeasuredTextLabel {
             let color = egui::Color32::from_rgba_unmultiplied(
                 (label.color[0] * 255.0) as u8,
                 (label.color[1] * 255.0) as u8,
@@ -1173,6 +1198,7 @@ fn layout_chart_text_with_fonts(
             } else {
                 1
             };
+            let mut placed = Vec::with_capacity(copies);
             for (wrap_pass, wrap_offset) in wrap_offsets[..copies].iter().enumerate() {
                 let coverage_wrap_pass = if label.source.is_some() {
                     wrap_pass as u8
@@ -1240,76 +1266,133 @@ fn layout_chart_text_with_fonts(
                 )) {
                     continue;
                 }
-                if !placement.try_place(footprint) {
+                placed.push(PlacedTextCopy {
+                    wrap_pass,
+                    coverage_wrap_pass,
+                    origin,
+                    angle,
+                    footprint,
+                });
+            }
+            MeasuredTextLabel {
+                galley,
+                color,
+                copies: placed,
+            }
+        };
+        let mut emit = |label_index: usize, measured: &MeasuredTextLabel, copy: &PlacedTextCopy| {
+            let label = &text_labels[label_index];
+            if let Some(active) = accepted.get_mut(label_index) {
+                *active = true;
+            }
+            if !capture_shapes {
+                return;
+            }
+            let (color, origin, angle, footprint, coverage_wrap_pass) = (
+                measured.color,
+                copy.origin,
+                copy.angle,
+                copy.footprint,
+                copy.coverage_wrap_pass,
+            );
+            let galley = &measured.galley;
+            if let Some(background) = label.background {
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    (background[0] * 255.) as u8,
+                    (background[1] * 255.) as u8,
+                    (background[2] * 255.) as u8,
+                    (background[3] * 255.) as u8,
+                );
+                let corners = footprint
+                    .corners
+                    .iter()
+                    .map(|p| egui::pos2(p[0], p[1]))
+                    .collect();
+                shapes.push((
+                    label.plane,
+                    label.priority,
+                    label.source,
+                    coverage_wrap_pass,
+                    egui::epaint::ClippedShape {
+                        clip_rect: clip,
+                        shape: egui::Shape::convex_polygon(corners, color, egui::Stroke::NONE),
+                    },
+                ));
+            }
+            if label.font_style.upperline && color.a() > 0 {
+                let rotate = |p: egui::Pos2| {
+                    egui::pos2(
+                        origin.x + p.x * angle.cos() - p.y * angle.sin(),
+                        origin.y + p.x * angle.sin() + p.y * angle.cos(),
+                    )
+                };
+                shapes.push((
+                    label.plane,
+                    label.priority,
+                    label.source,
+                    coverage_wrap_pass,
+                    egui::epaint::ClippedShape {
+                        clip_rect: clip,
+                        shape: egui::Shape::line_segment(
+                            [
+                                rotate(galley.rect.min),
+                                rotate(egui::pos2(galley.rect.max.x, galley.rect.min.y)),
+                            ],
+                            egui::Stroke::new(1_f32, color),
+                        ),
+                    },
+                ));
+            }
+            shapes.push((
+                label.plane,
+                label.priority,
+                label.source,
+                coverage_wrap_pass,
+                egui::epaint::ClippedShape {
+                    clip_rect: clip,
+                    shape: egui::epaint::TextShape::new(origin, galley.clone(), color)
+                        .with_angle(angle)
+                        .into(),
+                },
+            ));
+        };
+        let mut placed_groups: FxHashSet<TextLabelGroup> = FxHashSet::default();
+        for label_index in labels {
+            let label = &text_labels[label_index];
+            let members = label
+                .group
+                .and_then(|group| groups.get(&group).map(|m| (group, m)))
+                .filter(|(_, members)| members.len() > 1);
+            let Some((group, members)) = members else {
+                let measured = measure(label);
+                for copy in &measured.copies {
+                    if placement.try_place(copy.footprint) {
+                        emit(label_index, &measured, copy);
+                    }
+                }
+                continue;
+            };
+            if !placed_groups.insert(group) {
+                continue;
+            }
+            let measured: Vec<(usize, MeasuredTextLabel)> = members
+                .iter()
+                .map(|&index| (index, measure(&text_labels[index])))
+                .collect();
+            for wrap_pass in 0..3 {
+                let footprints: Vec<_> = measured
+                    .iter()
+                    .flat_map(|(_, m)| m.copies.iter())
+                    .filter(|c| c.wrap_pass == wrap_pass)
+                    .map(|c| c.footprint)
+                    .collect();
+                if footprints.is_empty() || !placement.try_place_all(&footprints) {
                     continue;
                 }
-                if let Some(active) = accepted.get_mut(label_index) {
-                    *active = true;
-                }
-                if capture_shapes {
-                    if let Some(background) = label.background {
-                        let color = egui::Color32::from_rgba_unmultiplied(
-                            (background[0] * 255.) as u8,
-                            (background[1] * 255.) as u8,
-                            (background[2] * 255.) as u8,
-                            (background[3] * 255.) as u8,
-                        );
-                        let corners = footprint
-                            .corners
-                            .iter()
-                            .map(|p| egui::pos2(p[0], p[1]))
-                            .collect();
-                        shapes.push((
-                            label.plane,
-                            label.priority,
-                            label.source,
-                            coverage_wrap_pass,
-                            egui::epaint::ClippedShape {
-                                clip_rect: clip,
-                                shape: egui::Shape::convex_polygon(
-                                    corners,
-                                    color,
-                                    egui::Stroke::NONE,
-                                ),
-                            },
-                        ));
+                for (index, m) in &measured {
+                    for copy in m.copies.iter().filter(|c| c.wrap_pass == wrap_pass) {
+                        emit(*index, m, copy);
                     }
-                    if label.font_style.upperline && color.a() > 0 {
-                        let rotate = |p: egui::Pos2| {
-                            egui::pos2(
-                                origin.x + p.x * angle.cos() - p.y * angle.sin(),
-                                origin.y + p.x * angle.sin() + p.y * angle.cos(),
-                            )
-                        };
-                        shapes.push((
-                            label.plane,
-                            label.priority,
-                            label.source,
-                            coverage_wrap_pass,
-                            egui::epaint::ClippedShape {
-                                clip_rect: clip,
-                                shape: egui::Shape::line_segment(
-                                    [
-                                        rotate(galley.rect.min),
-                                        rotate(egui::pos2(galley.rect.max.x, galley.rect.min.y)),
-                                    ],
-                                    egui::Stroke::new(1_f32, color),
-                                ),
-                            },
-                        ));
-                    }
-                    shapes.push((
-                        label.plane,
-                        label.priority,
-                        label.source,
-                        coverage_wrap_pass,
-                        egui::epaint::ClippedShape {
-                            clip_rect: clip,
-                            shape: egui::epaint::TextShape::new(origin, galley.clone(), color)
-                                .with_angle(angle)
-                                .into(),
-                        },
-                    ));
                 }
             }
         }
@@ -1350,6 +1433,7 @@ mod detached_text_layout_tests {
             italic: true,
             h_align: ferrite_render::HAlign::Left,
             v_align: ferrite_render::VAlign::Top,
+            group: None,
         }
     }
     fn environment(fixed: &FxHashSet<usize>, wrap: f32) -> ChartTextLayoutEnvironment<'_> {
@@ -1400,6 +1484,53 @@ mod detached_text_layout_tests {
         assert_eq!(b, a);
         let _ = live.end_pass();
         let _ = private.end_pass();
+    }
+    #[test]
+    fn lines_of_one_overlay_text_box_are_shown_or_hidden_together() {
+        let ctx = context();
+        let fixed = FxHashSet::default();
+        // A higher-priority label covers only the second line of the box.
+        let blocker = label(0, 9, [100., 140.]);
+        let box_line = |y: f32| {
+            let mut l = label(1, 1, [100., y]);
+            l.text = "UKC 1.2 m".into();
+            l
+        };
+        let mut labels = vec![blocker, box_line(100.), box_line(140.), box_line(180.)];
+        // Ungrouped (ENC behaviour): only the covered line is dropped.
+        let ungrouped =
+            layout_chart_text_with_fonts(environment(&fixed, 0.), &ctx, &labels, Vec::new(), false)
+                .1;
+        assert_eq!(ungrouped, [true, true, false, true]);
+        // Grouped: the whole box is dropped with it.
+        for l in &mut labels[1..] {
+            l.group = Some((7, 1, 2));
+        }
+        let grouped =
+            layout_chart_text_with_fonts(environment(&fixed, 0.), &ctx, &labels, Vec::new(), false)
+                .1;
+        assert_eq!(grouped, [true, false, false, false]);
+        // Without the blocker the box is shown whole, even where its own
+        // lines would overlap each other.
+        let mut tight: Vec<_> = (0..3)
+            .map(|i| {
+                let mut l = label(1, 1, [100., 100. + 4. * i as f32]);
+                l.group = Some((7, 1, 2));
+                l
+            })
+            .collect();
+        let shown =
+            layout_chart_text_with_fonts(environment(&fixed, 0.), &ctx, &tight, Vec::new(), false)
+                .1;
+        assert_eq!(shown, [true, true, true]);
+        for l in &mut tight {
+            l.group = None;
+        }
+        let shown =
+            layout_chart_text_with_fonts(environment(&fixed, 0.), &ctx, &tight, Vec::new(), false)
+                .1;
+        assert_eq!(shown, [true, false, false]);
+        let _ = ctx.end_pass();
     }
     #[test]
     fn decorated_text_retains_glyph_styles_and_rotates_upperline_with_owner() {
@@ -9097,14 +9228,15 @@ impl VectorEmissionOwned {
                 row.work.executed_commands = row.work.executed_commands.saturating_add(1);
             }
             let resolved = if let Some(resources) = resource_owners.as_deref_mut() {
-                let cell = instruction.cell_index().map(|v| v as usize);
+                // Cell-less overlay instructions (S-124/S-129) use the designated
+                // overlay owner; instructions with a cell keep their exact owner.
                 let draw = if self.owner_draw_borrow_enabled {
                     resources
-                        .resolve_draw_mut(cell)
+                        .resolve_instruction_draw_mut(instruction)
                         .map(|value| (value.cache, value.profile))
                 } else {
                     resources
-                        .resolve_mut(cell)
+                        .resolve_instruction_mut(instruction)
                         .map(|value| (value.cache, value.profile))
                 };
                 match draw {
@@ -9580,6 +9712,14 @@ impl VectorEmissionOwned {
                         italic: text.italic,
                         h_align: text.h_align,
                         v_align: text.v_align,
+                        group: (text.cell_index.is_none()
+                            && matches!(
+                                text.portrayal_origin,
+                                ferrite_render::PortrayalOrigin::CoverageExempt
+                            ))
+                        .then_some(text.feature_id)
+                        .flatten()
+                        .map(|id| (id, text.position.x.to_bits(), text.position.y.to_bits())),
                     });
                     if let Some(indices) = &mut text_instruction_indices {
                         indices.push(Some(inst_idx));

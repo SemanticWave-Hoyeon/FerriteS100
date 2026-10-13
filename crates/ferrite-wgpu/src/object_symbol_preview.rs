@@ -8,7 +8,8 @@ const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SOURCE_TEXT: usize = 8192;
 #[derive(Clone)]
 pub struct SelectedSymbolPreview {
-    cell: u32,
+    /// Source cell; None for an overlay product symbol (no source cell).
+    cell: Option<u32>,
     feature_id: i64,
     source: String,
     symbol: String,
@@ -40,9 +41,12 @@ impl SelectedSymbolPreview {
     ) -> Result<Self> {
         let error =
             || WgpuError::Render("Selected symbol preview input/size budget rejected".into());
-        let cell = feature.cell_index.ok_or_else(error)?;
-        let source = feature.source.as_deref().ok_or_else(error)?;
+        let cell = feature.cell_index;
         let name = feature.symbol_name.as_deref().ok_or_else(error)?;
+        if cell.is_none() != crate::is_overlay_symbol_id(name) {
+            return Err(error());
+        }
+        let source = feature.source.as_deref().ok_or_else(error)?;
         if source.len() > MAX_SOURCE_TEXT
             || name.len() > 1024
             || palette.len() > 128
@@ -119,7 +123,7 @@ impl SelectedSymbolPreview {
         })
     }
     pub fn matches(&self, feature: &SelectedFeature, palette: &str) -> bool {
-        feature.cell_index == Some(self.cell)
+        feature.cell_index == self.cell
             && feature.feature_id == self.feature_id
             && feature.source.as_deref() == Some(self.source.as_str())
             && feature.symbol_name.as_deref() == Some(self.symbol.as_str())
@@ -163,8 +167,15 @@ impl SelectedSymbolPreview {
                 egui::Color32::WHITE,
             );
             response.on_hover_text(format!(
-                "{} · {} · original cell PC · {} backdrop",
-                self.symbol, self.palette, self.background_token
+                "{} · {} · {} · {} backdrop",
+                self.symbol,
+                self.palette,
+                if self.cell.is_some() {
+                    "original cell PC"
+                } else {
+                    "overlay product PC"
+                },
+                self.background_token
             ));
             ui.vertical(|ui| {
                 ui.label(&self.symbol);
@@ -205,7 +216,12 @@ pub fn prepare_selected_symbol_preview(
             "Selected symbol preview identity budget rejected".into(),
         ));
     }
-    let owner = resources.resolve_mut(feature.cell_index.map(|v| v as usize))?;
+    // Overlay features (S-124/S-129) have no source cell; their namespaced
+    // symbols resolve from the registered overlay source via the overlay owner.
+    let owner = match feature.cell_index {
+        None if crate::is_overlay_symbol_id(name) => resources.resolve_overlay_mut()?,
+        cell => resources.resolve_mut(cell.map(|v| v as usize))?,
+    };
     let digest = *owner.owner.pc_digest();
     let palette = owner.profile.id.clone();
     let (background, background_token) = owner_background(owner.profile)?;
@@ -217,6 +233,52 @@ pub fn prepare_selected_symbol_preview(
         feature,
         digest,
         &palette,
+        geometry,
+        background,
+        background_token,
+    )
+    .map(Some)
+}
+/// Preview of an overlay product symbol (`S-124/...`, `S-129/...`) of a
+/// cell-less overlay feature, rendered from the registered overlay symbol
+/// source in its palette matching `active` (as the chart draws it). The
+/// backdrop is the overlay palette's DEPDW/CHWHT, else the active one's.
+/// None for features without a symbol or with a plain (cell PC) symbol.
+pub fn prepare_overlay_symbol_preview(
+    feature: &SelectedFeature,
+    active: &ferrite_portrayal_catalog::ColorProfile,
+) -> Result<Option<SelectedSymbolPreview>> {
+    let Some(name) = feature.symbol_name.as_deref() else {
+        return Ok(None);
+    };
+    if feature.cell_index.is_some() || !crate::is_overlay_symbol_id(name) {
+        return Ok(None);
+    }
+    if name.len() > 1024
+        || feature
+            .source
+            .as_ref()
+            .is_none_or(|source| source.len() > MAX_SOURCE_TEXT)
+    {
+        return Err(WgpuError::Render(
+            "Selected symbol preview identity budget rejected".into(),
+        ));
+    }
+    let (source, _) = crate::overlay_symbols::resolve_overlay_symbol(name).ok_or_else(|| {
+        WgpuError::Render(format!("Overlay symbol source not registered: {name}"))
+    })?;
+    let (background, background_token) =
+        owner_background(source.palette_for(active)).or_else(|_| owner_background(active))?;
+    let digest = source.sources().map(|s| *s.digest()).unwrap_or([0; 32]);
+    // A private cache: the overlay id resolves through the registry only.
+    let mut cache = crate::SymbolCache::new(source.symbols_dir());
+    let geometry = cache
+        .get_symbol(name, active)
+        .ok_or_else(|| WgpuError::Render(format!("Overlay PC symbol unavailable: {name}")))?;
+    SelectedSymbolPreview::from_geometry(
+        feature,
+        digest,
+        &active.id,
         geometry,
         background,
         background_token,
@@ -276,6 +338,59 @@ mod tests {
         foreign.source = Some("/other/test.000".into());
         assert!(!p.matches(&foreign, "Night"));
         assert!(!p.matches(&f, "Day"));
+    }
+    #[test]
+    fn overlay_symbol_preview_has_no_cell_and_needs_overlay_id() {
+        let mut f = feature();
+        f.cell_index = None;
+        f.symbol_name = Some("S-124/SAME".into());
+        let mut g = geometry();
+        g.name = "S-124/SAME".into();
+        let p = SelectedSymbolPreview::from_geometry(
+            &f,
+            [3; 32],
+            "Day",
+            &g,
+            egui::Color32::BLACK,
+            "DEPDW",
+        )
+        .unwrap();
+        assert!(p.matches(&f, "Day"));
+        let mut cell = f.clone();
+        cell.cell_index = Some(1);
+        assert!(!p.matches(&cell, "Day"));
+        // A plain symbol never previews without its cell, nor an overlay
+        // symbol with one.
+        let plain = SelectedFeature {
+            cell_index: None,
+            ..feature()
+        };
+        assert!(SelectedSymbolPreview::from_geometry(
+            &plain,
+            [0; 32],
+            "Day",
+            &geometry(),
+            egui::Color32::BLACK,
+            "DEPDW"
+        )
+        .is_err());
+        assert!(SelectedSymbolPreview::from_geometry(
+            &cell,
+            [0; 32],
+            "Day",
+            &g,
+            egui::Color32::BLACK,
+            "DEPDW"
+        )
+        .is_err());
+        // Cell features and unregistered prefixes.
+        let active = ferrite_portrayal_catalog::ColorProfile::new("Day".into(), "Day".into());
+        assert!(prepare_overlay_symbol_preview(&feature(), &active)
+            .unwrap()
+            .is_none());
+        let mut unregistered = f.clone();
+        unregistered.symbol_name = Some("S-999-unregistered/SAME".into());
+        assert!(prepare_overlay_symbol_preview(&unregistered, &active).is_err());
     }
     #[test]
     fn malformed_and_oversized_preview_declines_before_copy() {

@@ -50,7 +50,10 @@ pub struct DatasetDiscovery {
     /// Optional in generic S-100. S-101 consumers must require it and enforce
     /// their own 0..999 filename/sequence and reissue/cancellation contracts.
     pub update_number: Option<u32>,
-    pub issue_date: DatasetIssueDate,
+    /// Mandatory in S100XC, but omitted by some real producer catalogues
+    /// (e.g. UKHO 2026 S-124). Absence is reported as a metadata warning;
+    /// consumers whose sequencing depends on it (S-101) must reject `None`.
+    pub issue_date: Option<DatasetIssueDate>,
 }
 
 /// Only the exchange verifier constructs this wrapper, after authenticating
@@ -131,7 +134,13 @@ pub enum DatasetDiscoveryAuthorization {
     UnsignedEvaluation,
 }
 
-pub(super) fn parse(entry: Node<'_, '_>) -> Result<DatasetDiscovery> {
+/// Parse authenticated dataset discovery metadata. A missing issueDate is
+/// recorded in `warnings`; a present one must still be canonical and unique.
+pub(super) fn parse(
+    entry: Node<'_, '_>,
+    filename: &str,
+    warnings: &mut Vec<String>,
+) -> Result<DatasetDiscovery> {
     fn number(value: &str, label: &str) -> Result<u32> {
         ensure!(
             !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
@@ -156,7 +165,15 @@ pub(super) fn parse(entry: Node<'_, '_>) -> Result<DatasetDiscovery> {
         .map(|n| number(text(n)?, "updateNumber"))
         .transpose()?;
     ensure!(updates.next().is_none(), "Duplicate dataset updateNumber");
-    let issue_date = DatasetIssueDate::parse(text(unique_child(entry, XC, "issueDate")?)?)?;
+    let mut dates = entry.children().filter(|n| is(*n, XC, "issueDate"));
+    let issue_date = dates
+        .next()
+        .map(|n| DatasetIssueDate::parse(text(n)?))
+        .transpose()?;
+    ensure!(dates.next().is_none(), "Duplicate issueDate");
+    if issue_date.is_none() {
+        warnings.push(format!("issueDate missing for {filename}"));
+    }
     Ok(DatasetDiscovery {
         purpose,
         edition_number,

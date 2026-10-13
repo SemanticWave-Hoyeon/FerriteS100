@@ -200,7 +200,12 @@ impl OriginalDatasetAuthentication {
             old.len() == self.signatures().len() && copied.len() == old.len(),
             "Copied original signature set differs"
         );
-        let certificates = unique_child(entry.document().root_element(), XC, "certificates")?;
+        let certificate_containers: Vec<_> = entry
+            .document()
+            .root_element()
+            .children()
+            .filter(|n| is(*n, XC, "certificates"))
+            .collect();
         // Existing certificate parser rejects duplicate IDs and unknown types.
         let parsed_certificates = Certificates::parse(entry.document().root_element())?;
         for verified in self.signatures() {
@@ -225,9 +230,13 @@ impl OriginalDatasetAuthentication {
                     && actual.attributes == expected.attributes,
                 "Copied signature value, certificate reference, graph or attributes differ"
             );
-            let mut cert_nodes = certificates.children().filter(|n| {
-                is(*n, SE, "certificate") && n.attribute("id") == Some(verified.certificate_id())
-            });
+            let mut cert_nodes = certificate_containers
+                .iter()
+                .flat_map(|c| c.children())
+                .filter(|n| {
+                    is(*n, SE, "certificate")
+                        && n.attribute("id") == Some(verified.certificate_id())
+                });
             let cert_node = cert_nodes
                 .next()
                 .context("Missing copied signer certificate")?;

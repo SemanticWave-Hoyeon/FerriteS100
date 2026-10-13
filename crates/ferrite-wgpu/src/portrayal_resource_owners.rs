@@ -37,6 +37,21 @@ impl PortrayalResourceOwner {
         self.cache_revision
     }
 }
+/// Overlay-product instruction (S-124, S-129, ...): appended without a source
+/// cell and exempt from ENC coverage. Such instructions have no cell PC owner;
+/// they are drawn with the designated overlay owner (the owner of the lowest
+/// bound cell, which only selects the palette name and hosts the cache —
+/// namespaced `<prefix>/<id>` symbols resolve from the registered overlay
+/// source) and are not restricted by any cell's viewing-group selection.
+/// Instructions that carry a cell index are never treated as overlays.
+pub fn is_cellless_overlay_instruction(instruction: &ferrite_render::DrawingInstruction) -> bool {
+    instruction.cell_index().is_none()
+        && matches!(
+            instruction.portrayal_origin(),
+            ferrite_render::PortrayalOrigin::CoverageExempt
+        )
+}
+
 pub struct CellPortrayalResourceBinding {
     pub cell_index: usize,
     pub catalogue: Arc<BoundPortrayalCatalogue>,
@@ -203,6 +218,17 @@ impl CellPortrayalResources {
         })?;
         Ok(groups.as_deref())
     }
+    /// Viewing-group selection governing one instruction: its cell's captured
+    /// policy, or unrestricted (None) for cell-less overlay instructions.
+    pub fn viewing_groups_for_instruction(
+        &self,
+        instruction: &ferrite_render::DrawingInstruction,
+    ) -> Result<Option<&HashSet<u32>>> {
+        if is_cellless_overlay_instruction(instruction) {
+            return Ok(None);
+        }
+        self.viewing_groups_for_cell(instruction.cell_index().map(|v| v as usize))
+    }
     /// Only sealed immutable PC selections can prepare group-only decisions.
     pub(crate) fn prepare_owner_group_plan(
         &self,
@@ -223,6 +249,9 @@ impl CellPortrayalResources {
         &self,
         instruction: &ferrite_render::DrawingInstruction,
     ) -> Option<(bool, bool)> {
+        if is_cellless_overlay_instruction(instruction) {
+            return Some((true, true));
+        }
         // Match original ownership preconditions without constructing deferred error strings.
         let cell = instruction.cell_index()? as usize;
         if !self.cells.contains_key(&cell) {
@@ -320,7 +349,7 @@ impl CellPortrayalResources {
         scale: u32,
         override_group: Option<u32>,
     ) -> Result<bool> {
-        let groups = self.viewing_groups_for_cell(instruction.cell_index().map(|v| v as usize))?;
+        let groups = self.viewing_groups_for_instruction(instruction)?;
         Ok(ferrite_render::instruction_visible(
             instruction,
             scale,
@@ -376,17 +405,7 @@ impl CellPortrayalResources {
         &mut self,
         cell_index: Option<usize>,
     ) -> Result<ResolvedPortrayalResources<'_>> {
-        let row = self.resolve_row_mut(cell_index)?;
-        let owner = PortrayalResourceOwner {
-            pc_digest: *row.catalogue.source_digest(),
-            palette: row.profile.id.clone(),
-            cache_revision: row.cache.resource_revision(),
-        };
-        Ok(ResolvedPortrayalResources {
-            owner,
-            cache: &mut row.cache,
-            profile: &row.profile,
-        })
+        Ok(Self::owned(self.resolve_row_mut(cell_index)?))
     }
     // Shared original checks/order and borrowed row identity. No cached pointer/index
     // escapes the immutable registry and no policy/global-PC fallback is introduced.
@@ -397,6 +416,54 @@ impl CellPortrayalResources {
             WgpuError::Render(format!("No immutable PC resource owner for cell {cell}"))
         })?;
         Ok(&mut self.owners[index])
+    }
+    /// Designated owner for cell-less overlay instructions and overlay feature
+    /// previews: the owner bound to the lowest cell index.
+    fn overlay_row_mut(&mut self) -> Result<&mut OwnerResources> {
+        let index = *self.cells.values().next().ok_or_else(|| {
+            WgpuError::Render("No PC resource owner available for overlay instruction".into())
+        })?;
+        Ok(&mut self.owners[index])
+    }
+    fn owned(row: &mut OwnerResources) -> ResolvedPortrayalResources<'_> {
+        let owner = PortrayalResourceOwner {
+            pc_digest: *row.catalogue.source_digest(),
+            palette: row.profile.id.clone(),
+            cache_revision: row.cache.resource_revision(),
+        };
+        ResolvedPortrayalResources {
+            owner,
+            cache: &mut row.cache,
+            profile: &row.profile,
+        }
+    }
+    /// Resources for drawing overlay-product content (namespaced symbols).
+    pub fn resolve_overlay_mut(&mut self) -> Result<ResolvedPortrayalResources<'_>> {
+        Ok(Self::owned(self.overlay_row_mut()?))
+    }
+    /// `resolve_mut(instruction.cell_index())`, except that cell-less overlay
+    /// instructions use the designated overlay owner.
+    pub fn resolve_instruction_mut(
+        &mut self,
+        instruction: &ferrite_render::DrawingInstruction,
+    ) -> Result<ResolvedPortrayalResources<'_>> {
+        if is_cellless_overlay_instruction(instruction) {
+            return self.resolve_overlay_mut();
+        }
+        self.resolve_mut(instruction.cell_index().map(|v| v as usize))
+    }
+    pub(crate) fn resolve_instruction_draw_mut(
+        &mut self,
+        instruction: &ferrite_render::DrawingInstruction,
+    ) -> Result<DrawPortrayalResources<'_>> {
+        if is_cellless_overlay_instruction(instruction) {
+            let row = self.overlay_row_mut()?;
+            return Ok(DrawPortrayalResources {
+                cache: &mut row.cache,
+                profile: &row.profile,
+            });
+        }
+        self.resolve_draw_mut(instruction.cell_index().map(|v| v as usize))
     }
     pub(crate) fn resolve_draw_mut(
         &mut self,
@@ -773,6 +840,44 @@ mod draw_borrow_controls {
             assert_eq!(old_palette, new.profile.id);
         }
         assert_eq!(r.resolve_draw_mut(Some(2)).unwrap().profile.id, "Night");
+    }
+    #[test]
+    fn overlay_instructions_use_lowest_cell_owner_and_enc_none_still_fails() {
+        use ferrite_render::{DrawingInstruction, PointInstruction, PortrayalOrigin, WorldPoint};
+        let t = Temp::new();
+        let mut r = fixture(&t);
+        let mut overlay = DrawingInstruction::Point(PointInstruction::new(
+            "S-124/QUESMRK1".into(),
+            WorldPoint::new(0., 0.),
+        ));
+        let enc = overlay.clone();
+        overlay.set_portrayal_origin(PortrayalOrigin::CoverageExempt);
+        let expected = r.resolve_mut(Some(0)).unwrap().cache as *mut SymbolCache;
+        let resolved = r.resolve_instruction_mut(&overlay).unwrap();
+        assert_eq!(resolved.owner.palette(), "Day");
+        assert_eq!(resolved.cache as *mut SymbolCache, expected);
+        assert_eq!(
+            r.resolve_instruction_draw_mut(&overlay).unwrap().cache as *mut SymbolCache,
+            expected
+        );
+        assert_eq!(
+            r.resolve_overlay_mut().unwrap().cache as *mut SymbolCache,
+            expected
+        );
+        let old = r.resolve_mut(None).err().unwrap().to_string();
+        assert_eq!(
+            r.resolve_instruction_mut(&enc).err().unwrap().to_string(),
+            old
+        );
+        assert_eq!(
+            r.resolve_instruction_draw_mut(&enc)
+                .err()
+                .unwrap()
+                .to_string(),
+            old
+        );
+        let mut empty = CellPortrayalResources::prepare(&[], "Day", 0).unwrap();
+        assert!(empty.resolve_instruction_mut(&overlay).is_err());
     }
     #[test]
     fn missing_cell_errors_match_original_and_never_use_global_owner() {
@@ -1229,5 +1334,59 @@ mod compact_admission_registry_controls {
             assert_eq!(work.hits, 1);
             assert_eq!(warm.unwrap().mask, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod overlay_owner_controls {
+    use super::*;
+    use ferrite_render::{DrawingInstruction, PointInstruction, PortrayalOrigin, WorldPoint};
+    fn registry() -> CellPortrayalResources {
+        CellPortrayalResources {
+            cells: BTreeMap::from([(3, 0), (5, 0)]),
+            owners: Vec::new(),
+            cell_groups: BTreeMap::from([
+                (3, Some(Arc::new(HashSet::from([90000])))),
+                (5, Some(Arc::new(HashSet::new()))),
+            ]),
+            groups_sealed: true,
+            owner_group_plan: Default::default(),
+            compact_admission: Default::default(),
+        }
+    }
+    fn point(cell: Option<usize>, origin: PortrayalOrigin) -> DrawingInstruction {
+        let mut p = PointInstruction::new("S-129/UKCCONPT".into(), WorldPoint::new(0., 0.))
+            .with_viewing_groups(&[29050]);
+        if let Some(cell) = cell {
+            p = p.with_cell_index(cell);
+        }
+        let mut i = DrawingInstruction::Point(p);
+        i.set_portrayal_origin(origin);
+        i
+    }
+    #[test]
+    fn cellless_overlay_is_unrestricted_but_enc_checks_are_unchanged() {
+        let r = registry();
+        let overlay = point(None, PortrayalOrigin::CoverageExempt);
+        assert!(is_cellless_overlay_instruction(&overlay));
+        assert!(r
+            .viewing_groups_for_instruction(&overlay)
+            .unwrap()
+            .is_none());
+        assert!(r
+            .instruction_visible_for_cell(&overlay, 10000, None)
+            .unwrap());
+        assert_eq!(r.compiled_group_decision(&overlay), Some((true, true)));
+        // An ENC instruction without a cell still fails exactly as before.
+        let enc = point(None, PortrayalOrigin::default());
+        assert!(!is_cellless_overlay_instruction(&enc));
+        assert!(r.instruction_visible_for_cell(&enc, 10000, None).is_err());
+        assert!(r.viewing_groups_for_cell(None).is_err());
+        // A coverage-exempt instruction WITH a cell keeps its cell policy.
+        let celled = point(Some(5), PortrayalOrigin::CoverageExempt);
+        assert!(!is_cellless_overlay_instruction(&celled));
+        assert!(!r
+            .instruction_visible_for_cell(&celled, 10000, None)
+            .unwrap());
     }
 }

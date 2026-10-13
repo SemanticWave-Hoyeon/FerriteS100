@@ -1599,6 +1599,7 @@ dependencies = [
  "ferrite-portrayal-catalog",
  "ferrite-render",
  "ferrite-s100-core",
+ "ferrite-s100-gml",
  "ferrite-s101",
  "ferrite-s102",
  "ferrite-s421",
@@ -1639,6 +1640,23 @@ dependencies = [
  "geo-types",
  "sha2",
  "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-s100-gml"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ferrite-feature-catalog",
+ "ferrite-kernel",
+ "ferrite-lua",
+ "ferrite-s100-core",
+ "ferrite-xslt",
+ "flate2",
+ "roxmltree",
+ "sha2",
  "tracing",
 ]
 
@@ -1755,6 +1773,13 @@ dependencies = [
  "wgpu",
  "wgpu-profiler",
  "winit",
+]
+
+[[package]]
+name = "ferrite-xslt"
+version = "2.0.0"
+dependencies = [
+ "roxmltree",
 ]
 
 [[package]]

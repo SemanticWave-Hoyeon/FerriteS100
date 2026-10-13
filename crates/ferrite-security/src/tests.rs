@@ -540,7 +540,14 @@ fn dataset_discovery_is_bound_to_signed_catalogue_resource_and_retained_snapshot
     assert_eq!(bound.discovery().purpose, DatasetPurpose::NewDataset);
     assert_eq!(bound.discovery().edition_number, 1);
     assert_eq!(bound.discovery().update_number, Some(0));
-    assert_eq!(bound.discovery().issue_date.as_str(), "2026-06-18");
+    assert_eq!(
+        bound
+            .discovery()
+            .issue_date
+            .as_ref()
+            .map(DatasetIssueDate::as_str),
+        Some("2026-06-18")
+    );
     // Mutating valid XML metadata without a new signature must fail; existing
     // typed projection and retained resource snapshot remain immutable.
     let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
@@ -587,7 +594,14 @@ fn cancellation_target_edition_and_reissue_counter_are_not_rewritten() {
         assert_eq!(bound.discovery().purpose, expected);
         assert_eq!(bound.discovery().edition_number, 4);
         assert_eq!(bound.discovery().update_number, Some(20));
-        assert_eq!(bound.discovery().issue_date.as_str(), "2026-06-18");
+        assert_eq!(
+            bound
+                .discovery()
+                .issue_date
+                .as_ref()
+                .map(DatasetIssueDate::as_str),
+            Some("2026-06-18")
+        );
     }
     // Generic S-100 permits absent updateNumber; projection does not invent0.
     resign_catalogue_change(&f, "<xc:updateNumber>20</xc:updateNumber>", "");
@@ -640,7 +654,10 @@ fn correctly_signed_invalid_or_ambiguous_dataset_metadata_is_rejected() {
             "<xc:issueDate>2026-06-18</xc:issueDate>",
             "<xc:issueDate>2026-6-18</xc:issueDate>",
         ),
-        ("<xc:issueDate>2026-06-18</xc:issueDate>", ""),
+        (
+            "<xc:issueDate>2026-06-18</xc:issueDate>",
+            "<xc:issueDate>2026-06-18</xc:issueDate><xc:issueDate>2026-06-19</xc:issueDate>",
+        ),
     ] {
         f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
         resign_catalogue_change(&f, old, new);
@@ -649,6 +666,36 @@ fn correctly_signed_invalid_or_ambiguous_dataset_metadata_is_rejected() {
             "accepted signed invalid metadata: {new}"
         );
     }
+}
+
+#[test]
+fn missing_dataset_issue_date_is_a_warning_not_an_error() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let present = f.verify(NOW).unwrap();
+    assert!(!present
+        .metadata_warnings
+        .iter()
+        .any(|w| w.contains("issueDate missing")));
+    resign_catalogue_change(&f, "<xc:issueDate>2026-06-18</xc:issueDate>", "");
+    let report = f.verify(NOW).unwrap();
+    let bound = report.dataset_discovery.values().next().unwrap();
+    assert_eq!(bound.discovery().issue_date, None);
+    assert_eq!(bound.discovery().edition_number, 1);
+    let missing: Vec<_> = report
+        .metadata_warnings
+        .iter()
+        .filter(|w| w.contains("issueDate missing for file:/DATA.H5"))
+        .collect();
+    assert_eq!(missing.len(), 1, "{:?}", report.metadata_warnings);
+    // Signature strictness is unchanged: tampering after the edit still fails.
+    let xml = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    std::fs::write(
+        f.dir.path().join("CATALOG.XML"),
+        xml.replace("newDataset", "cancellation"),
+    )
+    .unwrap();
+    assert!(f.verify(NOW).is_err());
 }
 
 #[test]
@@ -1395,3 +1442,140 @@ fn incoming_rejects_symlink_files_directories_and_roots() {
 
 #[path = "trusted_cancellation_authority_tests.rs"]
 mod trusted_cancellation_authority_tests;
+/// A listed certificate outside the trusted scheme (unknown issuer, self-signed).
+fn rogue_certificate(id: &str) -> String {
+    let k = key(Nid::SECP384R1);
+    let rogue = certificate("ROGUE", &k, None, false, true);
+    format!(
+        "<se:certificate id=\"{id}\" issuer=\"rogue.example\">{}</se:certificate>",
+        STANDARD.encode(rogue.to_der().unwrap())
+    )
+}
+#[test]
+fn unreferenced_untrusted_certificate_is_ignored_not_trusted() {
+    let mut f = Fixture::new(false, true, Nid::SECP384R1);
+    f.container += &rogue_certificate("ROGUE");
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let report = f.verify(NOW).unwrap();
+    assert_eq!(report.resources[0].certificate_ids, ["LEAF"]);
+    let ignored: Vec<_> = report
+        .metadata_warnings
+        .iter()
+        .filter(|w| w.contains("Certificate ROGUE") && w.contains("ignored"))
+        .collect();
+    // Once for CATALOG.SIGN, once for CATALOG.XML.
+    assert_eq!(ignored.len(), 2, "{:?}", report.metadata_warnings);
+    let catalogue = verify_exchange_catalogue(f.dir.path(), &f.anchors, NOW).unwrap();
+    assert_eq!(catalogue.certificate_warnings().len(), 1);
+    assert!(catalogue
+        .signatures()
+        .iter()
+        .all(|s| s.certificate_id() == "LEAF"));
+}
+#[test]
+fn referenced_untrusted_certificate_still_fails() {
+    let mut f = Fixture::new(false, true, Nid::SECP384R1);
+    f.container += &rogue_certificate("ROGUE");
+    f.write("file:/DATA.H5", false, "ROGUE", "unencrypted");
+    let error = format!("{:#}", f.verify(NOW).unwrap_err());
+    assert!(
+        error.contains("Missing intermediate certificate"),
+        "{error}"
+    );
+}
+#[test]
+fn referenced_expired_certificate_still_fails_beside_unreferenced_one() {
+    let mut f = Fixture::new(false, true, Nid::SECP384R1);
+    f.container += &rogue_certificate("ROGUE");
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    assert!(f
+        .verify(NOW + 90000)
+        .unwrap_err()
+        .to_string()
+        .contains("expired"));
+}
+#[test]
+fn unreferenced_certificate_does_not_hide_tampered_resource() {
+    let mut f = Fixture::new(false, true, Nid::SECP384R1);
+    f.container += &rogue_certificate("ROGUE");
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    std::fs::write(f.dir.path().join("DATA.H5"), b"tampered").unwrap();
+    assert!(f
+        .verify(NOW)
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid data signature DATA"));
+}
+#[test]
+fn issuer_label_may_name_the_installed_administrator_root() {
+    // UKHO CATALOG.SIGN labels the issuer with the SA root MRN (its CN).
+    let mut f = Fixture::new(false, true, Nid::SECP384R1);
+    f.container = f.container.replace("issuer=\"IHO\"", "issuer=\"ROOT\"");
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    assert!(f.verify(NOW).is_ok());
+    // A label naming no installed anchor of a declared administrator fails.
+    f.container = f.container.replace("issuer=\"ROOT\"", "issuer=\"OTHER\"");
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    assert!(f
+        .verify(NOW)
+        .unwrap_err()
+        .to_string()
+        .contains("Missing intermediate certificate"));
+    // The label alone confers nothing: the anchor must also be the X.509 issuer.
+    let mut other = TrustAnchors::default();
+    let rk = key(Nid::SECP384R1);
+    other
+        .install_pem(
+            "IHO",
+            &certificate("ROOT", &rk, None, true, true).to_pem().unwrap(),
+        )
+        .unwrap();
+    f.container = f.container.replace("issuer=\"OTHER\"", "issuer=\"ROOT\"");
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    assert!(verify_exchange(f.dir.path(), &other, NOW).is_err());
+}
+#[test]
+fn signature_referencing_unlisted_certificate_fails_beside_ignored_one() {
+    let mut f = Fixture::new(false, true, Nid::SECP384R1);
+    f.container += &rogue_certificate("ROGUE");
+    f.write("file:/DATA.H5", false, "UNLISTED", "unencrypted");
+    assert!(f
+        .verify(NOW)
+        .unwrap_err()
+        .to_string()
+        .contains("Unknown certificateRef UNLISTED"));
+}
+#[test]
+fn multiple_certificate_containers_merge_with_unique_ids() {
+    let f = Fixture::new(false, true, Nid::SECP384R1);
+    let extra = format!(
+        "<se:schemeAdministrator id=\"IHO\"/>{}",
+        rogue_certificate("ROGUE")
+    );
+    f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
+    let xml_text = std::fs::read_to_string(f.dir.path().join("CATALOG.XML")).unwrap();
+    let split = xml_text.replace(
+        "</xc:certificates>",
+        &format!("</xc:certificates><xc:certificates>{extra}</xc:certificates>"),
+    );
+    f.catalogue(split.as_bytes());
+    let report = f.verify(NOW).unwrap();
+    assert!(report
+        .metadata_warnings
+        .iter()
+        .any(|w| w.contains("Certificate ROGUE")));
+    // A certificate ID repeated across containers is still rejected.
+    let duplicate = xml_text.replace(
+        "</xc:certificates>",
+        &format!(
+            "</xc:certificates><xc:certificates>{}</xc:certificates>",
+            f.container
+        ),
+    );
+    f.catalogue(duplicate.as_bytes());
+    assert!(f
+        .verify(NOW)
+        .unwrap_err()
+        .to_string()
+        .contains("Duplicate certificate"));
+}

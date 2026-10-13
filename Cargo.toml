@@ -19,6 +19,8 @@ members = [
     "crates/ferrite-plugin-api",
     "crates/ferrite-plugin-loader",
     "crates/ferrite-mcp",
+    "crates/ferrite-xslt",
+    "crates/ferrite-s100-gml",
 ]
 exclude = [
     "plugins/route-plugin",
@@ -135,6 +137,7 @@ ferrite-interoperability.workspace = true
 ferrite-security.workspace = true
 ferrite-feature-catalog.workspace = true
 ferrite-portrayal-catalog.workspace = true
+ferrite-s100-gml = { path = "crates/ferrite-s100-gml" }
 ferrite-render.workspace = true
 ferrite-wgpu = { workspace = true, features = ["s102-portrayal"] }
 ferrite-lua.workspace = true

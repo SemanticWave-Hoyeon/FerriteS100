@@ -56,6 +56,13 @@ pub use profiler::*;
 pub use renderer::*;
 pub use state::*;
 pub use symbol_cache::*;
+
+mod overlay_symbols;
+pub use overlay_symbols::{
+    is_overlay_symbol_id, overlay_symbol_source, register_overlay_catalogue,
+    register_overlay_symbol_source, registered_overlay_prefixes, unregister_overlay_symbol_source,
+    OverlaySymbolSource,
+};
 pub use vertex::*;
 
 /// Initialize wgpu for the given window
@@ -106,8 +113,8 @@ mod overscale_annotation;
 
 mod portrayal_resource_owners;
 pub use portrayal_resource_owners::{
-    CellPortrayalResourceBinding, CellPortrayalResources, OwnedSymbolKey, PortrayalResourceOwner,
-    ResolvedPortrayalResources,
+    is_cellless_overlay_instruction, CellPortrayalResourceBinding, CellPortrayalResources,
+    OwnedSymbolKey, PortrayalResourceOwner, ResolvedPortrayalResources,
 };
 
 mod dataset_catalogue_ui;
@@ -116,7 +123,9 @@ pub use dataset_catalogue_ui::DatasetCatalogueBinding;
 mod coverage_trial;
 
 mod object_symbol_preview;
-pub use object_symbol_preview::{prepare_selected_symbol_preview, SelectedSymbolPreview};
+pub use object_symbol_preview::{
+    prepare_overlay_symbol_preview, prepare_selected_symbol_preview, SelectedSymbolPreview,
+};
 
 mod static_line_bounds;
 
@@ -143,3 +152,4 @@ pub mod mcp_ui;
 
 /// Chat with locally installed LLM command-line clients.
 pub mod llm_chat_ui;
+pub mod overlay_ui;

@@ -134,6 +134,11 @@ pub enum DatasetLayerId {
     S421 {
         route_id: u32,
     },
+    /// Overlay GML dataset (S-124, S-129 or an imported warning) by host id.
+    Overlay {
+        product: String,
+        id: u32,
+    },
 }
 #[derive(Debug, Clone)]
 pub struct DatasetLayerEntry {
@@ -184,6 +189,8 @@ pub struct OwnShipIndication {
 pub struct AppUiState {
     pub s100_mcp: crate::mcp_ui::State,
     pub llm_chat: crate::llm_chat_ui::State,
+    /// S-124 warning list and S-129 plan windows.
+    pub overlays: crate::overlay_ui::State,
     pub reduced_motion: bool,
     /// Optional edge annotations; never mutate chart geometry or portrayal settings.
     pub coordinate_rulers: bool,
@@ -209,6 +216,9 @@ pub struct AppUiState {
     pub selected_dataset: Option<DatasetLayerId>,
     pub dataset_selection_requested: Option<DatasetLayerId>,
     pub dataset_unload_requested: Option<DatasetLayerId>,
+    /// Overlay datasets switched off in the data layer tree (host ids).
+    pub overlay_hidden: std::collections::BTreeSet<u32>,
+    pub overlay_visibility_requested: Option<(u32, bool)>,
     pub dataset_loading: bool,
 
     pub object_detail_sections: ObjectDetailSections,
@@ -966,11 +976,26 @@ impl EguiIntegration {
                                         for file in &layer.files {
                                             ui.push_id(&file.id, |ui| {
                                                 ui.horizontal(|ui| {
+                                                    // Overlay rows start with an on/off toggle;
+                                                    // the name button keeps the remaining budget.
+                                                    let mut toggle_width = 0.;
+                                                    if let DatasetLayerId::Overlay { id, .. } = &file.id {
+                                                        let mut shown = !state.overlay_hidden.contains(id);
+                                                        let toggle = ui
+                                                            .add(egui::Checkbox::without_text(&mut shown))
+                                                            .on_hover_text("Show on chart");
+                                                        toggle_width =
+                                                            toggle.rect.width() + ui.spacing().item_spacing.x;
+                                                        if toggle.changed() {
+                                                            state.overlay_visibility_requested =
+                                                                Some((*id, shown));
+                                                        }
+                                                    }
                                                     let selected = state.selected_dataset.as_ref()
                                                         == Some(&file.id);
                                                     let response = ui
                                                         .add_sized(
-                                                            [(row_width - 70.).max(45.), 20.],
+                                                            [(row_width - 70. - toggle_width).max(45.), 20.],
                                                             egui::Button::new(&file.name)
                                                                 .selected(selected)
                                                                 .truncate(),
@@ -1344,6 +1369,7 @@ impl EguiIntegration {
 
         crate::mcp_ui::draw(&self.ctx, &mut ui_state.s100_mcp);
         crate::llm_chat_ui::draw(&self.ctx, &mut ui_state.llm_chat, &ui_state.s100_mcp);
+        crate::overlay_ui::draw(&self.ctx, &mut ui_state.overlays);
 
         // Status bar
         egui::TopBottomPanel::bottom("status_bar")
@@ -1706,6 +1732,17 @@ impl EguiIntegration {
                 ui_state.object_details_hidden = !details;
             }
             ui.checkbox(&mut ui_state.coordinate_rulers, "Coordinate Rulers");
+            let new = ui_state.overlays.new_count;
+            let label = if new > 0 {
+                format!("S-124 Navigational Warnings ({new} new)")
+            } else {
+                "S-124 Navigational Warnings".to_owned()
+            };
+            ui.checkbox(&mut ui_state.overlays.navwarn_open, label);
+            ui.checkbox(
+                &mut ui_state.overlays.ukc_open,
+                "S-129 Under Keel Clearance",
+            );
             ui.separator();
             ui.menu_button("Color Palette", |ui| {
                 for profile in ["Day", "Dusk", "Night"] {

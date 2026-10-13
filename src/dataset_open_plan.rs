@@ -17,6 +17,9 @@ pub(crate) struct Plan {
     pub rasters: Vec<PathBuf>,
     pub notices: Vec<String>,
     pub routes: Vec<crate::s421_dataset_input::CapturedRouteInput>,
+    /// S-124 / S-129 GML datasets and imported warnings (KML, GPX,
+    /// shapefile, zipped shapefile), each opened independently.
+    pub overlays: Vec<PathBuf>,
     /// S-102 2.1 trial files: inspection only, never depth coverage.
     pub trials: Vec<PathBuf>,
     /// Filled by the discovery worker thread through the isolated inspector.
@@ -137,10 +140,12 @@ pub(crate) fn discover(root: &Path) -> Result<Plan> {
     let (routes, notices) = crate::s421_dataset_input::discover_routes(root)?;
     plan.routes = routes;
     plan.notices.extend(notices);
+    plan.overlays = crate::gml_overlay::discover(root)?;
     if plan.charts.is_empty()
         && plan.rasters.is_empty()
         && plan.trials.is_empty()
         && plan.routes.is_empty()
+        && plan.overlays.is_empty()
         && plan.notices.is_empty()
     {
         let mut archives = Vec::new();
@@ -195,7 +200,9 @@ pub(crate) fn single_file(path: &Path) -> Result<Plan> {
         });
     }
     let mut plan = Plan::default();
-    if crate::dataset_discovery::is_dataset_file(path, "h5")
+    if crate::gml_overlay::is_overlay_file(path) {
+        plan.overlays.push(path.to_path_buf());
+    } else if crate::dataset_discovery::is_dataset_file(path, "h5")
         || crate::dataset_discovery::is_dataset_file(path, "hdf5")
     {
         classify_rasters(&mut plan, vec![path.to_path_buf()]);

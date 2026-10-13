@@ -1,0 +1,20 @@
+[package]
+name = "ferrite-s100-gml"
+version.workspace = true
+edition.workspace = true
+description = "S-100 Part 10b GML datasets (S-124, S-129): reading, validation and XSLT portrayal input"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+flate2 = "=1.1.8"
+roxmltree = "=0.20.0"
+tracing.workspace = true
+sha2.workspace = true
+ferrite-feature-catalog.workspace = true
+ferrite-kernel.workspace = true
+ferrite-s100-core.workspace = true
+ferrite-xslt = { path = "../ferrite-xslt" }
+
+[dev-dependencies]
+ferrite-lua = { workspace = true, features = ["lua54"] }

@@ -20,6 +20,36 @@ use std::path::Path;
 
 use ferrite_portrayal_catalog::ColorProfile;
 
+use crate::overlay_symbols::{
+    is_overlay_symbol_id, resolve_overlay_symbol, valid_local_symbol, OverlaySymbolSource,
+};
+
+/// Where a symbol id's SVG lives: the cache's own PC (plain ids) or a
+/// registered overlay source (`<prefix>/<id>`, see `overlay_symbols`).
+struct SvgLocation {
+    path: std::path::PathBuf,
+    overlay: Option<std::sync::Arc<OverlaySymbolSource>>,
+}
+impl SvgLocation {
+    /// Overlay symbols use the overlay catalogue palette matching the active one.
+    fn profile<'a>(&'a self, active: &'a ColorProfile) -> &'a ColorProfile {
+        self.overlay
+            .as_deref()
+            .map_or(active, |overlay| overlay.palette_for(active))
+    }
+    fn overlay(&self) -> Option<&OverlaySymbolSource> {
+        self.overlay.as_deref()
+    }
+}
+
+/// Whole-SVG references: plain file stems, or overlay ids with a plain local stem.
+fn whole_reference_ok(symbol_id: &str) -> bool {
+    match ferrite_portrayal_catalog::split_overlay_symbol_id(symbol_id) {
+        Some((_, local)) => valid_local_symbol(local),
+        None => !symbol_id.contains(['/', '\\', '\0']),
+    }
+}
+
 /// Rendered symbol data (pixel buffer ready for GPU upload)
 #[derive(Debug, Clone)]
 pub struct SymbolGeometry {
@@ -259,6 +289,8 @@ pub struct SymbolCache {
     whole_motifs: HashMap<String, Option<std::sync::Arc<crate::whole_motif::NaturalMotifResource>>>,
     whole_motif_bytes: usize,
     resource_revision: u64,
+    /// Overlay registry generation whose sources this cache's overlay entries use.
+    overlay_generation: u64,
     /// Base path for symbol SVG files
     symbols_path: std::path::PathBuf,
     sources: Option<std::sync::Arc<ferrite_portrayal_catalog::CatalogueSources>>,
@@ -332,6 +364,7 @@ impl SymbolCache {
             whole_motifs: HashMap::new(),
             whole_motif_bytes: 0,
             resource_revision: next_symbol_resource_revision(),
+            overlay_generation: crate::overlay_symbols::overlay_generation(),
             symbols_path: symbols_path.as_ref().to_path_buf(),
             sources: None,
             fonts: Default::default(),
@@ -380,8 +413,68 @@ impl SymbolCache {
         self.shallow_pattern_contract.as_ref()
     }
 
-    fn source_exists(&self, path: &Path) -> bool {
-        match &self.sources {
+    fn sources_for<'a>(
+        &'a self,
+        overlay: Option<&'a OverlaySymbolSource>,
+    ) -> Option<&'a std::sync::Arc<ferrite_portrayal_catalog::CatalogueSources>> {
+        match overlay {
+            Some(overlay) => overlay.sources(),
+            None => self.sources.as_ref(),
+        }
+    }
+
+    /// Resolve a symbol id to its SVG file. None only for overlay ids whose
+    /// prefix is not registered (or whose local id is path-like).
+    fn locate(&self, symbol_id: &str) -> Option<SvgLocation> {
+        if is_overlay_symbol_id(symbol_id) {
+            let (source, local) = resolve_overlay_symbol(symbol_id)?;
+            return Some(SvgLocation {
+                path: source.svg_path(local),
+                overlay: Some(source),
+            });
+        }
+        Some(SvgLocation {
+            path: self.symbols_path.join(format!("{}.svg", symbol_id)),
+            overlay: None,
+        })
+    }
+
+    /// Drop overlay-derived entries after an overlay registration change.
+    /// Plain (S-101) entries are kept; the resource revision changes only when
+    /// overlay rasters were actually dropped.
+    fn sync_overlay_generation(&mut self) {
+        let generation = crate::overlay_symbols::overlay_generation();
+        if generation == self.overlay_generation {
+            return;
+        }
+        self.overlay_generation = generation;
+        // Overlay ids contain '/', plain S-101 ids and their derived keys never do.
+        self.missing_symbols.retain(|k| !k.contains('/'));
+        let before = self.symbols.len();
+        self.symbols.retain(|k, _| !k.contains('/'));
+        let mut dropped = before != self.symbols.len();
+        if self.lattice_patterns.keys().any(|k| k.contains('/')) {
+            self.lattice_patterns.clear();
+            self.lattice_pattern_bytes = 0;
+            dropped = true;
+        }
+        if self.whole_supports.keys().any(|k| k.contains('/')) {
+            self.whole_supports.clear();
+            self.whole_support_bytes = 0;
+            dropped = true;
+        }
+        if self.whole_motifs.keys().any(|k| k.contains('/')) {
+            self.whole_motifs.clear();
+            self.whole_motif_bytes = 0;
+            dropped = true;
+        }
+        if dropped {
+            self.resource_revision = next_symbol_resource_revision();
+        }
+    }
+
+    fn source_exists_in(&self, overlay: Option<&OverlaySymbolSource>, path: &Path) -> bool {
+        match self.sources_for(overlay) {
             Some(s) => match s.read_path(path) {
                 Ok(_) => true,
                 Err(error) => {
@@ -393,8 +486,16 @@ impl SymbolCache {
         }
     }
 
+    #[cfg(test)]
     fn read_source_svg(&self, path: &Path) -> Result<String, String> {
-        match &self.sources {
+        self.read_source_svg_in(None, path)
+    }
+    fn read_source_svg_in(
+        &self,
+        overlay: Option<&OverlaySymbolSource>,
+        path: &Path,
+    ) -> Result<String, String> {
+        match self.sources_for(overlay) {
             Some(s) => {
                 let bytes = s.read_path(path).map_err(|e| e.to_string())?;
                 if bytes.len() as u64 > MAX_SVG_BYTES {
@@ -406,9 +507,13 @@ impl SymbolCache {
         }
     }
 
-    fn svg_options(&self, svg_path: &Path) -> resvg::usvg::Options<'static> {
+    fn svg_options_in(
+        &self,
+        overlay: Option<&OverlaySymbolSource>,
+        svg_path: &Path,
+    ) -> resvg::usvg::Options<'static> {
         let mut options = resvg::usvg::Options::default();
-        if let Some(sources) = self.sources.clone() {
+        if let Some(sources) = self.sources_for(overlay).cloned() {
             let base = svg_path
                 .parent()
                 .unwrap_or_else(|| Path::new(""))
@@ -448,12 +553,15 @@ impl SymbolCache {
         }
         const KEY_LIMIT: usize = 64 * 1024;
         const CACHE_LIMIT: usize = 16 * 1024 * 1024;
-        if symbol_id.is_empty()
-            || symbol_id.len() > KEY_LIMIT / 2
-            || symbol_id.contains(['/', '\\', '\0'])
+        if symbol_id.is_empty() || symbol_id.len() > KEY_LIMIT / 2 || !whole_reference_ok(symbol_id)
         {
             return Err("Invalid whole SVG resource reference".into());
         }
+        self.sync_overlay_generation();
+        let location = self
+            .locate(symbol_id)
+            .ok_or("Whole SVG overlay symbol source is not registered")?;
+        let color_profile = location.profile(color_profile);
         let mut key = format!(
             "whole-svg-v1:{}:{}:{}:{:016x}:{:?}",
             self.resource_revision,
@@ -488,7 +596,7 @@ impl SymbolCache {
         if let Some(resource) = self.whole_supports.get(&key) {
             return Ok(resource.clone());
         }
-        let (tree, pivot, scale) = self.load_whole_svg(symbol_id, color_profile, pixels_per_mm)?;
+        let (tree, pivot, scale) = self.load_whole_svg(&location, color_profile, pixels_per_mm)?;
         let resource =
             crate::svg_painted_support::svg_painted_support(&tree, pivot, scale, limits)?
                 .map(std::sync::Arc::new);
@@ -521,18 +629,19 @@ impl SymbolCache {
 
     fn load_whole_svg(
         &self,
-        symbol_id: &str,
+        location: &SvgLocation,
         profile: &ColorProfile,
         ppm: f64,
     ) -> Result<(resvg::usvg::Tree, [f64; 2], f64), String> {
-        let path = self.symbols_path.join(format!("{symbol_id}.svg"));
-        let content = self.read_source_svg(&path)?;
+        let path = &location.path;
+        let content = self.read_source_svg_in(location.overlay(), path)?;
         let view_box = self
             .extract_viewbox(&content)
             .ok_or("Whole S100 SVG requires a finite positive root viewBox")?;
         let colored = self.inject_colors(&content, profile);
-        let tree = resvg::usvg::Tree::from_str(&colored, &self.svg_options(&path))
-            .map_err(|e| e.to_string())?;
+        let tree =
+            resvg::usvg::Tree::from_str(&colored, &self.svg_options_in(location.overlay(), path))
+                .map_err(|e| e.to_string())?;
         let size = tree.size();
         let pivot = svg_origin_in_viewport(Some(view_box), size.width(), size.height());
         Ok((
@@ -558,12 +667,15 @@ impl SymbolCache {
         }
         const KEY_LIMIT: usize = 64 * 1024;
         const CACHE_LIMIT: usize = 64 * 1024 * 1024;
-        if symbol_id.is_empty()
-            || symbol_id.len() > KEY_LIMIT / 2
-            || symbol_id.contains(['/', '\\', '\0'])
+        if symbol_id.is_empty() || symbol_id.len() > KEY_LIMIT / 2 || !whole_reference_ok(symbol_id)
         {
             return Err("Invalid whole motif resource reference".into());
         }
+        self.sync_overlay_generation();
+        let location = self
+            .locate(symbol_id)
+            .ok_or("Whole motif overlay symbol source is not registered")?;
+        let profile = location.profile(profile);
         let mut key = format!(
             "whole-motif-v1:{}:{}:{}:{:016x}:{:?}:{:?}",
             self.resource_revision,
@@ -599,7 +711,7 @@ impl SymbolCache {
         if let Some(resource) = self.whole_motifs.get(&key) {
             return Ok(resource.clone());
         }
-        let (tree, pivot, scale) = self.load_whole_svg(symbol_id, profile, ppm)?;
+        let (tree, pivot, scale) = self.load_whole_svg(&location, profile, ppm)?;
         let resource = crate::whole_motif::build_natural_motif(
             key.clone(),
             &tree,
@@ -644,6 +756,7 @@ impl SymbolCache {
         symbol_id: &str,
         color_profile: &ColorProfile,
     ) -> Option<&SymbolGeometry> {
+        self.sync_overlay_generation();
         // Hot path: already cached → single lookup
         if self.symbols.contains_key(symbol_id) {
             return self.symbols.get(symbol_id);
@@ -666,6 +779,7 @@ impl SymbolCache {
         symbol_ids: impl IntoIterator<Item = &'a str>,
         color_profile: &ColorProfile,
     ) {
+        self.sync_overlay_generation();
         let mut wanted: Vec<&str> = symbol_ids
             .into_iter()
             .filter(|id| {
@@ -695,12 +809,21 @@ impl SymbolCache {
         symbol_id: &str,
         color_profile: &ColorProfile,
     ) -> Option<Result<SymbolGeometry, String>> {
-        let svg_path = self.symbols_path.join(format!("{}.svg", symbol_id));
-        if !self.source_exists(&svg_path) {
+        let Some(location) = self.locate(symbol_id) else {
+            tracing::debug!("Overlay symbol source not registered for '{}'", symbol_id);
+            return None;
+        };
+        let svg_path = &location.path;
+        if !self.source_exists_in(location.overlay(), svg_path) {
             tracing::debug!("Symbol SVG not found: {}", svg_path.display());
             return None;
         }
-        Some(self.render_svg(&svg_path, symbol_id, color_profile))
+        Some(self.render_svg_in(
+            location.overlay(),
+            svg_path,
+            symbol_id,
+            location.profile(color_profile),
+        ))
     }
 
     /// Load a symbol from SVG file into cache (cold path, called once per symbol)
@@ -752,17 +875,20 @@ impl SymbolCache {
         if !mm_to_px.is_finite() || mm_to_px <= 0.0 {
             return None;
         }
+        self.sync_overlay_generation();
         let key = pattern_texture_key(symbol_id, target_width_px, target_height_px, mm_to_px);
         if self.symbols.contains_key(&key) {
             return self.symbols.get(&key);
         }
 
-        let svg_path = self.symbols_path.join(format!("{}.svg", symbol_id));
-        if !self.source_exists(&svg_path) {
+        let location = self.locate(symbol_id)?;
+        let color_profile = location.profile(color_profile);
+        let svg_path = location.path.clone();
+        if !self.source_exists_in(location.overlay(), &svg_path) {
             return None;
         }
 
-        let svg_content = match self.read_source_svg(&svg_path) {
+        let svg_content = match self.read_source_svg_in(location.overlay(), &svg_path) {
             Ok(c) => c,
             Err(_) => return None,
         };
@@ -770,7 +896,7 @@ impl SymbolCache {
         let view_box = self.extract_viewbox(&svg_content);
         let svg_with_colors = self.inject_colors(&svg_content, color_profile);
 
-        let opts = self.svg_options(&svg_path);
+        let opts = self.svg_options_in(location.overlay(), &svg_path);
         let tree = match resvg::usvg::Tree::from_str(&svg_with_colors, &opts) {
             Ok(t) => t,
             Err(_) => return None,
@@ -848,6 +974,11 @@ impl SymbolCache {
         lattice: ferrite_render::PatternLattice,
         pixels_per_mm: f64,
     ) -> Result<&PeriodicPatternGeometry, String> {
+        self.sync_overlay_generation();
+        let location = self
+            .locate(symbol_id)
+            .ok_or("Pattern overlay symbol source is not registered")?;
+        let color_profile = location.profile(color_profile);
         let key = lattice_cache_key(
             self.resource_revision,
             symbol_id,
@@ -855,11 +986,11 @@ impl SymbolCache {
             lattice,
             pixels_per_mm,
         )?;
-        self.get_symbol_for_lattice_key(symbol_id, color_profile, lattice, pixels_per_mm, &key)
+        self.get_symbol_for_lattice_key(&location, color_profile, lattice, pixels_per_mm, &key)
     }
     fn get_symbol_for_lattice_key(
         &mut self,
-        symbol_id: &str,
+        location: &SvgLocation,
         color_profile: &ColorProfile,
         lattice: ferrite_render::PatternLattice,
         pixels_per_mm: f64,
@@ -867,10 +998,10 @@ impl SymbolCache {
     ) -> Result<&PeriodicPatternGeometry, String> {
         const MAX_CACHE_ENTRIES: usize = 256;
         if !self.lattice_patterns.contains_key(key) {
-            let path = self.symbols_path.join(format!("{symbol_id}.svg"));
-            let content = self.read_source_svg(&path)?;
+            let path = &location.path;
+            let content = self.read_source_svg_in(location.overlay(), path)?;
             let colored = self.inject_colors(&content, color_profile);
-            let options = self.svg_options(&path);
+            let options = self.svg_options_in(location.overlay(), path);
             let tree =
                 resvg::usvg::Tree::from_str(&colored, &options).map_err(|e| e.to_string())?;
             let size = tree.size();
@@ -967,14 +1098,24 @@ impl SymbolCache {
     }
 
     /// Render SVG file to pixel buffer using resvg
+    #[cfg(test)]
     fn render_svg(
         &self,
         svg_path: &Path,
         symbol_id: &str,
         color_profile: &ColorProfile,
     ) -> Result<SymbolGeometry, String> {
+        self.render_svg_in(None, svg_path, symbol_id, color_profile)
+    }
+    fn render_svg_in(
+        &self,
+        overlay: Option<&OverlaySymbolSource>,
+        svg_path: &Path,
+        symbol_id: &str,
+        color_profile: &ColorProfile,
+    ) -> Result<SymbolGeometry, String> {
         // Read SVG file
-        let svg_content = self.read_source_svg(svg_path)?;
+        let svg_content = self.read_source_svg_in(overlay, svg_path)?;
 
         // Extract viewBox from original SVG (minX, minY, width, height)
         let view_box = self.extract_viewbox(&svg_content);
@@ -983,7 +1124,7 @@ impl SymbolCache {
         let svg_with_colors = self.inject_colors(&svg_content, color_profile);
 
         // Parse SVG with usvg
-        let opts = self.svg_options(svg_path);
+        let opts = self.svg_options_in(overlay, svg_path);
         let tree = resvg::usvg::Tree::from_str(&svg_with_colors, &opts)
             .map_err(|e| format!("Failed to parse SVG: {}", e))?;
 

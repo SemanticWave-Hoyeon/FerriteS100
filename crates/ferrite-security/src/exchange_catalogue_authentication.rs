@@ -10,6 +10,8 @@ pub struct AuthenticatedExchangeCatalogue {
     pub(super) verified_unix_seconds: i64,
     pub(super) trust_anchor_sha256: Arc<HashMap<String, String>>,
     pub(super) legacy_namespace: bool,
+    /// Listed but unreferenced CATALOG.SIGN certificates (ignored, untrusted).
+    pub(super) certificate_warnings: Vec<String>,
 }
 impl std::fmt::Debug for AuthenticatedExchangeCatalogue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,6 +36,10 @@ impl AuthenticatedExchangeCatalogue {
     }
     pub fn trust_anchor_sha256(&self) -> &HashMap<String, String> {
         &self.trust_anchor_sha256
+    }
+    /// CATALOG.SIGN certificates that no signature references; never trusted.
+    pub fn certificate_warnings(&self) -> &[String] {
+        &self.certificate_warnings
     }
     pub fn revocation_checked(&self) -> bool {
         false
@@ -115,8 +121,9 @@ impl<'a> CatalogueDiscoveryView<'a> {
             text(unique_child(entry, XC, "fileName")?)? == uri,
             "Original discovery filename differs from retained resource URI"
         );
-        // Require the same generic mandatory fields admitted during import.
-        dataset_discovery::parse(entry)?;
+        // Require the same generic fields admitted during import; a missing
+        // issueDate was already reported as a warning at import time.
+        dataset_discovery::parse(entry, uri, &mut Vec::new())?;
         Ok(entry.id())
     }
 }
@@ -155,12 +162,22 @@ pub fn verify_exchange_catalogue(
         filename == "CATALOG.XML",
         "Catalogue signature filename must be CATALOG.XML"
     );
-    let certs = Certificates::parse(node)?.verified(anchors, time)?;
     let signatures = node
         .children()
         .filter(|n| is(*n, SE, "digitalSignature"))
         .map(parse_signature)
         .collect::<Result<Vec<_>>>()?;
+    let mut certificate_warnings = Vec::new();
+    let certs = Certificates::parse(node)?.verified_referenced(
+        signatures.iter().map(|s| s.certificate.as_str()),
+        anchors,
+        time,
+        &mut certificate_warnings,
+    )?;
+    let certificate_warnings = certificate_warnings
+        .into_iter()
+        .map(|w| format!("CATALOG.SIGN: {w}"))
+        .collect();
     let catalogue = verify_resource_with_limit(
         resource_path(&root, filename)?,
         signatures,
@@ -189,5 +206,6 @@ pub fn verify_exchange_catalogue(
         verified_unix_seconds: time,
         trust_anchor_sha256,
         legacy_namespace: node.tag_name().namespace() != Some(SE),
+        certificate_warnings,
     })
 }

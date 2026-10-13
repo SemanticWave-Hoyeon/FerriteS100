@@ -140,6 +140,7 @@ mod ui_feature_audit;
 
 mod flat_eventloop_diagnostics;
 mod flat_service_trajectory;
+mod gml_overlay;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -503,6 +504,8 @@ struct AppConfig {
     auto_chart: Vec<PathBuf>,
     auto_s102: Vec<PathBuf>,
     auto_s421: Vec<PathBuf>,
+    /// `--overlay <file or folder>`: S-124/S-129 GML or imported warnings.
+    auto_overlay: Vec<PathBuf>,
     s102_pc_path: PathBuf,
     s102_adjustments_path: Option<PathBuf>,
     require_signatures: bool,
@@ -643,6 +646,11 @@ impl AppConfig {
                 .map(|p| PathBuf::from(&p[1]))
                 .collect(),
             auto_s102,
+            auto_overlay: args
+                .windows(2)
+                .filter(|p| p[0] == "--overlay")
+                .map(|p| PathBuf::from(&p[1]))
+                .collect(),
             s102_adjustments_path: args
                 .windows(2)
                 .find(|p| p[0] == "--s102-datum-adjustments")
@@ -1097,6 +1105,10 @@ struct DatasetOpenSession {
     routes_loaded: usize,
     routes_existing: usize,
     routes_failed: usize,
+    overlays: std::collections::VecDeque<PathBuf>,
+    overlays_loaded: usize,
+    overlays_existing: usize,
+    overlays_failed: usize,
     rasters: std::collections::VecDeque<PathBuf>,
     charts: Option<Vec<PathBuf>>,
     selected_charts: Vec<PathBuf>,
@@ -1121,13 +1133,21 @@ impl DatasetOpenSession {
             "completed"
         };
         format!(
-            "Dataset loading complete. S-101: {charts} ({chart_count} charts available). S-102: {} loaded, {} already open, {} failed. S-421: {} loaded, {} already open, {} failed. {} skipped or failed entries. See Logs for details.",
+            "Dataset loading complete. S-101: {charts} ({chart_count} charts available). S-102: {} loaded, {} already open, {} failed. S-421: {} loaded, {} already open, {} failed.{} {} skipped or failed entries. See Logs for details.",
             self.raster_loaded,
             self.raster_existing,
             self.raster_failed,
             self.routes_loaded,
             self.routes_existing,
             self.routes_failed,
+            if self.overlays_loaded + self.overlays_existing + self.overlays_failed > 0 {
+                format!(
+                    " S-124/S-129 overlays: {} loaded, {} already open, {} failed.",
+                    self.overlays_loaded, self.overlays_existing, self.overlays_failed
+                )
+            } else {
+                String::new()
+            },
             self.notices.len()
         )
     }
@@ -1270,6 +1290,9 @@ struct ChartApp {
     native_s421: native_s421::NativeS421,
     native_s421_ui_revision: u64,
     pending_auto_s421: Vec<PathBuf>,
+    /// S-124 / S-129 overlay datasets and their catalogues.
+    gml_overlays: gml_overlay::GmlOverlays,
+    pending_auto_overlays: Vec<PathBuf>,
     /// Base instruction count (chart instructions only, before plugin instructions)
     base_instruction_count: usize,
     applied_settings: SettingsState,
@@ -1449,6 +1472,16 @@ impl ChartApp {
             native_s421: native_s421::NativeS421::new(get_app_base_dir().join("Catalogues")),
             native_s421_ui_revision: 0,
             pending_auto_s421: Vec::new(),
+            gml_overlays: {
+                let mut overlays = gml_overlay::GmlOverlays::load(&get_app_base_dir());
+                // S-124 11.1.1: classifications and indications per OS user.
+                let user = gml_overlay::os_user_name();
+                if let Some(path) = gml_overlay::default_user_state_path(&user) {
+                    overlays.attach_user_store(path, user);
+                }
+                overlays
+            },
+            pending_auto_overlays: Vec::new(),
             plugin_system: {
                 let base = get_app_base_dir();
                 // Check both plugin directory names:
@@ -2880,6 +2913,8 @@ impl ChartApp {
             instruction.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
             next.add_instruction(instruction);
         }
+        self.append_overlay_instructions(&mut next, &request.profile);
+        let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
         if preserve_view {
             next.scaler = self.render_context.scaler.clone();
         } else {
@@ -3055,11 +3090,30 @@ impl ChartApp {
                 )?;
             }
             anyhow::ensure!(
-                next.raw_instructions()
-                    .iter()
-                    .all(|instruction| instruction.cell_index().is_some()),
+                next.raw_instructions().iter().all(|instruction| {
+                    instruction.cell_index().is_some()
+                        || gml_overlay::is_overlay_instruction(instruction)
+                }),
                 "Mixed-PC overlays require explicit host resource ownership"
             );
+            // S-124/S-129 overlays draw with the designated overlay owner.
+            let mut overlays = next.empty_for_rebuild();
+            overlays.set_instructions_from_cache(
+                next.raw_instructions()
+                    .iter()
+                    .filter(|instruction| gml_overlay::is_overlay_instruction(instruction))
+                    .cloned()
+                    .collect(),
+            );
+            if overlays.instruction_count() > 0 && !self.cells.is_empty() {
+                let resolved = resources.resolve_overlay_mut()?;
+                preflight_candidate_symbols(
+                    &overlays,
+                    resolved.cache,
+                    resolved.profile,
+                    renderer.raster_texture_limit(),
+                )?;
+            }
             renderer.preflight_owned_annotation(&next, resources)?;
             resources.seal_viewing_groups()?;
         } else if preflight_resources {
@@ -3824,6 +3878,7 @@ impl ChartApp {
             .collect();
         let native_files = self.native_s421.dataset_rows();
         let native_catalogue = self.native_s421.catalogue_layer();
+        let (overlay_layers, overlay_catalogues) = self.overlay_tree();
         for row in &native_files {
             catalogue_bindings.push(ferrite_wgpu::DatasetCatalogueBinding {
                 cell_index: None,
@@ -3888,6 +3943,11 @@ impl ChartApp {
                 ),
                 files: native_files,
             });
+            renderer.ui_state.dataset_layers.extend(overlay_layers);
+            renderer
+                .ui_state
+                .catalogue_layers
+                .extend(overlay_catalogues);
             if !renderer
                 .ui_state
                 .dataset_layers
@@ -3917,6 +3977,28 @@ impl ChartApp {
                 && self.pending_portrayal_change.is_none(),
             "Finish navigation or portrayal changes before unloading"
         );
+        if let ferrite_wgpu::DatasetLayerId::Overlay { id, .. } = &id {
+            self.ensure_navigation_scene()?;
+            anyhow::ensure!(self.gml_overlays.remove(*id), "Dataset is no longer loaded");
+            if self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.ui_state.selected_feature.as_ref())
+                .is_some_and(|f| {
+                    f.cell_index.is_none()
+                        && gml_overlay::decode_key(f.feature_id).is_some_and(|(d, _)| d == *id)
+                })
+            {
+                self.select_feature(None);
+            }
+            if let Some(renderer) = &mut self.renderer {
+                renderer.ui_state.selected_dataset = None;
+                renderer.ui_state.notice = Some("Dataset unloaded".into());
+            }
+            self.overlays_changed(false);
+            self.refresh_visible_selection();
+            return Ok(());
+        }
         if let ferrite_wgpu::DatasetLayerId::S421 { route_id } = &id {
             self.ensure_navigation_scene()?;
             self.native_s421.unload_route(*route_id)?;
@@ -3963,7 +4045,8 @@ impl ChartApp {
                 }
                 self.loaded_discovery.remove(&key);
             }
-            ferrite_wgpu::DatasetLayerId::S421 { .. } => {
+            ferrite_wgpu::DatasetLayerId::S421 { .. }
+            | ferrite_wgpu::DatasetLayerId::Overlay { .. } => {
                 anyhow::bail!("Native route dispatch state changed")
             }
             ferrite_wgpu::DatasetLayerId::S102Trial(path) => {
@@ -4097,6 +4180,7 @@ impl ChartApp {
                         );
                         self.dataset_open_session = Some(DatasetOpenSession {
                             routes: plan.routes.into(),
+                            overlays: plan.overlays.into(),
                             rasters: plan.rasters.into(),
                             charts: Some(plan.charts),
                             selected_charts: plan.selected_charts,
@@ -4154,6 +4238,21 @@ impl ChartApp {
             self.dataset_open_session = Some(session);
             return;
         }
+        // S-124/S-129 overlays (and imported warnings) open independently.
+        if let Some(path) = session.overlays.pop_front() {
+            match self.open_overlay_dataset(&path) {
+                Ok(gml_overlay::Added::New) => session.overlays_loaded += 1,
+                Ok(gml_overlay::Added::AlreadyOpen) => session.overlays_existing += 1,
+                Err(error) => {
+                    session.overlays_failed += 1;
+                    let message = format!("{}: {error:#}", path.display());
+                    tracing::warn!("{message}");
+                    session.notices.push(message);
+                }
+            }
+            self.dataset_open_session = Some(session);
+            return;
+        }
         // Each raster is transactional. A damaged/unsupported delivery cannot
         // prevent the remaining independent files from being attempted.
         if let Some(path) = session.rasters.pop_front() {
@@ -4197,6 +4296,7 @@ impl ChartApp {
             && session.routes_loaded == 0
             && session.routes_existing == 0
             && session.routes_failed == 0
+            && session.overlays_loaded + session.overlays_existing + session.overlays_failed == 0
             && session.notices.len() == 1
         {
             session.notices[0].clone()
@@ -5772,6 +5872,9 @@ impl ChartApp {
         } else {
             0
         };
+        // S-124/S-129 overlays: cell-less, coverage-exempt host instructions.
+        let profile = self.current_profile_name.clone();
+        self.append_overlay_instructions(&mut next, &profile);
         if let Some(renderer) = &self.renderer {
             let size = renderer.window().inner_size();
             next.set_viewport(size.width as f32, size.height as f32);
@@ -6437,7 +6540,24 @@ impl ChartApp {
             .collect()
     }
 
-    fn describe_hit(&self, sym: &RenderedSymbol) -> SelectedFeature {
+    fn describe_hit(&mut self, sym: &RenderedSymbol) -> SelectedFeature {
+        if sym.cell_index.is_none() {
+            if let Some(pick) = self.gml_overlays.describe(sym.feature_id) {
+                return SelectedFeature {
+                    feature_type: pick.feature_type,
+                    feature_id: sym.feature_id,
+                    foid: pick.foid,
+                    cell_index: None,
+                    primitive_type: pick.primitive,
+                    source: Some(pick.source),
+                    attributes: pick.attributes,
+                    world_pos: (sym.world_x, sym.world_y),
+                    longitude_shift: sym.longitude_shift,
+                    definition: pick.definition,
+                    symbol_name: (sym.kind == 0).then(|| sym.symbol_ref.clone()),
+                };
+            }
+        }
         // Use cell_index to look up feature in the correct cell
         // This fixes the bug where multiple cells have the same feature_id
         // but different feature types
@@ -11535,7 +11655,8 @@ impl ChartApp {
             reports.push(serde_json::json!({"wrapped_checks":wrapped_checks,"kind":kind,"cell":cell,"feature_id":id,"source":source_path,"feature_type":feature_type,"attributes":attributes,"foid":foid,"candidates":candidates.len(),"query_physical_pixels":[point.x,point.y],"candidate_identities":candidates.iter().map(|c|serde_json::json!({"cell":c.cell_index,"feature_id":c.feature_id,"kind":c.kind,"plane":c.plane,"priority":c.priority,"longitude_shift":c.longitude_shift})).collect::<Vec<_>>(),
                 "selected_geometry_vertices":self.renderer.as_ref().unwrap().selected_geometry_vertex_count()}));
             if candidates.len() > 1 {
-                self.select_feature(Some(self.describe_hit(&candidates[1])));
+                let feature = self.describe_hit(&candidates[1]);
+                self.select_feature(Some(feature));
             }
         }
         std::fs::write(
@@ -11603,6 +11724,18 @@ impl ChartApp {
         self.poll_scene_build(true);
         if feature.symbol_name.is_none() {
             return Ok(None);
+        }
+        if feature.cell_index.is_none() && gml_overlay::decode_key(feature.feature_id).is_some() {
+            // S-124/S-129 symbols: the registered overlay symbol source, in
+            // the overlay palette matching the active profile.
+            let active = self
+                .pc
+                .color_profiles
+                .profiles
+                .get(&self.current_profile_name)
+                .context("Active colour profile unavailable")?;
+            return ferrite_wgpu::prepare_overlay_symbol_preview(feature, active)
+                .map_err(Into::into);
         }
         let index = feature
             .cell_index
@@ -11747,6 +11880,13 @@ impl ChartApp {
                 }
             }
         }
+        if let Some(feature) = selected.as_ref().filter(|f| f.cell_index.is_none()) {
+            if let Some((dataset, _)) = gml_overlay::decode_key(feature.feature_id) {
+                // S-124: the selected part's NavwarnAreaAffected (11.2).
+                geometry.extend(self.gml_overlays.highlight_geometry(feature.feature_id));
+                self.gml_overlays.mark_displayed(dataset);
+            }
+        }
         if let Some(renderer) = &mut self.renderer {
             if selected.is_some() {
                 renderer.ui_state.object_details_hidden = false;
@@ -11834,7 +11974,7 @@ impl ChartApp {
             return;
         }
 
-        if !self.chart_loaded {
+        if !self.picking_enabled() {
             return;
         }
         if self.zoom_animating || self.zoom_rebuild_phase != 0 || self.pan_rebuild_phase != 0 {
@@ -12863,11 +13003,7 @@ impl ChartApp {
         self.render_context.zoom_to_fit(new_bounds);
         // Preserve arbitrary plugin callback count and final owned instructions
         // per rejected event. Do not assume plugin &self methods are pure.
-        self.render_context.remove_coverage_exempt_instructions();
-        for mut instr in self.plugin_system.get_render_instructions() {
-            instr.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
-            self.render_context.add_instruction(instr);
-        }
+        self.sync_host_overlay_instructions();
     }
     fn rebuild_view_ex(&mut self, rebuild_hit_test: bool, preserve_declutter: bool) -> bool {
         self.poll_scene_build(true);
@@ -12928,14 +13064,6 @@ impl ChartApp {
                 t.elapsed(),
             );
         }
-        // Pre-compute color profile and viewing groups before mutable borrow of renderer
-        let color_profile = self
-            .pc
-            .color_profiles
-            .profiles
-            .get(&self.current_profile_name);
-        let visible_vgs = self.get_visible_viewing_groups();
-
         // Prepare plugin instructions before renderer borrow
         // Always add plugin instructions (route overlays should render even without charts)
         let flat_overlay_timer = self
@@ -12944,11 +13072,7 @@ impl ChartApp {
             .filter(|r| r.flat_diagnostics_active())
             .map(|_| std::time::Instant::now());
         if !self.navigation_flush_active {
-            self.render_context.remove_coverage_exempt_instructions();
-            for mut instr in self.plugin_system.get_render_instructions() {
-                instr.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
-                self.render_context.add_instruction(instr);
-            }
+            self.sync_host_overlay_instructions();
         }
         if let (Some(t), Some(r)) = (flat_overlay_timer, self.renderer.as_ref()) {
             r.record_flat_stage(
@@ -12956,6 +13080,13 @@ impl ChartApp {
                 t.elapsed(),
             );
         }
+        // Pre-compute color profile and viewing groups before mutable borrow of renderer
+        let color_profile = self
+            .pc
+            .color_profiles
+            .profiles
+            .get(&self.current_profile_name);
+        let visible_vgs = self.get_visible_viewing_groups();
         let flat_coverage_timer = self
             .renderer
             .as_ref()
@@ -13034,7 +13165,7 @@ impl ChartApp {
         }
 
         // Rebuild symbols for hit testing (skip during animation for performance)
-        if rebuild_hit_test && self.chart_loaded {
+        if rebuild_hit_test && self.picking_enabled() {
             let hit_test_start = if profiling {
                 Some(std::time::Instant::now())
             } else {
@@ -13689,6 +13820,32 @@ impl ApplicationHandler for ChartApp {
                                     self.frames_since_loaded = Some(0);
                                 }
                             }
+                            for path in std::mem::take(&mut self.pending_auto_overlays) {
+                                let paths = if path.is_dir() {
+                                    gml_overlay::discover(&path)
+                                } else {
+                                    Ok(vec![path])
+                                };
+                                let result = paths.and_then(|paths| {
+                                    for path in paths {
+                                        self.open_overlay_dataset(&path)
+                                            .with_context(|| path.display().to_string())?;
+                                    }
+                                    Ok(())
+                                });
+                                if let Err(error) = result {
+                                    self.startup_error =
+                                        Some(format!("Overlay startup import failed: {error:#}"));
+                                    event_loop.exit();
+                                    return;
+                                }
+                                // With --chart, the screenshot waits for the charts.
+                                if self.auto_screenshot.is_some()
+                                    && self.pending_auto_chart.is_empty()
+                                {
+                                    self.frames_since_loaded = Some(0);
+                                }
+                            }
                             if !self.chart_loaded && self.auto_screenshot.is_some() {
                                 self.apply_auto_screenshot_camera();
                             }
@@ -14007,6 +14164,7 @@ impl ApplicationHandler for ChartApp {
             WindowEvent::RedrawRequested => {
                 self.service_mcp_ui();
                 self.service_llm_chat_ui();
+                self.service_overlay_ui();
                 if let Err(error) = self.ensure_s102_journal_ready() {
                     self.startup_error = Some(format!("S102 history recovery required: {error:#}"));
                     event_loop.exit();
@@ -14489,7 +14647,11 @@ impl ApplicationHandler for ChartApp {
                     } else if let Some(path) = rfd::FileDialog::new()
                         .add_filter(
                             "S-100 datasets / exchange catalogue",
-                            &["000", "h5", "H5", "xml"],
+                            &["000", "h5", "H5", "xml", "gml", "GML"],
+                        )
+                        .add_filter(
+                            "Navigational warning imports (not S-100)",
+                            &["kml", "gpx", "shp", "zip"],
                         )
                         .add_filter("All files (including numeric updates)", &["*"])
                         .set_title("Open Dataset")
@@ -15276,7 +15438,8 @@ impl ApplicationHandler for ChartApp {
                                 let selected = self
                                     .rendered_symbols
                                     .first()
-                                    .map(|symbol| self.describe_hit(symbol));
+                                    .cloned()
+                                    .map(|symbol| self.describe_hit(&symbol));
                                 self.select_feature(selected);
                                 if let Some(renderer) = &mut self.renderer {
                                     renderer.ui_state.show_logs = true;
@@ -15821,6 +15984,21 @@ impl ApplicationHandler for ChartApp {
         let now = std::time::Instant::now();
         let debug_wake =
             process_stats::debug_deadline(self.debug_mode, self.last_debug_update, now);
+        // S-124 lifecycle re-check (cancellation dates, date ranges, the 24 h
+        // new-message indication) runs on redraw; wake for it without charts too.
+        let overlay_wake = self
+            .gml_overlays
+            .next_check()
+            .filter(|_| self.renderer.is_some())
+            .map(|due| {
+                if due <= now {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                due.max(now + std::time::Duration::from_secs(1))
+            });
+        let debug_wake = [debug_wake, overlay_wake].into_iter().flatten().min();
         if self.debug_mode
             && now.duration_since(self.last_debug_update) >= process_stats::UPDATE_INTERVAL
         {
@@ -16166,6 +16344,7 @@ fn run_app() -> Result<()> {
     );
 
     app.pending_auto_s421 = config.auto_s421;
+    app.pending_auto_overlays = config.auto_overlay;
     app.applied_settings.display_mode = initial_display_mode;
     app.applied_settings.viewing_layers = config.initial_viewing_layers.into_iter().collect();
     primary_viewing_layers::capture_primary(&app.pc, &mut app.applied_settings)?;

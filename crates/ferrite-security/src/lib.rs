@@ -247,39 +247,53 @@ fn read_xml(path: &Path) -> Result<Vec<u8>> {
     Ok(b)
 }
 impl Certificates {
+    /// Merge every certificate container of `parent`. Some producers (UKHO 2026)
+    /// split certificates over several containers, each repeating the scheme
+    /// administrator declaration. Certificate IDs stay globally unique.
     fn parse(parent: Node<'_, '_>) -> Result<Self> {
-        let container = unique_child(
-            parent,
-            parent
-                .tag_name()
-                .namespace()
-                .context("Missing certificate namespace")?,
-            "certificates",
-        )?;
+        let ns = parent
+            .tag_name()
+            .namespace()
+            .context("Missing certificate namespace")?;
+        let containers: Vec<_> = parent
+            .children()
+            .filter(|n| is(*n, ns, "certificates"))
+            .collect();
+        ensure!(!containers.is_empty(), "Missing certificates");
         let mut result = Self {
             members: HashMap::new(),
             administrators: HashSet::new(),
         };
-        let mut ids = HashSet::new();
-        for n in container.children().filter(Node::is_element) {
-            let id = attribute(n, "id")?.to_owned();
-            ensure!(
-                ids.insert(id.clone()),
-                "Duplicate certificate/administrator ID {id}"
-            );
-            if is(n, SE, "schemeAdministrator") {
-                result.administrators.insert(id);
-            } else if is(n, SE, "certificate") {
-                let cert = X509::from_der(&decode(n)?)?;
-                result.members.insert(
-                    id,
-                    Certificate {
-                        cert,
-                        issuer: attribute(n, "issuer")?.into(),
-                    },
+        for container in containers {
+            let mut ids = HashSet::new();
+            for n in container.children().filter(Node::is_element) {
+                let id = attribute(n, "id")?.to_owned();
+                ensure!(
+                    ids.insert(id.clone()),
+                    "Duplicate certificate/administrator ID {id}"
                 );
-            } else {
-                bail!("Unsupported certificate container element");
+                if is(n, SE, "schemeAdministrator") {
+                    ensure!(
+                        !result.members.contains_key(&id),
+                        "Duplicate certificate/administrator ID {id}"
+                    );
+                    result.administrators.insert(id);
+                } else if is(n, SE, "certificate") {
+                    ensure!(
+                        !result.administrators.contains(&id) && !result.members.contains_key(&id),
+                        "Duplicate certificate/administrator ID {id}"
+                    );
+                    let cert = X509::from_der(&decode(n)?)?;
+                    result.members.insert(
+                        id,
+                        Certificate {
+                            cert,
+                            issuer: attribute(n, "issuer")?.into(),
+                        },
+                    );
+                } else {
+                    bail!("Unsupported certificate container element");
+                }
             }
         }
         ensure!(
@@ -288,47 +302,126 @@ impl Certificates {
         );
         Ok(result)
     }
+    /// Validate every listed certificate (test helper; production code only
+    /// validates certificates that signatures reference).
+    #[cfg(test)]
     fn verified(&self, anchors: &TrustAnchors, time: i64) -> Result<HashMap<String, X509>> {
         self.members
             .keys()
-            .map(|id| Ok((id.clone(), self.validate(id, anchors, time)?)))
+            .map(|id| {
+                Ok((
+                    id.clone(),
+                    self.validate(id, anchors, time, &mut HashSet::new())?,
+                ))
+            })
             .collect()
     }
-    fn validate(&self, id: &str, anchors: &TrustAnchors, time: i64) -> Result<X509> {
-        let leaf = self
+    /// S-100 Part 15: each signature names its signer by certificateRef. Only
+    /// those signers (and the intermediates on their paths) must chain to an
+    /// installed scheme administrator anchor; any failure among them is fatal.
+    /// Other listed certificates are not validated and never become usable
+    /// signer keys: they are absent from the returned map and reported.
+    fn verified_referenced<'s>(
+        &self,
+        references: impl IntoIterator<Item = &'s str>,
+        anchors: &TrustAnchors,
+        time: i64,
+        warnings: &mut Vec<String>,
+    ) -> Result<HashMap<String, X509>> {
+        let mut verified = HashMap::new();
+        let mut used = HashSet::new();
+        for id in references {
+            if !verified.contains_key(id) {
+                let cert = self.validate(id, anchors, time, &mut used)?;
+                verified.insert(id.to_owned(), cert);
+            }
+        }
+        let mut ignored: Vec<_> = self
             .members
-            .get(id)
+            .keys()
+            .filter(|id| !used.contains(id.as_str()))
+            .collect();
+        ignored.sort();
+        warnings.extend(ignored.into_iter().map(|id| {
+            format!("Certificate {id} is listed but not referenced by any signature; ignored (not validated, not trusted)")
+        }));
+        Ok(verified)
+    }
+    /// Installed anchor of a declared administrator whose subject CN equals an
+    /// XML issuer label (some producers write the SA root MRN, not the
+    /// administrator ID). Trust still comes only from the installed anchor and
+    /// the X.509 issuer name and signature checks below.
+    fn administrator_anchor_named<'a>(
+        &self,
+        label: &str,
+        anchors: &'a TrustAnchors,
+    ) -> Result<Option<&'a X509>> {
+        let mut found = None;
+        for administrator in &self.administrators {
+            let Some(root) = anchors.roots.get(administrator) else {
+                continue;
+            };
+            let named = root
+                .subject_name()
+                .entries_by_nid(Nid::COMMONNAME)
+                .any(|e| e.data().as_slice() == label.as_bytes());
+            if named {
+                ensure!(
+                    found.is_none(),
+                    "Ambiguous scheme administrator issuer {label}"
+                );
+                found = Some(root);
+            }
+        }
+        Ok(found)
+    }
+    fn validate<'s>(
+        &'s self,
+        id: &str,
+        anchors: &TrustAnchors,
+        time: i64,
+        used: &mut HashSet<&'s str>,
+    ) -> Result<X509> {
+        let (leaf_id, leaf) = self
+            .members
+            .get_key_value(id)
             .with_context(|| format!("Unknown certificateRef {id}"))?;
         let mut chain = Stack::new()?;
+        let mut path = vec![leaf_id.as_str()];
         let mut seen = HashSet::new();
-        let mut current = id;
+        let mut current: &str = leaf_id;
         let root = loop {
             ensure!(seen.insert(current), "Certificate issuer cycle");
             let item = self
                 .members
                 .get(current)
                 .context("Missing certificate issuer")?;
-            let issuer = if self.administrators.contains(&item.issuer) {
-                anchors
+            let (issuer, is_root) = if self.administrators.contains(&item.issuer) {
+                let root = anchors
                     .roots
                     .get(&item.issuer)
-                    .with_context(|| format!("Untrusted scheme administrator {}", item.issuer))?
+                    .with_context(|| format!("Untrusted scheme administrator {}", item.issuer))?;
+                (root, true)
+            } else if let Some(member) = self.members.get(&item.issuer) {
+                (&member.cert, false)
+            } else if let Some(root) = self.administrator_anchor_named(&item.issuer, anchors)? {
+                (root, true)
             } else {
-                &self
-                    .members
-                    .get(&item.issuer)
-                    .context("Missing intermediate certificate")?
-                    .cert
+                bail!(
+                    "Missing intermediate certificate {} for {current}",
+                    item.issuer
+                );
             };
             ensure!(
                 item.cert.issuer_name().to_der()? == issuer.subject_name().to_der()?,
                 "XML issuer does not match X.509 issuer"
             );
-            if self.administrators.contains(&item.issuer) {
+            if is_root {
                 break issuer;
             }
             chain.push(issuer.clone())?;
             current = &item.issuer;
+            path.push(current);
         };
         let mut store = X509StoreBuilder::new()?;
         store.add_cert(root.clone())?;
@@ -341,7 +434,11 @@ impl Certificates {
             let valid = ctx.verify_cert()?;
             Ok((valid, ctx.error().to_string()))
         })?;
-        ensure!(valid, "Certificate path validation failed: {error}");
+        ensure!(
+            valid,
+            "Certificate path validation failed for {id}: {error}"
+        );
+        used.extend(path);
         Ok(leaf.cert.clone())
     }
 }
@@ -604,10 +701,11 @@ pub fn verify_exchange(
         is(node, XC, "S100_ExchangeCatalogue"),
         "Unsupported catalogue namespace/type"
     );
-    let certs = Certificates::parse(node)?.verified(anchors, time)?;
+    let certificates = Certificates::parse(node)?;
     let mut resources = Vec::new();
     let mut dataset_discovery = HashMap::new();
     let mut metadata_warnings = Vec::new();
+    let mut pending = Vec::new();
     if legacy_namespace {
         metadata_warnings.push("Standalone signature uses legacy SE5.1 namespace; P-384 and current independently installed root remain required".into());
     }
@@ -673,9 +771,23 @@ pub fn verify_exchange(
             );
             signatures.push(signature);
         }
+        pending.push((entry, filename, path, signatures));
+    }
+    // Only certificates named by a certificateRef need a valid path; every one
+    // of them must validate, and unreferenced ones never become signer keys.
+    let certs = certificates.verified_referenced(
+        pending
+            .iter()
+            .flat_map(|(_, _, _, s)| s.iter().map(|s| s.certificate.as_str())),
+        anchors,
+        time,
+        &mut metadata_warnings,
+    )?;
+    metadata_warnings.extend(authenticated.certificate_warnings.iter().cloned());
+    for (entry, filename, path, signatures) in pending {
         let resource = verify_resource(path, signatures, &certs)?;
         if is(entry, XC, "S100_DatasetDiscoveryMetadata") {
-            let discovery = dataset_discovery::parse(entry)?;
+            let discovery = dataset_discovery::parse(entry, filename, &mut metadata_warnings)?;
             dataset_discovery.insert(
                 resource.path.clone(),
                 AuthenticatedDatasetDiscovery::bind(
@@ -709,6 +821,8 @@ pub fn verify_exchange(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unreferenced_certificate_tests;
 
 #[derive(Clone, Copy)]
 pub enum UnsignedPolicy {

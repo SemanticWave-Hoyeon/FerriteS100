@@ -73,6 +73,28 @@ impl TextPlacement {
         self.occupied.insert(footprint);
         true
     }
+    /// Place several footprints as one unit (the lines of one text box):
+    /// all when none collides with text already placed, else none. The
+    /// footprints are not tested against each other.
+    pub fn try_place_all(&mut self, footprints: &[TextFootprint]) -> bool {
+        if footprints
+            .iter()
+            .any(|f| !f.corners.iter().flatten().all(|v| v.is_finite()))
+        {
+            return false;
+        }
+        if footprints.iter().any(|footprint| {
+            self.occupied
+                .locate_in_envelope_intersecting(&footprint.envelope())
+                .any(|old| footprint.intersects(old))
+        }) {
+            return false;
+        }
+        for footprint in footprints {
+            self.occupied.insert(*footprint);
+        }
+        true
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -97,6 +119,18 @@ mod tests {
             [100., 4.],
             std::f32::consts::FRAC_PI_2
         )));
+    }
+    #[test]
+    fn grouped_footprints_place_all_or_none() {
+        let mut placement = TextPlacement::default();
+        let line = |y: f32| TextFootprint::rotated([0., y], [50., 12.], 0.);
+        // Overlapping lines of one box are placed together.
+        assert!(placement.try_place_all(&[line(0.), line(10.), line(20.)]));
+        // A box with one colliding line is not placed at all.
+        let other = |y: f32| TextFootprint::rotated([100., y], [50., 12.], 0.);
+        assert!(!placement.try_place_all(&[other(0.), line(25.)]));
+        assert!(placement.try_place(other(0.)));
+        assert!(!placement.try_place_all(&[TextFootprint::rotated([f32::NAN, 0.], [1., 1.], 0.)]));
     }
     #[test]
     fn touching_text_allowed_and_nonfinite_rejected() {

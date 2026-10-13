@@ -21,6 +21,21 @@ pub struct RuleFile {
     pub rule_type: RuleType,
     #[serde(default)]
     pub description: Option<String>,
+    /// `ruleType` is `TopLevelTemplate` (S-100 Part 9 entry point).
+    #[serde(default)]
+    pub top_level: bool,
+}
+
+impl RuleType {
+    /// Map a catalogue `fileFormat` value (`XSLT`, `LUA`) or a file extension
+    /// (`xsl`, `xslt`, `lua`) to a rule language.
+    pub fn from_format(format: &str) -> Option<Self> {
+        match format.trim().to_ascii_lowercase().as_str() {
+            "xslt" | "xsl" => Some(RuleType::Xslt),
+            "lua" => Some(RuleType::Lua),
+            _ => None,
+        }
+    }
 }
 
 /// Context parameter definition
@@ -113,8 +128,98 @@ impl PortrayalRules {
             .map(|r| self.base_path.join(&r.file_path))
     }
 
+    /// Language of the portrayal rules: the declared format of the top-level
+    /// rule file, else inferred from the main file extension.
+    pub fn rule_type(&self) -> Option<RuleType> {
+        self.rule_files
+            .values()
+            .find(|r| r.top_level)
+            .map(|r| r.rule_type)
+            .or_else(|| {
+                self.main_file
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| RuleType::from_format(&e.to_string_lossy()))
+            })
+    }
+
+    /// The top-level rule file entry (e.g. `main.xsl` for S-124/S-129).
+    pub fn main_rule(&self) -> Option<&RuleFile> {
+        let main = self.main_file.as_ref()?;
+        self.rule_files
+            .values()
+            .filter(|r| &r.file_path == main)
+            .min_by_key(|r| !r.top_level)
+    }
+
     /// Get context parameter by ID
     pub fn get_context_param(&self, id: &str) -> Option<&ContextParameter> {
         self.context_parameters.get(id)
     }
+}
+
+fn named_children<'a, 'i>(
+    node: roxmltree::Node<'a, 'i>,
+    name: &'static str,
+) -> impl Iterator<Item = roxmltree::Node<'a, 'i>> {
+    node.children()
+        .filter(move |n| n.is_element() && n.tag_name().name() == name)
+}
+
+fn child_text(node: roxmltree::Node<'_, '_>, name: &'static str) -> Option<String> {
+    named_children(node, name)
+        .next()
+        .and_then(|n| n.text())
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+}
+
+/// Read the catalogue `<rules>` section (S-100 Part 9 `ruleFile` entries).
+/// Declarations are additive: entries without a usable file name or with a
+/// path that escapes the Rules directory are ignored.
+pub(crate) fn read_declared_rule_files(doc: &roxmltree::Document<'_>) -> Vec<RuleFile> {
+    let mut out = Vec::new();
+    for rules in named_children(doc.root_element(), "rules") {
+        for rf in named_children(rules, "ruleFile") {
+            let Some(file_name) = child_text(rf, "fileName") else {
+                continue;
+            };
+            let path = PathBuf::from(&file_name);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let id = rf
+                .attribute("id")
+                .map(str::to_owned)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            let rule_type = child_text(rf, "fileFormat")
+                .and_then(|f| RuleType::from_format(&f))
+                .or_else(|| {
+                    path.extension()
+                        .and_then(|e| RuleType::from_format(&e.to_string_lossy()))
+                })
+                .unwrap_or_default();
+            let top_level = child_text(rf, "ruleType").as_deref() == Some("TopLevelTemplate");
+            let description = named_children(rf, "description")
+                .next()
+                .and_then(|d| child_text(d, "description").or_else(|| child_text(d, "name")));
+            out.push(RuleFile {
+                id,
+                file_path: path,
+                rule_type,
+                description,
+                top_level,
+            });
+        }
+    }
+    out
 }

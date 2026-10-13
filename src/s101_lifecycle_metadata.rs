@@ -490,7 +490,15 @@ pub(crate) fn capture_cached(
                 purpose: discovery.purpose,
                 edition: discovery.edition_number,
                 update: discovery.update_number,
-                issue_date: date(discovery.issue_date.as_str())?,
+                // S-101 update sequencing and reissue/cancellation ordering
+                // compare issue dates, so an absent date cannot be admitted.
+                issue_date: date(
+                    discovery
+                        .issue_date
+                        .as_ref()
+                        .context("S-101 lifecycle requires catalogue issueDate")?
+                        .as_str(),
+                )?,
                 original_canonical_key: key,
                 raw_resource_sha256: sha256,
                 catalogue_xml_hash: CatalogueHash::AuthenticatedSha384(

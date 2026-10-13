@@ -89,6 +89,28 @@ impl ViewingGroups {
         Ok(std::borrow::Cow::Owned(result))
     }
 
+    /// Declare a numeric viewing group the catalogue's rules use but its
+    /// `viewingGroups` section omits (host conformance repair for overlay
+    /// catalogues). Returns false when the group is already declared.
+    pub fn declare_implicit(&mut self, id: u32, name: &str) -> bool {
+        if self.numeric_ids.contains(&id) || self.groups.contains_key(&id) {
+            return false;
+        }
+        self.numeric_ids.insert(id);
+        self.identifiers.insert(id.to_string(), id);
+        self.groups.insert(
+            id,
+            ViewingGroup {
+                id,
+                catalogue_id: id.to_string(),
+                name: name.to_owned(),
+                description: None,
+                parent_id: None,
+            },
+        );
+        true
+    }
+
     /// Get viewing group by ID
     pub fn get(&self, id: u32) -> Option<&ViewingGroup> {
         self.groups.get(&id)

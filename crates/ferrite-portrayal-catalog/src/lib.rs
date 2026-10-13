@@ -48,3 +48,6 @@ pub fn parse_standalone_line_style(bytes: &[u8], id: &str) -> Result<LineStyle> 
 
 mod font_reference;
 pub use font_reference::{BoundFontDeclarations, BoundFontReference};
+
+mod overlay;
+pub use overlay::{overlay_symbol_id, split_overlay_symbol_id, OVERLAY_SYMBOL_SEPARATOR};
