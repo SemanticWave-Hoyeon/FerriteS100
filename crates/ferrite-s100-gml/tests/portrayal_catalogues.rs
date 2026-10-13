@@ -457,6 +457,7 @@ fn s129_datasets_portray() {
         let options = ConvertOptions {
             apply_feature_scale_minimum: false,
             opaque_invisible_text: true,
+            ..Default::default()
         };
         let alt = pc.portray(&input, &[], &options).unwrap();
         assert!(alt
@@ -598,7 +599,7 @@ fn undeclared_viewing_groups_are_dropped() {
       <textPoint><element><text>x</text><bodySize>10</bodySize><foreground>CHBLK</foreground></element></textPoint></textInstruction></displayList>"#;
     let doc = ferrite_xslt::parse(list, None, None).unwrap();
     let out = display_list_instructions(
-        &ferrite_xslt::NodeRef::root_of(doc),
+        &ferrite_xslt::NodeRef::root_of(doc.clone()),
         &input,
         Some(&pc.info),
         &ConvertOptions::default(),
@@ -611,6 +612,63 @@ fn undeclared_viewing_groups_are_dropped() {
         "{:#?}",
         out.notes
     );
+
+    // Errata correction: the group is treated as declared, with a note.
+    let options = ConvertOptions {
+        implicit_viewing_groups: ["26".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let out = display_list_instructions(
+        &ferrite_xslt::NodeRef::root_of(doc),
+        &input,
+        Some(&pc.info),
+        &options,
+    );
+    assert_eq!(out.features.len(), 1);
+    assert!(
+        out.features[0].instructions.starts_with("ViewingGroup:26;"),
+        "{}",
+        out.features[0].instructions
+    );
+    assert!(out.notes.iter().any(|n| n
+        .message
+        .contains("Undeclared viewing group 26 treated as declared")));
+}
+
+/// Literal S-124 portrayal (default options): the TextPlacement rule's
+/// viewing group 26 is undeclared, so its text instructions are dropped.
+#[test]
+fn s124_text_placement_dropped_by_default() {
+    let fc = feature_catalogue("S-124");
+    let pc = catalogue("S-124");
+    let path = root().join("TestData/UKHO-S100-2026/ExchangeSets/S-124_GB/S100_ROOT/S-124/DATASET_FILES/124GB00S2Y2026N43.GML");
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        "</S124:members>",
+        "<S124:TextPlacement gml:id=\"TP1\"><S124:text>TEST LABEL</S124:text>\
+         <S124:geometry><S100:pointProperty><S100:Point gml:id=\"TPG\"><gml:pos>50.70 -1.10</gml:pos>\
+         </S100:Point></S100:pointProperty></S124:geometry></S124:TextPlacement></S124:members>",
+    );
+    let dataset =
+        ferrite_s100_gml::read_bytes(text.as_bytes(), Some(&fc), Default::default()).unwrap();
+    let input = input_xml(&dataset, Some(&fc), &InputOptions::default());
+    let literal = pc.portray(&input, &[], &ConvertOptions::default()).unwrap();
+    assert!(literal
+        .features
+        .iter()
+        .all(|f| !f.instructions.contains("TEST LABEL")));
+    assert!(literal
+        .notes
+        .iter()
+        .any(|n| n.message.contains("viewing group 26 is not declared")));
+    let options = ConvertOptions {
+        implicit_viewing_groups: ["26", "12210"].into_iter().map(String::from).collect(),
+        ..Default::default()
+    };
+    let corrected = pc.portray(&input, &[], &options).unwrap();
+    assert!(corrected
+        .features
+        .iter()
+        .any(|f| f.instructions.contains("TEST LABEL")));
 }
 
 #[test]

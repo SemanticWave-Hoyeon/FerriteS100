@@ -130,6 +130,9 @@ pub struct State {
     pub show_before_range: bool,
     /// Show messages classified as Information on the chart.
     pub show_information: bool,
+    /// "Correct known PC errata" (shared by the S-124 and S-129 windows);
+    /// off applies the portrayal catalogues literally per S-100 Part 9.
+    pub correct_pc_errata: bool,
     /// The OS user the classifications and indications belong to, and
     /// whether they are saved (11.1.1).
     pub user_status: String,
@@ -221,6 +224,7 @@ fn draw_navwarn(ctx: &egui::Context, state: &mut State) {
                 {
                     state.options_changed = true;
                 }
+                errata_checkbox(ui, state);
             });
             if !state.user_status.is_empty() || !state.lifecycle_time.is_empty() {
                 ui.horizontal_wrapped(|ui| {
@@ -248,6 +252,21 @@ fn draw_navwarn(ctx: &egui::Context, state: &mut State) {
                 });
         });
     state.navwarn_open = open;
+}
+
+/// The shared "Correct known PC errata" option.
+fn errata_checkbox(ui: &mut egui::Ui, state: &mut State) {
+    if ui
+        .checkbox(&mut state.correct_pc_errata, "Correct known PC errata")
+        .on_hover_text(
+            "Off (default): the IHO portrayal catalogues are applied literally (S-100 Part 9).\n\
+             On: S-129 information box text with transparency 1 is drawn opaque, and S-124 \
+             instructions in viewing groups the catalogue does not declare are drawn.",
+        )
+        .changed()
+    {
+        state.options_changed = true;
+    }
 }
 
 fn draw_message(
@@ -368,6 +387,7 @@ fn draw_ukc(ctx: &egui::Context, state: &mut State) {
                 {
                     state.options_changed = true;
                 }
+                errata_checkbox(ui, state);
             });
             ui.separator();
             if state.plans.is_empty() {

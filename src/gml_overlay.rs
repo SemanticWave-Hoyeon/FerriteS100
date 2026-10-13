@@ -289,8 +289,13 @@ pub(crate) struct ProductCatalogues {
     pub fc: Arc<FeatureCatalogue>,
     xslt: XsltPortrayal,
     /// Catalogue used for Part 9a conversion: symbol references namespaced
-    /// with the product prefix, implicit viewing groups declared.
+    /// with the product prefix, implicit viewing groups declared (so the
+    /// errata correction can pass them; literal portrayal never emits them).
     pc: PortrayalCatalogue,
+    /// Viewing groups the rules use but the catalogue does not declare.
+    /// Instructions in them are not drawn unless the user enables
+    /// [`GmlOverlays::correct_pc_errata`].
+    implicit_groups: HashSet<String>,
     pub fc_status: CatalogueStatus,
     pub pc_status: CatalogueStatus,
 }
@@ -321,21 +326,25 @@ impl ProductCatalogues {
         let mut pc = PortrayalCatalogue::load(&pc_dir)
             .with_context(|| format!("{id} portrayal catalogue {}", pc_dir.display()))?;
         pc.namespace_symbol_references(id);
-        let mut xslt = XsltPortrayal::load(&pc_dir)?;
+        let xslt = XsltPortrayal::load(&pc_dir)?;
+        let declared_groups = pc.viewing_groups.groups.len();
+        let mut implicit_groups = HashSet::new();
         if product == Product::S124 {
             for group in S124_IMPLICIT_GROUPS {
-                // The rules emit these groups; dropping them would lose the
-                // TextPlacement text and co-located part counts.
-                if pc
-                    .viewing_groups
-                    .declare_implicit(group, &format!("{id} implicit viewing group {group}"))
-                {
-                    warn!(
-                        "Conformance: {id} {} rules use viewing group {group}, which portrayal_catalogue.xml does not declare; treated as an implicitly declared, always displayed overlay group",
-                        pc.version
-                    );
+                if xslt.info.viewing_groups.contains(&group.to_string()) {
+                    continue;
                 }
-                xslt.info.viewing_groups.insert(group.to_string());
+                // Literal Part 9: the group cannot be enabled, so its
+                // instructions (TextPlacement text, co-located part counts)
+                // are not drawn. The host catalogue declares it anyway so
+                // the errata correction can draw them on request.
+                pc.viewing_groups
+                    .declare_implicit(group, &format!("{id} implicit viewing group {group}"));
+                implicit_groups.insert(group.to_string());
+                warn!(
+                    "Conformance note: {id} {} rules use viewing group {group}, which portrayal_catalogue.xml does not declare; its instructions are not drawn (S-100 Part 9 9-11.2.2). \"Correct known PC errata\" draws them as an implicitly declared overlay group",
+                    pc.version
+                );
             }
         }
         let fc_status = CatalogueStatus {
@@ -353,8 +362,7 @@ impl ProductCatalogues {
             path: pc_dir.display().to_string(),
             item_count: pc.symbols.symbols.len(),
             validation_message: Some(format!(
-                "Installed {id} Portrayal Catalogue (XSLT, {} viewing groups)",
-                pc.viewing_groups.groups.len()
+                "Installed {id} Portrayal Catalogue (XSLT, {declared_groups} viewing groups)"
             )),
         };
         info!(
@@ -367,6 +375,7 @@ impl ProductCatalogues {
             fc: Arc::new(fc),
             xslt,
             pc,
+            implicit_groups,
             fc_status,
             pc_status,
         })
@@ -409,7 +418,7 @@ pub(crate) struct OverlayDataset {
     pub visible: bool,
     input: Option<PortrayalInput>,
     /// XSLT result and the context parameters / options it was made with.
-    portrayal: Option<((bool, bool), portrayal::Portrayal)>,
+    portrayal: Option<((bool, bool, bool), portrayal::Portrayal)>,
 }
 
 impl OverlayDataset {
@@ -462,6 +471,11 @@ pub(crate) struct GmlOverlays {
     pub plain_boundaries: bool,
     /// Apply S-129 feature `scaleMinimum` (S-129 says it controls visibility).
     pub apply_scale_minimum: bool,
+    /// "Correct known PC errata" user option, off by default (catalogues
+    /// applied literally per S-100 Part 9). On: S-129 text with transparency
+    /// 1 is drawn opaque and S-124 instructions in undeclared viewing groups
+    /// are drawn. Persisted with the per-user state.
+    correct_pc_errata: bool,
     /// NavwarnPart chosen from the warning list: portrayed even when filtered,
     /// so it can be interrogated (S-124 11.2).
     pub list_selection: Option<(u32, String)>,
@@ -509,8 +523,11 @@ impl GmlOverlays {
                     .map(|(_, v)| v.eq_ignore_ascii_case("true") || v == "1")
             })
             .unwrap_or(true);
-        if s129.is_some() {
-            warn!("Conformance: S-129 2.0.0 InformationBox rule sets text transparency 1 (fully transparent by S-100 Part 9 9-12.2.2.3); the host renders that text opaque, treating the value as opacity as the catalogue evidently intends");
+        if let Some(c) = &s129 {
+            warn!(
+                "Conformance note: S-129 {} InformationBox rule sets text transparency 1, which is fully transparent by S-100 Part 9 9-12.2.2.3; the text is not visible. \"Correct known PC errata\" draws it opaque",
+                c.pc.version
+            );
         }
         Self {
             s124,
@@ -523,6 +540,7 @@ impl GmlOverlays {
             sort: SortOrder::Received,
             plain_boundaries,
             apply_scale_minimum: true,
+            correct_pc_errata: false,
             list_selection: None,
             registry: None,
             registry_ids: Vec::new(),
@@ -865,7 +883,11 @@ impl GmlOverlays {
     /// application starts with an empty state (never fails).
     pub fn attach_user_store(&mut self, path: PathBuf, user: String) {
         let status = match read_user_state(&path) {
-            Ok(Some((stored, stored_user))) => {
+            Ok(Some(StoredUserState {
+                state: stored,
+                user: stored_user,
+                correct_pc_errata,
+            })) => {
                 if stored_user != user {
                     warn!(
                         "S-124 user state {} was saved by user {stored_user:?}, loaded for {user:?}",
@@ -883,6 +905,10 @@ impl GmlOverlays {
                     *e = (*e).min(t);
                 }
                 self.user = merged;
+                if correct_pc_errata != self.correct_pc_errata {
+                    self.correct_pc_errata = correct_pc_errata;
+                    self.log_errata_mode();
+                }
                 info!(
                     "S-124 user state for {user}: {} classifications, {} displayed, {} receipts ({})",
                     self.user.classification.len(),
@@ -926,12 +952,37 @@ impl GmlOverlays {
             .unwrap_or_else(|| "User state not saved".into())
     }
 
+    /// The "Correct known PC errata" option.
+    pub fn correct_pc_errata(&self) -> bool {
+        self.correct_pc_errata
+    }
+
+    /// Switch the "Correct known PC errata" option; re-portrays and saves it
+    /// with the per-user state.
+    pub fn set_correct_pc_errata(&mut self, on: bool) {
+        if on == self.correct_pc_errata {
+            return;
+        }
+        self.correct_pc_errata = on;
+        self.log_errata_mode();
+        self.invalidate();
+        self.persist_user_state();
+    }
+
+    fn log_errata_mode(&self) {
+        if self.correct_pc_errata {
+            info!("Correct known PC errata: on (S-129 transparency-1 text drawn opaque, S-124 undeclared viewing groups drawn)");
+        } else {
+            info!("Correct known PC errata: off (portrayal catalogues applied literally per S-100 Part 9)");
+        }
+    }
+
     fn persist_user_state(&mut self) {
         let Some(store) = &mut self.user_store else {
             return;
         };
         self.user.prune(Utc::now());
-        match write_user_state(&store.path, &store.user, &self.user) {
+        match write_user_state(&store.path, &store.user, &self.user, self.correct_pc_errata) {
             Ok(()) => store.status = format!("User {} · state saved", store.user),
             Err(error) => {
                 warn!(
@@ -1009,7 +1060,8 @@ impl GmlOverlays {
         let started = std::time::Instant::now();
         self.registry();
         let mut out = Vec::new();
-        let options_key = (self.plain_boundaries, self.apply_scale_minimum);
+        let errata = self.correct_pc_errata;
+        let options_key = (self.plain_boundaries, self.apply_scale_minimum, errata);
         let plain = if self.plain_boundaries {
             "true"
         } else {
@@ -1036,17 +1088,28 @@ impl GmlOverlays {
                 ));
             }
             let key = match product {
-                Product::S124 => (true, true),
+                Product::S124 => (true, true, errata),
                 Product::S129 => options_key,
             };
             if entry.portrayal.as_ref().is_none_or(|(k, _)| *k != key) {
                 let (overrides, options) = match product {
-                    Product::S124 => (Vec::new(), ConvertOptions::default()),
+                    Product::S124 => (
+                        Vec::new(),
+                        ConvertOptions {
+                            implicit_viewing_groups: if errata {
+                                catalogues.implicit_groups.clone()
+                            } else {
+                                HashSet::new()
+                            },
+                            ..ConvertOptions::default()
+                        },
+                    ),
                     Product::S129 => (
                         vec![("PlainBoundaries", plain)],
                         ConvertOptions {
                             apply_feature_scale_minimum: self.apply_scale_minimum,
-                            opaque_invisible_text: true,
+                            opaque_invisible_text: errata,
+                            ..ConvertOptions::default()
                         },
                     ),
                 };
@@ -1508,6 +1571,17 @@ struct UserStateDocument {
     classification: BTreeMap<String, StoredClassification>,
     displayed: BTreeSet<String>,
     received: BTreeMap<String, DateTime<Utc>>,
+    /// "Correct known PC errata" option (absent in older files: off).
+    #[serde(default)]
+    correct_pc_errata: bool,
+}
+
+/// A user state file read back.
+struct StoredUserState {
+    state: NavwarnUserState,
+    /// OS user the state was saved for.
+    user: String,
+    correct_pc_errata: bool,
 }
 
 /// Name of the OS user running the application.
@@ -1563,7 +1637,7 @@ pub(crate) fn default_user_state_path(user: &str) -> Option<PathBuf> {
 }
 
 /// The stored state and the user it was saved for; None when there is no file.
-fn read_user_state(path: &Path) -> Result<Option<(NavwarnUserState, String)>> {
+fn read_user_state(path: &Path) -> Result<Option<StoredUserState>> {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -1612,11 +1686,20 @@ fn read_user_state(path: &Path) -> Result<Option<(NavwarnUserState, String)>> {
         displayed: doc.displayed.into_iter().collect(),
         received: doc.received.into_iter().collect(),
     };
-    Ok(Some((state, doc.user)))
+    Ok(Some(StoredUserState {
+        state,
+        user: doc.user,
+        correct_pc_errata: doc.correct_pc_errata,
+    }))
 }
 
 /// Replace the stored state atomically (temporary file, then rename).
-fn write_user_state(path: &Path, user: &str, state: &NavwarnUserState) -> Result<()> {
+fn write_user_state(
+    path: &Path,
+    user: &str,
+    state: &NavwarnUserState,
+    correct_pc_errata: bool,
+) -> Result<()> {
     use std::io::Write;
     let mut classification: Vec<_> = state.classification.iter().collect();
     classification.sort();
@@ -1653,6 +1736,7 @@ fn write_user_state(path: &Path, user: &str, state: &NavwarnUserState) -> Result
             .take(MAX_USER_STATE_ENTRIES)
             .map(|(k, t)| (k.clone(), *t))
             .collect(),
+        correct_pc_errata,
     };
     let bytes = serde_json::to_vec_pretty(&doc)?;
     let parent = path
@@ -2140,6 +2224,7 @@ impl ChartApp {
             ui.apply_scale_minimum,
             ui.show_before_range,
             ui.show_information,
+            ui.correct_pc_errata,
         );
         let sort = sort_order(ui.sort);
         let mut changed = false;
@@ -2149,6 +2234,7 @@ impl ChartApp {
             g.apply_scale_minimum = options.1;
             g.policy.show_before_fixed_date_range = options.2;
             g.policy.show_information = options.3;
+            g.set_correct_pc_errata(options.4);
             g.invalidate();
             changed = true;
         }
@@ -2239,6 +2325,7 @@ impl ChartApp {
             ui.plans = plans;
             ui.plain_boundaries = g.plain_boundaries;
             ui.apply_scale_minimum = g.apply_scale_minimum;
+            ui.correct_pc_errata = g.correct_pc_errata();
             ui.show_before_range = g.policy.show_before_fixed_date_range;
             ui.show_information = g.policy.show_information;
             ui.user_status = g.user_status();
@@ -2450,14 +2537,15 @@ mod tests {
         for d in g.datasets.iter().filter(|d| d.dataset.imported) {
             assert!(per_dataset(d.id) > 0, "{} not portrayed", d.name());
         }
-        // Every S-129 dataset is portrayed; text uses the opaque decision.
+        // Every S-129 dataset is portrayed (information box text literal:
+        // transparency 1).
         for d in g.datasets.iter().filter(|d| d.product() == Product::S129) {
             assert!(per_dataset(d.id) > 0);
         }
         assert!(list
             .iter()
             .any(|i| matches!(i, DrawingInstruction::Text(_))));
-        // The S-124 implicit groups keep TextPlacement text.
+        // S-124 text in undeclared viewing groups is not drawn by default.
         let s124_text = list.iter().any(|i| {
             matches!(i, DrawingInstruction::Text(_))
                 && g.dataset(decode_key(i.feature_id().unwrap()).unwrap().0)
@@ -2508,9 +2596,10 @@ mod tests {
             .all(|i| decode_key(i.feature_id().unwrap()).unwrap().0 != first));
     }
     /// TextPlacement uses viewing group 26, which the S-124 2.0.0 catalogue
-    /// does not declare: the text must still be portrayed.
+    /// does not declare: literally (Part 9 9-11.2.2) it is never drawn; the
+    /// "Correct known PC errata" option draws it.
     #[test]
-    fn s124_text_placement_uses_implicit_viewing_group() {
+    fn s124_text_placement_needs_errata_option() {
         let base = root();
         let path = base.join(
             "TestData/UKHO-S100-2026/ExchangeSets/S-124_GB/S100_ROOT/S-124/DATASET_FILES/124GB00S2Y2026N43.GML",
@@ -2533,12 +2622,53 @@ mod tests {
             g.add(dataset, Provenance::Unverified).unwrap(),
             Added::New
         ));
-        let (_, list) = g.instructions("Day").unwrap();
-        assert!(
+        let has_label = |list: &[DrawingInstruction]| {
             list.iter()
-                .any(|i| matches!(i, DrawingInstruction::Text(t) if t.text.contains("TEST LABEL"))),
-            "{list:#?}"
-        );
+                .any(|i| matches!(i, DrawingInstruction::Text(t) if t.text.contains("TEST LABEL")))
+        };
+        let (_, list) = g.instructions("Day").unwrap();
+        assert!(!list.is_empty());
+        assert!(!has_label(&list), "{list:#?}");
+        g.set_correct_pc_errata(true);
+        let (_, list) = g.instructions("Day").unwrap();
+        assert!(has_label(&list), "{list:#?}");
+        g.set_correct_pc_errata(false);
+        let (_, list) = g.instructions("Day").unwrap();
+        assert!(!has_label(&list));
+    }
+
+    /// The S-129 information box text has transparency 1: kept literally by
+    /// default, drawn opaque with the errata option.
+    #[test]
+    fn s129_information_box_text_transparency() {
+        let base = root();
+        let path = base.join("TestData/IHO-S129-Test-Datasets/12900MCTDS130TS.gml");
+        if !path.exists() {
+            eprintln!("skipping: TestData not present");
+            return;
+        }
+        let mut g = GmlOverlays::load(&base);
+        let (dataset, _) = g.read(&path, &path).unwrap();
+        assert!(matches!(
+            g.add(dataset, Provenance::Unverified).unwrap(),
+            Added::New
+        ));
+        let texts = |g: &mut GmlOverlays| -> Vec<f32> {
+            let (_, list) = g.instructions("Day").unwrap();
+            list.iter()
+                .filter_map(|i| match i {
+                    DrawingInstruction::Text(t) => Some(t.color_opacity),
+                    _ => None,
+                })
+                .collect()
+        };
+        let literal = texts(&mut g);
+        assert!(!literal.is_empty());
+        assert!(literal.iter().all(|a| *a == 0.0), "{literal:?}");
+        g.set_correct_pc_errata(true);
+        let corrected = texts(&mut g);
+        assert_eq!(corrected.len(), literal.len());
+        assert!(corrected.iter().all(|a| *a > 0.0), "{corrected:?}");
     }
     /// The exchange-set signature path the app uses for S-101 is generic:
     /// S-124 datasets listed in a signed CATALOG.XML go through it unchanged.
@@ -2667,9 +2797,19 @@ mod tests {
         // Reclassifying on chart removes the entry from the file.
         g.classify(id, UserClassification::OnChart);
         drop(g);
-        let g = start(&path);
+        let mut g = start(&path);
         assert!(!g.user.classification.contains_key(&message_key));
         assert_eq!(g.user.classification.len(), 1); // b stays Information
+                                                    // The "Correct known PC errata" option is off by default and saved.
+        assert!(!g.correct_pc_errata());
+        g.set_correct_pc_errata(true);
+        drop(g);
+        let mut g = start(&path);
+        assert!(g.correct_pc_errata());
+        assert_eq!(g.user.classification.len(), 1);
+        g.set_correct_pc_errata(false);
+        drop(g);
+        assert!(!start(&path).correct_pc_errata());
 
         // Another OS user has a separate file.
         let bob = dir.path().join("navwarn").join("bob.json");
@@ -2703,6 +2843,13 @@ mod tests {
         )
         .unwrap();
         assert!(read_user_state(&path).is_err());
+        // Files written before the errata option read it as off.
+        std::fs::write(
+            &path,
+            br#"{"version":1,"user":"alice","saved":"2026-01-01T00:00:00Z","classification":{},"displayed":[],"received":{}}"#,
+        )
+        .unwrap();
+        assert!(!read_user_state(&path).unwrap().unwrap().correct_pc_errata);
         // No store: nothing written, startup unaffected.
         let mut g = GmlOverlays::load(&root());
         assert_eq!(g.user_status(), "User state not saved");

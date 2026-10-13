@@ -30,6 +30,8 @@
 //!   declare can never be enabled by the user, so by Part 9 clause 9-11.2.2
 //!   ("Instruction is disabled if any Viewing Group is disabled") it is never
 //!   shown; it is dropped with a note (the host rejects undeclared groups).
+//!   [`ConvertOptions::implicit_viewing_groups`] treats listed groups as
+//!   declared (an explicit errata correction, off by default).
 //! * Symbol references (PointInstruction, SymbolFill, LineSymbol) are
 //!   written as `"<product>/<id>"` ([`namespaced_symbol`]) because the host
 //!   namespaces overlay symbols; line style and area fill catalogue ids stay
@@ -813,12 +815,18 @@ pub struct ConvertOptions {
     /// opaque, treating the value as opacity. Off by default: Part 9 defines
     /// 1 as fully transparent.
     pub opaque_invisible_text: bool,
+    /// Viewing groups the catalogue's rules use but do not declare, treated
+    /// as declared (host errata correction). Empty by default: an instruction
+    /// in an undeclared group can never be enabled, so by Part 9 clause
+    /// 9-11.2.2 it is not drawn.
+    pub implicit_viewing_groups: HashSet<String>,
 }
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
             apply_feature_scale_minimum: true,
             opaque_invisible_text: false,
+            implicit_viewing_groups: HashSet::new(),
         }
     }
 }
@@ -1256,13 +1264,22 @@ impl Converter<'_> {
             );
         }
         if let Some(catalogue) = self.catalogue {
+            if let Some(g) = groups.iter().find(|g| {
+                !catalogue.viewing_groups.contains(*g)
+                    && !self.options.implicit_viewing_groups.contains(*g)
+            }) {
+                return Err(format!(
+                    "viewing group {g} is not declared by the catalogue"
+                ));
+            }
             if let Some(g) = groups
                 .iter()
                 .find(|g| !catalogue.viewing_groups.contains(*g))
             {
-                return Err(format!(
-                    "viewing group {g} is not declared by the catalogue"
-                ));
+                self.note(
+                    feature,
+                    format!("Undeclared viewing group {g} treated as declared (ConvertOptions::implicit_viewing_groups)"),
+                );
             }
         }
         if groups.iter().any(|g| g.contains([';', ':', ','])) {
