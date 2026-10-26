@@ -155,7 +155,7 @@ impl Batch {
             let _ = tx.send(result);
         });
         // Audit-only bounded host loop. No wait or poll in measured display frames.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = ferrite_kernel::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let _ = device.poll(wgpu::Maintain::Poll);
             match rx.recv_timeout(std::time::Duration::from_millis(2)) {
@@ -164,7 +164,7 @@ impl Batch {
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    if std::time::Instant::now() < deadline => {}
+                    if ferrite_kernel::time::Instant::now() < deadline => {}
                 Err(error) => {
                     self.readback.unmap();
                     return Err(format!("timestamp_readback_timeout_or_disconnect:{error}"));

@@ -44,3 +44,8 @@ serde.workspace = true
 
 # Typed S102 material owner; preserve workspace-selected Lua backend.
 ferrite-s102 = { path = "../ferrite-s102", default-features = false, optional = true }
+
+# Web: WebGPU (wgpu default) plus the WebGL2 fallback. Single-threaded wasm
+# (no atomics) needs wgpu's Send/Sync opt-in for the renderer's shared state.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wgpu = { workspace = true, features = ["webgl", "fragile-send-sync-non-atomic-wasm"] }

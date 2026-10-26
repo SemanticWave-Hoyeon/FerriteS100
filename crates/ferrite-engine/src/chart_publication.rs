@@ -251,6 +251,8 @@ fn replace_history_file(
     let result = (|| -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
+        // wasm32: the std::fs stub File has no Drop (native-only path).
+        #[allow(clippy::drop_non_drop)]
         drop(file);
         std::fs::rename(temporary, path)?;
         Ok(())

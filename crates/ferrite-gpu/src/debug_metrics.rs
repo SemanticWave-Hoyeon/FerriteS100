@@ -1,5 +1,6 @@
 //! Bounded diagnostics, never portrayal authority or physical presentation FPS.
-use std::time::{Duration, Instant};
+use ferrite_kernel::time::Instant;
+use std::time::Duration;
 pub const PERIOD: Duration = Duration::from_millis(500);
 pub const REASONS: [&str; 10] = [
     "mode",

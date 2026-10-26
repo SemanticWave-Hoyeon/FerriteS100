@@ -25,6 +25,7 @@ members = [
     "crates/ferrite-engine",
     "crates/ferrite-cli",
     "crates/ferrite-capi",
+    "crates/ferrite-wasm",
 ]
 exclude = [
     "plugins/route-plugin",

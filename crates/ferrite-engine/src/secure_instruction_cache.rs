@@ -207,6 +207,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         owns_temporary = true;
         file.write_all(bytes)?;
         file.sync_all()?;
+        // wasm32: the std::fs stub File has no Drop (native-only path).
+        #[allow(clippy::drop_non_drop)]
         drop(file);
         replace(&temporary, path)?;
         #[cfg(unix)]

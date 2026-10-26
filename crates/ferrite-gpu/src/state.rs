@@ -56,10 +56,7 @@ impl GpuState {
         let size = window.inner_size();
 
         // Create instance
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        let instance = Self::instance().await;
 
         // Create surface
         let surface = instance
@@ -142,6 +139,34 @@ impl GpuState {
         })
     }
 
+    /// A wgpu instance on every backend. On the web WebGPU is used when the
+    /// browser offers it, otherwise WebGL2.
+    async fn instance() -> wgpu::Instance {
+        let descriptor = wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        };
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            wgpu::util::new_instance_with_webgpu_detection(&descriptor).await
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            wgpu::Instance::new(&descriptor)
+        }
+    }
+
+    /// Device limits: the wgpu defaults; WebGL2 (web fallback) offers only
+    /// its downlevel limits at the adapter's resolution.
+    fn required_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if adapter.get_info().backend == wgpu::Backend::Gl {
+            return wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+        }
+        let _ = adapter;
+        wgpu::Limits::default()
+    }
+
     /// The renderer's device on `adapter`, with the timestamp queries the
     /// adapter supports; also returns the adapter's features.
     async fn request_device(
@@ -169,7 +194,7 @@ impl GpuState {
                 &wgpu::DeviceDescriptor {
                     label: Some("ferrite-device"),
                     required_features: requested_features,
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: Self::required_limits(adapter),
                     memory_hints: Default::default(),
                 },
                 None,
@@ -183,10 +208,7 @@ impl GpuState {
     /// density of the offscreen target.
     pub async fn new_headless(window: Arc<dyn SurfaceHost>) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        let instance = Self::instance().await;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
@@ -320,7 +342,7 @@ impl GpuState {
             capture.borrow_mut().arm(frame, source, view);
         }
     }
-    pub(crate) fn surface_pacing_clock(&self) -> Option<std::time::Instant> {
+    pub(crate) fn surface_pacing_clock(&self) -> Option<ferrite_kernel::time::Instant> {
         self.surface_pacing
             .as_ref()
             .and_then(|capture| capture.borrow().clock())
@@ -328,7 +350,7 @@ impl GpuState {
     pub(crate) fn surface_pacing_record(
         &self,
         stage: crate::surface_pacing::Stage,
-        timer: Option<std::time::Instant>,
+        timer: Option<ferrite_kernel::time::Instant>,
     ) {
         if let (Some(capture), Some(timer)) = (&self.surface_pacing, timer) {
             let elapsed = timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;

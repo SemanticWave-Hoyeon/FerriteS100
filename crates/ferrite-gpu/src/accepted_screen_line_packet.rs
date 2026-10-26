@@ -1,6 +1,7 @@
 //! Diagnostic-only one-emitter capture. Never used to authorize or replace drawing.
+use ferrite_kernel::time::Instant;
 use serde::Serialize;
-use std::{cell::Cell, ffi::OsStr, io, sync::Arc, time::Instant};
+use std::{cell::Cell, ffi::OsStr, io, sync::Arc};
 const CAP: usize = 32 * 1024 * 1024 - 64 * 1024;
 pub(crate) const REPLAY_POSE: usize = 199;
 const CONTROL: usize = 4096;

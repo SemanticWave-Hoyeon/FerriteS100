@@ -12,7 +12,7 @@ use ferrite_engine::pick::FeatureReport;
 use ferrite_engine::platform::Platform;
 use ferrite_engine::scene::PreparedScene;
 use ferrite_gpu::headless::{HeadlessSurface, HeadlessUi};
-use ferrite_gpu::{PhysicalSize, SurfaceHost, SymbolCache, WgpuRenderer};
+use ferrite_gpu::{PhysicalSize, SurfaceHost, SymbolCache, UiLayer, WgpuRenderer};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -136,74 +136,36 @@ pub fn palettes(engine: &ChartEngine) -> Vec<String> {
     names
 }
 
-/// Renders prepared [`ChartEngine`] scenes into RGBA images with
-/// ferrite-gpu on an offscreen target (no window, no GUI toolkit): the same
-/// emission the viewer performs for a frame (palette, display settings,
-/// viewing groups, per-catalogue cell resources, chart text), drawn as its
-/// chart image export draws.
-pub struct OffscreenChartRenderer {
-    renderer: WgpuRenderer<HeadlessUi>,
-    surface: Arc<HeadlessSurface>,
+/// Emits prepared [`ChartEngine`] scenes into a ferrite-gpu renderer: the
+/// same emission the viewer performs for a frame (palette, display settings,
+/// viewing groups, per-catalogue cell resources, chart text). The renderer
+/// then draws offscreen ([`OffscreenChartRenderer`]) or presents to a
+/// surface (the web canvas of `ferrite-wasm`).
+#[derive(Default)]
+pub struct SceneEmitter {
     /// Symbols of one catalogue and palette (rasterized per palette).
     symbols: Option<(([u8; 32], String), SymbolCache)>,
 }
 
-impl OffscreenChartRenderer {
-    /// A renderer for `width` x `height` physical pixels at `scale_factor`
-    /// physical pixels per logical pixel.
-    pub fn new(width: u32, height: u32, scale_factor: f64) -> Result<Self> {
-        ensure!(width > 0 && height > 0, "Empty render size");
-        ensure!(
-            scale_factor.is_finite() && scale_factor > 0.,
-            "Invalid scale factor"
-        );
-        let (renderer, surface) = pollster::block_on(WgpuRenderer::new_headless_with(
-            PhysicalSize::new(width, height),
-            scale_factor,
-        ))
-        .context("No GPU adapter for offscreen rendering")?;
-        Ok(Self {
-            renderer,
-            surface,
-            symbols: None,
-        })
+impl SceneEmitter {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn size(&self) -> (u32, u32) {
-        let size = self.surface.inner_size();
-        (size.width, size.height)
-    }
-
-    /// Physical pixels per logical pixel.
-    pub fn scale_factor(&self) -> f64 {
-        self.surface.scale_factor()
-    }
-
-    pub fn resize(&mut self, width: u32, height: u32) {
-        let size = PhysicalSize::new(width.max(1), height.max(1));
-        self.surface.set_size(size);
-        self.renderer.resize(size);
-    }
-
-    /// GPU adapter name.
-    pub fn adapter(&self) -> &str {
-        &self.renderer.state.gpu_name
-    }
-
-    /// Draw `scene` (prepared by `engine` for a view of this renderer's
-    /// size) at camera zoom `zoom` (1: all data; the viewer's zoom level,
-    /// used for symbol decluttering) and read the image back.
-    pub fn render(
+    /// Emit `scene` (prepared by `engine` for a view of the renderer's size)
+    /// at camera zoom `zoom` (1: all data; the viewer's zoom level, used for
+    /// symbol decluttering) into `renderer`'s next frame.
+    pub fn emit<U: UiLayer>(
         &mut self,
+        renderer: &mut WgpuRenderer<U>,
         engine: &ChartEngine,
         scene: &mut PreparedScene,
         zoom: f64,
-    ) -> Result<RgbaImage> {
+    ) -> Result<()> {
         let state = engine.state();
         let display = engine.display();
         let profile = display.profile.as_str();
         let pc = &state.pc;
-        let renderer = &mut self.renderer;
         renderer.set_settings(display.settings.clone());
         renderer.set_color_profile(profile);
         renderer.background_color = ferrite_s101::lookup_pc_color(pc, "DEPDW", profile);
@@ -285,7 +247,73 @@ impl OffscreenChartRenderer {
                 Some(&visible),
             )?;
         }
-        Ok(renderer.render_offscreen()?)
+        Ok(())
+    }
+}
+
+/// Renders prepared [`ChartEngine`] scenes into RGBA images with
+/// ferrite-gpu on an offscreen target (no window, no GUI toolkit): the same
+/// emission the viewer performs for a frame ([`SceneEmitter`]), drawn as its
+/// chart image export draws.
+pub struct OffscreenChartRenderer {
+    renderer: WgpuRenderer<HeadlessUi>,
+    surface: Arc<HeadlessSurface>,
+    emitter: SceneEmitter,
+}
+
+impl OffscreenChartRenderer {
+    /// A renderer for `width` x `height` physical pixels at `scale_factor`
+    /// physical pixels per logical pixel.
+    pub fn new(width: u32, height: u32, scale_factor: f64) -> Result<Self> {
+        ensure!(width > 0 && height > 0, "Empty render size");
+        ensure!(
+            scale_factor.is_finite() && scale_factor > 0.,
+            "Invalid scale factor"
+        );
+        let (renderer, surface) = pollster::block_on(WgpuRenderer::new_headless_with(
+            PhysicalSize::new(width, height),
+            scale_factor,
+        ))
+        .context("No GPU adapter for offscreen rendering")?;
+        Ok(Self {
+            renderer,
+            surface,
+            emitter: SceneEmitter::new(),
+        })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        let size = self.surface.inner_size();
+        (size.width, size.height)
+    }
+
+    /// Physical pixels per logical pixel.
+    pub fn scale_factor(&self) -> f64 {
+        self.surface.scale_factor()
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        let size = PhysicalSize::new(width.max(1), height.max(1));
+        self.surface.set_size(size);
+        self.renderer.resize(size);
+    }
+
+    /// GPU adapter name.
+    pub fn adapter(&self) -> &str {
+        &self.renderer.state.gpu_name
+    }
+
+    /// Draw `scene` (prepared by `engine` for a view of this renderer's
+    /// size) at camera zoom `zoom` (1: all data; the viewer's zoom level,
+    /// used for symbol decluttering) and read the image back.
+    pub fn render(
+        &mut self,
+        engine: &ChartEngine,
+        scene: &mut PreparedScene,
+        zoom: f64,
+    ) -> Result<RgbaImage> {
+        self.emitter.emit(&mut self.renderer, engine, scene, zoom)?;
+        Ok(self.renderer.render_offscreen()?)
     }
 }
 

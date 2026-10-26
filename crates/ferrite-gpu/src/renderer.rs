@@ -13,7 +13,7 @@ type FlatDiagnosticCell =
 struct FlatDiagnosticSpan {
     cell: FlatDiagnosticCell,
     stage: ferrite_render::flat_reuse_diagnostics::FlatFrameStage,
-    start: std::time::Instant,
+    start: ferrite_kernel::time::Instant,
 }
 impl Drop for FlatDiagnosticSpan {
     fn drop(&mut self) {
@@ -7984,7 +7984,7 @@ impl VectorEmissionOwned {
             .map(|cell| FlatDiagnosticSpan {
                 cell: cell.clone(),
                 stage,
-                start: std::time::Instant::now(),
+                start: ferrite_kernel::time::Instant::now(),
             })
     }
     fn record_flat_stage(
@@ -8367,7 +8367,7 @@ impl VectorEmissionOwned {
                 self.vector_frame.frame_cpu.line_geometry.index_len(),
             ],
         );
-        let cpu_temporal_start = profiling.then(std::time::Instant::now);
+        let cpu_temporal_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_visibility_span = self.flat_span(
             services,
             ferrite_render::flat_reuse_diagnostics::FlatFrameStage::Visibility,
@@ -8399,7 +8399,7 @@ impl VectorEmissionOwned {
             );
         }
         self.vector_frame.temporal_visibility_counts = (hidden, diagnostics);
-        let cpu_classification_start = profiling.then(std::time::Instant::now);
+        let cpu_classification_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_classification_span = self.flat_span(
             services,
             ferrite_render::flat_reuse_diagnostics::FlatFrameStage::SourceClassification,
@@ -8421,11 +8421,11 @@ impl VectorEmissionOwned {
         if let Some(start) = cpu_classification_start {
             services.record("emit_classification", start.elapsed());
         }
-        let cpu_coverage_start = profiling.then(std::time::Instant::now);
+        let cpu_coverage_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_gpu_coverage_start = self
             .flat_diagnostic
             .as_ref()
-            .map(|_| std::time::Instant::now());
+            .map(|_| ferrite_kernel::time::Instant::now());
         self.vector_frame.prepared_coverage = match context.prepared_coverage_binding() {
             Ok(binding) => binding,
             Err(error) => {
@@ -8557,7 +8557,7 @@ impl VectorEmissionOwned {
         }
         let instructions = context.raw_instructions();
         // One owned arena view per emitter call; every authority/view gate still runs.
-        let cpu_projection_start = profiling.then(std::time::Instant::now);
+        let cpu_projection_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_projection_span = self.flat_span(
             services,
             ferrite_render::flat_reuse_diagnostics::FlatFrameStage::SourceProjectionPreparation,
@@ -8573,7 +8573,7 @@ impl VectorEmissionOwned {
         if let Some(start) = cpu_projection_start {
             services.record("emit_projection", start.elapsed());
         }
-        let cpu_execution_visibility_start = profiling.then(std::time::Instant::now);
+        let cpu_execution_visibility_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_execution_visibility_span = self.flat_span(
             services,
             ferrite_render::flat_reuse_diagnostics::FlatFrameStage::ExecutionVisibility,
@@ -8591,7 +8591,7 @@ impl VectorEmissionOwned {
             services.record("emit_execution_visibility", start.elapsed());
         }
         let viewing_scale = self.viewing_scale(services);
-        let cpu_compact_start = profiling.then(std::time::Instant::now);
+        let cpu_compact_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_compact_span = self.flat_span(
             services,
             ferrite_render::flat_reuse_diagnostics::FlatFrameStage::CompactAdmission,
@@ -8629,7 +8629,7 @@ impl VectorEmissionOwned {
         if let Some(start) = cpu_compact_start {
             services.record("emit_compact", start.elapsed());
         }
-        let cpu_owner_start = profiling.then(std::time::Instant::now);
+        let cpu_owner_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_owner_span = self.flat_span(
             services,
             ferrite_render::flat_reuse_diagnostics::FlatFrameStage::OwnerAdmission,
@@ -8639,10 +8639,10 @@ impl VectorEmissionOwned {
         } else if let Some(resources) = resource_owners.as_deref() {
             let owner_start = self
                 .owner_group_plan_diagnostics
-                .then(std::time::Instant::now);
+                .then(ferrite_kernel::time::Instant::now);
             let compile_start = self
                 .owner_group_plan_diagnostics
-                .then(std::time::Instant::now);
+                .then(ferrite_kernel::time::Instant::now);
             let (group_plan, hit) = if self.owner_group_plan_enabled {
                 resources.prepare_owner_group_plan(context)
             } else {
@@ -8780,7 +8780,7 @@ impl VectorEmissionOwned {
             visible_viewing_groups
         };
 
-        let cpu_view_deps_start = profiling.then(std::time::Instant::now);
+        let cpu_view_deps_start = profiling.then(ferrite_kernel::time::Instant::now);
         let flat_view_deps_span = self.flat_span(
             services,
             ferrite_render::flat_reuse_diagnostics::FlatFrameStage::ViewDependencyClassification,
@@ -8842,7 +8842,7 @@ impl VectorEmissionOwned {
         let tail_start = self
             .suppression_tail
             .as_ref()
-            .map(|_| std::time::Instant::now());
+            .map(|_| ferrite_kernel::time::Instant::now());
         let suppressed_lines = self
             .line_suppression
             .plan_context_projected_with_visibility(
@@ -8989,7 +8989,7 @@ impl VectorEmissionOwned {
         if let Some(wave) = &mut emitter_wave {
             wave.begin_dispatch();
         }
-        let cpu_dispatch_start = profiling.then(std::time::Instant::now);
+        let cpu_dispatch_start = profiling.then(ferrite_kernel::time::Instant::now);
         // Visit only cells whose source bounds meet the view (same 50% margin
         // and longitude copies as the per-instruction culling below); their
         // ordinals are merged in ascending order, so drawing order is kept.
@@ -9197,7 +9197,7 @@ impl VectorEmissionOwned {
 
             drop(line_owner);
             let inst_start = if profiling {
-                Some(std::time::Instant::now())
+                Some(ferrite_kernel::time::Instant::now())
             } else {
                 None
             };
@@ -12209,7 +12209,7 @@ impl SceneBuildJob {
     /// Run on any thread. Mirrors the UI-thread rebuild order: reset, world
     /// map, then the shared cell emitter.
     pub fn run(mut self) -> BuiltScene {
-        let start = std::time::Instant::now();
+        let start = ferrite_kernel::time::Instant::now();
         self.emission.begin_frame(self.exact_line_quad);
         let result = {
             let mut services = EmissionServices {

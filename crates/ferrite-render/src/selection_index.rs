@@ -97,7 +97,7 @@ impl SelectionIndex {
         spans: impl Fn(usize) -> Option<&'a [LineSpan]>,
         resolve: impl Fn(usize) -> Option<crate::ResolvedLinePaths<'b>>,
     ) {
-        let started = std::time::Instant::now();
+        let started = ferrite_kernel::time::Instant::now();
         self.clear();
         self.instructions.extend_from_slice(displayed);
         let mut entries = Vec::with_capacity(displayed.len());

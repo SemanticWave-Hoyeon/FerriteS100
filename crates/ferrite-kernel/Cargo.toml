@@ -28,3 +28,8 @@ num-integer = "=0.1.47"
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# wasm32-unknown-unknown has no std monotonic clock (`std::time::Instant::now`
+# panics there); `time::Instant` uses performance.now() through web-time.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "=1.1.0"

@@ -1617,6 +1617,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "web-time",
 ]
 
 [[package]]
@@ -1696,6 +1697,7 @@ name = "ferrite-portrayal-catalog"
 version = "2.0.0"
 dependencies = [
  "ferrite-kernel",
+ "getrandom 0.3.4",
  "quick-xml 0.37.5",
  "regexml",
  "roxmltree",
@@ -1925,6 +1927,22 @@ dependencies = [
  "tracing",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "ferrite-wasm"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cli",
+ "ferrite-engine",
+ "ferrite-gpu",
+ "js-sys",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
 ]
 
 [[package]]
@@ -2226,9 +2244,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]

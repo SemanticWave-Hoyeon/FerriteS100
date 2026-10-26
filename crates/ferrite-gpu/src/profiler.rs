@@ -3,9 +3,10 @@
 //! Tracks hot-path timings and periodically logs a summary.
 //! Also wraps wgpu-profiler for GPU-side timestamp queries.
 
+use ferrite_kernel::time::Instant;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Global flag to enable/disable profiling at runtime
 static PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);

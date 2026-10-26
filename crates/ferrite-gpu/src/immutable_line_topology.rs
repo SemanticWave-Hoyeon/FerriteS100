@@ -53,7 +53,7 @@ impl Cache {
         if !cache.enabled {
             return cache;
         }
-        let started = std::time::Instant::now();
+        let started = ferrite_kernel::time::Instant::now();
         let cap =
             CAP_BYTES.min(usize::try_from(state.device.limits().max_buffer_size).unwrap_or(0));
         if let Some(indices) = build(cap) {

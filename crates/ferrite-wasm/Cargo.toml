@@ -1,0 +1,23 @@
+[package]
+name = "ferrite-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web (wasm32-unknown-unknown) bindings of the S-100 ChartEngine: in-memory platform, sequential execution, precomputed S-101 portrayal and ferrite-gpu rendering into a canvas (WebGPU, WebGL2 fallback)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+ferrite-cli = { path = "../ferrite-cli", default-features = false, features = ["crypto-rust"] }
+ferrite-engine = { workspace = true, features = ["crypto-rust"] }
+ferrite-gpu.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "=0.2.108"
+wasm-bindgen-futures = "=0.4.58"
+js-sys = "=0.3.85"
+web-sys = { version = "=0.3.85", features = ["Document", "Element", "HtmlCanvasElement", "Window", "console"] }
+wgpu.workspace = true

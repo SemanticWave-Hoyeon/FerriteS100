@@ -558,7 +558,7 @@ impl LineSuppressionCache {
         visibility: Option<&[bool]>,
     ) -> Vec<bool> {
         let diagnostics = self.eligibility_diagnostics_policy == Some(true);
-        let started = diagnostics.then(std::time::Instant::now);
+        let started = diagnostics.then(ferrite_kernel::time::Instant::now);
         // Explicit group policy ALWAYS executes the complete original predicate.
         let attempt = self.eligibility_policy == Some(true) && groups.is_none();
         let (cached, summary) = if attempt {
@@ -833,7 +833,7 @@ impl LineSuppressionCache {
                 let projection_start = self
                     .growth_child_work
                     .as_ref()
-                    .map(|_| std::time::Instant::now());
+                    .map(|_| ferrite_kernel::time::Instant::now());
                 use ferrite_kernel::par::prelude::*;
                 let transformed: Vec<_> = instructions
                     .par_iter()
@@ -2144,7 +2144,7 @@ impl PreparedLineSuppression {
             w.all_segments = w.all_segments.saturating_add(segment_count as u64);
             w.new_segments = w.new_segments.saturating_add(new_segment_count as u64);
         }
-        let group_start = work.as_ref().map(|_| std::time::Instant::now());
+        let group_start = work.as_ref().map(|_| ferrite_kernel::time::Instant::now());
         type CoincidentSourceGroups<'a> = HashMap<Curve<'a>, Vec<(usize, (i32, i32))>>;
         let mut groups: CoincidentSourceGroups<'_> = HashMap::new();
         let mut segments = Vec::with_capacity(segment_count);
@@ -2171,7 +2171,7 @@ impl PreparedLineSuppression {
                 .group_and_segment_build_ns
                 .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
-        let index_start = work.as_ref().map(|_| std::time::Instant::now());
+        let index_start = work.as_ref().map(|_| ferrite_kernel::time::Instant::now());
         let tree = rstar::RTree::bulk_load(segments);
         let new_tree = rstar::RTree::bulk_load(new_segments);
         if let (Some(w), Some(start)) = (work.as_mut(), index_start) {
@@ -2179,7 +2179,7 @@ impl PreparedLineSuppression {
                 .two_index_build_ns
                 .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
-        let target_start = work.as_ref().map(|_| std::time::Instant::now());
+        let target_start = work.as_ref().map(|_| ferrite_kernel::time::Instant::now());
         let mut previous_target_cursor = 0usize;
         let mut targets = Vec::new();
         let mut bytes = std::mem::size_of::<Self>();
@@ -2491,7 +2491,7 @@ impl PreparedLineSuppression {
             w.all_segments = w.all_segments.saturating_add(segment_count as u64);
             w.new_segments = w.new_segments.saturating_add(new_segment_count as u64);
         }
-        let group_start = work.as_ref().map(|_| std::time::Instant::now());
+        let group_start = work.as_ref().map(|_| ferrite_kernel::time::Instant::now());
         type CoincidentSourceGroups<'a> = HashMap<Curve<'a>, Vec<(usize, (i32, i32))>>;
         let mut groups: CoincidentSourceGroups<'_> = HashMap::new();
 
@@ -2505,7 +2505,7 @@ impl PreparedLineSuppression {
                 .group_and_segment_build_ns
                 .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
-        let index_start = work.as_ref().map(|_| std::time::Instant::now());
+        let index_start = work.as_ref().map(|_| ferrite_kernel::time::Instant::now());
         let (owned_index, new_start) = OwnedGrowthIndex::stage(
             &selected,
             covered,
@@ -2519,7 +2519,7 @@ impl PreparedLineSuppression {
                 .two_index_build_ns
                 .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
-        let target_start = work.as_ref().map(|_| std::time::Instant::now());
+        let target_start = work.as_ref().map(|_| ferrite_kernel::time::Instant::now());
         let mut previous_target_cursor = 0usize;
         let mut targets = Vec::new();
         let mut bytes = std::mem::size_of::<Self>();

@@ -835,7 +835,7 @@ pub struct GmlOverlays {
     registry: Option<NavwarnRegistry>,
     /// Dataset ids in registry input order.
     pub registry_ids: Vec<u32>,
-    evaluated: Option<std::time::Instant>,
+    evaluated: Option<ferrite_kernel::time::Instant>,
     /// New-message indications of the last evaluation (registry order).
     new_flags: Vec<bool>,
     /// Viewing time selected by the user (the S-101 date-dependent
@@ -1273,7 +1273,7 @@ impl GmlOverlays {
         }
         self.registry = Some(registry);
         self.registry_ids = ids;
-        self.evaluated = Some(std::time::Instant::now());
+        self.evaluated = Some(ferrite_kernel::time::Instant::now());
         if changed && !force {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -1281,11 +1281,11 @@ impl GmlOverlays {
     }
 
     /// When the periodic lifecycle re-check is due (None without datasets).
-    pub fn next_check(&self) -> Option<std::time::Instant> {
+    pub fn next_check(&self) -> Option<ferrite_kernel::time::Instant> {
         if self.datasets.is_empty() {
             return None;
         }
-        let now = std::time::Instant::now();
+        let now = ferrite_kernel::time::Instant::now();
         Some(
             self.evaluated
                 .and_then(|t| t.checked_add(std::time::Duration::from_secs(60)))
@@ -1505,7 +1505,7 @@ impl GmlOverlays {
     }
 
     fn portray(&mut self, profile: &str) -> Vec<DrawingInstruction> {
-        let started = std::time::Instant::now();
+        let started = ferrite_kernel::time::Instant::now();
         self.registry();
         let mut out = Vec::new();
         let errata = self.correct_pc_errata;

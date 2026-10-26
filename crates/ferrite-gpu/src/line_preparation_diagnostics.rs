@@ -1,7 +1,7 @@
 //! Optional host-only line preparation clocks. Children overlap ancestors.
 use crate::shared_cell::Shared;
+use ferrite_kernel::time::Instant;
 use serde::Serialize;
-use std::time::Instant;
 
 pub const STAGE_NAMES: [&str; 10] = [
     "shared_admission",

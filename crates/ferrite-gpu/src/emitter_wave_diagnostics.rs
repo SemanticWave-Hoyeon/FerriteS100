@@ -1,7 +1,7 @@
 //! Optional coarse emitter-wave HOST clocks; no geometry/authority result cache.
 use crate::shared_cell::Shared;
+use ferrite_kernel::time::Instant;
 use ferrite_render::DrawingInstruction;
-use std::time::Instant;
 pub(crate) const NAMES: [&str; 4] = ["area", "line", "point", "text"];
 #[derive(Clone, Default, serde::Serialize)]
 pub(crate) struct Work {

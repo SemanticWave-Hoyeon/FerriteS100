@@ -7,6 +7,14 @@ pub mod map_camera;
 pub mod par;
 pub mod rhumb;
 pub mod scale_policy;
+/// Monotonic time that also works on wasm32-unknown-unknown, where
+/// `std::time::Instant::now` panics. Native: exactly `std::time::Instant`.
+pub mod time {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub use std::time::Instant;
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub use web_time::Instant;
+}
 pub mod triangulation;
 pub mod whole_symbol;
 

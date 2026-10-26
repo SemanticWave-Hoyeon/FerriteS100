@@ -286,7 +286,7 @@ impl CellPortrayalResources {
             }
             return Ok((None, work));
         };
-        let start = diagnostics.then(std::time::Instant::now);
+        let start = diagnostics.then(ferrite_kernel::time::Instant::now);
         let (plan, hit) = cache.prepare(context, |i| self.compiled_group_decision(i));
         if let Some(start) = start {
             work.prepare_host_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -302,7 +302,7 @@ impl CellPortrayalResources {
             work.cold = u64::from(!hit);
             work.retained_payload_bytes = plan.charged_bytes() as u64;
         }
-        let start = diagnostics.then(std::time::Instant::now);
+        let start = diagnostics.then(ferrite_kernel::time::Instant::now);
         let result = plan.evaluate(context, execution, scale, override_group, |ordinal| {
             if diagnostics {
                 work.original_owner_calls = work.original_owner_calls.saturating_add(1);

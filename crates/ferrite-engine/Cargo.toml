@@ -52,9 +52,14 @@ ferrite-s100-core.workspace = true
 ferrite-s100-gml = { path = "../ferrite-s100-gml" }
 ferrite-s101.workspace = true
 ferrite-s102 = { workspace = true, optional = true }
-ferrite-s421 = { path = "../ferrite-s421" }
 ferrite-security.workspace = true
 ferrite-xslt = { path = "../ferrite-xslt" }
+
+# S-421 route input reads the profile through ferrite-s421, whose plugin layer
+# (abi_stable/libloading) does not build for wasm32; the web build mirrors the
+# two items it needs in `s421_dataset_input` (S-421 input is native-only).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ferrite-s421 = { path = "../ferrite-s421" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

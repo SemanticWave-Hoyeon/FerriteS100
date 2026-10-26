@@ -1,5 +1,6 @@
 //! Bounded hidden-surface attribution. No GPU waits, readbacks or disk writes.
-use std::{ffi::OsStr, time::Instant};
+use ferrite_kernel::time::Instant;
+use std::ffi::OsStr;
 pub(crate) const FRAMES: usize = 500;
 const BUDGET: usize = 1024 * 1024;
 

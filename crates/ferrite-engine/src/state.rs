@@ -62,7 +62,7 @@ pub struct CellScene {
     /// Vector instructions changed by interoperability composition.
     pub ic_changed: usize,
     /// When Lua portrayal finished (post-Lua timing).
-    pub after_lua: std::time::Instant,
+    pub after_lua: ferrite_kernel::time::Instant,
 }
 
 /// Cells portrayed for a portrayal change (see
@@ -586,7 +586,7 @@ impl EngineState {
         if jobs.is_empty() {
             return Ok(());
         }
-        let started = std::time::Instant::now();
+        let started = ferrite_kernel::time::Instant::now();
         let results: Vec<Result<S101Cell>> = crate::platform::parallel_map(
             self.platform.executor.as_ref(),
             &jobs,
@@ -848,7 +848,7 @@ impl EngineState {
             triangulate,
             self.portrayal_run(common, &identities),
         )?;
-        let after_lua = std::time::Instant::now();
+        let after_lua = ferrite_kernel::time::Instant::now();
 
         let ic_changed = if let Some(ic) = active_ic {
             let level2 = self.ic_level2(&ic)?;

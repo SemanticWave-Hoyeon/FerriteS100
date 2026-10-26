@@ -1,5 +1,19 @@
 //! Discovery/capture only: no authentication or portrayal authority is produced here.
+#[cfg(not(target_arch = "wasm32"))]
 use ferrite_s421::s421::{Profile, MAX_XML_BYTES};
+#[cfg(target_arch = "wasm32")]
+pub use wasm_profile::{Profile, MAX_XML_BYTES};
+/// The web build has no `ferrite-s421` (its plugin layer needs dynamic
+/// loading); these mirror `ferrite_s421::s421::{Profile, MAX_XML_BYTES}`.
+#[cfg(any(target_arch = "wasm32", test))]
+mod wasm_profile {
+    pub const MAX_XML_BYTES: usize = 8 * 1024 * 1024;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Profile {
+        Published1,
+        Candidate2,
+    }
+}
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
@@ -232,6 +246,16 @@ pub fn discover_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wasm_profile_mirror_matches_ferrite_s421() {
+        assert_eq!(wasm_profile::MAX_XML_BYTES, MAX_XML_BYTES);
+        for (native, mirror) in [
+            (Profile::Published1, wasm_profile::Profile::Published1),
+            (Profile::Candidate2, wasm_profile::Profile::Candidate2),
+        ] {
+            assert_eq!(format!("{native:?}"), format!("{mirror:?}"));
+        }
+    }
     #[test]
     fn namespace_alias_and_dialects_preserve_original_bytes() {
         for (ns, p) in [

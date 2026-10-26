@@ -717,6 +717,8 @@ impl UserRecord for FileRecord {
                 .open(&temporary)?;
             file.write_all(bytes)?;
             file.sync_all()?;
+            // wasm32: the std::fs stub File has no Drop (native-only path).
+            #[allow(clippy::drop_non_drop)]
             drop(file);
             std::fs::rename(&temporary, path)?;
             Ok(())
@@ -896,8 +898,16 @@ pub trait Clock: Send + Sync {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 impl Clock for SystemClock {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn now(&self) -> SystemTime {
         SystemTime::now()
+    }
+    /// wasm32-unknown-unknown has no std wall clock (`SystemTime::now`
+    /// panics); chrono reads the JavaScript `Date` there.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    fn now(&self) -> SystemTime {
+        let millis = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)
     }
     fn utc(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
