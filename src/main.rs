@@ -39,6 +39,12 @@ fn prepare_flat_coverage(
     extent: winit::dpi::PhysicalSize<u32>,
     density: f64,
 ) -> Result<()> {
+    // The viewer shows retained scenes through a moving affine: prepare the
+    // overscan its drift budget can reveal (the exact viewport is unchanged).
+    context.set_navigation_overscan(
+        ferrite_gpu::navigation_overscan_fraction()
+            .filter(|_| !navigation_motion_audit::overscan_suppressed()),
+    );
     ferrite_engine::scene::prepare_flat_coverage(
         inventory,
         context,
@@ -79,6 +85,7 @@ mod llm_chat;
 mod native_mcp;
 mod native_s421;
 mod navigation;
+mod navigation_motion_audit;
 mod plugins;
 mod point_retention_audit;
 mod process_stats;
@@ -1055,6 +1062,8 @@ struct ChartApp {
     background_scene_builds: bool,
     navigation_flush_active: bool,
     navigation_burst_audit: Option<Box<flat_event_burst::Audit>>,
+    /// Background scene build counters (navigation motion audit).
+    scene_build_stats: navigation_motion_audit::SceneBuildStats,
     /// Charts to auto-load on startup
     pending_auto_chart: Vec<PathBuf>,
     /// Auto-screenshot path (take screenshot after load, then exit)
@@ -1302,6 +1311,7 @@ impl ChartApp {
                 && std::env::var_os("FERRITE_MOTION_PREVIEW").is_none_or(|v| v != "0"),
             navigation_flush_active: false,
             navigation_burst_audit: None,
+            scene_build_stats: Default::default(),
             pending_auto_chart,
             auto_screenshot,
             selection_audit: None,
@@ -11201,9 +11211,16 @@ impl ChartApp {
         let mut job = renderer.begin_scene_build(context, resources, groups);
         let inventory = self.engine.coverage_inventory.clone();
         let (extent, density) = (window.inner_size(), window.scale_factor());
+        self.scene_build_stats.started += 1;
         self.scene_build = Some(std::thread::spawn(move || {
+            let start = std::time::Instant::now();
             match prepare_flat_coverage(inventory.as_deref(), job.context_mut(), extent, density) {
-                Ok(()) => job.run(),
+                Ok(()) => {
+                    let mut built = job.run();
+                    // Coverage preparation and emission: the whole build.
+                    built.build_time = start.elapsed();
+                    built
+                }
                 Err(error) => job.fail(format!("coverage preparation failed: {error:#}")),
             }
         }));
@@ -11247,6 +11264,8 @@ impl ChartApp {
                 }
             }
         }
+        self.scene_build_stats
+            .record(build_time, installed.installed);
         if !installed.installed {
             tracing::debug!(
                 "Background scene discarded: {}",
@@ -14533,6 +14552,19 @@ impl ApplicationHandler for ChartApp {
                                 {
                                     self.startup_error =
                                         Some(format!("Point retention audit failed: {error:#}"));
+                                    event_loop.exit();
+                                    return;
+                                }
+                            }
+                        }
+                        if ferrite_ui::background_test::enabled() {
+                            if let Some(path) = std::env::var_os("FERRITE_NAV_MOTION_AUDIT") {
+                                std::env::remove_var("FERRITE_NAV_MOTION_AUDIT");
+                                if let Err(error) =
+                                    self.audit_navigation_motion(&PathBuf::from(path))
+                                {
+                                    self.startup_error =
+                                        Some(format!("Navigation motion audit failed: {error:#}"));
                                     event_loop.exit();
                                     return;
                                 }

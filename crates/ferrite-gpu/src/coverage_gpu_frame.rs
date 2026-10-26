@@ -19,7 +19,7 @@ pub struct CoverageGpuPlan<'a> {
     view_revision: u64,
     instruction_count: usize,
     passes: usize,
-    masks: Vec<(usize, usize, &'a PixelMask)>,
+    masks: Vec<(usize, usize, &'a PixelMask, [i64; 2])>,
     pixel_bytes: usize,
     clip_indices: Option<Vec<usize>>,
     unique_pixel_bytes: usize,
@@ -89,9 +89,11 @@ impl<'a> CoverageGpuPlan<'a> {
                 }
             }
             for dataset in datasets {
-                let mask = source
+                // The overscan composite when prepared: identical to the exact
+                // mask inside the chart pixels, plus the navigation ring.
+                let (mask, window_origin) = source
                     .frame()
-                    .mask(dataset)
+                    .device_mask(dataset)
                     .ok_or_else(|| invalid("Missing dataset coverage mask"))?;
                 let size = mask.size();
                 let image = if size.contains(&0) { [1, 1] } else { size };
@@ -111,7 +113,7 @@ impl<'a> CoverageGpuPlan<'a> {
                         "Coverage frame textures exceed aggregate pixel budget",
                     ));
                 }
-                masks.push((pass, dataset, mask));
+                masks.push((pass, dataset, mask, window_origin));
             }
         }
         let (clip_indices, unique_pixel_bytes, reuse_admitted) =
@@ -130,7 +132,7 @@ impl<'a> CoverageGpuPlan<'a> {
     }
     fn frame_local_aliases(
         prepared: &PreparedCoverage,
-        masks: &[(usize, usize, &PixelMask)],
+        masks: &[(usize, usize, &PixelMask, [i64; 2])],
         logical_bytes: usize,
         reuse: bool,
     ) -> (Option<Vec<usize>>, usize, bool) {
@@ -141,7 +143,7 @@ impl<'a> CoverageGpuPlan<'a> {
         let mut seen = BTreeMap::new();
         let mut indices = Vec::with_capacity(masks.len());
         let mut unique_bytes = 0;
-        for (pass, _, mask) in masks {
+        for (pass, _, mask, _) in masks {
             // All passes were validated above. Keep a transparent cold fallback
             // if future planner changes invalidate that invariant.
             let Ok(source) = prepared.pass(*pass) else {
@@ -171,7 +173,7 @@ impl<'a> CoverageGpuPlan<'a> {
         image[0] as usize * image[1] as usize
     }
     fn validate_upload_limit(&self, limit: u32) -> Result<()> {
-        for (_, _, mask) in &self.masks {
+        for (_, _, mask, _) in &self.masks {
             let size = mask.size();
             let image = if size.contains(&0) { [1, 1] } else { size };
             if image.iter().any(|dimension| *dimension > limit) {
@@ -232,17 +234,18 @@ impl CoverageGpuFrame {
         let mut clips = Vec::new();
         let mut logical_allocated = 0usize;
         let mut unique_allocated = 0usize;
-        for (alias, (pass, dataset, mask)) in plan.masks.into_iter().enumerate() {
+        for (alias, (pass, dataset, mask, window_origin)) in plan.masks.into_iter().enumerate() {
             let index = plan
                 .clip_indices
                 .as_ref()
                 .map_or(alias, |indices| indices[alias]);
             if index == clips.len() {
-                let clip = CoverageClip::new(
+                let clip = CoverageClip::new_in_window(
                     device,
                     queue,
                     layout,
                     Some(mask),
+                    window_origin,
                     ClipTransform::IDENTITY,
                     plan.pixel_bytes - logical_allocated,
                 )?;

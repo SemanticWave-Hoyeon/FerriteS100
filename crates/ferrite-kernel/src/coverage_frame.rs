@@ -227,6 +227,120 @@ pub struct CoverageFrame {
     known_datasets: BTreeSet<usize>,
     selected: BTreeMap<usize, SelectedDataset>,
     scale_annotations: Option<FrameScaleAnnotations>,
+    overscan: Option<OverscanCoverage>,
+}
+
+/// Device masks of the S-98 selection for an expanded region, outside the
+/// exact chart pixels only: the input of `CoverageFrame::build_overscan`.
+/// Independent of the exact frame, so both can be prepared concurrently.
+#[derive(Debug)]
+pub struct OverscanRing {
+    window_origin: [i64; 2],
+    window_size: [u32; 2],
+    inner: [i64; 4],
+    masks: BTreeMap<usize, PixelMask>,
+}
+impl OverscanRing {
+    /// `inner` is the device pixel rectangle of the exact chart pixels; the
+    /// window `[origin, origin + size)` contains it. `raster_budget` bounds
+    /// the expanded rasterization.
+    pub fn rasterize(
+        inventory: &[CoverageFootprint],
+        selection: &Selection,
+        inner: [i64; 4],
+        window_origin: [i64; 2],
+        window_size: [u32; 2],
+        raster_budget: usize,
+    ) -> Result<Self> {
+        ensure!(
+            inner[0] <= inner[2]
+                && inner[1] <= inner[3]
+                && inner[0] >= window_origin[0]
+                && inner[1] >= window_origin[1]
+                && inner[2] <= window_origin[0] + window_size[0] as i64
+                && inner[3] <= window_origin[1] + window_size[1] as i64,
+            "Overscan window does not contain the exact chart pixels"
+        );
+        let hole = [
+            (inner[0] - window_origin[0]) as u32,
+            (inner[1] - window_origin[1]) as u32,
+            (inner[2] - window_origin[0]) as u32,
+            (inner[3] - window_origin[1]) as u32,
+        ];
+        let masks = crate::coverage_raster::rasterize_selected_dataset_masks_window(
+            inventory,
+            selection,
+            window_origin,
+            window_size,
+            Some(hole),
+            raster_budget,
+        )?
+        .into_iter()
+        .map(|m| (m.dataset_id, m.mask))
+        .collect();
+        Ok(Self {
+            window_origin,
+            window_size,
+            inner,
+            masks,
+        })
+    }
+}
+
+/// Navigation overscan: device masks over the viewport expanded on every side,
+/// shown only while the retained scene moves under a motion-preview affine.
+/// Inside `inner` (the exact frame's chart pixels) every mask is bit-identical
+/// to the exact frame, and draw/pick decisions there are unchanged; outside it
+/// the masks follow an S-98 selection for the expanded region. Datasets that
+/// only that selection displays ("ring-only") are clipped to the ring.
+#[derive(Debug)]
+pub struct OverscanCoverage {
+    window_origin: [i64; 2],
+    window_size: [u32; 2],
+    /// Device pixel rectangle `[x0, y0, x1, y1)` that follows the exact frame.
+    inner: [i64; 4],
+    masks: BTreeMap<usize, PixelMask>,
+    ring_only: BTreeSet<usize>,
+    pixel_bytes: usize,
+}
+impl OverscanCoverage {
+    /// Device pixel of texel (0, 0) of every overscan mask.
+    pub fn window_origin(&self) -> [i64; 2] {
+        self.window_origin
+    }
+    pub fn window_size(&self) -> [u32; 2] {
+        self.window_size
+    }
+    pub fn inner(&self) -> [i64; 4] {
+        self.inner
+    }
+    /// Selected only for the expanded region: never drawn inside `inner`.
+    pub fn is_ring_only(&self, dataset_id: usize) -> bool {
+        self.ring_only.contains(&dataset_id)
+    }
+    pub fn ring_only_count(&self) -> usize {
+        self.ring_only.len()
+    }
+    /// Logical R8 texels of all overscan masks.
+    pub fn pixel_bytes(&self) -> usize {
+        self.pixel_bytes
+    }
+    fn contains_inner(&self, point: [f64; 2]) -> bool {
+        let [x0, y0, x1, y1] = self.inner.map(|v| v as f64);
+        point[0] >= x0 && point[0] < x1 && point[1] >= y0 && point[1] < y1
+    }
+    fn accepts(&self, dataset_id: usize, point: [f64; 2]) -> bool {
+        let x = point[0].floor() - self.window_origin[0] as f64;
+        let y = point[1].floor() - self.window_origin[1] as f64;
+        x >= 0.
+            && y >= 0.
+            && x < u32::MAX as f64
+            && y < u32::MAX as f64
+            && self
+                .masks
+                .get(&dataset_id)
+                .is_some_and(|mask| mask.contains_pixel(x as u32, y as u32))
+    }
 }
 impl CoverageFrame {
     /// Pixel budget covers construction peaks in the rasterizer. Region and
@@ -396,7 +510,96 @@ impl CoverageFrame {
             known_datasets,
             selected,
             scale_annotations,
+            overscan: None,
         })
+    }
+    /// Navigation overscan masks for this frame from a ring rasterized for
+    /// the expanded region (same inventory identities as this frame).
+    /// `mask_budget` bounds the retained composite masks.
+    pub fn build_overscan(
+        &self,
+        ring: OverscanRing,
+        mask_budget: usize,
+    ) -> Result<OverscanCoverage> {
+        let OverscanRing {
+            window_origin,
+            window_size,
+            inner,
+            masks: ring,
+        } = ring;
+        for dataset in ring.keys() {
+            ensure!(
+                self.known_datasets.contains(dataset),
+                "Overscan inventory names an unknown dataset"
+            );
+        }
+        let inner_texels = [
+            (inner[0] - window_origin[0]) as u32,
+            (inner[1] - window_origin[1]) as u32,
+            (inner[2] - window_origin[0]) as u32,
+            (inner[3] - window_origin[1]) as u32,
+        ];
+        let ring_only: BTreeSet<usize> = ring
+            .keys()
+            .filter(|d| !self.selected.contains_key(d))
+            .copied()
+            .collect();
+        let mut ring = ring;
+        let parts: Vec<_> = self
+            .selected
+            .keys()
+            .chain(ring_only.iter())
+            .map(|dataset| (*dataset, ring.remove(dataset)))
+            .collect();
+        use crate::par::prelude::*;
+        let composed = parts
+            .into_par_iter()
+            .map(|(dataset, ring)| {
+                crate::coverage_raster::compose_overscan_mask_owned(
+                    self.selected.get(&dataset).map(|d| &d.visible),
+                    ring,
+                    window_origin,
+                    inner_texels,
+                    mask_budget,
+                )
+                .map(|mask| (dataset, mask))
+            })
+            .collect::<Vec<_>>();
+        let mut masks = BTreeMap::new();
+        let mut pixel_bytes = 0usize;
+        for composed in composed {
+            let (dataset, mask) = composed?;
+            pixel_bytes += mask.pixels().len();
+            masks.insert(dataset, mask);
+        }
+        ensure!(pixel_bytes <= mask_budget, "Overscan mask budget exceeded");
+        Ok(OverscanCoverage {
+            window_origin,
+            window_size,
+            inner,
+            masks,
+            ring_only,
+            pixel_bytes,
+        })
+    }
+    /// Attach overscan masks built by `build_overscan` for this frame.
+    pub fn set_overscan(&mut self, overscan: OverscanCoverage) {
+        self.overscan = Some(overscan);
+    }
+    pub fn overscan(&self) -> Option<&OverscanCoverage> {
+        self.overscan.as_ref()
+    }
+    /// The mask a backend uploads for a clipped dataset and the device pixel of
+    /// its texel space origin: the overscan composite when present (identical
+    /// to `mask` inside the exact chart pixels), else the exact mask at (0, 0).
+    pub fn device_mask(&self, dataset_id: usize) -> Option<(&PixelMask, [i64; 2])> {
+        match &self.overscan {
+            Some(overscan) => overscan
+                .masks
+                .get(&dataset_id)
+                .map(|mask| (mask, overscan.window_origin)),
+            None => self.mask(dataset_id).map(|mask| (mask, [0, 0])),
+        }
     }
     pub fn scale_annotations(&self) -> Option<&FrameScaleAnnotations> {
         self.scale_annotations.as_ref()
@@ -410,6 +613,20 @@ impl CoverageFrame {
             "Unknown coverage dataset {dataset_id}"
         );
         let Some(dataset) = self.selected.get(&dataset_id) else {
+            // Ring-only data exists only outside the exact chart pixels; its
+            // composite mask is empty inside them, so drawing there is unchanged.
+            if let Some(overscan) = self
+                .overscan
+                .as_ref()
+                .filter(|o| o.ring_only.contains(&dataset_id))
+            {
+                return Ok(match origin {
+                    InstructionOrigin::Point(p) if overscan.contains_inner(p) => {
+                        FrameCoverageDecision::Hidden
+                    }
+                    _ => FrameCoverageDecision::ClipDataset(dataset_id),
+                });
+            }
             return Ok(FrameCoverageDecision::Hidden);
         };
         Ok(match coverage_render_policy(&dataset.obscuring, origin)? {
@@ -439,6 +656,12 @@ impl CoverageFrame {
         Ok(match decision {
             FrameCoverageDecision::Hidden => false,
             FrameCoverageDecision::Unclipped => true,
+            FrameCoverageDecision::ClipDataset(id)
+                if !self.selected.contains_key(&id)
+                    && self.overscan.as_ref().is_some_and(|o| o.is_ring_only(id)) =>
+            {
+                self.overscan.as_ref().unwrap().accepts(id, point)
+            }
             FrameCoverageDecision::ClipDataset(id) => {
                 let mask = self.mask(id).context("No mask for clipped dataset")?;
                 point.iter().all(|p| *p >= 0. && *p < u32::MAX as f64)
@@ -853,5 +1076,166 @@ mod scale_annotation_tests {
                 .unwrap()
                 .contains_pixel(point[0] as u32, point[1] as u32));
         }
+    }
+}
+
+#[cfg(test)]
+mod overscan_tests {
+    use super::*;
+    use crate::scale_policy::CoverageScaleRange;
+    fn square(x: f64, y: f64, w: f64) -> Region {
+        Region::from_rings(
+            &[[x, y], [x + w, y], [x + w, y + w], [x, y + w], [x, y]],
+            &[],
+        )
+        .unwrap()
+    }
+    fn footprint(id: usize, min: u32, region: Region) -> CoverageFootprint {
+        CoverageFootprint {
+            dataset_id: id,
+            coverage_id: id as i64,
+            region,
+            scales: CoverageScaleRange {
+                minimum_denominator: Some(min),
+                optimum_denominator: min / 2,
+                maximum_denominator: min / 4,
+            },
+        }
+    }
+    fn source(id: usize, origin: InstructionOrigin) -> CoverageSource {
+        CoverageSource::Dataset {
+            dataset_id: id,
+            origin,
+        }
+    }
+    #[test]
+    fn overscan_keeps_exact_pixels_and_decisions_and_adds_the_ring() {
+        use crate::coverage_selection::select_coverages;
+        // Viewport [0, 10)^2; overscan window [-5, 15)^2. Dataset 0 is coarse
+        // everywhere, 1 is finer in the viewport's west half, 2 is finer only in the
+        // ring (east of the viewport), 3 lies far outside the window.
+        let inventory = vec![
+            footprint(0, 180000, square(-20., -20., 50.)),
+            footprint(
+                1,
+                45000,
+                Region::from_rings(&[[0., 0.], [5., 0.], [5., 10.], [0., 10.], [0., 0.]], &[])
+                    .unwrap(),
+            ),
+            footprint(2, 45000, square(11., -2., 4.)),
+            footprint(3, 45000, square(40., 40., 2.)),
+        ];
+        let viewport = square(0., 0., 10.);
+        let expanded = square(-5., -5., 20.);
+        let exact_selection = select_coverages(&inventory, 22500., &viewport).unwrap();
+        let ring_selection = select_coverages(&inventory, 22500., &expanded).unwrap();
+        let exact =
+            CoverageFrame::new(&inventory, &exact_selection, &viewport, [10, 10], 1 << 16).unwrap();
+        let reference =
+            CoverageFrame::new(&inventory, &exact_selection, &viewport, [10, 10], 1 << 16).unwrap();
+        let mut frame = exact;
+        let ring = OverscanRing::rasterize(
+            &inventory,
+            &ring_selection,
+            [0, 0, 10, 10],
+            [-5, -5],
+            [20, 20],
+            1 << 16,
+        )
+        .unwrap();
+        let overscan = frame.build_overscan(ring, 1 << 16).unwrap();
+        assert!(overscan.is_ring_only(2) && !overscan.is_ring_only(0));
+        assert!(!overscan.is_ring_only(1) && !overscan.is_ring_only(3));
+        frame.set_overscan(overscan);
+        let sources = [
+            InstructionOrigin::NonPoint,
+            InstructionOrigin::Point([5.5, 5.5]),
+            InstructionOrigin::Point([-3.5, 5.5]),
+            InstructionOrigin::Point([12.5, 0.5]),
+        ];
+        for dataset in 0..4 {
+            // Inside the exact pixels: the uploaded mask equals the exact one.
+            if let Some((mask, origin)) = frame.device_mask(dataset) {
+                assert_eq!(origin, [-5, -5]);
+                for y in 0..10u32 {
+                    for x in 0..10u32 {
+                        let exact = reference
+                            .mask(dataset)
+                            .is_some_and(|m| m.contains_pixel(x, y));
+                        assert_eq!(
+                            mask.contains_pixel(x + 5, y + 5),
+                            exact,
+                            "{dataset} {x},{y}"
+                        );
+                    }
+                }
+            }
+            for origin in sources {
+                let decision = frame.decision(source(dataset, origin)).unwrap();
+                let exact = reference.decision(source(dataset, origin)).unwrap();
+                if dataset == 2 {
+                    // Ring-only: hidden in the viewport, clipped to the ring outside it.
+                    let expected = match origin {
+                        InstructionOrigin::Point([x, y])
+                            if (0. ..10.).contains(&x) && (0. ..10.).contains(&y) =>
+                        {
+                            FrameCoverageDecision::Hidden
+                        }
+                        _ => FrameCoverageDecision::ClipDataset(2),
+                    };
+                    assert_eq!(decision, expected);
+                    assert_eq!(exact, FrameCoverageDecision::Hidden);
+                } else {
+                    assert_eq!(decision, exact, "dataset {dataset}");
+                }
+                // Picking inside the viewport is unchanged.
+                for p in [[0.5, 0.5], [5.5, 5.5], [9.5, 9.5]] {
+                    assert_eq!(
+                        frame.accepts_fragment(decision, p).unwrap(),
+                        reference.accepts_fragment(exact, p).unwrap()
+                    );
+                }
+            }
+        }
+        // The ring: coarse data west of the viewport, ring-only data east.
+        let (coarse, _) = frame.device_mask(0).unwrap();
+        assert!(coarse.contains_pixel(1, 7)); // device (-4, 2)
+        let (ring_only, _) = frame.device_mask(2).unwrap();
+        assert!(ring_only.contains_pixel(17, 6)); // device (12, 1)
+        assert!(frame
+            .accepts_fragment(FrameCoverageDecision::ClipDataset(2), [12.5, 1.5])
+            .unwrap());
+        // Coarse obscured by ring-only finer data in the ring.
+        assert!(!coarse.contains_pixel(17, 6));
+        assert!(frame.device_mask(3).is_none());
+        // Invalid windows are refused.
+        assert!(OverscanRing::rasterize(
+            &inventory,
+            &ring_selection,
+            [0, 0, 10, 10],
+            [1, 0],
+            [20, 20],
+            1 << 16
+        )
+        .is_err());
+        assert!(reference
+            .build_overscan(
+                OverscanRing::rasterize(
+                    &[footprint(9, 45000, square(0., 0., 1.))],
+                    &select_coverages(
+                        &[footprint(9, 45000, square(0., 0., 1.))],
+                        22500.,
+                        &expanded
+                    )
+                    .unwrap(),
+                    [0, 0, 10, 10],
+                    [-5, -5],
+                    [20, 20],
+                    1 << 16
+                )
+                .unwrap(),
+                1 << 16
+            )
+            .is_err());
     }
 }

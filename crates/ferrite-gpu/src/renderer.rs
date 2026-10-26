@@ -640,6 +640,9 @@ struct TextLabel {
     /// Lines of one cell-less overlay text box share a group and are placed
     /// together; None for every ENC label.
     group: Option<TextLabelGroup>,
+    /// From data only the navigation overscan selects (drawn only outside the
+    /// exact viewport). Placed after all other labels so it never displaces one.
+    overscan_only: bool,
 }
 
 /// wgpu-based chart renderer
@@ -1122,8 +1125,12 @@ fn layout_chart_text_with_fonts(
         let mut labels: Vec<_> = (0..text_labels.len()).collect();
         // Higher planes/priorities retain text on collisions; stable source
         // order provides a neutral tie break. This is a display-engine policy.
+        // Overscan-only labels come last: they never displace another label.
         labels.sort_by_key(|&index| {
-            std::cmp::Reverse((text_labels[index].plane, text_labels[index].priority))
+            (
+                text_labels[index].overscan_only,
+                std::cmp::Reverse((text_labels[index].plane, text_labels[index].priority)),
+            )
         });
         // Lines of one multi-line overlay text box (same feature and anchor)
         // are placed as one unit: all shown or all hidden. Ungrouped (all
@@ -1433,6 +1440,7 @@ mod detached_text_layout_tests {
             h_align: ferrite_render::HAlign::Left,
             v_align: ferrite_render::VAlign::Top,
             group: None,
+            overscan_only: false,
         }
     }
     fn environment(fixed: &FxHashSet<usize>, wrap: f32) -> ChartTextLayoutEnvironment<'_> {
@@ -1650,6 +1658,12 @@ struct VectorFrameState {
     world_map_chart_boxes: Vec<(f64, f64, f64, f64)>,
     /// Screen pixels corresponding to 360° of longitude (0 = wrapping disabled)
     lon_wrap_screen_px: f32,
+    /// Whole pixels prepared beyond each side of `chart_geometry_viewport` for
+    /// a navigation preview (context overscan); None prepares the viewport only.
+    overscan_margin: Option<[f32; 2]>,
+    /// Line indices emitted only for the overscan ring. Parent execution
+    /// evidence excludes them, so it is that of the exact viewport.
+    overscan_extra_line_indices: usize,
 }
 
 impl VectorFrameState {
@@ -1688,6 +1702,41 @@ impl VectorFrameState {
             ];
         }
         self.scene_bounds = Some(b);
+    }
+
+    /// Retained pixel -> current target pixel, as (scale, translation).
+    fn navigation_affine(&self) -> ([f32; 2], [f32; 2]) {
+        let scale = [self.screen_zoom_scale, self.screen_zoom_scale_y];
+        let (px, py) = self.screen_zoom_pivot;
+        let (ox, oy) = self.screen_pan_offset;
+        (
+            scale,
+            [(ox - px) * scale[0] + px, (oy - py) * scale[1] + py],
+        )
+    }
+    /// Retained pixels the scene was prepared for: the chart viewport plus
+    /// its navigation overscan.
+    fn prepared_rect(&self) -> Option<crate::motion_preview::Rect> {
+        let v = self.chart_geometry_viewport?;
+        let [mx, my] = self.overscan_margin.unwrap_or([0., 0.]);
+        Some([v.x - mx, v.y - my, v.x + v.width + mx, v.y + v.height + my])
+    }
+    /// Chart pixels the current affine shows from outside the prepared
+    /// rectangle: the navigation placeholder's area. Empty for an exact frame.
+    fn unprepared_rects(&self) -> Vec<crate::motion_preview::Rect> {
+        let (scale, translation) = self.navigation_affine();
+        if scale == [1., 1.] && translation == [0., 0.] {
+            return Vec::new();
+        }
+        let (Some(v), Some(prepared)) = (self.chart_geometry_viewport, self.prepared_rect()) else {
+            return Vec::new();
+        };
+        crate::motion_preview::unprepared_rects(
+            scale,
+            translation,
+            [v.x, v.y, v.x + v.width, v.y + v.height],
+            prepared,
+        )
     }
 
     fn continuous_transform_key(&self, viewport_size: (f32, f32)) -> [u32; 9] {
@@ -1777,8 +1826,14 @@ pub struct WgpuRenderer<U> {
     scene_generation: u64,
     /// A background build is in flight: preview beyond the drift budget.
     scene_build_pending: bool,
-    /// The accepted preview passed `PREFETCH_FRACTION` of its drift budget.
+    /// The accepted preview passed `prefetch_fraction` of its drift budget
+    /// or of its overscan margin.
     preview_refresh_due: bool,
+    /// `FERRITE_NAV_PREFETCH`, default `motion_preview::PREFETCH_FRACTION`.
+    prefetch_fraction: f32,
+    /// Fill unprepared chart pixels of a moving preview with the background
+    /// and reference coastlines (`FERRITE_NAV_PLACEHOLDER=0` disables).
+    navigation_placeholder: bool,
     /// Independent chart-font metrics for background builds. Sharing the live
     /// UI context would make every UI pass wait on the worker's layout lock.
     worker_fonts: Option<(PrivateEmissionEnvironment, Arc<dyn ChartFontContext>)>,
@@ -2340,6 +2395,8 @@ impl<U: UiLayer> WgpuRenderer<U> {
                     chart_geometry_viewport: None,
                     world_map_chart_boxes: Vec::new(),
                     lon_wrap_screen_px: 0.0,
+                    overscan_margin: None,
+                    overscan_extra_line_indices: 0,
                 },
             },
 
@@ -2381,6 +2438,10 @@ impl<U: UiLayer> WgpuRenderer<U> {
             scene_generation: 0,
             scene_build_pending: false,
             preview_refresh_due: false,
+            prefetch_fraction: crate::motion_preview::prefetch_fraction(
+                std::env::var_os("FERRITE_NAV_PREFETCH").as_deref(),
+            ),
+            navigation_placeholder: crate::motion_preview::placeholder_enabled(),
             worker_fonts: None,
 
             overscale_program_reuse: Arc::new(crate::overscale_annotation::ProgramReuse::new(
@@ -3550,7 +3611,8 @@ impl<U: UiLayer> WgpuRenderer<U> {
             &self.world_map_detailed,
             self.background_color,
         );
-        self.vector_emission.symbol_quad(&mut services, instance)
+        self.vector_emission
+            .exact_symbol_quad(&mut services, instance)
     }
 
     /// Pack symbol instances into contiguous vertex/index arrays for single-buffer rendering.
@@ -4295,6 +4357,21 @@ impl<U: UiLayer> WgpuRenderer<U> {
         self.motion_preview_active
     }
 
+    /// Navigation diagnostics for the current frame: the overscan margin the
+    /// displayed scene was prepared with, and the fraction of the chart
+    /// viewport the current affine shows from outside that preparation
+    /// (drawn as the placeholder; 0 for an exact frame).
+    pub fn navigation_preparation(&self) -> (Option<[f32; 2]>, f32) {
+        let frame = &self.vector_emission.vector_frame;
+        let fraction = frame.chart_geometry_viewport.map_or(0., |v| {
+            crate::motion_preview::area_fraction(
+                &frame.unprepared_rects(),
+                [v.x, v.y, v.x + v.width, v.y + v.height],
+            )
+        });
+        (frame.overscan_margin, fraction)
+    }
+
     pub fn begin_flat_diagnostics(
         &mut self,
         frame: u64,
@@ -4557,15 +4634,18 @@ impl<U: UiLayer> WgpuRenderer<U> {
         let identity = view.scale == [1., 1.] && view.translation == [0., 0.];
         let preview = !identity && self.preview_differs_from_exact_navigation();
         let viewport = target.viewport;
+        let overscan = self.vector_emission.vector_frame.overscan_margin;
         // While a background build is in flight the preview is the only frame
         // available; its install restarts the budget from the newer scene.
+        // With an overscan the shown pixels must also stay inside it.
         let within_budget = !preview
             || self.scene_build_pending
-            || crate::motion_preview::within_drift(
+            || crate::motion_preview::within_drift_overscan(
                 view.scale,
                 view.translation,
                 [viewport.x, viewport.y],
                 [viewport.width, viewport.height],
+                overscan,
             );
         self.record_flat_reuse(
             Some(ferrite_render::flat_reuse_diagnostics::NavigationAffine {
@@ -4580,12 +4660,13 @@ impl<U: UiLayer> WgpuRenderer<U> {
         }
         self.motion_preview_active = preview;
         self.preview_refresh_due = preview
-            && !crate::motion_preview::within_drift_fraction(
+            && crate::motion_preview::prefetch_due(
                 view.scale,
                 view.translation,
                 [viewport.x, viewport.y],
                 [viewport.width, viewport.height],
-                crate::motion_preview::PREFETCH_FRACTION,
+                overscan,
+                self.prefetch_fraction,
             );
         self.vector_emission.vector_frame.screen_zoom_scale = view.scale[0];
         self.vector_emission.vector_frame.screen_zoom_scale_y = view.scale[1];
@@ -7192,6 +7273,48 @@ mod longitude_culling_tests {
     }
 }
 
+/// The context's navigation overscan, unless 360° of longitude is so narrow
+/// that a ring piece, shifted to a longitude copy, could reach the viewport.
+fn navigation_overscan_margin(context: &RenderContext, lon_wrap_px: f32) -> Option<[f32; 2]> {
+    let margin = context.navigation_overscan_margin()?;
+    let v = context.scaler.viewport;
+    // Ring geometry lies within margin + 600 px (thick lines, symbols) of the viewport.
+    let reach = v.width + 2. * (margin[0] + 600.);
+    (lon_wrap_px <= 0. || lon_wrap_px > reach).then_some(margin)
+}
+
+/// Viewport fraction of reference coastline kept beyond each side of the
+/// viewport as the navigation placeholder.
+const WORLD_MAP_PLACEHOLDER_FRACTION: f32 = 1.0;
+
+/// `clip` grown by the overscan margin, if any.
+fn overscan_clip(clip: [f32; 4], margin: Option<[f32; 2]>) -> Option<[f32; 4]> {
+    margin.map(|[mx, my]| [clip[0] - mx, clip[1] - my, clip[2] + mx, clip[3] + my])
+}
+
+/// Up to two pieces of `segment` inside `ring` but beyond its `exact` clip
+/// (Cohen-Sutherland keeps the segment's direction, so the exact piece lies
+/// between them). They never reach inside the exact clip rectangle.
+fn overscan_ring_pieces(
+    segment: [f32; 4],
+    exact: Option<(f32, f32, f32, f32)>,
+    ring: [f32; 4],
+) -> [Option<[f32; 4]>; 2] {
+    let [x0, y0, x1, y1] = segment;
+    let Some((rx0, ry0, rx1, ry1)) =
+        RendererGeometry::clip_line_segment(x0, y0, x1, y1, ring[0], ring[1], ring[2], ring[3])
+    else {
+        return [None, None];
+    };
+    match exact {
+        None => [Some([rx0, ry0, rx1, ry1]), None],
+        Some((ex0, ey0, ex1, ey1)) => [
+            ((rx0, ry0) != (ex0, ey0)).then_some([rx0, ry0, ex0, ey0]),
+            ((ex1, ey1) != (rx1, ry1)).then_some([ex1, ey1, rx1, ry1]),
+        ],
+    }
+}
+
 /// Intersect a chart's physical-pixel viewport with the current render target.
 fn chart_pass_scissor(viewport: ferrite_render::Viewport, extent: [u32; 2]) -> Option<[u32; 4]> {
     let [vx, vy, vw, vh] = [viewport.x, viewport.y, viewport.width, viewport.height].map(f64::from);
@@ -7214,6 +7337,78 @@ fn intersect_scissors(a: [u32; 4], b: [u32; 4]) -> Option<[u32; 4]> {
     let right = a[0].saturating_add(a[2]).min(b[0].saturating_add(b[2]));
     let bottom = a[1].saturating_add(a[3]).min(b[1].saturating_add(b[3]));
     (right > x && bottom > y).then(|| [x, y, right - x, bottom - y])
+}
+#[cfg(test)]
+mod overscan_ring_tests {
+    use super::*;
+    #[test]
+    fn ring_pieces_extend_the_exact_piece_without_entering_its_clip() {
+        let exact_clip = [0., 0., 100., 50.];
+        let ring = overscan_clip(exact_clip, Some([25., 10.])).unwrap();
+        assert_eq!(ring, [-25., -10., 125., 60.]);
+        let clip = |s: [f32; 4], c: [f32; 4]| {
+            RendererGeometry::clip_line_segment(s[0], s[1], s[2], s[3], c[0], c[1], c[2], c[3])
+        };
+        // Crosses the whole ring left to right: one piece on each side.
+        let segment = [-200., 20., 300., 20.];
+        let exact = clip(segment, exact_clip);
+        assert_eq!(exact, Some((0., 20., 100., 20.)));
+        let pieces = overscan_ring_pieces(segment, exact, ring);
+        assert_eq!(
+            pieces,
+            [Some([-25., 20., 0., 20.]), Some([100., 20., 125., 20.])]
+        );
+        // Wholly in the ring: one piece; reversed direction keeps its order.
+        let segment = [120., 55., 110., 52.];
+        assert_eq!(clip(segment, exact_clip), None);
+        assert_eq!(
+            overscan_ring_pieces(segment, None, ring),
+            [Some([120., 55., 110., 52.]), None]
+        );
+        // Inside the exact clip: nothing extra; beyond the ring: nothing.
+        let segment = [10., 10., 20., 20.];
+        assert_eq!(
+            overscan_ring_pieces(segment, clip(segment, exact_clip), ring),
+            [None, None]
+        );
+        assert_eq!(
+            overscan_ring_pieces([500., 500., 600., 600.], None, ring),
+            [None, None]
+        );
+        // Ring pieces never re-enter the exact clip rectangle's interior.
+        for segment in [
+            [-30., -30., 130., 70.],
+            [50., -40., 60., 90.],
+            [-50., 25., 40., 25.],
+        ] {
+            for piece in overscan_ring_pieces(segment, clip(segment, exact_clip), ring)
+                .into_iter()
+                .flatten()
+            {
+                let mid = [(piece[0] + piece[2]) / 2., (piece[1] + piece[3]) / 2.];
+                assert!(
+                    mid[0] <= 0. || mid[0] >= 100. || mid[1] <= 0. || mid[1] >= 50.,
+                    "{segment:?} -> {piece:?}"
+                );
+            }
+        }
+        assert_eq!(overscan_clip(exact_clip, None), None);
+    }
+    #[test]
+    fn overscan_margin_is_dropped_when_longitude_copies_come_near() {
+        let mut context = RenderContext::new(ferrite_render::Viewport::new(1000., 800.));
+        assert_eq!(navigation_overscan_margin(&context, 0.), None);
+        context.set_navigation_overscan(Some(0.25));
+        assert_eq!(navigation_overscan_margin(&context, 0.), Some([250., 200.]));
+        assert_eq!(
+            navigation_overscan_margin(&context, 1e6),
+            Some([250., 200.])
+        );
+        // 360 degrees narrower than the viewport plus both rings and guards.
+        assert_eq!(navigation_overscan_margin(&context, 2000.), None);
+        context.set_navigation_overscan(Some(f32::NAN));
+        assert_eq!(navigation_overscan_margin(&context, 0.), None);
+    }
 }
 #[cfg(test)]
 mod chart_pass_scissor_tests {
@@ -7403,6 +7598,8 @@ impl VectorFrameState {
             chart_geometry_viewport: None,
             world_map_chart_boxes: Vec::new(),
             lon_wrap_screen_px: 0.0,
+            overscan_margin: None,
+            overscan_extra_line_indices: 0,
         }
     }
 }
@@ -7873,10 +8070,32 @@ impl VectorEmissionOwned {
             }
         }
     }
+    /// The packed quad, culled against the surface plus the overscan ring.
+    /// Quads only the ring admits lie wholly outside the exact cull rectangle.
     fn symbol_quad(
         &self,
         services: &mut EmissionServices<'_>,
         instance: &SymbolInstance,
+    ) -> Option<[TextureVertex; 4]> {
+        self.symbol_quad_culled(
+            services,
+            instance,
+            self.vector_frame.overscan_margin.unwrap_or([0., 0.]),
+        )
+    }
+    /// The quad culled against the surface alone: Parent execution evidence.
+    fn exact_symbol_quad(
+        &self,
+        services: &mut EmissionServices<'_>,
+        instance: &SymbolInstance,
+    ) -> Option<[TextureVertex; 4]> {
+        self.symbol_quad_culled(services, instance, [0., 0.])
+    }
+    fn symbol_quad_culled(
+        &self,
+        services: &mut EmissionServices<'_>,
+        instance: &SymbolInstance,
+        ring: [f32; 2],
     ) -> Option<[TextureVertex; 4]> {
         let tex = self
             .symbol_textures
@@ -7885,10 +8104,10 @@ impl VectorEmissionOwned {
             return None;
         }
         let (vp_w, vp_h) = services.state.viewport_size();
-        let sym_min_x = -200.;
-        let sym_min_y = -200.;
-        let sym_max_x = vp_w + 200.;
-        let sym_max_y = vp_h + 200.;
+        let sym_min_x = -200. - ring[0];
+        let sym_min_y = -200. - ring[1];
+        let sym_max_x = vp_w + 200. + ring[0];
+        let sym_max_y = vp_h + 200. + ring[1];
         let display_scale = instance.scale / tex.render_scale
             * services.symbol_scale
             * services.state.scale_factor() as f32;
@@ -7976,6 +8195,22 @@ impl VectorEmissionOwned {
             }
         }
     }
+    /// The command's dataset is displayed only by the navigation overscan.
+    fn is_overscan_only_source(&self, ordinal: usize) -> bool {
+        self.vector_frame
+            .prepared_coverage
+            .as_ref()
+            .and_then(|prepared| prepared.pass(0).ok())
+            .is_some_and(|pass| {
+                pass.frame().overscan().is_some_and(|overscan| {
+                    matches!(
+                        pass.decision(ordinal),
+                        Ok(ferrite_kernel::coverage_frame::FrameCoverageDecision::ClipDataset(id))
+                            if overscan.is_ring_only(id)
+                    )
+                })
+            })
+    }
     fn is_device_fixed_source(&self, _services: &mut EmissionServices<'_>, ordinal: usize) -> bool {
         self.vector_frame
             .static_source_classification
@@ -8036,14 +8271,28 @@ impl VectorEmissionOwned {
         let clip_x_max = scaler.viewport.x + vw + margin;
         let clip_y_max = scaler.viewport.y + vh + margin;
 
+        // Coastlines are also the navigation placeholder for chart that is not
+        // prepared yet: keep pieces up to one viewport beyond every side. They
+        // lie outside the clip guard, so the viewport's pixels are unchanged.
+        let placeholder = if crate::motion_preview::placeholder_enabled() {
+            WORLD_MAP_PLACEHOLDER_FRACTION
+        } else {
+            0.
+        };
+        let ring = [
+            clip_x_min - vw * placeholder,
+            clip_y_min - vh * placeholder,
+            clip_x_max + vw * placeholder,
+            clip_y_max + vh * placeholder,
+        ];
         // Use actual physical viewport corners, including its origin and clip guard.
         let a = scaler.screen_to_world(ScreenPoint {
-            x: clip_x_min,
-            y: clip_y_min,
+            x: ring[0],
+            y: ring[1],
         });
         let b = scaler.screen_to_world(ScreenPoint {
-            x: clip_x_max,
-            y: clip_y_max,
+            x: ring[2],
+            y: ring[3],
         });
         let view = [a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)];
         let detailed = ferrite_render::BackgroundCoastlines::use_detailed(scaler.scale_x())
@@ -8052,6 +8301,30 @@ impl VectorEmissionOwned {
             &services.world_map_detailed
         } else {
             &services.world_map_coastlines
+        };
+        let push_quad = |frame: &mut VectorGeometryCpu, [cx0, cy0, cx1, cy1]: [f32; 4]| {
+            let dx = cx1 - cx0;
+            let dy = cy1 - cy0;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len >= 0.5 {
+                let nx = -dy / len * width * 0.5;
+                let ny = dx / len * width * 0.5;
+                let base_index = frame.world_map_line_vertices.len() as u32;
+                frame.world_map_line_vertices.extend([
+                    LineVertex::new(cx0, cy0, -nx, -ny, color),
+                    LineVertex::new(cx0, cy0, nx, ny, color),
+                    LineVertex::new(cx1, cy1, nx, ny, color),
+                    LineVertex::new(cx1, cy1, -nx, -ny, color),
+                ]);
+                frame.world_map_line_indices.extend([
+                    base_index,
+                    base_index + 1,
+                    base_index + 2,
+                    base_index,
+                    base_index + 2,
+                    base_index + 3,
+                ]);
+            }
         };
         let lon_offsets: [f64; 3] = [-360.0, 0.0, 360.0];
         for &lon_offset in &lon_offsets {
@@ -8074,62 +8347,20 @@ impl VectorEmissionOwned {
                         continue;
                     }
 
-                    if let Some((cx0, cy0, cx1, cy1)) = RendererGeometry::clip_line_segment(
+                    let exact = RendererGeometry::clip_line_segment(
                         prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max,
                         clip_y_max,
-                    ) {
-                        let dx = cx1 - cx0;
-                        let dy = cy1 - cy0;
-                        let len = (dx * dx + dy * dy).sqrt();
-
-                        if len >= 0.5 {
-                            let nx = -dy / len * width * 0.5;
-                            let ny = dx / len * width * 0.5;
-
-                            let base_index =
-                                self.vector_frame.frame_cpu.world_map_line_vertices.len() as u32;
-
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_vertices
-                                .push(LineVertex::new(cx0, cy0, -nx, -ny, color));
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_vertices
-                                .push(LineVertex::new(cx0, cy0, nx, ny, color));
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_vertices
-                                .push(LineVertex::new(cx1, cy1, nx, ny, color));
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_vertices
-                                .push(LineVertex::new(cx1, cy1, -nx, -ny, color));
-
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_indices
-                                .push(base_index);
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_indices
-                                .push(base_index + 1);
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_indices
-                                .push(base_index + 2);
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_indices
-                                .push(base_index);
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_indices
-                                .push(base_index + 2);
-                            self.vector_frame
-                                .frame_cpu
-                                .world_map_line_indices
-                                .push(base_index + 3);
+                    );
+                    if let Some((cx0, cy0, cx1, cy1)) = exact {
+                        push_quad(&mut self.vector_frame.frame_cpu, [cx0, cy0, cx1, cy1]);
+                    }
+                    if placeholder > 0. {
+                        for piece in
+                            overscan_ring_pieces([prev.x, prev.y, curr.x, curr.y], exact, ring)
+                                .into_iter()
+                                .flatten()
+                        {
+                            push_quad(&mut self.vector_frame.frame_cpu, piece);
                         }
                     }
 
@@ -8354,6 +8585,8 @@ impl VectorEmissionOwned {
             self.gpu_timestamp_target_camera = context.scaler.flat_encoded_identity();
         }
         self.vector_frame.chart_geometry_viewport = Some(context.scaler.viewport);
+        self.vector_frame.overscan_margin =
+            navigation_overscan_margin(context, self.vector_frame.lon_wrap_screen_px);
         self.bind_triangulation_context(services, context);
         let profiling = crate::profiler::is_profiling_enabled();
         let total_timer = if profiling {
@@ -8451,6 +8684,20 @@ impl VectorEmissionOwned {
             }
         };
         self.vector_frame.emitting_coverage_source = None;
+        // A coverage frame without its overscan (over the mask budget) leaves
+        // the ring masked: prepare and preview the viewport alone.
+        if self
+            .vector_frame
+            .prepared_coverage
+            .as_ref()
+            .is_some_and(|prepared| {
+                !prepared
+                    .pass(0)
+                    .is_ok_and(|pass| pass.frame().overscan().is_some())
+            })
+        {
+            self.vector_frame.overscan_margin = None;
+        }
         // GPU resource readiness is independent of parent permission. That
         // permission, temporal visibility and cell groups are evaluated freshly
         // below on every trial; no execution decisions are cached.
@@ -9219,7 +9466,8 @@ impl VectorEmissionOwned {
             let before_execution = execution.as_ref().map(|_| {
                 (
                     self.vector_frame.frame_cpu.area_indices.len(),
-                    self.vector_frame.frame_cpu.line_geometry.index_len(),
+                    self.vector_frame.frame_cpu.line_geometry.index_len()
+                        - self.vector_frame.overscan_extra_line_indices,
                     self.vector_frame.frame_cpu.pattern_indices.len(),
                     self.vector_frame.frame_cpu.symbol_instances.len(),
                     self.vector_frame.frame_cpu.text_labels.len(),
@@ -9576,6 +9824,7 @@ impl VectorEmissionOwned {
                         .then_some(text.feature_id)
                         .flatten()
                         .map(|id| (id, text.position.x.to_bits(), text.position.y.to_bits())),
+                        overscan_only: self.is_overscan_only_source(inst_idx),
                     });
                     if let Some(indices) = &mut text_instruction_indices {
                         indices.push(Some(inst_idx));
@@ -9590,7 +9839,8 @@ impl VectorEmissionOwned {
                 mask[inst_idx] = before
                     != (
                         self.vector_frame.frame_cpu.area_indices.len(),
-                        self.vector_frame.frame_cpu.line_geometry.index_len(),
+                        self.vector_frame.frame_cpu.line_geometry.index_len()
+                            - self.vector_frame.overscan_extra_line_indices,
                         self.vector_frame.frame_cpu.pattern_indices.len(),
                         self.vector_frame.frame_cpu.symbol_instances.len(),
                         self.vector_frame.frame_cpu.text_labels.len(),
@@ -9598,7 +9848,7 @@ impl VectorEmissionOwned {
                 if matches!(instruction, DrawingInstruction::Point(_)) {
                     mask[inst_idx] = self.vector_frame.frame_cpu.symbol_instances[before.3..]
                         .iter()
-                        .any(|instance| self.symbol_quad(services, instance).is_some());
+                        .any(|instance| self.exact_symbol_quad(services, instance).is_some());
                 }
             }
         }
@@ -10505,6 +10755,15 @@ impl VectorEmissionOwned {
         let hatch_clip_min_y = -hatch_margin;
         let hatch_clip_max_x = vp_w + hatch_margin;
         let hatch_clip_max_y = vp_h + hatch_margin;
+        let hatch_ring = overscan_clip(
+            [
+                hatch_clip_min_x,
+                hatch_clip_min_y,
+                hatch_clip_max_x,
+                hatch_clip_max_y,
+            ],
+            self.vector_frame.overscan_margin,
+        );
         let half_line_width = line_width * 0.5;
 
         self.accepted_screen_line_packet.path();
@@ -10534,6 +10793,38 @@ impl VectorEmissionOwned {
                     || ey < hatch_clip_min_y
                     || ey > hatch_clip_max_y
                 {
+                    // Overscan ring: whole segments that never touch the
+                    // exact clip rectangle, so the viewport is unchanged.
+                    if let Some([rx0, ry0, rx1, ry1]) = hatch_ring {
+                        let inside = |x: f32, y: f32| x >= rx0 && x <= rx1 && y >= ry0 && y <= ry1;
+                        let len = ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt();
+                        if inside(sx, sy)
+                            && inside(ex, ey)
+                            && len >= 0.001
+                            && RendererGeometry::clip_line_segment(
+                                sx,
+                                sy,
+                                ex,
+                                ey,
+                                hatch_clip_min_x,
+                                hatch_clip_min_y,
+                                hatch_clip_max_x,
+                                hatch_clip_max_y,
+                            )
+                            .is_none()
+                        {
+                            let nx = -(ey - sy) / len * half_line_width;
+                            let ny = (ex - sx) / len * half_line_width;
+                            let before = self.vector_frame.frame_cpu.line_geometry.index_len();
+                            self.vector_frame
+                                .frame_cpu
+                                .line_geometry
+                                .append_emitted([sx, sy], [ex, ey], [-nx, -ny], [nx, ny], color_arr)
+                                .map_err(|e| crate::WgpuError::Render(e.into()))?;
+                            self.vector_frame.overscan_extra_line_indices +=
+                                self.vector_frame.frame_cpu.line_geometry.index_len() - before;
+                        }
+                    }
                     continue;
                 }
                 // Render as a line quad
@@ -10762,6 +11053,7 @@ impl VectorEmissionOwned {
         let clip_y_max = scaler.viewport.y + vh + margin;
 
         let clip = [clip_x_min, clip_y_min, clip_x_max, clip_y_max];
+        let ring_clip = overscan_clip(clip, self.vector_frame.overscan_margin);
         let before_emission = timing.as_ref().map(|_| {
             (
                 self.vector_frame.frame_cpu.line_geometry.vertex_len(),
@@ -10790,6 +11082,7 @@ impl VectorEmissionOwned {
                         color,
                         width,
                         clip,
+                        ring_clip,
                     )?;
                 }
             }
@@ -10829,7 +11122,7 @@ impl VectorEmissionOwned {
             let mut prev = shifted(project(0, points[0]), 0, 0.);
             for (segment, p) in points[1..].iter().enumerate() {
                 let curr = shifted(project(segment + 1, *p), segment, 1.);
-                self.add_line_span(services, prev, curr, color, width, clip)?;
+                self.add_line_span(services, prev, curr, color, width, clip, ring_clip)?;
                 prev = curr;
             }
         }
@@ -10873,6 +11166,10 @@ impl VectorEmissionOwned {
         }
         Ok(())
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "One emitted segment: endpoints, style, exact clip and overscan ring clip"
+    )]
     fn add_line_span(
         &mut self,
         _services: &mut EmissionServices<'_>,
@@ -10881,6 +11178,7 @@ impl VectorEmissionOwned {
         color: [f32; 4],
         width: f32,
         clip: [f32; 4],
+        ring_clip: Option<[f32; 4]>,
     ) -> crate::Result<()> {
         let [clip_x_min, clip_y_min, clip_x_max, clip_y_max] = clip;
         // Skip segments with NaN/Inf coordinates
@@ -10889,10 +11187,36 @@ impl VectorEmissionOwned {
             return Ok(());
         }
 
-        // Clip to viewport bounds for clean edges
-        if let Some((cx0, cy0, cx1, cy1)) = RendererGeometry::clip_line_segment(
+        let exact = RendererGeometry::clip_line_segment(
             prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
-        ) {
+        );
+        // Overscan ring: the parts of the segment beyond the exact clip, as
+        // separate pieces, so the exact piece keeps its endpoints (and pixels).
+        if let Some(ring) = ring_clip {
+            for [x0, y0, x1, y1] in
+                overscan_ring_pieces([prev.x, prev.y, curr.x, curr.y], exact, ring)
+                    .into_iter()
+                    .flatten()
+            {
+                let (dx, dy) = (x1 - x0, y1 - y0);
+                let len = (dx * dx + dy * dy).sqrt();
+                if len >= 0.001 {
+                    let nx = -dy / len * width * 0.5;
+                    let ny = dx / len * width * 0.5;
+                    let before = self.vector_frame.frame_cpu.line_geometry.index_len();
+                    self.vector_frame
+                        .frame_cpu
+                        .line_geometry
+                        .append_emitted([x0, y0], [x1, y1], [-nx, -ny], [nx, ny], color)
+                        .map_err(|e| crate::WgpuError::Render(e.into()))?;
+                    self.vector_frame.overscan_extra_line_indices +=
+                        self.vector_frame.frame_cpu.line_geometry.index_len() - before;
+                }
+            }
+        }
+
+        // Clip to viewport bounds for clean edges
+        if let Some((cx0, cy0, cx1, cy1)) = exact {
             let dx = cx1 - cx0;
             let dy = cy1 - cy0;
             let len = (dx * dx + dy * dy).sqrt();
@@ -11201,6 +11525,8 @@ impl VectorEmissionOwned {
                 chart_geometry_viewport: None,
                 world_map_chart_boxes: Vec::new(),
                 lon_wrap_screen_px: 0.0,
+                overscan_margin: None,
+                overscan_extra_line_indices: 0,
             },
         }
     }

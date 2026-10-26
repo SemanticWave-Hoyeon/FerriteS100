@@ -83,6 +83,118 @@ impl<U: UiLayer> VectorDrawScene<'_, U> {
         }
         visible
     }
+    fn draw_navigation_placeholder(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        device: &wgpu::Device,
+        chart_scissor: [u32; 4],
+    ) {
+        let frame = &self.emission.vector_frame;
+        let rects = frame.unprepared_rects();
+        if rects.is_empty() {
+            return;
+        }
+        let (scale, translation) = frame.navigation_affine();
+        // One background quad covering the whole surface in retained pixels.
+        let [w, h] = self.extent.map(|v| v as f32);
+        let x = |sx: f32| (sx - translation[0]) / scale[0];
+        let y = |sy: f32| (sy - translation[1]) / scale[1];
+        let bg = self.background.to_array();
+        let quad = [
+            Vertex2D::new(x(-1.), y(-1.), bg),
+            Vertex2D::new(x(w + 1.), y(-1.), bg),
+            Vertex2D::new(x(w + 1.), y(h + 1.), bg),
+            Vertex2D::new(x(-1.), y(h + 1.), bg),
+        ];
+        if !quad
+            .iter()
+            .all(|v| v.position.iter().all(|c| c.is_finite()))
+        {
+            return;
+        }
+        use wgpu::util::DeviceExt;
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("navigation-placeholder-fill"),
+            contents: bytemuck::cast_slice(&quad),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("navigation-placeholder-fill-indices"),
+            contents: bytemuck::cast_slice(&[0u32, 1, 2, 0, 2, 3]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let world_line_count = frame.frame_cpu.world_map_line_indices.len() as u32;
+        // Low-detail chart: the retained area fills (land, depth zones) in
+        // priority order without coverage clipping, where they exist beyond
+        // the overscan (geographic culling keeps half a viewport).
+        let mut areas: Vec<_> = frame
+            .frame_cpu
+            .area_priority_ranges
+            .iter()
+            .filter(|(_, _, start, end, source)| {
+                end > start
+                    && !matches!(
+                        resolve_frame_binding(frame, *source, 0),
+                        Ok(crate::coverage_gpu_frame::CoverageGpuBinding::Hidden) | Err(_)
+                    )
+            })
+            .map(|&(plane, priority, start, end, _)| ((plane, priority), start, end))
+            .collect();
+        areas.sort_by_key(|(key, _, _)| *key);
+        for r in rects {
+            let scissor = [
+                r[0].floor().max(0.) as u32,
+                r[1].floor().max(0.) as u32,
+                r[2].ceil().max(0.) as u32,
+                r[3].ceil().max(0.) as u32,
+            ];
+            let Some([sx, sy, sw, sh]) = intersect_scissors(
+                [
+                    scissor[0],
+                    scissor[1],
+                    scissor[2].saturating_sub(scissor[0]),
+                    scissor[3].saturating_sub(scissor[1]),
+                ],
+                chart_scissor,
+            ) else {
+                continue;
+            };
+            render_pass.set_scissor_rect(sx, sy, sw, sh);
+            render_pass.set_pipeline(&self.pipelines.area_pipeline);
+            render_pass.set_bind_group(0, self.views[0], &[]);
+            render_pass.set_vertex_buffer(0, vertices.slice(..));
+            render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..6, 0, 0..1);
+            if let (Some(vb), Some(ib), true) = (
+                self.world_lines.vertices,
+                self.world_lines.indices,
+                world_line_count > 0,
+            ) {
+                render_pass.set_pipeline(&self.pipelines.line_pipeline);
+                render_pass.set_bind_group(0, self.views[0], &[]);
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..world_line_count, 0, 0..1);
+            }
+            if let (Some(vb), Some(ib), false) =
+                (self.area.vertices, self.area.indices, areas.is_empty())
+            {
+                render_pass.set_pipeline(&self.pipelines.area_pipeline);
+                render_pass.set_bind_group(0, self.views[0], &[]);
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                for &(_, start, end) in &areas {
+                    render_pass.draw_indexed(start as u32..end as u32, 0, 0..1);
+                }
+            }
+        }
+        render_pass.set_scissor_rect(
+            chart_scissor[0],
+            chart_scissor[1],
+            chart_scissor[2],
+            chart_scissor[3],
+        );
+    }
     fn is_device_fixed_source(&self, source: usize) -> bool {
         self.emission
             .vector_frame
@@ -670,6 +782,16 @@ impl<U: UiLayer> VectorDrawScene<'_, U> {
                     chart_scissor[1],
                     chart_scissor[2],
                     chart_scissor[3],
+                );
+            }
+            // Navigation placeholder: chart pixels the moving retained scene was
+            // not prepared for (beyond its overscan) show the background and
+            // reference coastlines instead of a blank. Never in an exact frame.
+            if let Some(renderer) = self.raster_renderer.filter(|r| r.navigation_placeholder) {
+                self.draw_navigation_placeholder(
+                    &mut render_pass,
+                    &renderer.state.device,
+                    chart_scissor,
                 );
             }
             // Dedicated S-98 annotation; never enters instructions, displayed

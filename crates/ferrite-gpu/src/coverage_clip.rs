@@ -144,7 +144,8 @@ pub struct CoverageClip {
     pub bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     _texture: wgpu::Texture,
-    origin: [u32; 2],
+    /// Device pixel of the uploaded image's texel (0, 0).
+    origin: [f32; 2],
     uniforms: ClipUniforms,
     pixel_bytes: usize,
 }
@@ -160,13 +161,31 @@ impl CoverageClip {
         transform: ClipTransform,
         byte_budget: usize,
     ) -> Result<Self> {
+        Self::new_in_window(device, queue, layout, mask, [0, 0], transform, byte_budget)
+    }
+    /// `mask` lives in a window whose texel (0, 0) is device pixel
+    /// `window_origin` (a navigation overscan may start left of the surface).
+    pub fn new_in_window(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        mask: Option<&PixelMask>,
+        window_origin: [i64; 2],
+        transform: ClipTransform,
+        byte_budget: usize,
+    ) -> Result<Self> {
         let size = mask.map_or([0, 0], PixelMask::size);
-        let origin = mask.map_or([0, 0], PixelMask::origin);
-        if origin.iter().any(|v| *v > 1 << 24) {
+        let texel_origin = mask.map_or([0, 0], PixelMask::origin);
+        let origin = [
+            texel_origin[0] as i64 + window_origin[0],
+            texel_origin[1] as i64 + window_origin[1],
+        ];
+        if origin.iter().any(|v| v.unsigned_abs() > 1 << 24) {
             return Err(WgpuError::Texture(
                 "Coverage origin exceeds exact device-pixel range".into(),
             ));
         }
+        let origin = origin.map(|v| v as f32);
         let mode = if mask.is_none() {
             0
         } else if size.contains(&0) {
@@ -231,10 +250,7 @@ impl CoverageClip {
             mode,
             padding: [0; 3],
             scale: transform.scale,
-            bias: [
-                transform.bias[0] - origin[0] as f32,
-                transform.bias[1] - origin[1] as f32,
-            ],
+            bias: [transform.bias[0] - origin[0], transform.bias[1] - origin[1]],
             size,
             padding2: [0; 2],
         };
@@ -272,8 +288,8 @@ impl CoverageClip {
     pub fn set_transform(&mut self, queue: &wgpu::Queue, transform: ClipTransform) {
         self.uniforms.scale = transform.scale;
         self.uniforms.bias = [
-            transform.bias[0] - self.origin[0] as f32,
-            transform.bias[1] - self.origin[1] as f32,
+            transform.bias[0] - self.origin[0],
+            transform.bias[1] - self.origin[1],
         ];
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
     }

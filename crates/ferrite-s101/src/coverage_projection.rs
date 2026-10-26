@@ -1,7 +1,7 @@
 //! S-101 coverage inventory projected by the same flat view as chart geometry.
 //! Keep extraction outside navigation; device projection and selection are per view.
 use anyhow::{ensure, Context, Result};
-use ferrite_kernel::coverage_frame::CoverageFrame;
+use ferrite_kernel::coverage_frame::{CoverageFrame, OverscanRing};
 use ferrite_kernel::coverage_selection::{CoverageFootprint, Region};
 use ferrite_kernel::{coverage_frame::CoverageSource, coverage_rendering::InstructionOrigin};
 #[cfg(test)]
@@ -847,24 +847,70 @@ impl GeographicCoverageInventory {
             .iter()
             .map(|(index, region)| Ok((*index, region.map_affine(|p| affine.screen(p))?)))
             .collect::<Result<Vec<_>>>()?;
-        let plan = crate::coverage_loading::display_plan_with_retention(
-            &inventory,
-            scaler.display_scale,
-            &viewport,
-            &retained,
-        )?;
-        let frame = Arc::new(CoverageFrame::new_with_scale_annotations(
-            &plan.eligible_inventory,
-            &plan.selection,
-            &viewport,
-            extent,
-            pixel_budget,
-            scaler.display_scale,
-            [
-                v.x as f64 + v.width as f64 * 0.5,
-                v.y as f64 + v.height as f64 * 0.5,
-            ],
-        )?);
+        let overscan_window = context
+            .navigation_overscan_margin()
+            .and_then(|margin| Some((margin, overscan_window(v, extent, margin)?)));
+        // The exact frame and a navigation overscan ring (the S-98 selection
+        // for the viewport grown by `margin` on every side, rasterized outside
+        // the exact chart pixels) are independent: prepare them concurrently.
+        let (frame, ring) = ferrite_kernel::par::join(
+            || -> Result<CoverageFrame> {
+                let plan = crate::coverage_loading::display_plan_with_retention(
+                    &inventory,
+                    scaler.display_scale,
+                    &viewport,
+                    &retained,
+                )?;
+                CoverageFrame::new_with_scale_annotations(
+                    &plan.eligible_inventory,
+                    &plan.selection,
+                    &viewport,
+                    extent,
+                    pixel_budget,
+                    scaler.display_scale,
+                    [
+                        v.x as f64 + v.width as f64 * 0.5,
+                        v.y as f64 + v.height as f64 * 0.5,
+                    ],
+                )
+            },
+            || -> Option<OverscanRing> {
+                let ([mx, my], (inner, origin, size)) = overscan_window?;
+                let [mx, my] = [mx, my].map(f64::from);
+                let expanded = Region::from_rings(
+                    &[
+                        [x - mx, y - my],
+                        [right + mx, y - my],
+                        [right + mx, bottom + my],
+                        [x - mx, bottom + my],
+                        [x - mx, y - my],
+                    ],
+                    &[],
+                )
+                .ok()?;
+                let (eligible, selection, _) =
+                    crate::coverage_loading::display_selection_with_retention(
+                        &inventory,
+                        scaler.display_scale,
+                        &expanded,
+                        &retained,
+                    )
+                    .ok()?;
+                OverscanRing::rasterize(&eligible, &selection, inner, origin, size, pixel_budget)
+                    .ok()
+            },
+        );
+        let mut frame = frame?;
+        // Every longitude copy uploads the masks: keep them within the
+        // backend's logical mask budget, else prepare no overscan (the exact
+        // frame is complete without it, and decides every exact pixel).
+        if let Some(ring) = ring {
+            let copies = if wrapping { 3 } else { 1 };
+            if let Ok(overscan) = frame.build_overscan(ring, OVERSCAN_MASK_BUDGET / copies) {
+                frame.set_overscan(overscan);
+            }
+        }
+        let frame = Arc::new(frame);
         // PreparedCoverage and its caller share the already-sorted raw order.
         let northings = binding
             .as_ref()
@@ -1005,6 +1051,49 @@ impl GeographicCoverageInventory {
     }
 }
 
+/// Logical R8 texels of navigation overscan masks over all longitude copies.
+/// A backend uploads them instead of the exact masks; the GPU coverage plan
+/// admits 128 MiB in total.
+pub const OVERSCAN_MASK_BUDGET: usize = 120 * 1024 * 1024;
+
+/// Device pixels of a navigation overscan: the exact chart pixels (the chart
+/// pass scissor: the viewport rounded outward, within the surface) and the
+/// window grown by whole `margin` pixels on every side as (origin, size).
+pub fn overscan_window(
+    viewport: ferrite_render::Viewport,
+    extent: [u32; 2],
+    margin: [f32; 2],
+) -> Option<([i64; 4], [i64; 2], [u32; 2])> {
+    let [vx, vy, vw, vh] = [viewport.x, viewport.y, viewport.width, viewport.height].map(f64::from);
+    let [mx, my] = margin.map(f64::from);
+    if ![vx, vy, vw, vh, mx, my].iter().all(|v| v.is_finite())
+        || vw <= 0.
+        || vh <= 0.
+        || mx < 0.
+        || my < 0.
+        || extent.contains(&0)
+    {
+        return None;
+    }
+    let inner = [
+        vx.floor().clamp(0., extent[0] as f64) as i64,
+        vy.floor().clamp(0., extent[1] as f64) as i64,
+        (vx + vw).ceil().clamp(0., extent[0] as f64) as i64,
+        (vy + vh).ceil().clamp(0., extent[1] as f64) as i64,
+    ];
+    if inner[2] <= inner[0] || inner[3] <= inner[1] {
+        return None;
+    }
+    let (mx, my) = (mx.ceil() as i64, my.ceil() as i64);
+    let origin = [vx.floor() as i64 - mx, vy.floor() as i64 - my];
+    let end = [(vx + vw).ceil() as i64 + mx, (vy + vh).ceil() as i64 + my];
+    let origin = [origin[0].min(inner[0]), origin[1].min(inner[1])];
+    let end = [end[0].max(inner[2]), end[1].max(inner[3])];
+    let size = [end[0] - origin[0], end[1] - origin[1]];
+    (size.iter().all(|s| *s > 0 && *s < 1 << 20))
+        .then(|| (inner, origin, [size[0] as u32, size[1] as u32]))
+}
+
 #[cfg(test)]
 mod anchored_local_coverage_tests {
     use super::*;
@@ -1096,6 +1185,148 @@ mod anchored_local_coverage_tests {
                 .iter()
                 .all(|i| i.portrayal_origin().requires_view_reprojection()));
         }
+    }
+}
+
+#[cfg(test)]
+mod navigation_overscan_tests {
+    use super::*;
+    use ferrite_kernel::coverage_frame::FrameCoverageDecision;
+    use ferrite_render::{GeoBounds, PointInstruction, PortrayalOrigin, Viewport};
+    fn coverage(
+        key: i64,
+        min: u32,
+        [x0, y0, x1, y1]: [f64; 4],
+    ) -> Option<Vec<crate::coverage_geometry::DataCoverage>> {
+        Some(vec![crate::coverage_geometry::DataCoverage {
+            feature_key: key,
+            drawing_index: None,
+            scales: ferrite_kernel::scale_policy::CoverageScaleRange {
+                minimum_denominator: Some(min),
+                optimum_denominator: min / 2,
+                maximum_denominator: min / 4,
+            },
+            surfaces: vec![crate::coverage_geometry::GeographicSurface {
+                exterior: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]],
+                holes: vec![],
+            }],
+        }])
+    }
+    #[test]
+    fn overscan_window_is_the_scissor_grown_by_whole_pixels() {
+        let v = Viewport::with_origin(10.5, 0., 100., 50.);
+        let (inner, origin, size) = overscan_window(v, [200, 50], [25., 12.5]).unwrap();
+        assert_eq!(inner, [10, 0, 111, 50]);
+        assert_eq!(origin, [-15, -13]);
+        assert_eq!(size, [151, 76]);
+        assert!(overscan_window(v, [0, 50], [25., 12.5]).is_none());
+        assert!(overscan_window(v, [200, 50], [f32::NAN, 1.]).is_none());
+    }
+    /// The exact viewport keeps its decisions and fragment rights with an
+    /// overscan; data only the overscan selects is clipped to the ring.
+    #[test]
+    fn overscan_keeps_viewport_decisions_and_adds_ring_only_data() {
+        let mut c = RenderContext::new(Viewport::new(64., 40.));
+        c.set_bounds(GeoBounds::new(0., 0., 1., 1.));
+        c.scaler.display_scale = 22500.;
+        let s = &c.scaler;
+        let left = s
+            .screen_to_world(ferrite_render::ScreenPoint::new(0., 20.))
+            .x;
+        let right = s
+            .screen_to_world(ferrite_render::ScreenPoint::new(64., 20.))
+            .x;
+        let ring = s
+            .screen_to_world(ferrite_render::ScreenPoint::new(80., 20.))
+            .x;
+        let top = s
+            .screen_to_world(ferrite_render::ScreenPoint::new(0., 0.))
+            .y;
+        let bottom = s
+            .screen_to_world(ferrite_render::ScreenPoint::new(0., 40.))
+            .y;
+        let east = [right + (ring - right) * 0.2, bottom, ring + 1., top];
+        let source = GeographicCoverageInventory {
+            binding_cache: Mutex::new(None),
+            binding_cache_enabled: false,
+            binding_requests: AtomicU64::new(0),
+            binding_hits: AtomicU64::new(0),
+            plane_cache: Mutex::new(None),
+            datasets: vec![
+                // Coarse everywhere; finer over the west half; finer only east of the view.
+                coverage(1, 180000, [left - 5., bottom - 5., right + 5., top + 5.]),
+                coverage(
+                    2,
+                    45000,
+                    [left - 5., bottom - 5., (left + right) / 2., top + 5.],
+                ),
+                coverage(3, 45000, east),
+            ],
+        };
+        let point = |cell: usize, at: WorldPoint| {
+            let mut p = ferrite_render::DrawingInstruction::Point(
+                PointInstruction::new("ACHBRT07".into(), at).with_cell_index(cell),
+            );
+            p.set_portrayal_origin(PortrayalOrigin::feature_point(at).unwrap());
+            p
+        };
+        let nonpoint = |cell: usize| {
+            let mut p = ferrite_render::DrawingInstruction::Point(
+                PointInstruction::new("ACHBRT07".into(), WorldPoint::new(0.5, 0.5))
+                    .with_cell_index(cell),
+            );
+            p.set_portrayal_origin(PortrayalOrigin::NonPoint);
+            p
+        };
+        let middle = (top + bottom) / 2.;
+        for cell in 0..3 {
+            c.add_instruction(nonpoint(cell));
+            c.add_instruction(point(cell, WorldPoint::new((left + right) / 2., middle)));
+            c.add_instruction(point(cell, WorldPoint::new((right + ring) / 2., middle)));
+        }
+        c.get_sorted_instructions();
+        let exact = source
+            .prepare_flat(&c, &BTreeSet::new(), [64, 40], false, 1 << 20)
+            .unwrap()
+            .unwrap();
+        c.set_navigation_overscan(Some(0.25));
+        assert_eq!(c.navigation_overscan_margin(), Some([16., 10.]));
+        let overscanned = source
+            .prepare_flat(&c, &BTreeSet::new(), [64, 40], false, 1 << 20)
+            .unwrap()
+            .unwrap();
+        let frame = overscanned.pass(0).unwrap().frame();
+        let overscan = frame.overscan().expect("overscan prepared");
+        assert_eq!(overscan.window_origin(), [-16, -10]);
+        assert!(overscan.is_ring_only(2));
+        assert!(!overscan.is_ring_only(0) && !overscan.is_ring_only(1));
+        let mut ring_only = 0;
+        for ordinal in 0..c.instruction_count() {
+            let a = exact.pass(0).unwrap();
+            let b = overscanned.pass(0).unwrap();
+            let (da, db) = (a.decision(ordinal).unwrap(), b.decision(ordinal).unwrap());
+            if da != db {
+                assert_eq!(da, FrameCoverageDecision::Hidden);
+                assert_eq!(db, FrameCoverageDecision::ClipDataset(2));
+                ring_only += 1;
+            }
+            for y in 0..40 {
+                for x in 0..64 {
+                    let p = [x as f64 + 0.5, y as f64 + 0.5];
+                    assert_eq!(
+                        a.accepts_fragment(ordinal, p).unwrap(),
+                        b.accepts_fragment(ordinal, p).unwrap(),
+                        "ordinal {ordinal} pixel {x},{y}"
+                    );
+                }
+            }
+        }
+        // The non-point command and the ring point of the east dataset; its
+        // point inside the viewport stays hidden.
+        assert_eq!(ring_only, 2);
+        // The ring shows the east data beyond the viewport's right edge.
+        let (mask, origin) = frame.device_mask(2).unwrap();
+        assert!(mask.contains_pixel((72 - origin[0]) as u32, (20 - origin[1]) as u32));
     }
 }
 

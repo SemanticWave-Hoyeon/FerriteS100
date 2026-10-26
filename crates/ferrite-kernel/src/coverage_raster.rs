@@ -133,6 +133,94 @@ pub fn rasterize_selected_masks(
     extent: [u32; 2],
     byte_budget: usize,
 ) -> Result<Vec<CoveragePixelMask>> {
+    rasterize_selected_masks_with(inventory, selection, byte_budget, &|region, budget| {
+        rasterize(region, extent, budget)
+    })
+}
+
+/// `rasterize_selected_masks` over an overscan window (see `rasterize_window`).
+/// Texels inside `hole` (a texel rectangle) stay empty.
+/// Components are rasterized and obscured in parallel (same results); the
+/// budget bounds each component and the aggregate after each stage.
+pub fn rasterize_selected_masks_window(
+    inventory: &[CoverageFootprint],
+    selection: &Selection,
+    window_origin: [i64; 2],
+    size: [u32; 2],
+    hole: Option<[u32; 4]>,
+    byte_budget: usize,
+) -> Result<Vec<CoveragePixelMask>> {
+    use crate::par::prelude::*;
+    let mut datasets = BTreeSet::new();
+    for selected in &selection.coverages {
+        let coverage = inventory
+            .get(selected.inventory_index)
+            .ok_or_else(|| anyhow::anyhow!("Invalid selected coverage index"))?;
+        datasets.insert(coverage.dataset_id);
+    }
+    let mut indexes = Vec::new();
+    for (index, coverage) in inventory.iter().enumerate() {
+        if datasets.contains(&coverage.dataset_id) {
+            coverage.scales.validate()?;
+            indexes.push(index);
+        }
+    }
+    let raw = indexes
+        .par_iter()
+        .map(|&index| {
+            rasterize_window_with_hole(
+                &inventory[index].region,
+                window_origin,
+                size,
+                hole,
+                byte_budget,
+            )
+            .map(|mask| (index, mask))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let raw_bytes = raw.iter().map(|(_, m)| m.pixels.len()).sum::<usize>();
+    ensure!(
+        raw_bytes <= byte_budget,
+        "Aggregate coverage masks exceed byte budget"
+    );
+    let minimum = |index: usize| {
+        inventory[index]
+            .scales
+            .minimum_denominator
+            .unwrap_or(u32::MAX)
+    };
+    let result: Vec<CoveragePixelMask> = raw
+        .par_iter()
+        .map(|(index, mask)| {
+            let mut visible = mask.clone();
+            for (other, obscuring) in &raw {
+                if minimum(*other) < minimum(*index) {
+                    visible.subtract(obscuring);
+                }
+            }
+            CoveragePixelMask {
+                inventory_index: *index,
+                mask: visible,
+            }
+        })
+        .collect();
+    ensure!(
+        raw_bytes + result.iter().map(|m| m.mask.pixels.len()).sum::<usize>() <= byte_budget,
+        "Aggregate coverage masks exceed byte budget"
+    );
+    Ok(result)
+}
+
+type RegionRaster<'a> = dyn Fn(&Region, usize) -> Result<PixelMask> + 'a;
+
+fn rasterize_selected_masks_with(
+    inventory: &[CoverageFootprint],
+    selection: &Selection,
+    byte_budget: usize,
+    raster: &RegionRaster<'_>,
+) -> Result<Vec<CoveragePixelMask>> {
     let mut datasets = BTreeSet::new();
     for selected in &selection.coverages {
         let coverage = inventory
@@ -147,7 +235,7 @@ pub fn rasterize_selected_masks(
             continue;
         }
         coverage.scales.validate()?;
-        let mask = rasterize(&coverage.region, extent, byte_budget - bytes)?;
+        let mask = raster(&coverage.region, byte_budget - bytes)?;
         bytes += mask.pixels.len();
         raw.push((index, mask));
     }
@@ -319,6 +407,265 @@ pub fn rasterize(region: &Region, extent: [u32; 2], byte_budget: usize) -> Resul
     })
 }
 
+/// `rasterize` over a window of `size` texels whose texel (0, 0) is device
+/// pixel `window_origin` (which may be negative, e.g. a navigation overscan
+/// beyond the surface). Texel (i, j) samples device centre
+/// (i + origin.x + 0.5, j + origin.y + 0.5) with the same half-open rule.
+pub fn rasterize_window(
+    region: &Region,
+    window_origin: [i64; 2],
+    size: [u32; 2],
+    byte_budget: usize,
+) -> Result<PixelMask> {
+    rasterize_window_with_hole(region, window_origin, size, None, byte_budget)
+}
+
+/// `rasterize_window`, leaving the texels of `hole` empty (their owner is
+/// another mask, e.g. the exact frame's chart pixels).
+pub fn rasterize_window_with_hole(
+    region: &Region,
+    window_origin: [i64; 2],
+    size: [u32; 2],
+    hole: Option<[u32; 4]>,
+    byte_budget: usize,
+) -> Result<PixelMask> {
+    if region.is_empty() || size.contains(&0) {
+        return Ok(PixelMask::empty());
+    }
+    let offset = [window_origin[0] as f64, window_origin[1] as f64];
+    ensure!(
+        window_origin.iter().all(|v| v.unsigned_abs() < 1 << 40),
+        "Coverage window origin out of range"
+    );
+    let bounds = region
+        .polygons()
+        .iter()
+        .filter_map(BoundingRect::bounding_rect)
+        .fold(
+            [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ],
+            |mut bounds, r| {
+                bounds[0] = bounds[0].min(r.min().x);
+                bounds[1] = bounds[1].min(r.min().y);
+                bounds[2] = bounds[2].max(r.max().x);
+                bounds[3] = bounds[3].max(r.max().y);
+                bounds
+            },
+        );
+    let clamp = |v: f64, maximum: u32| v.clamp(0., maximum as f64) as u32;
+    let origin = [
+        clamp((bounds[0] - offset[0]).floor(), size[0]),
+        clamp((bounds[1] - offset[1]).floor(), size[1]),
+    ];
+    let end = [
+        clamp((bounds[2] - offset[0]).ceil(), size[0]),
+        clamp((bounds[3] - offset[1]).ceil(), size[1]),
+    ];
+    let extent = [end[0] - origin[0], end[1] - origin[1]];
+    if extent.contains(&0) {
+        return Ok(PixelMask::empty());
+    }
+    let bytes = (extent[0] as usize)
+        .checked_mul(extent[1] as usize)
+        .ok_or_else(|| anyhow::anyhow!("Coverage mask size overflow"))?;
+    ensure!(
+        bytes <= byte_budget,
+        "Coverage mask exceeds byte budget: {bytes} > {byte_budget}"
+    );
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(bytes)?;
+    pixels.resize(bytes, 0);
+    let mut crossings = Vec::new();
+    let mut fill = |row_start: usize, start: u32, stop: u32| {
+        if start < stop {
+            pixels
+                [row_start + (start - origin[0]) as usize..row_start + (stop - origin[0]) as usize]
+                .fill(255);
+        }
+    };
+    for row in 0..extent[1] {
+        let texel_y = origin[1] + row;
+        let y = texel_y as f64 + offset[1] + 0.5;
+        scanline_crossings(region, y, &mut crossings)?;
+        let start_of_row = row as usize * extent[0] as usize;
+        let hole_x = hole
+            .filter(|h| texel_y >= h[1] && texel_y < h[3])
+            .map(|h| [h[0], h[2]]);
+        for pair in crossings.as_chunks::<2>().0 {
+            let start = clamp((pair[0] - offset[0] - 0.5).ceil(), size[0]).max(origin[0]);
+            let stop = clamp((pair[1] - offset[0] - 0.5).ceil(), size[0]).min(end[0]);
+            match hole_x {
+                Some([h0, h1]) => {
+                    fill(start_of_row, start, stop.min(h0));
+                    fill(start_of_row, start.max(h1), stop);
+                }
+                None => fill(start_of_row, start, stop),
+            }
+        }
+    }
+    Ok(PixelMask {
+        origin,
+        size: extent,
+        pixels,
+    })
+}
+
+/// `compose_overscan_mask` taking the ring by value: when the ring's rectangle
+/// already holds the exact part, the exact texels are written into it in place
+/// (no second window-sized allocation or ring copy).
+pub fn compose_overscan_mask_owned(
+    exact: Option<&PixelMask>,
+    ring: Option<PixelMask>,
+    window_origin: [i64; 2],
+    inner: [u32; 4],
+    byte_budget: usize,
+) -> Result<PixelMask> {
+    let Some(mut ring) = ring.filter(|m| !m.size.contains(&0)) else {
+        return compose_overscan_mask(exact, None, window_origin, inner, byte_budget);
+    };
+    let [ix0, iy0, ix1, iy1] = inner.map(i64::from);
+    let r = [
+        ring.origin[0] as i64,
+        ring.origin[1] as i64,
+        (ring.origin[0] + ring.size[0]) as i64,
+        (ring.origin[1] + ring.size[1]) as i64,
+    ];
+    let a = exact.filter(|m| !m.size.contains(&0)).and_then(|m| {
+        let x0 = (m.origin[0] as i64 - window_origin[0]).max(ix0);
+        let y0 = (m.origin[1] as i64 - window_origin[1]).max(iy0);
+        let x1 = (m.origin[0] as i64 + m.size[0] as i64 - window_origin[0]).min(ix1);
+        let y1 = (m.origin[1] as i64 + m.size[1] as i64 - window_origin[1]).min(iy1);
+        (x0 < x1 && y0 < y1).then_some((m, [x0, y0, x1, y1]))
+    });
+    if a.is_some_and(|(_, a)| a[0] < r[0] || a[1] < r[1] || a[2] > r[2] || a[3] > r[3]) {
+        return compose_overscan_mask(exact, Some(&ring), window_origin, inner, byte_budget);
+    }
+    ensure!(
+        ring.pixels.len() <= byte_budget,
+        "Overscan mask byte budget exceeded"
+    );
+    let width = ring.size[0] as usize;
+    // Ring texels inside the exact chart pixels are never its own.
+    let (hx0, hx1) = (ix0.max(r[0]), ix1.min(r[2]));
+    if hx0 < hx1 {
+        for y in iy0.max(r[1])..iy1.min(r[3]) {
+            let row = (y - r[1]) as usize * width;
+            ring.pixels[row + (hx0 - r[0]) as usize..row + (hx1 - r[0]) as usize].fill(0);
+        }
+    }
+    if let Some((m, a)) = a {
+        let source_width = m.size[0] as usize;
+        for y in a[1]..a[3] {
+            let device_y = y + window_origin[1] - m.origin[1] as i64;
+            let device_x = a[0] + window_origin[0] - m.origin[0] as i64;
+            let s = device_y as usize * source_width + device_x as usize;
+            let t = (y - r[1]) as usize * width + (a[0] - r[0]) as usize;
+            let n = (a[2] - a[0]) as usize;
+            ring.pixels[t..t + n].copy_from_slice(&m.pixels[s..s + n]);
+        }
+    }
+    Ok(ring)
+}
+
+/// Navigation overscan composite in a window's texel space (device pixel =
+/// texel + `window_origin`). Texels inside `inner` (texel rect `[x0, y0, x1,
+/// y1)`) copy `exact`, a device-space mask, so that region is bit-identical to
+/// the exact frame; every other texel copies `ring`, already in texel space.
+pub fn compose_overscan_mask(
+    exact: Option<&PixelMask>,
+    ring: Option<&PixelMask>,
+    window_origin: [i64; 2],
+    inner: [u32; 4],
+    byte_budget: usize,
+) -> Result<PixelMask> {
+    let [ix0, iy0, ix1, iy1] = inner.map(i64::from);
+    // Exact part, clipped to the inner rectangle, in texel coordinates.
+    let a = exact.filter(|m| !m.size.contains(&0)).and_then(|m| {
+        let x0 = (m.origin[0] as i64 - window_origin[0]).max(ix0);
+        let y0 = (m.origin[1] as i64 - window_origin[1]).max(iy0);
+        let x1 = (m.origin[0] as i64 + m.size[0] as i64 - window_origin[0]).min(ix1);
+        let y1 = (m.origin[1] as i64 + m.size[1] as i64 - window_origin[1]).min(iy1);
+        (x0 < x1 && y0 < y1).then_some((m, [x0, y0, x1, y1]))
+    });
+    let b = ring.filter(|m| !m.size.contains(&0)).map(|m| {
+        (
+            m,
+            [
+                m.origin[0] as i64,
+                m.origin[1] as i64,
+                (m.origin[0] + m.size[0]) as i64,
+                (m.origin[1] + m.size[1]) as i64,
+            ],
+        )
+    });
+    let rects: Vec<[i64; 4]> = a.iter().map(|x| x.1).chain(b.iter().map(|x| x.1)).collect();
+    if rects.is_empty() {
+        return Ok(PixelMask::empty());
+    }
+    let lo = [
+        rects.iter().map(|r| r[0]).min().unwrap(),
+        rects.iter().map(|r| r[1]).min().unwrap(),
+    ];
+    let hi = [
+        rects.iter().map(|r| r[2]).max().unwrap(),
+        rects.iter().map(|r| r[3]).max().unwrap(),
+    ];
+    ensure!(
+        lo.iter().all(|v| *v >= 0) && hi.iter().all(|v| *v <= u32::MAX as i64),
+        "Overscan mask outside its window"
+    );
+    let size = [(hi[0] - lo[0]) as u32, (hi[1] - lo[1]) as u32];
+    let bytes = (size[0] as usize)
+        .checked_mul(size[1] as usize)
+        .ok_or_else(|| anyhow::anyhow!("Overscan mask size overflow"))?;
+    ensure!(bytes <= byte_budget, "Overscan mask byte budget exceeded");
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(bytes)?;
+    pixels.resize(bytes, 0);
+    let width = size[0] as usize;
+    if let Some((m, r)) = b {
+        let source_width = m.size[0] as usize;
+        for y in r[1]..r[3] {
+            let source = (y - r[1]) as usize * source_width;
+            let target = (y - lo[1]) as usize * width;
+            let mut copy = |x0: i64, x1: i64| {
+                if x0 < x1 {
+                    let s = source + (x0 - r[0]) as usize;
+                    let t = target + (x0 - lo[0]) as usize;
+                    let n = (x1 - x0) as usize;
+                    pixels[t..t + n].copy_from_slice(&m.pixels[s..s + n]);
+                }
+            };
+            if y >= iy0 && y < iy1 {
+                copy(r[0], r[2].min(ix0));
+                copy(r[0].max(ix1), r[2]);
+            } else {
+                copy(r[0], r[2]);
+            }
+        }
+    }
+    if let Some((m, r)) = a {
+        let source_width = m.size[0] as usize;
+        for y in r[1]..r[3] {
+            let device_y = y + window_origin[1] - m.origin[1] as i64;
+            let device_x = r[0] + window_origin[0] - m.origin[0] as i64;
+            let s = device_y as usize * source_width + device_x as usize;
+            let t = (y - lo[1]) as usize * width + (r[0] - lo[0]) as usize;
+            let n = (r[2] - r[0]) as usize;
+            pixels[t..t + n].copy_from_slice(&m.pixels[s..s + n]);
+        }
+    }
+    Ok(PixelMask {
+        origin: [lo[0] as u32, lo[1] as u32],
+        size,
+        pixels,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +823,34 @@ pub fn rasterize_selected_dataset_masks(
     byte_budget: usize,
 ) -> Result<Vec<DatasetPixelMask>> {
     let components = rasterize_selected_masks(inventory, selection, extent, byte_budget)?;
+    group_dataset_masks(inventory, components, byte_budget)
+}
+
+/// `rasterize_selected_dataset_masks` over an overscan window, `hole` empty.
+pub fn rasterize_selected_dataset_masks_window(
+    inventory: &[CoverageFootprint],
+    selection: &Selection,
+    window_origin: [i64; 2],
+    size: [u32; 2],
+    hole: Option<[u32; 4]>,
+    byte_budget: usize,
+) -> Result<Vec<DatasetPixelMask>> {
+    let components = rasterize_selected_masks_window(
+        inventory,
+        selection,
+        window_origin,
+        size,
+        hole,
+        byte_budget,
+    )?;
+    group_dataset_masks(inventory, components, byte_budget)
+}
+
+fn group_dataset_masks(
+    inventory: &[CoverageFootprint],
+    components: Vec<CoveragePixelMask>,
+    byte_budget: usize,
+) -> Result<Vec<DatasetPixelMask>> {
     let mut groups = std::collections::BTreeMap::<usize, Vec<PixelMask>>::new();
     let mut resident = 0usize;
     for component in components {
@@ -672,5 +1047,136 @@ mod dataset_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod overscan_window_tests {
+    use super::*;
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Region {
+        Region::from_rings(&[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], &[]).unwrap()
+    }
+    fn concave() -> Region {
+        Region::from_rings(
+            &[
+                [-6.3, -2.5],
+                [13.7, 1.2],
+                [13.7, 8.5],
+                [8.5, 8.5],
+                [8.5, 14.2],
+                [-6.3, 14.2],
+                [-6.3, -2.5],
+            ],
+            &[vec![[1., 2.5], [5.5, 2.5], [5.5, 6.], [1., 6.], [1., 2.5]]],
+        )
+        .unwrap()
+    }
+    #[test]
+    fn zero_origin_window_is_the_surface_raster() {
+        let region = concave();
+        assert_eq!(
+            rasterize_window(&region, [0, 0], [12, 10], 1000).unwrap(),
+            rasterize(&region, [12, 10], 1000).unwrap()
+        );
+    }
+    #[test]
+    fn window_texels_sample_the_same_device_pixels_beyond_the_surface() {
+        let region = concave();
+        let origin = [-8i64, -4i64];
+        let window = rasterize_window(&region, origin, [30, 24], 1000).unwrap();
+        // The device raster of the region moved by +8/+4 (exact in f64).
+        let moved = region.map_affine(|p| [p[0] + 8., p[1] + 4.]).unwrap();
+        let shifted = rasterize(&moved, [30, 24], 1000).unwrap();
+        for y in 0..24 {
+            for x in 0..30 {
+                assert_eq!(
+                    window.contains_pixel(x, y),
+                    shifted.contains_pixel(x, y),
+                    "texel {x},{y}"
+                );
+            }
+        }
+        // Device pixel (-6, 0) is inside; texel = device - origin.
+        assert!(window.contains_pixel(2, 4));
+        assert!(rasterize_window(&region, origin, [30, 24], 10).is_err());
+    }
+    #[test]
+    fn composite_copies_exact_inside_and_ring_outside() {
+        // Exact mask in device space over the 10x10 surface, ring raster of a
+        // different selection over the window [-5, 15).
+        let exact = rasterize(&rect(2., 0., 10., 10.), [10, 10], 1000).unwrap();
+        let ring = rasterize_window(&rect(-5., -5., 6., 15.), [-5, -5], [20, 20], 1000).unwrap();
+        let inner = [5, 5, 15, 15];
+        let composite =
+            compose_overscan_mask(Some(&exact), Some(&ring), [-5, -5], inner, 1000).unwrap();
+        for ty in 0..20u32 {
+            for tx in 0..20u32 {
+                let (dx, dy) = (tx as i64 - 5, ty as i64 - 5);
+                let inside = (0..10).contains(&dx) && (0..10).contains(&dy);
+                let expected = if inside {
+                    exact.contains_pixel(dx as u32, dy as u32)
+                } else {
+                    ring.contains_pixel(tx, ty)
+                };
+                assert_eq!(
+                    composite.contains_pixel(tx, ty),
+                    expected,
+                    "texel {tx},{ty}"
+                );
+            }
+        }
+        // Ring-only data never reaches the inner rectangle.
+        let ring_only = compose_overscan_mask(None, Some(&ring), [-5, -5], inner, 1000).unwrap();
+        for ty in 5..15 {
+            for tx in 5..15 {
+                assert!(!ring_only.contains_pixel(tx, ty));
+            }
+        }
+        assert!(ring_only.contains_pixel(2, 2));
+        // The owned variant gives the same texels, in place when it can.
+        for exact in [Some(&exact), None] {
+            let owned =
+                compose_overscan_mask_owned(exact, Some(ring.clone()), [-5, -5], inner, 1000)
+                    .unwrap();
+            let borrowed =
+                compose_overscan_mask(exact, Some(&ring), [-5, -5], inner, 1000).unwrap();
+            for ty in 0..20u32 {
+                for tx in 0..20u32 {
+                    assert_eq!(
+                        owned.contains_pixel(tx, ty),
+                        borrowed.contains_pixel(tx, ty)
+                    );
+                }
+            }
+        }
+        // A ring smaller than the exact part falls back to a new allocation.
+        let small = rasterize_window(&rect(-5., -5., -1., 2.), [-5, -5], [20, 20], 1000).unwrap();
+        let owned =
+            compose_overscan_mask_owned(Some(&exact), Some(small.clone()), [-5, -5], inner, 1000)
+                .unwrap();
+        let borrowed =
+            compose_overscan_mask(Some(&exact), Some(&small), [-5, -5], inner, 1000).unwrap();
+        assert_eq!(owned, borrowed);
+        // A hole leaves the exact chart pixels empty in the ring raster.
+        let holed = rasterize_window_with_hole(
+            &rect(-5., -5., 6., 15.),
+            [-5, -5],
+            [20, 20],
+            Some(inner),
+            1000,
+        )
+        .unwrap();
+        for ty in 0..20u32 {
+            for tx in 0..20u32 {
+                let in_hole = (5..15).contains(&tx) && (5..15).contains(&ty);
+                assert_eq!(
+                    holed.contains_pixel(tx, ty),
+                    ring.contains_pixel(tx, ty) && !in_hole
+                );
+            }
+        }
+        let empty = compose_overscan_mask(None, None, [-5, -5], inner, 0).unwrap();
+        assert!(empty.pixels().is_empty() && empty.size() == [0, 0]);
+        assert!(compose_overscan_mask(Some(&exact), Some(&ring), [-5, -5], inner, 10).is_err());
     }
 }

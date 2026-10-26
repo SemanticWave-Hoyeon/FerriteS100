@@ -217,6 +217,8 @@ pub struct RenderContext {
     temporal_index_dirty: bool,
     /// Optimization: animation mode (skip expensive operations)
     pub animation_mode: bool,
+    /// Viewport fraction prepared beyond every side for a navigation preview.
+    navigation_overscan: Option<f32>,
 }
 
 impl RenderContext {
@@ -259,6 +261,7 @@ impl RenderContext {
             temporal_indices: Vec::new(),
             temporal_index_dirty: false,
             animation_mode: false,
+            navigation_overscan: None,
         }
     }
 
@@ -273,6 +276,7 @@ impl RenderContext {
         next.dependency_plan_cache_enabled = self.dependency_plan_cache_enabled;
         next.retained_path_cache_enabled = self.retained_path_cache_enabled;
         next.coverage_exempt_empty_fast_path = self.coverage_exempt_empty_fast_path;
+        next.navigation_overscan = self.navigation_overscan;
         next
     }
 
@@ -321,12 +325,38 @@ impl RenderContext {
             temporal_indices: self.temporal_indices.clone(),
             temporal_index_dirty: self.temporal_index_dirty,
             animation_mode: self.animation_mode,
+            navigation_overscan: self.navigation_overscan,
         }
     }
 
     /// True when both owners hold the very same instruction allocation.
     pub fn shares_instructions_with(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.instructions, &other.instructions)
+    }
+
+    /// Prepare coverage and screen-space culling for the chart viewport
+    /// expanded by `fraction` of its size on every side, for a host that shows
+    /// the retained scene through a moving affine. The exact chart pixels are
+    /// unchanged; `None` (the default) prepares the viewport alone.
+    pub fn set_navigation_overscan(&mut self, fraction: Option<f32>) {
+        let fraction = fraction.filter(|f| f.is_finite() && *f > 0.);
+        if fraction != self.navigation_overscan {
+            self.invalidate_coverage_view();
+            self.navigation_overscan = fraction;
+        }
+    }
+    pub fn navigation_overscan(&self) -> Option<f32> {
+        self.navigation_overscan
+    }
+    /// Whole physical pixels prepared beyond each side of the chart viewport.
+    pub fn navigation_overscan_margin(&self) -> Option<[f32; 2]> {
+        let fraction = self.navigation_overscan?;
+        let v = self.scaler.viewport;
+        let margin = [(v.width * fraction).ceil(), (v.height * fraction).ceil()];
+        margin
+            .iter()
+            .all(|m| m.is_finite() && *m >= 0. && *m < 1e6)
+            .then_some(margin)
     }
 
     /// Set animation mode (enables fast-path optimizations)

@@ -41,6 +41,7 @@ fn label(source: usize, priority: i32, style: TextFontStyle, italic: bool) -> Te
         h_align: ferrite_render::HAlign::Left,
         v_align: ferrite_render::VAlign::Top,
         group: None,
+        overscan_only: false,
     }
 }
 fn layout(

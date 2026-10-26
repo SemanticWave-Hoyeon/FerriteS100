@@ -84,6 +84,25 @@ pub fn display_plan_with_retention(
     viewport: &Region,
     retained: &[(usize, Region)],
 ) -> Result<S101DisplayPlan> {
+    let (eligible, selection, minimum_retention) =
+        display_selection_with_retention(inventory, denominator, viewport, retained)?;
+    let masks = assign_masks(&eligible, &selection, viewport)?;
+    Ok(S101DisplayPlan {
+        eligible_inventory: eligible,
+        selection,
+        masks,
+        minimum_retention,
+    })
+}
+/// The eligible inventory and Appendix E selection of `display_plan_with_retention`
+/// without E-1.4 masks (for example a navigation overscan region, whose device
+/// masks come from pixel obscuring alone), plus the minimum-retention indices.
+pub fn display_selection_with_retention(
+    inventory: &[CoverageFootprint],
+    denominator: f64,
+    viewport: &Region,
+    retained: &[(usize, Region)],
+) -> Result<(Vec<CoverageFootprint>, Selection, Vec<usize>)> {
     let band = display_scale_band(denominator)?;
     let mut bands = inventory
         .iter()
@@ -100,13 +119,7 @@ pub fn display_plan_with_retention(
         }
     }
     let selection = select_with_band_membership(&eligible, denominator, viewport, &bands)?;
-    let masks = assign_masks(&eligible, &selection, viewport)?;
-    Ok(S101DisplayPlan {
-        eligible_inventory: eligible,
-        selection,
-        masks,
-        minimum_retention,
-    })
+    Ok((eligible, selection, minimum_retention))
 }
 #[cfg(test)]
 mod tests {

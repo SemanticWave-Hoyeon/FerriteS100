@@ -17,6 +17,24 @@ pub fn current_num_threads() -> usize {
 /// Whether data-parallel iteration runs on several threads.
 pub const ENABLED: bool = cfg!(feature = "parallel");
 
+/// Run two independent closures, in parallel with the `parallel` feature.
+pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Send,
+    RB: Send,
+{
+    #[cfg(feature = "parallel")]
+    {
+        rayon::join(a, b)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        (a(), b())
+    }
+}
+
 #[cfg(not(feature = "parallel"))]
 pub mod prelude {
     use std::cmp::Ordering;
@@ -30,6 +48,18 @@ pub mod prelude {
         type Iter = std::slice::Iter<'a, T>;
         fn par_iter(&'a self) -> Self::Iter {
             self.iter()
+        }
+    }
+
+    /// `into_par_iter` on vectors.
+    pub trait IntoParallelIterator {
+        type Iter: Iterator;
+        fn into_par_iter(self) -> Self::Iter;
+    }
+    impl<T> IntoParallelIterator for Vec<T> {
+        type Iter = std::vec::IntoIter<T>;
+        fn into_par_iter(self) -> Self::Iter {
+            self.into_iter()
         }
     }
 

@@ -34,6 +34,16 @@ pub use area_index_upload_reuse::Work as AreaIndexUploadReuseWork;
 mod immutable_line_topology;
 mod line_preparation_diagnostics;
 mod motion_preview;
+/// Viewport fraction a host prepares beyond every side of the chart viewport
+/// (`RenderContext::set_navigation_overscan`) for this renderer's motion
+/// preview: None when the preview (`FERRITE_MOTION_PREVIEW=0`) or the
+/// overscan (`FERRITE_NAV_OVERSCAN=0`) is off.
+pub fn navigation_overscan_fraction() -> Option<f32> {
+    let off = |name: &str| std::env::var_os(name).is_some_and(|v| v == "0");
+    (motion_preview::enabled(std::env::var_os("FERRITE_MOTION_PREVIEW").as_deref())
+        && !off("FERRITE_NAV_OVERSCAN"))
+    .then_some(motion_preview::OVERSCAN_FRACTION)
+}
 mod pipeline;
 mod prepared_vector_coverage;
 mod primary_line_geometry;
