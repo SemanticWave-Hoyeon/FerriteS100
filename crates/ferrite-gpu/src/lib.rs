@@ -71,8 +71,16 @@ pub mod chart_text_backend;
 pub use chart_text_backend::{
     ChartFontContext, ChartTextAtlas, FontPassInput, FontPassOutput, PrivateFontSpec,
 };
+/// Chart text over `epaint` without a GUI toolkit (offscreen rendering).
+pub mod headless_text;
 #[cfg(test)]
-mod test_text_backend;
+mod test_text_backend {
+    pub(crate) use crate::headless_text::{
+        layout_no_wrap, HeadlessAtlas as TestAtlas, HeadlessFonts as TestFonts,
+    };
+}
+/// Offscreen rendering host: no window, no GUI toolkit.
+pub mod headless;
 /// Host-supplied presentation surface and overlay compositor.
 pub mod ui_layer;
 pub use ferrite_render::host_settings::{CatalogueStatus, DisplayMode, SettingsState};

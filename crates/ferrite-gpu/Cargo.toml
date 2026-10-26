@@ -5,7 +5,7 @@ edition.workspace = true
 description = "wgpu renderer for S-100 charts, independent of windowing and GUI toolkits"
 
 [features]
-s102-portrayal = ["dep:ferrite-s102"]
+s102-portrayal = ["dep:ferrite-s102", "ferrite-s102/crypto-openssl"]
 lua54 = ["ferrite-s102?/lua54"]
 lua55 = ["ferrite-s102?/lua55"]
 # Test-only hooks used by ferrite-ui tests.
@@ -38,8 +38,8 @@ serde_json.workspace = true
 sha2.workspace = true
 
 # Internal crates
-ferrite-render = { workspace = true }
-ferrite-portrayal-catalog = { workspace = true }
+ferrite-render = { workspace = true, features = ["parallel"] }
+ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
 serde.workspace = true
 
 # Typed S102 material owner; preserve workspace-selected Lua backend.

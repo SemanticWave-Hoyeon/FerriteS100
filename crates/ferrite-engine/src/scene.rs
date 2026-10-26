@@ -63,6 +63,20 @@ impl EngineState {
             .collect()
     }
 
+    /// Viewing groups displayed with the bound catalogue for `settings`: the
+    /// display mode preset plus the primary viewing layers (the viewer adds
+    /// its own plugin overlay group).
+    pub fn viewing_groups(&self, settings: &SettingsState) -> Result<HashSet<u32>> {
+        let preset = match settings.display_mode {
+            DisplayMode::Base => ferrite_s101::DisplayPreset::Base,
+            DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
+            DisplayMode::All => ferrite_s101::DisplayPreset::Other,
+        };
+        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.pc, preset)?;
+        groups.extend(primary_viewing_layers::resolve(&self.pc, settings)?);
+        Ok(groups)
+    }
+
     /// Viewing groups displayed for loaded cell `index` with its own
     /// catalogue: the display mode preset plus the primary viewing layers.
     pub fn cell_viewing_groups(

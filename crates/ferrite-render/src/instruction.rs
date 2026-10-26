@@ -623,7 +623,7 @@ pub struct LineInstruction {
 /// merges already-ordered runs (per-cell lists arrive pre-sorted), and the
 /// instructions are then moved once each into their sorted positions.
 pub fn sort_by_render_order(instructions: &mut Vec<DrawingInstruction>) {
-    use rayon::prelude::*;
+    use ferrite_kernel::par::prelude::*;
     let Ok(count) = u32::try_from(instructions.len()) else {
         instructions.sort_by_cached_key(DrawingInstruction::render_order);
         return;

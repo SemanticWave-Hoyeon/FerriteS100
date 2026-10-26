@@ -2,17 +2,7 @@
 //! Trust anchors are installed independently; embedded certificates never become roots.
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use openssl::{
-    hash::{hash, MessageDigest},
-    nid::Nid,
-    sign::Verifier,
-    stack::Stack,
-    x509::{
-        store::X509StoreBuilder,
-        verify::{X509VerifyFlags, X509VerifyParam},
-        X509StoreContext, X509,
-    },
-};
+use crypto::{Cert, Curve};
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::Serialize;
 use std::{
@@ -24,23 +14,44 @@ use std::{
 const SE: &str = "http://www.iho.int/s100/se/5.2";
 const XC: &str = "http://www.iho.int/s100/xc/5.2";
 const MAX_XML: u64 = 16 * 1024 * 1024;
+mod crypto;
+pub use crypto::CryptoBackend;
+mod source;
+use source::{local_files, SourceHandle};
+pub use source::{ExchangeSource, LocalFiles, MemoryExchange};
+
+/// Independently installed scheme administrator roots, verified with one
+/// [`CryptoBackend`] (the default backend unless chosen explicitly).
 #[derive(Default)]
 pub struct TrustAnchors {
-    roots: HashMap<String, X509>,
+    roots: HashMap<String, Cert>,
+    backend: CryptoBackend,
 }
 impl TrustAnchors {
+    /// Empty anchors verified by `backend`.
+    pub fn with_backend(backend: CryptoBackend) -> Self {
+        Self {
+            roots: HashMap::new(),
+            backend,
+        }
+    }
+    pub fn backend(&self) -> CryptoBackend {
+        self.backend
+    }
     pub fn install_pem(&mut self, administrator: &str, pem: &[u8]) -> Result<()> {
         ensure!(!administrator.is_empty(), "Empty scheme administrator ID");
-        let certificates = X509::stack_from_pem(pem)?;
+        let certificates = Cert::stack_from_pem(self.backend, pem)?;
         ensure!(
             certificates.len() == 1,
             "A trust anchor must contain exactly one certificate"
         );
         let root = certificates.into_iter().next().unwrap();
-        let key = root.public_key()?;
-        ensure!(root.verify(&key)?, "Trust anchor is not self-signed");
         ensure!(
-            root.subject_name().to_der()? == root.issuer_name().to_der()?,
+            root.verifies_own_signature()?,
+            "Trust anchor is not self-signed"
+        );
+        ensure!(
+            root.subject_der() == root.issuer_der(),
             "Trust anchor issuer differs from subject"
         );
         ensure!(
@@ -63,9 +74,15 @@ pub struct VerifiedResource {
 }
 /// Private immutable input copy retained while a product reader owns the resource.
 /// Copying and hashing use constant memory and authenticate the exact copied bytes.
+/// Sources with local files ([`ExchangeSource::file_snapshots`]) get a private
+/// temporary file; other sources an owned in-memory copy.
 pub struct AuthenticatedSnapshot {
-    file: tempfile::NamedTempFile,
+    storage: SnapshotStorage,
     pub source: PathBuf,
+}
+enum SnapshotStorage {
+    File(tempfile::NamedTempFile),
+    Memory(std::sync::Arc<[u8]>),
 }
 /// Private frozen input for host corrections when dataset authentication is disabled.
 /// This type carries no verification status and must never count as authenticated.
@@ -108,8 +125,40 @@ impl UnauthenticatedSnapshot {
     }
 }
 impl AuthenticatedSnapshot {
+    /// The private copy's file. An in-memory snapshot has no file: its path
+    /// is empty and opening it fails, so it never redirects to live input.
     pub fn path(&self) -> &Path {
-        self.file.path()
+        match &self.storage {
+            SnapshotStorage::File(file) => file.path(),
+            SnapshotStorage::Memory(_) => Path::new(""),
+        }
+    }
+    /// The authenticated bytes of an in-memory snapshot.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match &self.storage {
+            SnapshotStorage::File(_) => None,
+            SnapshotStorage::Memory(bytes) => Some(bytes),
+        }
+    }
+    /// Whole private copy (file or memory), at most `limit` bytes.
+    pub fn read_bytes(&self, limit: u64) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.reader()?
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= limit,
+            "Authenticated snapshot exceeds byte limit"
+        );
+        Ok(bytes)
+    }
+    /// Independent reader of the private copy (`tempfile::reopen` checks
+    /// file identity and does not disturb other readers' cursors).
+    fn reader(&self) -> Result<Box<dyn Read + '_>> {
+        Ok(match &self.storage {
+            SnapshotStorage::File(file) => Box::new(file.reopen()?),
+            SnapshotStorage::Memory(bytes) => Box::new(&bytes[..]),
+        })
     }
 }
 impl VerifiedResource {
@@ -135,9 +184,15 @@ impl VerifiedResource {
 }
 impl ResourceAuthentication {
     fn snapshot(&self) -> Result<AuthenticatedSnapshot> {
-        let mut input = File::open(&self.path)?;
-        let mut output = tempfile::NamedTempFile::new()?;
-        let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
+        let source = self.source.0.as_ref();
+        let mut input = source.open(&self.path)?;
+        let mut file = if source.file_snapshots() {
+            Some(tempfile::NamedTempFile::new()?)
+        } else {
+            None
+        };
+        let mut memory = Vec::new();
+        let mut digest = crypto::Sha384::new()?;
         let mut buffer = [0u8; 64 * 1024];
         let mut size = 0u64;
         loop {
@@ -152,16 +207,25 @@ impl ResourceAuthentication {
                 size <= self.size,
                 "Resource changed after signature verification"
             );
-            output.write_all(&buffer[..n])?;
+            match &mut file {
+                Some(output) => output.write_all(&buffer[..n])?,
+                None => memory.extend_from_slice(&buffer[..n]),
+            }
             digest.update(&buffer[..n])?;
         }
         ensure!(
             size == self.size && hex(&digest.finish()?) == self.sha384,
             "Resource changed after signature verification"
         );
-        output.flush()?;
+        let storage = match file {
+            Some(mut output) => {
+                output.flush()?;
+                SnapshotStorage::File(output)
+            }
+            None => SnapshotStorage::Memory(memory.into()),
+        };
         Ok(AuthenticatedSnapshot {
-            file: output,
+            storage,
             source: self.path.clone(),
         })
     }
@@ -181,7 +245,7 @@ pub struct VerificationReport {
 }
 #[derive(Clone)]
 struct Certificate {
-    cert: X509,
+    cert: Cert,
     issuer: String,
 }
 struct Certificates {
@@ -240,9 +304,9 @@ fn xml(bytes: &[u8]) -> Result<Document<'_>> {
     )
     .context("Invalid S-100 XML")
 }
-fn read_xml(path: &Path) -> Result<Vec<u8>> {
+fn read_xml(source: &dyn ExchangeSource, path: &Path) -> Result<Vec<u8>> {
     let mut b = Vec::new();
-    File::open(path)?.take(MAX_XML + 1).read_to_end(&mut b)?;
+    source.open(path)?.take(MAX_XML + 1).read_to_end(&mut b)?;
     ensure!(b.len() as u64 <= MAX_XML, "XML exceeds size limit");
     Ok(b)
 }
@@ -250,7 +314,7 @@ impl Certificates {
     /// Merge every certificate container of `parent`. Some producers (UKHO 2026)
     /// split certificates over several containers, each repeating the scheme
     /// administrator declaration. Certificate IDs stay globally unique.
-    fn parse(parent: Node<'_, '_>) -> Result<Self> {
+    fn parse(parent: Node<'_, '_>, backend: CryptoBackend) -> Result<Self> {
         let ns = parent
             .tag_name()
             .namespace()
@@ -283,7 +347,7 @@ impl Certificates {
                         !result.administrators.contains(&id) && !result.members.contains_key(&id),
                         "Duplicate certificate/administrator ID {id}"
                     );
-                    let cert = X509::from_der(&decode(n)?)?;
+                    let cert = Cert::from_der(backend, &decode(n)?)?;
                     result.members.insert(
                         id,
                         Certificate {
@@ -305,7 +369,7 @@ impl Certificates {
     /// Validate every listed certificate (test helper; production code only
     /// validates certificates that signatures reference).
     #[cfg(test)]
-    fn verified(&self, anchors: &TrustAnchors, time: i64) -> Result<HashMap<String, X509>> {
+    fn verified(&self, anchors: &TrustAnchors, time: i64) -> Result<HashMap<String, Cert>> {
         self.members
             .keys()
             .map(|id| {
@@ -327,7 +391,7 @@ impl Certificates {
         anchors: &TrustAnchors,
         time: i64,
         warnings: &mut Vec<String>,
-    ) -> Result<HashMap<String, X509>> {
+    ) -> Result<HashMap<String, Cert>> {
         let mut verified = HashMap::new();
         let mut used = HashSet::new();
         for id in references {
@@ -355,16 +419,16 @@ impl Certificates {
         &self,
         label: &str,
         anchors: &'a TrustAnchors,
-    ) -> Result<Option<&'a X509>> {
+    ) -> Result<Option<&'a Cert>> {
         let mut found = None;
         for administrator in &self.administrators {
             let Some(root) = anchors.roots.get(administrator) else {
                 continue;
             };
             let named = root
-                .subject_name()
-                .entries_by_nid(Nid::COMMONNAME)
-                .any(|e| e.data().as_slice() == label.as_bytes());
+                .subject_common_names()
+                .iter()
+                .any(|cn| cn.as_slice() == label.as_bytes());
             if named {
                 ensure!(
                     found.is_none(),
@@ -381,12 +445,12 @@ impl Certificates {
         anchors: &TrustAnchors,
         time: i64,
         used: &mut HashSet<&'s str>,
-    ) -> Result<X509> {
+    ) -> Result<Cert> {
         let (leaf_id, leaf) = self
             .members
             .get_key_value(id)
             .with_context(|| format!("Unknown certificateRef {id}"))?;
-        let mut chain = Stack::new()?;
+        let mut chain = Vec::new();
         let mut path = vec![leaf_id.as_str()];
         let mut seen = HashSet::new();
         let mut current: &str = leaf_id;
@@ -413,31 +477,20 @@ impl Certificates {
                 );
             };
             ensure!(
-                item.cert.issuer_name().to_der()? == issuer.subject_name().to_der()?,
+                item.cert.issuer_der() == issuer.subject_der(),
                 "XML issuer does not match X.509 issuer"
             );
             if is_root {
                 break issuer;
             }
-            chain.push(issuer.clone())?;
+            chain.push(issuer.clone());
             current = &item.issuer;
             path.push(current);
         };
-        let mut store = X509StoreBuilder::new()?;
-        store.add_cert(root.clone())?;
-        let mut param = X509VerifyParam::new()?;
-        param.set_time(time);
-        param.set_flags(X509VerifyFlags::CHECK_SS_SIGNATURE)?;
-        store.set_param(&param)?;
-        let mut context = X509StoreContext::new()?;
-        let (valid, error) = context.init(&store.build(), &leaf.cert, &chain, |ctx| {
-            let valid = ctx.verify_cert()?;
-            Ok((valid, ctx.error().to_string()))
-        })?;
-        ensure!(
-            valid,
-            "Certificate path validation failed for {id}: {error}"
-        );
+        crypto::ensure_backend(root, anchors.backend)?;
+        if let Err(error) = crypto::verify_path(&leaf.cert, &chain, root, time) {
+            bail!("Certificate path validation failed for {id}: {error}");
+        }
         used.extend(path);
         Ok(leaf.cert.clone())
     }
@@ -482,17 +535,16 @@ fn resource_relative_name(name: &str) -> Result<String> {
     );
     Ok(name.to_owned())
 }
-fn resource_path(root: &Path, name: &str) -> Result<PathBuf> {
+fn resource_path(source: &dyn ExchangeSource, root: &Path, name: &str) -> Result<PathBuf> {
     let name = resource_relative_name(name)?;
-    let path = root
-        .join(&name)
-        .canonicalize()
+    let path = source
+        .canonicalize(&root.join(&name))
         .with_context(|| format!("Missing exchange resource {name}"))?;
     ensure!(
         path.starts_with(root),
         "Exchange resource symlink escapes root"
     );
-    ensure!(path.is_file(), "Exchange resource is not a file");
+    ensure!(source.is_file(&path), "Exchange resource is not a file");
     Ok(path)
 }
 fn metadata_flag(entry: Node<'_, '_>, name: &str) -> Result<bool> {
@@ -510,9 +562,9 @@ fn metadata_flag(entry: Node<'_, '_>, name: &str) -> Result<bool> {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn require_data_key(cert: &X509) -> Result<()> {
-    let der = cert.to_der()?;
-    let (rest, parsed) = x509_parser::parse_x509_certificate(&der)
+fn require_data_key(cert: &Cert) -> Result<()> {
+    let der = cert.der();
+    let (rest, parsed) = x509_parser::parse_x509_certificate(der)
         .map_err(|e| anyhow::anyhow!("Invalid certificate DER: {e}"))?;
     ensure!(rest.is_empty(), "Trailing certificate bytes");
     ensure!(
@@ -525,29 +577,30 @@ fn require_data_key(cert: &X509) -> Result<()> {
             "Certificate does not permit digital signatures"
         );
     }
-    let key = cert.public_key()?;
     ensure!(
-        key.ec_key()?.group().curve_name() == Some(Nid::SECP384R1),
+        cert.ec_curve()? == Curve::P384,
         "Data signature key is not NIST P-384"
     );
     Ok(())
 }
 fn verify_resource(
+    source: &SourceHandle,
     path: PathBuf,
     signatures: Vec<Signature>,
-    certificates: &HashMap<String, X509>,
+    certificates: &HashMap<String, Cert>,
 ) -> Result<VerifiedResource> {
-    verify_resource_with_limit(path, signatures, certificates, None)
+    verify_resource_with_limit(source, path, signatures, certificates, None)
 }
 fn verify_resource_with_limit(
+    source: &SourceHandle,
     path: PathBuf,
     signatures: Vec<Signature>,
-    certificates: &HashMap<String, X509>,
+    certificates: &HashMap<String, Cert>,
     max_bytes: Option<u64>,
 ) -> Result<VerifiedResource> {
     if let Some(limit) = max_bytes {
         ensure!(
-            std::fs::metadata(&path)?.len() <= limit,
+            source.0.len(&path)? <= limit,
             "Signed resource exceeds receiver byte budget"
         );
     }
@@ -581,28 +634,25 @@ fn verify_resource_with_limit(
     // Validate each distinct certificate/key once, without weakening chain validation
     // performed by the exchange verifier before this resource is visited.
     let mut keys = HashMap::new();
-    let mut parsed_signatures = Vec::with_capacity(signatures.len());
     for s in &signatures {
         if !keys.contains_key(&s.certificate) {
             let cert = certificates
                 .get(&s.certificate)
                 .with_context(|| format!("Unknown certificateRef {}", s.certificate))?;
             require_data_key(cert)?;
-            keys.insert(s.certificate.clone(), cert.public_key()?.ec_key()?);
+            keys.insert(s.certificate.clone(), cert.clone());
         }
         // NIST P-384 ECDSA DER is at most 104 bytes; reject trailing data explicitly.
         ensure!(s.bytes.len() <= 104, "Invalid signature DER length");
-        let parsed = openssl::ecdsa::EcdsaSig::from_der(&s.bytes)?;
         ensure!(
-            parsed.to_der()? == s.bytes,
+            crypto::canonical_ecdsa_der(keys[&s.certificate].backend(), &s.bytes)?,
             "Trailing or noncanonical signature DER"
         );
-        parsed_signatures.push(parsed);
     }
     // Every direct ECDSA signature signs the same SHA-384 digest. Stream and hash
     // file bytes once, independent of the number of signatures or providers.
-    let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
-    let mut input = File::open(&path)?;
+    let mut digest = crypto::Sha384::new()?;
+    let mut input = source.0.open(&path)?;
     let mut buffer = [0u8; 64 * 1024];
     let mut size = 0u64;
     loop {
@@ -624,11 +674,11 @@ fn verify_resource_with_limit(
     while let Some(i) = ready.pop_front() {
         let s = &signatures[i];
         let signed = if let Some(parent) = parents[i] {
-            hash(MessageDigest::sha384(), &signatures[parent].bytes)?
+            crypto::sha384(&signatures[parent].bytes)?
         } else {
-            digest
+            digest.clone()
         };
-        let valid = parsed_signatures[i].verify(&signed, &keys[&s.certificate])?;
+        let valid = keys[&s.certificate].verify_ecdsa_digest(&signed, &s.bytes)?;
         if s.target.is_some() {
             ensure!(valid, "Invalid chained signature {}", s.id);
         } else {
@@ -648,7 +698,7 @@ fn verify_resource_with_limit(
         .keys()
         .map(|id| {
             let cert = certificates.get(id).context("Missing verified signer")?;
-            Ok((id.clone(), std::sync::Arc::<[u8]>::from(cert.to_der()?)))
+            Ok((id.clone(), std::sync::Arc::<[u8]>::from(cert.der())))
         })
         .collect::<Result<HashMap<_, _>>>()?;
     let descriptors = signatures
@@ -661,13 +711,14 @@ fn verify_resource_with_limit(
                 id: s.id.clone(),
                 certificate_id: s.certificate.clone(),
                 der: s.bytes.clone(),
-                signer_certificate_sha256: hex(&cert.digest(MessageDigest::sha256())?),
+                signer_certificate_sha256: cert.sha256_hex()?,
                 signer_certificate_der: signer_der[&s.certificate].clone(),
                 signature_target: s.target.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
     let authentication = std::sync::Arc::new(ResourceAuthentication {
+        source: source.clone(),
         path: path.clone(),
         sha384: hex(&digest),
         size,
@@ -689,8 +740,19 @@ pub fn verify_exchange(
     anchors: &TrustAnchors,
     time: i64,
 ) -> Result<VerificationReport> {
-    let root = root.as_ref().canonicalize()?;
-    let authenticated = verify_exchange_catalogue(&root, anchors, time)?;
+    verify_exchange_in(&local_files(), root, anchors, time)
+}
+/// [`verify_exchange`] over any [`ExchangeSource`]: the same files are read
+/// through `source`, and retained snapshots are taken from it.
+pub fn verify_exchange_in(
+    source: &std::sync::Arc<dyn ExchangeSource>,
+    root: impl AsRef<Path>,
+    anchors: &TrustAnchors,
+    time: i64,
+) -> Result<VerificationReport> {
+    let handle = SourceHandle(source.clone());
+    let root = source.canonicalize(root.as_ref())?;
+    let authenticated = verify_exchange_catalogue_in(source, &root, anchors, time)?;
     let catalogue = authenticated.catalogue;
     let bytes = authenticated.bytes;
     let trust_anchor_sha256 = authenticated.trust_anchor_sha256;
@@ -701,7 +763,7 @@ pub fn verify_exchange(
         is(node, XC, "S100_ExchangeCatalogue"),
         "Unsupported catalogue namespace/type"
     );
-    let certificates = Certificates::parse(node)?;
+    let certificates = Certificates::parse(node, anchors.backend)?;
     let mut resources = Vec::new();
     let mut dataset_discovery = HashMap::new();
     let mut metadata_warnings = Vec::new();
@@ -726,7 +788,7 @@ pub fn verify_exchange(
             algorithm == "ECDSA-384-SHA2" || algorithm == "8",
             "Unsupported signature algorithm {algorithm}"
         );
-        let path = resource_path(&root, filename)?;
+        let path = resource_path(source.as_ref(), &root, filename)?;
         ensure!(paths.insert(path.clone()), "Duplicate resource filename");
         let expected_status = if metadata_flag(entry, "dataProtection")? {
             "encrypted"
@@ -785,7 +847,7 @@ pub fn verify_exchange(
     )?;
     metadata_warnings.extend(authenticated.certificate_warnings.iter().cloned());
     for (entry, filename, path, signatures) in pending {
-        let resource = verify_resource(path, signatures, &certs)?;
+        let resource = verify_resource(&handle, path, signatures, &certs)?;
         if is(entry, XC, "S100_DatasetDiscoveryMetadata") {
             let discovery = dataset_discovery::parse(entry, filename, &mut metadata_warnings)?;
             dataset_discovery.insert(
@@ -870,8 +932,11 @@ impl AuthorizedDatasets {
                     bound.resource_path() == canonical && snapshot.source == canonical,
                     "Authenticated discovery resource/snapshot path mismatch"
                 );
-                let mut input = File::open(snapshot.path())?;
-                let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
+                let mut input: Box<dyn Read> = match &snapshot.storage {
+                    SnapshotStorage::File(_) => Box::new(File::open(snapshot.path())?),
+                    SnapshotStorage::Memory(bytes) => Box::new(&bytes[..]),
+                };
+                let mut digest = crypto::Sha384::new()?;
                 let mut buffer = [0u8; 64 * 1024];
                 let mut total = 0u64;
                 loop {
@@ -916,6 +981,18 @@ pub fn authorize_datasets(
     time: i64,
     policy: UnsignedPolicy,
 ) -> Result<AuthorizedDatasets> {
+    authorize_datasets_in(&local_files(), paths, anchors, time, policy)
+}
+/// [`authorize_datasets`] over any [`ExchangeSource`]. Keys are the
+/// source's canonical paths; snapshots are private files for sources with
+/// [`ExchangeSource::file_snapshots`], owned bytes otherwise.
+pub fn authorize_datasets_in(
+    source: &std::sync::Arc<dyn ExchangeSource>,
+    paths: &[PathBuf],
+    anchors: &TrustAnchors,
+    time: i64,
+    policy: UnsignedPolicy,
+) -> Result<AuthorizedDatasets> {
     let mut reports: HashMap<PathBuf, VerificationReport> = HashMap::new();
     let mut out = AuthorizedDatasets {
         dataset_discovery: HashMap::new(),
@@ -925,7 +1002,7 @@ pub fn authorize_datasets(
         metadata_warnings: Vec::new(),
     };
     for path in paths {
-        let canonical = path.canonicalize()?;
+        let canonical = source.canonicalize(path)?;
         if out.snapshots.contains_key(&canonical) {
             continue;
         }
@@ -933,11 +1010,13 @@ pub fn authorize_datasets(
             .parent()
             .into_iter()
             .flat_map(Path::ancestors)
-            .find(|p| p.join("CATALOG.XML").exists() || p.join("CATALOG.SIGN").exists());
-        if let Some(root) = root.filter(|p| p.join("CATALOG.SIGN").exists()) {
-            let root = root.canonicalize()?;
+            .find(|p| {
+                source.exists(&p.join("CATALOG.XML")) || source.exists(&p.join("CATALOG.SIGN"))
+            });
+        if let Some(root) = root.filter(|p| source.exists(&p.join("CATALOG.SIGN"))) {
+            let root = source.canonicalize(root)?;
             if !reports.contains_key(&root) {
-                let report = verify_exchange(&root, anchors, time)?;
+                let report = verify_exchange_in(source, &root, anchors, time)?;
                 out.metadata_warnings
                     .extend(report.metadata_warnings.iter().cloned());
                 reports.insert(root.clone(), report);
@@ -977,10 +1056,13 @@ pub fn authorize_datasets(
 }
 
 mod detached;
-pub use detached::{verify_detached, DetachedAlgorithm};
+pub use detached::{verify_detached, verify_detached_with, DetachedAlgorithm};
 
 mod catalogue;
-pub use catalogue::{authorize_catalogue, AuthorizedCatalogue, CatalogueDiscovery, CatalogueScope};
+pub use catalogue::{
+    authorize_catalogue, authorize_catalogue_in, AuthorizedCatalogue, CatalogueDiscovery,
+    CatalogueScope,
+};
 
 #[cfg(test)]
 mod unverified_input_tests {
@@ -1008,8 +1090,8 @@ pub use dataset_discovery::{
 
 mod exchange_catalogue_authentication;
 pub use exchange_catalogue_authentication::{
-    verify_exchange_catalogue, AuthenticatedExchangeCatalogue, CatalogueDiscoveryView,
-    OriginalEntryView,
+    verify_exchange_catalogue, verify_exchange_catalogue_in, AuthenticatedExchangeCatalogue,
+    CatalogueDiscoveryView, OriginalEntryView,
 };
 
 mod copied_original_signatures;

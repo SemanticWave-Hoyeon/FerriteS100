@@ -31,7 +31,7 @@ use crate::chart_cells::chart_data_bounds;
 use crate::gml_overlay::{self, GmlOverlays, Provenance, SymbolRegistrar};
 use crate::pick::{find_features_at, FeatureReport, GeometryPicker, PickCandidate, PickSurface};
 use crate::platform::{parallel_map, EntryKind, Platform};
-use crate::portrayal::{AreaTriangulator, PortrayalChangeRequest};
+use crate::portrayal::{AreaTriangulator, PortrayalChangeRequest, PortrayalSource};
 use crate::scene::{prepare_flat_coverage, PreparedScene};
 use crate::state::{EngineState, ViewportPixels};
 use crate::{dataset_signature_policy, s101_update_plan, CellHydrationSource, ChartLoadResult};
@@ -51,8 +51,10 @@ use std::sync::{Arc, Condvar, Mutex};
 pub enum SignaturePolicy {
     /// Open without verification (datasets are marked unverified).
     Off,
-    /// Reject unsigned or invalid datasets (S-100 Part 15). Needs a source of
-    /// local files until the signature backend reads bytes (stage 5).
+    /// Reject unsigned or invalid datasets (S-100 Part 15). Exchange sets are
+    /// verified through the platform data source (files or bytes); S-101
+    /// cells still need a source of local files (the update planner and its
+    /// lifecycle metadata are path-based).
     Required,
 }
 
@@ -107,6 +109,14 @@ pub enum DatasetSource {
     Folder(PathBuf),
     /// Explicit dataset files.
     Files(Vec<PathBuf>),
+    /// Datasets held by the host, named by paths that are only their
+    /// identity (exchange-set file names, update chains and product sniffing
+    /// use them). Under [`SignaturePolicy::Off`] they are opened unverified.
+    /// Under [`SignaturePolicy::Required`] S-124/S-129 datasets are verified
+    /// from the bytes (include their signature files and exchange catalogue
+    /// among the inputs); S-101 datasets from bytes are rejected until the
+    /// S-101 update planner reads non-local sources.
+    Bytes(Vec<(PathBuf, Arc<[u8]>)>),
 }
 
 /// Colour profile and portrayal settings for the next [`ChartEngine::prepare`].
@@ -134,6 +144,26 @@ pub struct View {
     /// Geographic extent to fit (None: all loaded data).
     pub fit: Option<GeoBounds>,
     pub viewport: ViewportPixels,
+    /// A camera on the loaded data; overrides `fit`.
+    pub camera: Option<Camera>,
+}
+
+/// A camera relative to the loaded data, as the viewer's `--center` and
+/// `--zoom`: zoom 1 shows all data, the centre pans the view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Camera {
+    /// Centre (latitude, longitude) in degrees; None: centre of the data.
+    pub center: Option<[f64; 2]>,
+    pub zoom: Zoom,
+}
+
+/// Magnification of a [`Camera`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Zoom {
+    /// Factor over the all-data view (the viewer's zoom level).
+    Factor(f64),
+    /// Display scale denominator (1:N) at the view's pixel density.
+    Scale(f64),
 }
 
 impl View {
@@ -146,6 +176,14 @@ impl View {
                 height,
                 scale_factor: 1.0,
             },
+            camera: None,
+        }
+    }
+    /// A camera in a `width` x `height` pixel view at density 1.
+    pub fn camera(width: u32, height: u32, camera: Camera) -> Self {
+        Self {
+            camera: Some(camera),
+            ..Self::fit(width, height)
         }
     }
 }
@@ -393,6 +431,74 @@ impl ChartEngine {
         &self.overlays.catalogue_errors
     }
 
+    /// Where S-101 cell instructions come from (default: Lua when the
+    /// `lua-native` feature is built, otherwise precomputed payloads).
+    pub fn portrayal_source(&self) -> PortrayalSource {
+        self.state.portrayal_source
+    }
+    pub fn set_portrayal_source(&mut self, source: PortrayalSource) {
+        self.state.portrayal_source = source;
+    }
+    /// Export: also write a precomputed payload of every cell the following
+    /// preparations portray with Lua to the platform cache store, for hosts
+    /// without Lua ([`PortrayalSource::Precomputed`]).
+    pub fn set_precomputed_export(&mut self, export: bool) {
+        self.state.precomputed_export = export;
+    }
+
+    /// Geographic extent of `camera` in `viewport` over the loaded data, and
+    /// its zoom factor over the all-data view.
+    pub fn camera_view(
+        &self,
+        camera: Camera,
+        viewport: ViewportPixels,
+    ) -> Result<(GeoBounds, f64)> {
+        let projection = self.state.render_context.scaler.projection();
+        let base = self.state.bounds;
+        let pan = match camera.center {
+            Some([lat, lon]) => projection
+                .pan_to(base, ferrite_render::WorldPoint::new(lon, lat))
+                .context("Invalid camera centre")?,
+            None => [0., 0.],
+        };
+        // The viewer keeps the longitude pan within one turn.
+        let pan = [pan[0] - (pan[0] / 360.).round() * 360., pan[1]];
+        let bounds = |zoom: f64| {
+            projection
+                .view_bounds(base, zoom, pan)
+                .context("Invalid camera zoom")
+        };
+        let zoom = match camera.zoom {
+            Zoom::Factor(zoom) => zoom,
+            Zoom::Scale(denominator) => {
+                ensure!(
+                    denominator.is_finite() && denominator > 0.,
+                    "Invalid scale denominator"
+                );
+                // The display scale is inversely proportional to the zoom
+                // at a fixed centre; two corrections absorb the latitude of
+                // the actual view centre.
+                let display_scale = |zoom: f64| -> Result<f64> {
+                    let mut scaler = self.state.render_context.scaler.clone();
+                    scaler.set_viewport(ferrite_render::Viewport::new(
+                        viewport.width as f32,
+                        viewport.height as f32,
+                    ));
+                    scaler.set_pixel_ratio(viewport.scale_factor);
+                    scaler.zoom_to_fit(bounds(zoom)?);
+                    Ok(scaler.display_scale)
+                };
+                let mut zoom = 1.0;
+                for _ in 0..3 {
+                    zoom *= display_scale(zoom)? / denominator;
+                }
+                zoom
+            }
+        };
+        ensure!(zoom.is_finite() && zoom > 0., "Invalid camera zoom");
+        Ok((bounds(zoom)?, zoom))
+    }
+
     /// Start opening `source` in the background.
     pub fn open(&mut self, source: DatasetSource) -> OpenJob {
         let shared = Arc::new(JobShared {
@@ -409,6 +515,7 @@ impl ChartEngine {
             pc: Arc::clone(&self.state.pc),
             decoded: Arc::clone(&self.state.decoded_chart_cache),
             overlay_products: self.overlays.s124.is_some() || self.overlays.s129.is_some(),
+            inventory: self.state.catalogue_inventory.clone(),
         };
         let worker = Arc::clone(&shared);
         self.state.platform.executor.spawn(Box::new(move || {
@@ -549,7 +656,10 @@ impl ChartEngine {
 
     fn data_bounds(&self) -> GeoBounds {
         if !self.state.cells.is_empty() {
-            return chart_data_bounds(&self.state.cells, std::iter::empty());
+            // The viewer's all-data view: the data extent with a margin.
+            let mut bounds = chart_data_bounds(&self.state.cells, std::iter::empty());
+            bounds.expand_by_percent(0.1);
+            return bounds;
         }
         self.overlays
             .bounds()
@@ -614,6 +724,56 @@ impl ChartEngine {
             .collect()
     }
 
+    /// Exchange-set checks of the loaded S-101 datasets: the discovery
+    /// metadata of each dataset's exchange catalogue (`CATALOG.XML`) against
+    /// the materialized cell (XC profile, effective scales, regional
+    /// coverage). Disagreements are issues; outcomes and datasets without
+    /// catalogue metadata are notices.
+    pub fn exchange_set_checks(&self) -> (Vec<ValidationIssue>, Vec<String>) {
+        let mut issues = Vec::new();
+        let mut notices = Vec::new();
+        for cell in &self.state.cells {
+            let subject = cell.file_path.display().to_string();
+            let metadata = s101_update_plan::dataset_key(&cell.dsid)
+                .ok()
+                .and_then(|key| self.state.loaded_discovery.get(&key))
+                .and_then(Option::as_ref);
+            let Some(metadata) = metadata else {
+                notices.push(format!(
+                    "{}: no exchange catalogue metadata; exchange-set checks not applied",
+                    cell.dsid.dataset_name
+                ));
+                continue;
+            };
+            let mut issue = |check: &str, error: anyhow::Error| {
+                issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    subject: subject.clone(),
+                    check: check.into(),
+                    message: format!("{error:#}"),
+                })
+            };
+            if let Err(error) = metadata.validate_xc_profile(&cell.dsid) {
+                issue("XC profile", error);
+            }
+            match metadata.validate_effective_xc_scales(cell) {
+                Ok(status) => notices.push(format!(
+                    "{}: exchange catalogue scales {status:?}",
+                    cell.dsid.dataset_name
+                )),
+                Err(error) => issue("XC scales", error),
+            }
+            match metadata.validate_xc_regions(cell) {
+                Ok(status) => notices.push(format!(
+                    "{}: exchange catalogue coverage {status:?}",
+                    cell.dsid.dataset_name
+                )),
+                Err(error) => issue("XC coverage", error),
+            }
+        }
+        (issues, notices)
+    }
+
     pub fn display(&self) -> &DisplayOptions {
         &self.display
     }
@@ -650,7 +810,10 @@ impl ChartEngine {
         self.state.render_context.settings = self.display.display.clone();
         self.state.render_context.settings.color_profile = self.display.profile.clone();
         // The camera of this view: residency selects cells near it.
-        let fit = view.fit.unwrap_or(self.state.bounds);
+        let fit = match view.camera {
+            Some(camera) => self.camera_view(camera, view.viewport)?.0,
+            None => view.fit.unwrap_or(self.state.bounds),
+        };
         self.state.render_context.set_bounds(self.state.bounds);
         self.state
             .render_context
@@ -848,6 +1011,8 @@ struct OpenTask {
     pc: Arc<BoundPortrayalCatalogue>,
     decoded: crate::decoded_chart_cache::SharedDecodedChartCache,
     overlay_products: bool,
+    /// Installed S-101 catalogue inventory (empty: none).
+    inventory: PathBuf,
 }
 
 /// One S-101 chain read into memory.
@@ -858,6 +1023,20 @@ struct ByteChain {
 
 impl OpenTask {
     fn run(self, cancel: &AtomicBool) -> Result<OpenedDatasets> {
+        if let DatasetSource::Bytes(files) = &self.source {
+            // Host bytes: the same opening over a memory source of them.
+            let mut memory = crate::platform::MemoryDataSource::new();
+            for (path, bytes) in files {
+                memory.insert(path.clone(), Arc::clone(bytes));
+            }
+            let paths = files.iter().map(|(path, _)| path.clone()).collect();
+            return OpenTask {
+                platform: self.platform.clone().with_data(Arc::new(memory)),
+                source: DatasetSource::Files(paths),
+                ..self
+            }
+            .run(cancel);
+        }
         let data = self.platform.data.as_ref();
         let mut notices = Vec::new();
         let mut issues = Vec::new();
@@ -885,8 +1064,12 @@ impl OpenTask {
                 files.dedup();
                 files
             }
+            DatasetSource::Bytes(_) => unreachable!("opened from memory above"),
         };
-        let explicit = matches!(self.source, DatasetSource::Files(_));
+        let explicit = matches!(
+            self.source,
+            DatasetSource::Files(_) | DatasetSource::Bytes(_)
+        );
         let mut charts = Vec::new();
         let mut overlays = Vec::new();
         for path in inputs {
@@ -897,10 +1080,17 @@ impl OpenTask {
             } else if crate::dataset_discovery::is_dataset_file(&path, "h5")
                 || crate::dataset_discovery::is_dataset_file(&path, "hdf5")
             {
-                notices.push(format!(
-                    "Not opened (S-102 is not yet served by ChartEngine): {}",
-                    path.display()
-                ));
+                notices.push(if cfg!(feature = "s102-hdf5") {
+                    format!(
+                        "Not opened (S-102 is not yet served by ChartEngine): {}",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "Not opened (S-102 support is not built: feature s102-hdf5): {}",
+                        path.display()
+                    )
+                });
             } else if explicit {
                 notices.push(format!("Not a supported dataset: {}", path.display()));
             }
@@ -918,8 +1108,8 @@ impl OpenTask {
         }
         let require = self.signatures == SignaturePolicy::Required;
         ensure!(
-            !require || data.local_paths(),
-            "Signature verification needs a source of local files until the byte-based signature backend (stage 5)"
+            !require || data.local_paths() || charts.is_empty(),
+            "S-101 signature verification needs a source of local files (the S-101 update planner is path-based)"
         );
         let cells = if charts.is_empty() {
             Vec::new()
@@ -958,10 +1148,21 @@ impl OpenTask {
         Ok(anchors)
     }
 
+    /// Local sources: the native file verifier, unchanged. Other sources:
+    /// the same verification reading exchange sets through the data source.
     fn authorize(&self, paths: &[PathBuf]) -> Result<ferrite_security::AuthorizedDatasets> {
         match self.signatures {
             SignaturePolicy::Off => dataset_signature_policy::unchecked_datasets(paths),
-            SignaturePolicy::Required => ferrite_security::authorize_datasets(
+            SignaturePolicy::Required if self.platform.data.local_paths() => {
+                ferrite_security::authorize_datasets(
+                    paths,
+                    &self.trust_anchors()?,
+                    self.platform.clock.unix_seconds(),
+                    ferrite_security::UnsignedPolicy::Reject,
+                )
+            }
+            SignaturePolicy::Required => ferrite_security::authorize_datasets_in(
+                &dataset_signature_policy::exchange_source(&self.platform.data),
                 paths,
                 &self.trust_anchors()?,
                 self.platform.clock.unix_seconds(),
@@ -974,6 +1175,23 @@ impl OpenTask {
     fn read_overlay(&self, path: &Path) -> Result<(Vec<u8>, Provenance)> {
         let data = self.platform.data.as_ref();
         let limits = ferrite_s100_gml::ReadLimits::default();
+        if !data.local_paths() && self.signatures == SignaturePolicy::Required {
+            // Bytes source: the authenticated in-memory snapshot.
+            let report = self.authorize(&[path.to_path_buf()])?;
+            let snapshot =
+                dataset_signature_policy::dataset_snapshot_in(data, &report, path, true)?
+                    .context("Required authenticated dataset snapshot is missing")?;
+            let bytes = snapshot
+                .bytes()
+                .context("Authenticated snapshot of a bytes source holds no bytes")?;
+            ensure!(
+                bytes.len() <= limits.bytes,
+                "{} exceeds the {} byte dataset limit",
+                path.display(),
+                limits.bytes
+            );
+            return Ok((bytes.to_vec(), Provenance::Authenticated));
+        }
         let (bytes_path, provenance) = if data.local_paths() {
             let require = self.signatures == SignaturePolicy::Required;
             let report = self.authorize(&[path.to_path_buf()])?;
@@ -1009,13 +1227,18 @@ impl OpenTask {
 
     /// Validate and normalize a materialized cell as the viewer does.
     fn admit(&self, cell: &mut S101Cell) -> Result<()> {
-        ferrite_s101::validate_dataset_catalogues(
-            &cell.dsid,
-            &self.fc,
-            &self.pc.product_id,
-            &self.pc.version,
-        )
-        .with_context(|| format!("Incompatible S-101 dataset {}", cell.file_path.display()))?;
+        self.admit_with(cell, &self.fc, &self.pc)
+    }
+
+    /// [`Self::admit`] against the catalogue pair that owns the cell.
+    fn admit_with(
+        &self,
+        cell: &mut S101Cell,
+        fc: &BoundFeatureCatalogue,
+        pc: &BoundPortrayalCatalogue,
+    ) -> Result<()> {
+        ferrite_s101::validate_dataset_catalogues(&cell.dsid, fc, &pc.product_id, &pc.version)
+            .with_context(|| format!("Incompatible S-101 dataset {}", cell.file_path.display()))?;
         ferrite_s101::validate_spatial_scale_properties(&cell.dsid, cell.features.values())
             .with_context(|| {
                 format!(
@@ -1045,13 +1268,29 @@ impl OpenTask {
             s101_update_plan::authorized_folder_plans(charts, &authorization, require)?;
         notices.extend(plan_notices);
         let codes = Arc::new(self.fc.feature_type_codes());
+        let owners = self.inventory_owners(&plans, notices);
         let plans: Vec<_> = plans.into_iter().map(Arc::new).collect();
         let results = parallel_map(self.platform.executor.as_ref(), &plans, |plan| {
             if cancel.load(Ordering::Relaxed) {
                 bail!("Open cancelled");
             }
             let (mut cell, source_identity) = plan.load_with_decoded_cache(&self.decoded)?;
-            self.admit(&mut cell)?;
+            // Datasets of other catalogue editions: their installed owner.
+            let owner = owners.as_ref().and_then(|(registry, codes)| {
+                let key = EngineState::catalogue_dataset_key(&plan.base.id).ok()?;
+                let owner = registry.owner_for(&key)?;
+                Some((owner, codes.get(owner.fc().source_digest())?))
+            });
+            let codes = match owner {
+                Some((owner, owner_codes)) => {
+                    self.admit_with(&mut cell, owner.fc(), owner.pc())?;
+                    Arc::clone(owner_codes)
+                }
+                None => {
+                    self.admit(&mut cell)?;
+                    Arc::clone(&codes)
+                }
+            };
             cell.normalize_feature_codes(&codes);
             Ok(ChartLoadResult {
                 base_metadata: plan.base.metadata.clone(),
@@ -1078,6 +1317,75 @@ impl OpenTask {
             }
         }
         Ok(cells)
+    }
+
+    /// Catalogue owners from the installed inventory for planned datasets
+    /// the bound pair cannot process (as the viewer's loader stages them),
+    /// with each owner's feature type codes. None without an inventory or
+    /// when no dataset needs one; a failed selection is a notice (those
+    /// datasets are then rejected by the bound pair).
+    #[allow(clippy::type_complexity)]
+    fn inventory_owners(
+        &self,
+        plans: &[s101_update_plan::Plan],
+        notices: &mut Vec<String>,
+    ) -> Option<(
+        crate::s101_catalogue_selection::DatasetCatalogueRegistry,
+        BTreeMap<[u8; 32], Arc<Vec<String>>>,
+    )> {
+        use crate::s101_catalogue_selection::{
+            DatasetCatalogueOwner, DatasetCatalogueRegistry, DatasetCatalogueRequest,
+        };
+        if self.inventory.as_os_str().is_empty()
+            || plans.iter().all(|plan| {
+                ferrite_s101::validate_dataset_catalogues(
+                    &plan.base.id,
+                    &self.fc,
+                    &self.pc.product_id,
+                    &self.pc.version,
+                )
+                .is_ok()
+            })
+        {
+            return None;
+        }
+        let staged = (|| -> Result<DatasetCatalogueRegistry> {
+            let requests = plans
+                .iter()
+                .map(|plan| {
+                    Ok(DatasetCatalogueRequest {
+                        dataset_key: EngineState::catalogue_dataset_key(&plan.base.id)?,
+                        source_identity: plan.captured_source_identity_sha(),
+                        identification: plan.base.id.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let fallback = Arc::new(DatasetCatalogueOwner::new(
+                Arc::clone(&self.fc),
+                Arc::clone(&self.pc),
+            )?);
+            DatasetCatalogueRegistry::default().stage(&requests, fallback, &self.inventory)
+        })();
+        let registry = match staged {
+            Ok(registry) => registry,
+            Err(error) => {
+                notices.push(format!("Installed catalogue selection failed: {error:#}"));
+                return None;
+            }
+        };
+        let mut codes = BTreeMap::new();
+        for plan in plans {
+            let Some(owner) = EngineState::catalogue_dataset_key(&plan.base.id)
+                .ok()
+                .and_then(|key| registry.owner_for(&key))
+            else {
+                continue;
+            };
+            codes
+                .entry(*owner.fc().source_digest())
+                .or_insert_with(|| Arc::new(owner.fc().feature_type_codes()));
+        }
+        Some((registry, codes))
     }
 
     /// Any source: chains planned from the dataset identifications and

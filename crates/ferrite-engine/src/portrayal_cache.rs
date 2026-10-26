@@ -72,7 +72,7 @@ pub fn encode_cache_payload(
     instructions: &[DrawingInstruction],
 ) -> std::result::Result<Vec<u8>, String> {
     use bincode::Options;
-    use rayon::prelude::*;
+    use ferrite_kernel::par::prelude::*;
     let options = || {
         bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -153,7 +153,7 @@ pub fn decode_cache_payload(
     if offset != payload.len() {
         return Err(malformed());
     }
-    use rayon::prelude::*;
+    use ferrite_kernel::par::prelude::*;
     let decoded: Vec<_> = segments.par_iter().map(|segment| decode(segment)).collect();
     let mut all = Vec::with_capacity(instructions as usize);
     for segment in decoded {

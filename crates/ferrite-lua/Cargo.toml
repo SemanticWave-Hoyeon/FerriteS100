@@ -6,15 +6,18 @@ description = "Lua integration for S-100 portrayal rules"
 
 [features]
 default = ["lua54"]
-lua54 = ["ferrite-lua-runtime/lua54"]
-lua55 = ["ferrite-lua-runtime/lua55"]
+# The mlua interpreter (portrayal sessions, host functions). Without it only
+# the Part 9a instruction parser and the portrayal context model are built.
+native = ["dep:ferrite-lua-runtime"]
+lua54 = ["native", "ferrite-lua-runtime/lua54"]
+lua55 = ["native", "ferrite-lua-runtime/lua55"]
 
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
 
 # Lua runtime
-ferrite-lua-runtime = { path = "../ferrite-lua-runtime", default-features = false }
+ferrite-lua-runtime = { path = "../ferrite-lua-runtime", default-features = false, optional = true }
 
 # Internal crates
 ferrite-s100-core = { workspace = true }

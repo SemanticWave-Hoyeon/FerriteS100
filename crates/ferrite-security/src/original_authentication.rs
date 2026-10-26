@@ -46,6 +46,8 @@ impl VerifiedSignatureDescriptor {
 
 #[derive(Debug)]
 pub(super) struct ResourceAuthentication {
+    /// Source the resource was authenticated from; captures reread it.
+    pub(super) source: SourceHandle,
     pub(super) path: PathBuf,
     pub(super) sha384: String,
     pub(super) size: u64,

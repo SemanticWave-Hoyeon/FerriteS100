@@ -1,6 +1,7 @@
-//! Test-only chart text backend over `epaint::Fonts`, the font engine the
-//! application's egui contexts use. Lets renderer unit tests run without a
-//! GUI toolkit; `ferrite-ui` tests cover the egui implementation itself.
+//! Chart text backend over `epaint::Fonts`, the font engine the
+//! application's egui contexts use, for renderers without a GUI toolkit:
+//! offscreen image rendering ([`crate::headless`]) and the renderer's unit
+//! tests. `ferrite-ui` provides (and tests) the egui implementation.
 use crate::chart_text_backend::{
     ChartFontContext, ChartTextAtlas, FontPassInput, FontPassOutput, PrivateFontSpec,
 };
@@ -13,7 +14,7 @@ use epaint::{
 use std::sync::{Arc, Mutex};
 
 /// Unwrapped single-section layout, as egui's `Painter::layout_no_wrap`.
-pub(crate) fn layout_no_wrap(
+pub fn layout_no_wrap(
     context: &dyn ChartFontContext,
     text: String,
     font: FontId,
@@ -32,16 +33,16 @@ struct State {
 }
 
 /// A text context with egui's default options (one `Fonts` per density).
-pub(crate) struct TestFonts(Mutex<State>);
+pub struct HeadlessFonts(Mutex<State>);
 
-impl Default for TestFonts {
+impl Default for HeadlessFonts {
     fn default() -> Self {
         Self::with_fonts(FontDefinitions::default())
     }
 }
 
-impl TestFonts {
-    pub(crate) fn with_fonts(definitions: FontDefinitions) -> Self {
+impl HeadlessFonts {
+    pub fn with_fonts(definitions: FontDefinitions) -> Self {
         Self(Mutex::new(State {
             definitions,
             zoom: 1.,
@@ -49,12 +50,12 @@ impl TestFonts {
             fonts: None,
         }))
     }
-    pub(crate) fn set_fonts(&self, definitions: FontDefinitions) {
+    pub fn set_fonts(&self, definitions: FontDefinitions) {
         let mut state = self.0.lock().unwrap();
         state.definitions = definitions;
         state.fonts = None;
     }
-    pub(crate) fn set_zoom_factor(&self, zoom: f32) {
+    pub fn set_zoom_factor(&self, zoom: f32) {
         self.0.lock().unwrap().zoom = zoom;
     }
     fn fonts(&self) -> Fonts {
@@ -65,12 +66,12 @@ impl TestFonts {
             .clone()
             .expect("No fonts available until the first pass")
     }
-    pub(crate) fn layout_no_wrap(&self, text: String, font: FontId, color: Color32) -> Arc<Galley> {
+    pub fn layout_no_wrap(&self, text: String, font: FontId, color: Color32) -> Arc<Galley> {
         layout_no_wrap(self, text, font, color)
     }
 }
 
-impl ChartFontContext for TestFonts {
+impl ChartFontContext for HeadlessFonts {
     fn pixels_per_point(&self) -> f32 {
         self.0.lock().unwrap().ppp
     }
@@ -142,20 +143,20 @@ impl ChartFontContext for TestFonts {
         device: &wgpu::Device,
         _format: wgpu::TextureFormat,
     ) -> Box<dyn ChartTextAtlas> {
-        Box::new(TestAtlas::new(device))
+        Box::new(HeadlessAtlas::new(device))
     }
 }
 
 /// RGBA8 sRGB atlas textures with egui-wgpu's bind group layout.
-pub(crate) struct TestAtlas {
+pub struct HeadlessAtlas {
     layout: wgpu::BindGroupLayout,
     textures: std::collections::HashMap<TextureId, (wgpu::Texture, wgpu::BindGroup)>,
 }
 
-impl TestAtlas {
-    pub(crate) fn new(device: &wgpu::Device) -> Self {
+impl HeadlessAtlas {
+    pub fn new(device: &wgpu::Device) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("test_text_atlas_layout"),
+            label: Some("headless_text_atlas_layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -182,7 +183,7 @@ impl TestAtlas {
     }
 }
 
-impl ChartTextAtlas for TestAtlas {
+impl ChartTextAtlas for HeadlessAtlas {
     fn update_texture(
         &mut self,
         device: &wgpu::Device,
@@ -208,7 +209,7 @@ impl ChartTextAtlas for TestAtlas {
             },
             None => {
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("test_text_atlas"),
+                    label: Some("headless_text_atlas"),
                     size,
                     mip_level_count: 1,
                     sample_count: 1,
@@ -232,7 +233,7 @@ impl ChartTextAtlas for TestAtlas {
                     ..Default::default()
                 });
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("test_text_atlas"),
+                    label: Some("headless_text_atlas"),
                     layout: &self.layout,
                     entries: &[
                         wgpu::BindGroupEntry {

@@ -10,6 +10,11 @@ use openssl::{
         X509NameBuilder,
     },
 };
+use openssl::{
+    hash::{hash, MessageDigest},
+    nid::Nid,
+    x509::X509,
+};
 const NOW: i64 = 1_791_043_200;
 fn key(curve: Nid) -> PKey<Private> {
     PKey::from_ec_key(EcKey::generate(&EcGroup::from_curve_name(curve).unwrap()).unwrap()).unwrap()
@@ -69,6 +74,12 @@ struct Fixture {
     anchors: TrustAnchors,
     key: PKey<Private>,
     container: String,
+    /// PEM of the installed root, for anchors of another crypto backend.
+    #[cfg_attr(
+        not(all(feature = "crypto-openssl", feature = "crypto-rust")),
+        allow(dead_code)
+    )]
+    root_pem: Vec<u8>,
 }
 impl Fixture {
     fn new(intermediate: bool, digital: bool, curve: Nid) -> Self {
@@ -98,6 +109,7 @@ impl Fixture {
             anchors,
             key: k,
             container,
+            root_pem: root.to_pem().unwrap(),
         }
     }
     fn write(&self, name: &str, chained: bool, cert_ref: &str, status: &str) {
@@ -294,7 +306,13 @@ fn batch_authorization_requires_membership_and_explicit_unsigned_policy() {
             .contains("not signed by")
     );
     std::fs::remove_file(f.dir.path().join("CATALOG.SIGN")).unwrap();
-    assert!(authorize_datasets(&[p.clone()], &f.anchors, NOW, UnsignedPolicy::Reject).is_err());
+    assert!(authorize_datasets(
+        std::slice::from_ref(&p),
+        &f.anchors,
+        NOW,
+        UnsignedPolicy::Reject
+    )
+    .is_err());
     assert_eq!(
         authorize_datasets(&[p], &f.anchors, NOW, UnsignedPolicy::Evaluation)
             .unwrap()
@@ -315,6 +333,9 @@ fn legacy_namespace_and_metadata_discrepancy_do_not_skip_byte_authentication() {
     assert!(f.verify(NOW).is_err());
 }
 
+fn local() -> SourceHandle {
+    SourceHandle(local_files())
+}
 fn resource_fixture(
     bytes: usize,
     direct: usize,
@@ -323,7 +344,7 @@ fn resource_fixture(
     tempfile::TempDir,
     PathBuf,
     Vec<Signature>,
-    HashMap<String, X509>,
+    HashMap<String, Cert>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("PAYLOAD");
@@ -332,7 +353,10 @@ fn resource_fixture(
     let k = key(Nid::SECP384R1);
     let certificate = certificate("PRODUCER", &k, None, false, true);
     let mut certs = HashMap::new();
-    certs.insert("LEAF".into(), certificate);
+    certs.insert(
+        "LEAF".into(),
+        Cert::from_der(CryptoBackend::default(), &certificate.to_der().unwrap()).unwrap(),
+    );
     let signed = signature(&k, &data);
     let mut signatures = Vec::new();
     for i in 0..direct {
@@ -370,15 +394,16 @@ fn copy_signatures(signatures: &[Signature]) -> Vec<Signature> {
 #[test]
 fn reverse_ordered_long_signature_chain_and_branch_are_all_verified() {
     let (_dir, path, signatures, certs) = resource_fixture(4096, 3, 128);
-    let report = verify_resource(path.clone(), copy_signatures(&signatures), &certs).unwrap();
+    let report =
+        verify_resource(&local(), path.clone(), copy_signatures(&signatures), &certs).unwrap();
     assert_eq!(report.signature_ids.len(), 131);
     assert_eq!(report.size, 4096);
     let mut bad = copy_signatures(&signatures);
     bad[64].bytes[8] ^= 1;
-    assert!(verify_resource(path.clone(), bad, &certs).is_err());
+    assert!(verify_resource(&local(), path.clone(), bad, &certs).is_err());
     let mut bad = copy_signatures(&signatures);
     bad.last_mut().unwrap().bytes.push(0);
-    assert!(verify_resource(path, bad, &certs).is_err());
+    assert!(verify_resource(&local(), path, bad, &certs).is_err());
 }
 #[test]
 #[ignore = "Explicit performance experiment; not part of routine regression tests"]
@@ -391,7 +416,7 @@ fn signature_verification_benchmark() {
         for sample in 0..3 {
             let signatures = copy_signatures(&signatures);
             let start = std::time::Instant::now();
-            let r = verify_resource(path.clone(), signatures, &certs).unwrap();
+            let r = verify_resource(&local(), path.clone(), signatures, &certs).unwrap();
             println!("BENCH case={case} bytes={bytes} direct={direct} chain={chained} sample={sample} seconds={:.6}",start.elapsed().as_secs_f64());
             assert_eq!(r.size, bytes as u64);
             assert_eq!(r.signature_ids.len(), direct + chained);
@@ -556,7 +581,13 @@ fn dataset_discovery_is_bound_to_signed_catalogue_resource_and_retained_snapshot
         xml.replace("newDataset", "cancellation"),
     )
     .unwrap();
-    assert!(authorize_datasets(&[path.clone()], &f.anchors, NOW, UnsignedPolicy::Reject).is_err());
+    assert!(authorize_datasets(
+        std::slice::from_ref(&path),
+        &f.anchors,
+        NOW,
+        UnsignedPolicy::Reject
+    )
+    .is_err());
     assert_eq!(bound.discovery().purpose, DatasetPurpose::NewDataset);
     let snapshot = report.snapshots[&canonical].as_ref().unwrap();
     std::fs::write(&path, b"changed after authorization").unwrap();
@@ -705,7 +736,7 @@ fn unsigned_evaluation_never_projects_live_catalogue_values() {
     std::fs::write(&path, b"evaluation").unwrap();
     std::fs::write(dir.path().join("CATALOG.XML"), b"untrusted arbitrary XML").unwrap();
     let report = authorize_datasets(
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustAnchors::default(),
         NOW,
         UnsignedPolicy::Evaluation,
@@ -732,8 +763,13 @@ fn checked_discovery_rejects_rekey_missing_snapshot_and_changed_private_bytes() 
     let f = Fixture::new(false, true, Nid::SECP384R1);
     f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
     let path = f.dir.path().join("DATA.H5").canonicalize().unwrap();
-    let mut result =
-        authorize_datasets(&[path.clone()], &f.anchors, NOW, UnsignedPolicy::Reject).unwrap();
+    let mut result = authorize_datasets(
+        std::slice::from_ref(&path),
+        &f.anchors,
+        NOW,
+        UnsignedPolicy::Reject,
+    )
+    .unwrap();
     assert!(result.checked_dataset_discovery(&path).is_ok());
     let other = f.dir.path().join("OTHER.H5");
     result
@@ -966,7 +1002,7 @@ fn signed_catalogue_and_resource_receiver_budget_is_checked_before_streaming() {
     f.write("file:/DATA.H5", false, "LEAF", "unencrypted");
     let raw = std::fs::read(f.dir.path().join("CATALOG.XML")).unwrap();
     let doc = xml(&raw).unwrap();
-    let certificates = Certificates::parse(doc.root_element())
+    let certificates = Certificates::parse(doc.root_element(), f.anchors.backend())
         .unwrap()
         .verified(&f.anchors, NOW)
         .unwrap();
@@ -980,9 +1016,12 @@ fn signed_catalogue_and_resource_receiver_budget_is_checked_before_streaming() {
         }]
     };
     let path = f.dir.path().join("DATA.H5");
-    assert!(verify_resource_with_limit(path.clone(), make(), &certificates, Some(27)).is_err());
+    assert!(
+        verify_resource_with_limit(&local(), path.clone(), make(), &certificates, Some(27))
+            .is_err()
+    );
     assert_eq!(
-        verify_resource_with_limit(path, make(), &certificates, Some(28))
+        verify_resource_with_limit(&local(), path, make(), &certificates, Some(28))
             .unwrap()
             .size,
         28
@@ -1579,3 +1618,6 @@ fn multiple_certificate_containers_merge_with_unique_ids() {
         .to_string()
         .contains("Duplicate certificate"));
 }
+#[cfg(all(feature = "crypto-openssl", feature = "crypto-rust"))]
+#[path = "cross_backend_tests.rs"]
+mod cross_backend_tests;

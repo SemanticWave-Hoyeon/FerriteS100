@@ -4,6 +4,7 @@ pub mod depth_selection;
 pub mod geocentric;
 pub mod geodesy;
 pub mod map_camera;
+pub mod par;
 pub mod rhumb;
 pub mod scale_policy;
 pub mod triangulation;

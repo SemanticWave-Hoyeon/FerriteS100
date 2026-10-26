@@ -3,6 +3,13 @@ name = "ferrite-interoperability"
 version.workspace = true
 edition.workspace = true
 description = "Product-neutral, bounded S-100 interoperability catalogue reader"
+
+[features]
+default = ["crypto-openssl"]
+# Signature backend of ferrite-security (dependents select one).
+crypto-openssl = ["ferrite-security/crypto-openssl"]
+crypto-rust = ["ferrite-security/crypto-rust"]
+
 [dependencies]
 anyhow.workspace = true
 ferrite-kernel.workspace = true

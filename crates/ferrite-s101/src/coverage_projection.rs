@@ -748,7 +748,7 @@ impl GeographicCoverageInventory {
             .flat_map(|(dataset_id, coverages)| coverages.iter().map(move |c| (dataset_id, c)))
             .collect();
         let footprints = {
-            use rayon::prelude::*;
+            use ferrite_kernel::par::prelude::*;
             jobs.par_iter()
                 .map(|&(dataset_id, coverage)| -> Result<_> {
                 let mut region: Option<Region> = None;
@@ -875,7 +875,7 @@ impl GeographicCoverageInventory {
         if let Some(binding) = binding.as_ref() {
             // The longitude copies are independent: prepare them in parallel
             // and keep their order (and the first error in that order).
-            use rayon::prelude::*;
+            use ferrite_kernel::par::prelude::*;
             let prepared: Vec<Result<_>> = shifts
                 .par_iter()
                 .map(|&shift| -> Result<_> {

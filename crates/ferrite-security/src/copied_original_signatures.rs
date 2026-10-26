@@ -41,7 +41,10 @@ struct Declaration {
     kind: String,
     attributes: Vec<(Option<String>, String, String)>,
 }
-fn declarations(entry: Node<'_, '_>) -> Result<BTreeMap<String, Declaration>> {
+fn declarations(
+    entry: Node<'_, '_>,
+    backend: CryptoBackend,
+) -> Result<BTreeMap<String, Declaration>> {
     let mut out = BTreeMap::new();
     let containers = entry
         .children()
@@ -69,7 +72,7 @@ fn declarations(entry: Node<'_, '_>) -> Result<BTreeMap<String, Declaration>> {
             "Copied signature DER length exceeds P-384 bound"
         );
         ensure!(
-            openssl::ecdsa::EcdsaSig::from_der(&signature.bytes)?.to_der()? == signature.bytes,
+            crypto::canonical_ecdsa_der(backend, &signature.bytes)?,
             "Noncanonical copied signature DER"
         );
         let mut attributes = node
@@ -137,8 +140,8 @@ impl OriginalDatasetAuthentication {
         self.validate_copied_signature_declarations(incoming)?;
         // Unlike opening path()/source, tempfile::reopen checks file identity
         // and gives an independent handle without disturbing parser cursors.
-        let mut input = snapshot.file.reopen()?;
-        let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
+        let mut input = snapshot.reader()?;
+        let mut digest = crypto::Sha384::new()?;
         let mut buffer = [0u8; 64 * 1024];
         let mut size = 0u64;
         loop {
@@ -159,6 +162,7 @@ impl OriginalDatasetAuthentication {
             size == self.resource_size() && hex(&digest.finish()?) == self.resource_sha384(),
             "Retained snapshot bytes differ from original authentication"
         );
+        drop(input);
         Ok(CopiedOriginalSignatureBinding {
             original: self.clone(),
             incoming,
@@ -194,8 +198,8 @@ impl OriginalDatasetAuthentication {
                 )?)?,
             "Copied signature algorithm declaration differs from original"
         );
-        let old = declarations(original_entry)?;
-        let copied = declarations(entry)?;
+        let old = declarations(original_entry, incoming.backend)?;
+        let copied = declarations(entry, incoming.backend)?;
         ensure!(
             old.len() == self.signatures().len() && copied.len() == old.len(),
             "Copied original signature set differs"
@@ -207,7 +211,8 @@ impl OriginalDatasetAuthentication {
             .filter(|n| is(*n, XC, "certificates"))
             .collect();
         // Existing certificate parser rejects duplicate IDs and unknown types.
-        let parsed_certificates = Certificates::parse(entry.document().root_element())?;
+        let parsed_certificates =
+            Certificates::parse(entry.document().root_element(), incoming.backend)?;
         for verified in self.signatures() {
             let expected = old
                 .get(verified.id())
@@ -250,12 +255,12 @@ impl OriginalDatasetAuthentication {
                 .get(verified.certificate_id())
                 .context("Missing parsed copied signer")?
                 .cert
-                .to_der()?;
+                .der()
+                .to_vec();
             ensure!(
                 bytes == canonical
                     && bytes == verified.signer_certificate_der()
-                    && hex(&hash(MessageDigest::sha256(), &bytes)?)
-                        == verified.signer_certificate_sha256(),
+                    && hex(&crypto::sha256(&bytes)?) == verified.signer_certificate_sha256(),
                 "Copied signer certificate differs from retained canonical certificate"
             );
         }

@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 description = "S-100 Portrayal Catalogue XML parser"
 
+[features]
+default = ["parallel"]
+# Parallel catalogue snapshot reads (rayon); off: sequential, identical result.
+parallel = ["ferrite-kernel/parallel"]
+
 [dependencies]
-rayon.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -24,11 +24,13 @@ pub struct Plan {
     /// S-102 2.1 trial files: inspection only, never depth coverage.
     pub trials: Vec<PathBuf>,
     /// Filled by the discovery worker thread through the isolated inspector.
+    #[cfg(feature = "s102-hdf5")]
     pub trial_inspections: Vec<(
         PathBuf,
         Result<ferrite_s102::trial_inspection::TrialInspection, String>,
     )>,
 }
+#[cfg(feature = "s102-hdf5")]
 impl Plan {
     /// Run the isolated S-102 2.1 trial inspector for each discovered trial.
     pub fn inspect_trials(&mut self) {
@@ -47,8 +49,10 @@ fn supported_product(spec: &str) -> bool {
     spec == "INT.IHO.S-102.3.0.0"
 }
 
+#[cfg(feature = "s102-hdf5")]
 const MAX_HDF_DISCOVERY_BYTES: u64 = 512 * 1024 * 1024;
 
+#[cfg(feature = "s102-hdf5")]
 fn checked_product_text(raw: &[u8]) -> Result<String> {
     ensure!(
         raw.len() <= 255 && !raw.contains(&0),
@@ -57,6 +61,15 @@ fn checked_product_text(raw: &[u8]) -> Result<String> {
     Ok(std::str::from_utf8(raw)?.to_owned())
 }
 
+#[cfg(not(feature = "s102-hdf5"))]
+fn hdf_product(path: &Path) -> Result<String> {
+    anyhow::bail!(
+        "S-102 (HDF5) support is not built (feature s102-hdf5): {}",
+        path.display()
+    )
+}
+
+#[cfg(feature = "s102-hdf5")]
 fn hdf_product(path: &Path) -> Result<String> {
     use ferrite_s102::hdf5::{
         types::{FixedAscii, FixedUnicode, TypeDescriptor, VarLenAscii, VarLenUnicode},
@@ -229,7 +242,7 @@ pub fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
     Ok(plan)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "s102-hdf5"))]
 mod tests {
     use super::*;
     use ferrite_s102::hdf5::{

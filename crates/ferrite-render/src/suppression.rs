@@ -834,7 +834,7 @@ impl LineSuppressionCache {
                     .growth_child_work
                     .as_ref()
                     .map(|_| std::time::Instant::now());
-                use rayon::prelude::*;
+                use ferrite_kernel::par::prelude::*;
                 let transformed: Vec<_> = instructions
                     .par_iter()
                     .zip(&prepared)
@@ -1899,8 +1899,9 @@ struct SegmentForest {
 impl SegmentForest {
     const STRIP: usize = 32 * 1024;
     fn build(mut segments: Vec<IndexedSegment>, strip: usize) -> Self {
-        use rayon::prelude::*;
-        let strips = (segments.len() / strip.max(1)).clamp(1, rayon::current_num_threads() * 2);
+        use ferrite_kernel::par::prelude::*;
+        let strips = (segments.len() / strip.max(1))
+            .clamp(1, ferrite_kernel::par::current_num_threads() * 2);
         if strips == 1 {
             return Self {
                 trees: vec![rstar::RTree::bulk_load(segments)],
@@ -1939,7 +1940,7 @@ impl PreparedLineSuppression {
         budget: usize,
         strip: usize,
     ) -> Option<Self> {
-        use rayon::prelude::*;
+        use ferrite_kernel::par::prelude::*;
         use rstar::RTreeObject;
         let selected: Vec<_> = instructions
             .iter()

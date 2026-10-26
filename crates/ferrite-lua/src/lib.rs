@@ -37,24 +37,34 @@
 
 mod context;
 mod error;
+#[cfg(feature = "native")]
 mod host;
 mod instruction;
+#[cfg(feature = "native")]
 mod resource_limits;
+#[cfg(feature = "native")]
 mod session;
+#[cfg(feature = "native")]
 pub use resource_limits::LuaResourceLimits;
 
 pub use context::*;
 pub use error::*;
+#[cfg(feature = "native")]
 pub use host::*;
 pub use instruction::*;
+#[cfg(feature = "native")]
 pub use session::*;
 
 // Re-export runtime types for product adapters without a second Lua version.
+#[cfg(feature = "native")]
 pub use ferrite_lua_runtime::{mlua, selected_version};
+#[cfg(feature = "native")]
 pub use ferrite_lua_runtime::{selected_version as lua_runtime_version, RuntimeVersion};
 
 // Exact linked interpreter release plus conservative build-input fingerprint.
+#[cfg(feature = "native")]
 pub use ferrite_lua_runtime::{runtime_identity, RuntimeIdentity};
 
 // Compiler retention policy can be injected without changing bound PC inputs.
+#[cfg(feature = "native")]
 pub use ferrite_lua_runtime::ChunkCache;

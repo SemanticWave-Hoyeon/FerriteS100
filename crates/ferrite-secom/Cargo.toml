@@ -6,7 +6,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-ferrite-security.workspace = true
+ferrite-security = { workspace = true, features = ["crypto-openssl"] }
 base64 = "=0.22.1"
 serde_json.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-manual-roots"] }

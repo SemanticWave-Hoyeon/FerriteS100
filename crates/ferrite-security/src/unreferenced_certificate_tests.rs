@@ -52,7 +52,11 @@ fn verify_signatures(
         .descendants()
         .filter(|n| is(*n, XC, "S100_DatasetDiscoveryMetadata"))
     {
-        let path = resource_path(&root, text(unique_child(entry, XC, "fileName")?)?)?;
+        let path = resource_path(
+            &LocalFiles,
+            &root,
+            text(unique_child(entry, XC, "fileName")?)?,
+        )?;
         let signatures = entry
             .children()
             .filter(|n| is(*n, XC, "digitalSignatureValue"))
@@ -63,7 +67,7 @@ fn verify_signatures(
         pending.push((path, signatures));
     }
     let mut warnings = authenticated.certificate_warnings().to_vec();
-    let certs = Certificates::parse(node)?.verified_referenced(
+    let certs = Certificates::parse(node, anchors.backend())?.verified_referenced(
         pending
             .iter()
             .flat_map(|(_, s)| s.iter().map(|s| s.certificate.as_str())),
@@ -77,7 +81,7 @@ fn verify_signatures(
     );
     let count = pending.len();
     for (path, signatures) in pending {
-        verify_resource(path, signatures, &certs)?;
+        verify_resource(&SourceHandle(local_files()), path, signatures, &certs)?;
     }
     Ok((count, warnings))
 }

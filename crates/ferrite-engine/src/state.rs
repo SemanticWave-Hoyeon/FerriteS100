@@ -7,13 +7,15 @@ use crate::chart_cells::{canonical_cell_digest, CANONICAL_CELL_PARTS};
 use crate::platform::Platform;
 use crate::portrayal::{
     try_lua_portrayal, try_lua_portrayal_for_cells, validated_lua_context, AreaTriangulator,
-    CellCaches, CellPortrayalSelection, PortrayalChangeRequest,
+    CellCaches, CellPortrayalSelection, PortrayalChangeRequest, PortrayalRun, PortrayalSource,
+    PrecomputedCells,
 };
+#[cfg(feature = "s102-hdf5")]
+use crate::s102_journal_admission;
 use crate::{
     cell_source_identity, decoded_chart_cache, interoperability, primary_viewing_layers,
     s101_catalogue_selection, s101_lifecycle_metadata, s101_update_plan,
-    s102_depth_policy::DepthPolicy, s102_journal_admission, s102_original_inputs,
-    CellHydrationSource,
+    s102_depth_policy::DepthPolicy, s102_original_inputs, CellHydrationSource,
 };
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
@@ -24,8 +26,11 @@ use ferrite_render::DrawingInstruction;
 use ferrite_render::{GeoBounds, RenderContext};
 use ferrite_s100_core::S101Cell;
 use ferrite_s101::coverage_projection::GeographicCoverageInventory;
+#[cfg(feature = "s102-hdf5")]
 use ferrite_s102::BathymetryCoverage;
-use ferrite_security::{AuthenticatedSnapshot, UnauthenticatedSnapshot};
+#[cfg(feature = "s102-hdf5")]
+use ferrite_security::AuthenticatedSnapshot;
+use ferrite_security::UnauthenticatedSnapshot;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -118,7 +123,9 @@ pub struct EngineState {
     pub ic_combination: Option<String>,
     pub ic_assigned_vectors: usize,
     /// S-102 2.1 trial files opened for inspection only (never depth).
+    #[cfg(feature = "s102-hdf5")]
     pub s102_trials: Vec<(PathBuf, ferrite_s102::trial_inspection::TrialInspection)>,
+    #[cfg(feature = "s102-hdf5")]
     pub bathymetry: Vec<(
         PathBuf,
         BathymetryCoverage,
@@ -128,6 +135,7 @@ pub struct EngineState {
     pub depth_policies: HashMap<PathBuf, DepthPolicy>,
     pub depth_inputs: HashMap<PathBuf, Arc<UnauthenticatedSnapshot>>,
     pub s102_original_inputs: s102_original_inputs::Registry,
+    #[cfg(feature = "s102-hdf5")]
     pub s102_journal_gate: Option<s102_journal_admission::Gate>,
     pub require_signatures: bool,
     pub operational_mode: bool,
@@ -136,6 +144,11 @@ pub struct EngineState {
     pub decoded_chart_cache: decoded_chart_cache::SharedDecodedChartCache,
     /// Services the state reads inputs, caches and time through.
     pub platform: Platform,
+    /// Where cell drawing instructions come from (Lua or precomputed).
+    pub portrayal_source: PortrayalSource,
+    /// Write precomputed payloads of every cell portrayed with Lua to the
+    /// platform cache store (see [`PrecomputedCells`]).
+    pub precomputed_export: bool,
 }
 
 impl EngineState {
@@ -186,12 +199,15 @@ impl EngineState {
             ic: None,
             ic_combination: None,
             ic_assigned_vectors: 0,
+            #[cfg(feature = "s102-hdf5")]
             s102_trials: Vec::new(),
+            #[cfg(feature = "s102-hdf5")]
             bathymetry: Vec::new(),
             bathymetry_bounds: Default::default(),
             depth_policies: HashMap::new(),
             depth_inputs: HashMap::new(),
             s102_original_inputs: Default::default(),
+            #[cfg(feature = "s102-hdf5")]
             s102_journal_gate: None,
             require_signatures: false,
             operational_mode: false,
@@ -201,6 +217,53 @@ impl EngineState {
                 decoded_chart_cache::DecodedChartCache::new(),
             )),
             platform,
+            portrayal_source: PortrayalSource::default(),
+            precomputed_export: false,
+        }
+    }
+
+    /// Portrayal inputs of precomputed payload keys other than the
+    /// catalogues and the cells (see [`PrecomputedCells`]).
+    pub fn precomputed_common(settings: Option<&SettingsState>, profile: &str) -> [u8; 32] {
+        use sha2::Digest;
+        use std::hash::Hash;
+        let mut hasher = crate::portrayal::PortableHasher(sha2::Sha256::new());
+        crate::portrayal_cache::CACHE_SCHEMA_VERSION.hash(&mut hasher);
+        if let Some(settings) = settings {
+            let mut pc_settings = settings.clone();
+            pc_settings.interoperability_enabled = true; // IC composition is outside the cache.
+            primary_viewing_layers::hash_identity(&pc_settings, &mut hasher);
+            format!("{:?}", pc_settings).hash(&mut hasher);
+        }
+        profile.hash(&mut hasher);
+        hasher.0.finalize().into()
+    }
+
+    /// Source identities of the loaded cells, by cell index.
+    pub fn cell_identities(&self) -> Vec<Option<[u8; 32]>> {
+        (0..self.cells.len())
+            .map(|index| self.cell_identity_sha(index))
+            .collect()
+    }
+
+    /// How a portrayal with `common` inputs runs on this state's platform.
+    pub fn portrayal_run<'a>(
+        &'a self,
+        common: [u8; 32],
+        identities: &'a [Option<[u8; 32]>],
+    ) -> PortrayalRun<'a> {
+        let precomputed = (self.portrayal_source == PortrayalSource::Precomputed
+            || self.precomputed_export)
+            .then(|| PrecomputedCells {
+                store: self.platform.cache.as_ref(),
+                common,
+                identities,
+                export: self.precomputed_export,
+            });
+        PortrayalRun {
+            executor: self.platform.executor.as_ref(),
+            source: self.portrayal_source,
+            precomputed,
         }
     }
 
@@ -344,6 +407,8 @@ impl EngineState {
                 .or_insert_with(|| Arc::clone(owner));
         }
         let mut ordered = std::collections::BTreeMap::<u32, Vec<DrawingInstruction>>::new();
+        let common = Self::precomputed_common(Some(&request.settings), &request.profile);
+        let identities = self.cell_identities();
         for (digests, owner) in owners {
             let resident = self.resident_cells.as_deref();
             let indexed = self.cells.iter().enumerate().filter(|(index, cell)| {
@@ -363,6 +428,7 @@ impl EngineState {
                 Some(&request.settings),
                 None,
                 triangulate,
+                self.portrayal_run(common, &identities),
             )?;
             for instruction in staged.raw_instructions() {
                 let index = instruction
@@ -394,7 +460,11 @@ impl EngineState {
         crate::portrayal_cache::CACHE_SCHEMA_VERSION.hash(&mut *hasher);
         // Fail closed if the linked runtime cannot identify itself. A major/minor
         // label alone cannot invalidate output from another Lua patch or build.
+        // Without a linked runtime there is no Lua output to cache.
+        #[cfg(feature = "lua-native")]
         ferrite_lua::runtime_identity()?.hash(&mut *hasher);
+        #[cfg(not(feature = "lua-native"))]
+        None::<()>?;
         hash_bound_catalogue_inputs(&self.fc, &self.pc, &mut *hasher);
         if let Some(settings) = settings {
             let mut pc_settings = settings.clone();
@@ -673,17 +743,18 @@ impl EngineState {
         if !self.cells.is_empty() {
             displayed.push("S-101");
         }
-        if !self.bathymetry.is_empty() {
+        #[cfg(feature = "s102-hdf5")]
+        let bathymetry: Vec<&dyn ferrite_kernel::NumericCoverageSource> = self
+            .bathymetry
+            .iter()
+            .map(|(_, c, _)| c as &dyn ferrite_kernel::NumericCoverageSource)
+            .collect();
+        #[cfg(not(feature = "s102-hdf5"))]
+        let bathymetry: Vec<&dyn ferrite_kernel::NumericCoverageSource> = Vec::new();
+        if !bathymetry.is_empty() {
             displayed.push("S-102");
         }
-        interoperability::Level2::new(
-            ic,
-            self.ic_combination.as_deref(),
-            &displayed,
-            self.bathymetry
-                .iter()
-                .map(|(_, c, _)| c as &dyn ferrite_kernel::NumericCoverageSource),
-        )
+        interoperability::Level2::new(ic, self.ic_combination.as_deref(), &displayed, bathymetry)
     }
     /// Selection for S-102 rasters being composed now: S-102 is on display.
     pub fn ic_s102_selection(
@@ -750,7 +821,15 @@ impl EngineState {
         // Portray every cell; unchanged cells are reused from their per-cell
         // caches. (A whole-scene cache keyed by every cell was removed: it
         // missed on any change of the open set and accumulated without bound.)
-        let cell_caches = self.cell_instruction_cache_paths(settings);
+        // Exports and precomputed scenes never read the native cell cache.
+        let cell_caches =
+            if self.precomputed_export || self.portrayal_source == PortrayalSource::Precomputed {
+                None
+            } else {
+                self.cell_instruction_cache_paths(settings)
+            };
+        let common = Self::precomputed_common(settings, &self.current_profile_name);
+        let identities = self.cell_identities();
         try_lua_portrayal(
             &self.cells,
             &self.fc,
@@ -767,6 +846,7 @@ impl EngineState {
                 resident: self.resident_cells.as_deref(),
             },
             triangulate,
+            self.portrayal_run(common, &identities),
         )?;
         let after_lua = std::time::Instant::now();
 
@@ -866,6 +946,8 @@ impl EngineState {
                     triangulate,
                 )?;
             } else {
+                let common = Self::precomputed_common(Some(&request.settings), &request.profile);
+                let identities = self.cell_identities();
                 try_lua_portrayal(
                     &self.cells,
                     fc,
@@ -878,6 +960,7 @@ impl EngineState {
                         resident: self.resident_cells.as_deref(),
                     },
                     triangulate,
+                    self.portrayal_run(common, &identities),
                 )?;
             }
         }

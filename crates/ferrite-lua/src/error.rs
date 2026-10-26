@@ -1,10 +1,12 @@
 //! Error types for Lua integration
 
+#[cfg(feature = "native")]
 use crate::mlua;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum LuaError {
+    #[cfg(feature = "native")]
     #[error("Lua runtime error: {0}")]
     Runtime(#[from] mlua::Error),
 

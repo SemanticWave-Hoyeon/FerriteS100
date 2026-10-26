@@ -6,9 +6,25 @@ license.workspace = true
 description = "S-100 chart engine: dataset discovery, opening, signatures, update chains, caches and product adapters, independent of windowing, GUI and GPU"
 
 [features]
-default = ["lua54"]
-lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54"]
-lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55"]
+default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl"]
+# Threads and rayon: parallel cell loading, Lua portrayal workers, cache
+# coding, suppression and coverage projection. Off: everything runs on the
+# calling thread (sequential executor) with identical results.
+parallel = ["ferrite-kernel/parallel", "ferrite-render/parallel", "ferrite-s101/parallel", "ferrite-portrayal-catalog/parallel"]
+# mlua S-101 portrayal (needs lua54 or lua55, which select the interpreter).
+# Off: S-101 cells are portrayed from precomputed per-cell instruction
+# payloads in the cache store (`PortrayalSource::Precomputed`).
+lua-native = ["ferrite-lua/native"]
+lua54 = ["lua-native", "ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102?/lua54"]
+lua55 = ["lua-native", "ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102?/lua55"]
+# S-102 bathymetry (HDF5, C library; its portrayal needs lua-native). Off:
+# S-102 inputs are reported as unsupported.
+s102-hdf5 = ["dep:ferrite-s102", "lua-native"]
+# Signature backends of ferrite-security; at least one is required.
+# OpenSSL (C, vendored) is the default; crypto-rust alone builds without
+# OpenSSL, with both OpenSSL stays the default (`CryptoBackend::Rust` selectable).
+crypto-openssl = ["ferrite-security/crypto-openssl"]
+crypto-rust = ["ferrite-security/crypto-rust"]
 # Test-only helpers used by the application's own tests.
 test-support = []
 
@@ -17,7 +33,6 @@ anyhow.workspace = true
 bincode.workspace = true
 chrono.workspace = true
 quick-xml.workspace = true
-rayon.workspace = true
 roxmltree = "=0.20.0"
 serde.workspace = true
 serde_json.workspace = true
@@ -36,7 +51,7 @@ ferrite-render.workspace = true
 ferrite-s100-core.workspace = true
 ferrite-s100-gml = { path = "../ferrite-s100-gml" }
 ferrite-s101.workspace = true
-ferrite-s102.workspace = true
+ferrite-s102 = { workspace = true, optional = true }
 ferrite-s421 = { path = "../ferrite-s421" }
 ferrite-security.workspace = true
 ferrite-xslt = { path = "../ferrite-xslt" }

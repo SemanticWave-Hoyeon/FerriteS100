@@ -12,7 +12,8 @@ pub const MSAA_SAMPLE_COUNT: u32 = 4;
 /// GPU state containing device, queue, and surface
 pub struct GpuState {
     /// Shared only so a worker shadow can exist; only the owner presents.
-    pub surface: Arc<wgpu::Surface<'static>>,
+    /// None for an offscreen (headless) state.
+    pub surface: Option<Arc<wgpu::Surface<'static>>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -79,34 +80,7 @@ impl GpuState {
         let gpu_name = adapter_info.name.clone();
         tracing::info!("Using GPU adapter: {:?}", gpu_name);
 
-        // Check which timestamp query features the adapter supports
-        let adapter_features = adapter.features();
-        let mut requested_features = wgpu::Features::empty();
-        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-            requested_features |= wgpu::Features::TIMESTAMP_QUERY;
-            tracing::info!("GPU supports TIMESTAMP_QUERY");
-        }
-        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
-            requested_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-            tracing::info!("GPU supports TIMESTAMP_QUERY_INSIDE_ENCODERS");
-        }
-        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
-            requested_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
-            tracing::info!("GPU supports TIMESTAMP_QUERY_INSIDE_PASSES");
-        }
-
-        // Request device
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("ferrite-device"),
-                    required_features: requested_features,
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
-            .await?;
+        let (device, queue, adapter_features) = Self::request_device(&adapter).await?;
 
         // Configure surface
         // Use non-sRGB format to avoid automatic gamma correction
@@ -145,7 +119,7 @@ impl GpuState {
         tracing::info!("MSAA enabled with {} samples", MSAA_SAMPLE_COUNT);
 
         Ok(GpuState {
-            surface: Arc::new(surface),
+            surface: Some(Arc::new(surface)),
             device,
             queue,
             config,
@@ -166,6 +140,99 @@ impl GpuState {
             .map(std::cell::RefCell::new),
             prebuilt: Default::default(),
         })
+    }
+
+    /// The renderer's device on `adapter`, with the timestamp queries the
+    /// adapter supports; also returns the adapter's features.
+    async fn request_device(
+        adapter: &wgpu::Adapter,
+    ) -> Result<(wgpu::Device, wgpu::Queue, wgpu::Features)> {
+        // Check which timestamp query features the adapter supports
+        let adapter_features = adapter.features();
+        let mut requested_features = wgpu::Features::empty();
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            requested_features |= wgpu::Features::TIMESTAMP_QUERY;
+            tracing::info!("GPU supports TIMESTAMP_QUERY");
+        }
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+            requested_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            tracing::info!("GPU supports TIMESTAMP_QUERY_INSIDE_ENCODERS");
+        }
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+            requested_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+            tracing::info!("GPU supports TIMESTAMP_QUERY_INSIDE_PASSES");
+        }
+
+        // Request device
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("ferrite-device"),
+                    required_features: requested_features,
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: Default::default(),
+                },
+                None,
+            )
+            .await?;
+        Ok((device, queue, adapter_features))
+    }
+
+    /// GPU state without a presentation surface: frames are only rendered
+    /// into offscreen textures (image export). `window` reports the size and
+    /// density of the offscreen target.
+    pub async fn new_headless(window: Arc<dyn SurfaceHost>) -> Result<Self> {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or(WgpuError::AdapterNotFound)?;
+        let adapter_info = adapter.get_info();
+        let gpu_name = adapter_info.name.clone();
+        tracing::info!("Using GPU adapter (offscreen): {:?}", gpu_name);
+        let (device, queue, adapter_features) = Self::request_device(&adapter).await?;
+        // The non-sRGB format a window surface uses on the desktop platforms;
+        // PC colours are already sRGB values (see `new`).
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        let (msaa_texture, msaa_view) = Self::create_msaa_texture(&device, &config);
+        Ok(GpuState {
+            surface: None,
+            device,
+            queue,
+            config,
+            size,
+            scale_factor: window.scale_factor(),
+            window,
+            msaa_texture: Some(msaa_texture),
+            msaa_view: Some(msaa_view),
+            gpu_name,
+            adapter_features,
+            adapter_backend: adapter_info.backend,
+            surface_pacing: None,
+            prebuilt: Default::default(),
+        })
+    }
+
+    /// Whether frames are presented to a window surface (false: offscreen).
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some()
     }
 
     /// Create MSAA texture and view
@@ -195,7 +262,7 @@ impl GpuState {
     /// It never acquires or presents, and carries no pacing collector.
     pub(crate) fn worker_shadow(&self) -> Self {
         Self {
-            surface: Arc::clone(&self.surface),
+            surface: self.surface.clone(),
             device: self.device.clone(),
             queue: self.queue.clone(),
             config: self.config.clone(),
@@ -219,7 +286,9 @@ impl GpuState {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.config);
+            }
 
             // Recreate MSAA texture with new size
             let (msaa_texture, msaa_view) = Self::create_msaa_texture(&self.device, &self.config);
@@ -231,10 +300,14 @@ impl GpuState {
     /// Get current surface texture for rendering
     pub fn get_current_texture(&self) -> Result<wgpu::SurfaceTexture> {
         let timer = self.surface_pacing_clock();
-        let result = self
-            .surface
-            .get_current_texture()
-            .map_err(|e| WgpuError::Render(e.to_string()));
+        let result = match &self.surface {
+            Some(surface) => surface
+                .get_current_texture()
+                .map_err(|e| WgpuError::Render(e.to_string())),
+            None => Err(WgpuError::Render(
+                "Offscreen renderer has no window surface".into(),
+            )),
+        };
         self.surface_pacing_record(crate::surface_pacing::Stage::Acquire, timer);
         if let Some(capture) = &self.surface_pacing {
             capture.borrow_mut().acquire(result.is_err());

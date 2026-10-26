@@ -23,6 +23,8 @@ members = [
     "crates/ferrite-xslt",
     "crates/ferrite-s100-gml",
     "crates/ferrite-engine",
+    "crates/ferrite-cli",
+    "crates/ferrite-capi",
 ]
 exclude = [
     "plugins/route-plugin",
@@ -97,11 +99,11 @@ ferrite-s100-core = { path = "crates/ferrite-s100-core" }
 ferrite-s101 = { path = "crates/ferrite-s101", default-features = false }
 ferrite-s102 = { path = "crates/ferrite-s102", default-features = false }
 ferrite-kernel = { path = "crates/ferrite-kernel" }
-ferrite-interoperability = { path = "crates/ferrite-interoperability" }
-ferrite-security = { path = "crates/ferrite-security" }
+ferrite-interoperability = { path = "crates/ferrite-interoperability", default-features = false }
+ferrite-security = { path = "crates/ferrite-security", default-features = false }
 ferrite-feature-catalog = { path = "crates/ferrite-feature-catalog" }
-ferrite-portrayal-catalog = { path = "crates/ferrite-portrayal-catalog" }
-ferrite-render = { path = "crates/ferrite-render" }
+ferrite-portrayal-catalog = { path = "crates/ferrite-portrayal-catalog", default-features = false }
+ferrite-render = { path = "crates/ferrite-render", default-features = false }
 ferrite-gpu = { path = "crates/ferrite-gpu" }
 ferrite-ui = { path = "crates/ferrite-ui" }
 ferrite-lua = { path = "crates/ferrite-lua", default-features = false }
@@ -129,7 +131,7 @@ lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferri
 lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-gpu/lua55", "ferrite-ui/lua55", "ferrite-engine/lua55"]
 
 [dependencies]
-ferrite-engine.workspace = true
+ferrite-engine = { workspace = true, features = ["parallel", "s102-hdf5", "crypto-openssl"] }
 quick-xml.workspace = true
 roxmltree = "=0.20.0"
 chrono.workspace = true
@@ -140,11 +142,11 @@ ferrite-s102.workspace = true
 ferrite-s421 = { path = "crates/ferrite-s421" }
 ferrite-kernel.workspace = true
 ferrite-interoperability.workspace = true
-ferrite-security.workspace = true
+ferrite-security = { workspace = true, features = ["crypto-openssl"] }
 ferrite-feature-catalog.workspace = true
-ferrite-portrayal-catalog.workspace = true
+ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
 ferrite-s100-gml = { path = "crates/ferrite-s100-gml" }
-ferrite-render.workspace = true
+ferrite-render = { workspace = true, features = ["parallel"] }
 ferrite-gpu = { workspace = true, features = ["s102-portrayal"] }
 ferrite-ui = { workspace = true, features = ["s102-portrayal"] }
 ferrite-lua.workspace = true

@@ -1,8 +1,12 @@
 //! Application choice to open datasets without authenticating their signatures.
 //! Content identities and parsing remain independent of this setting.
+use crate::platform::DataSource;
 use anyhow::{ensure, Context, Result};
-use ferrite_security::{AuthenticatedSnapshot, AuthorizedDatasets, DatasetDiscoveryAuthorization};
+use ferrite_security::{
+    AuthenticatedSnapshot, AuthorizedDatasets, DatasetDiscoveryAuthorization, ExchangeSource,
+};
 use std::{
+    io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -12,12 +16,60 @@ pub fn verification_enabled(ui: Option<bool>, requested: bool, operational: bool
     operational || ui.unwrap_or(requested)
 }
 
+/// The signature verifier reads exchange sets through the platform data
+/// source: the same catalogue and resource files, as bytes. Snapshots are
+/// private files for sources of local files and owned bytes otherwise.
+struct SourceExchange(Arc<dyn DataSource>);
+impl ExchangeSource for SourceExchange {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        self.0.canonicalize(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.0.exists(path)
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        self.0.is_file(path)
+    }
+    fn len(&self, path: &Path) -> io::Result<u64> {
+        self.0.len(path)
+    }
+    fn open(&self, path: &Path) -> io::Result<Box<dyn io::Read + '_>> {
+        Ok(Box::new(io::Cursor::new(self.0.read(path)?)))
+    }
+    fn file_snapshots(&self) -> bool {
+        self.0.local_paths()
+    }
+}
+
+/// [`ExchangeSource`] view of a platform data source.
+pub fn exchange_source(data: &Arc<dyn DataSource>) -> Arc<dyn ExchangeSource> {
+    Arc::new(SourceExchange(Arc::clone(data)))
+}
+
 pub fn dataset_snapshot(
     report: &AuthorizedDatasets,
     path: &Path,
     require_signature: bool,
 ) -> Result<Option<Arc<AuthenticatedSnapshot>>> {
-    let canonical = path.canonicalize()?;
+    dataset_snapshot_key(report, path.canonicalize()?, require_signature)
+}
+
+/// [`dataset_snapshot`] keyed by the data source's canonical path (the key
+/// [`ferrite_security::authorize_datasets_in`] used).
+pub fn dataset_snapshot_in(
+    data: &dyn DataSource,
+    report: &AuthorizedDatasets,
+    path: &Path,
+    require_signature: bool,
+) -> Result<Option<Arc<AuthenticatedSnapshot>>> {
+    dataset_snapshot_key(report, data.canonicalize(path)?, require_signature)
+}
+
+fn dataset_snapshot_key(
+    report: &AuthorizedDatasets,
+    canonical: PathBuf,
+    require_signature: bool,
+) -> Result<Option<Arc<AuthenticatedSnapshot>>> {
     let snapshot = report
         .snapshots
         .get(&canonical)

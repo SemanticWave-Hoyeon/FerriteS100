@@ -9,7 +9,7 @@ description = "Native read-only S-100 dataset MCP service"
 ferrite-iso8211.workspace = true
 ferrite-s100-core.workspace = true
 ferrite-feature-catalog.workspace = true
-ferrite-portrayal-catalog.workspace = true
+ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

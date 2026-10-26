@@ -125,8 +125,59 @@ XSLT(`ferrite-xslt`), GML(`ferrite-s100-gml`), 커널(`ferrite-kernel`), ISO 821
 | 단계 | 내용 |
 |---|---|
 | 4 | **완료.** `ferrite_engine::platform`에 `Platform`(`DataSource`·`CacheStore`·`UserStore`·`Clock`·`Executor`)과 네이티브·메모리·순차 구현을 두고 `EngineState`·`GmlOverlays`에 주입했다. 카탈로그(FC 바이트, PC `CatalogueSources::from_files`), 데이터셋 탐색, S-124/S-129 카탈로그·XSLT 규칙(`ferrite_xslt::ModuleSource`)·데이터셋 읽기와 검증, 셀 포트레이얼 캐시, NAVWARN 사용자 상태, 하이드레이션 병렬 실행이 서비스를 거친다. `S101Cell::load_update_chain_bytes_with_identity`, `inspect_dataset_identification_bytes`로 파일 없이 셀을 연다. `chart_engine::ChartEngine`(`new`·`open`→`OpenJob`(`poll`·`wait`·`cancel`)·`install`·`set_display`·`prepare`→`PreparedScene`·`pick`·`feature`), `pick`(`PickSurface`, `find_features_at`, `FeatureReport`), `scene`(`PreparedScene`, 셀 리소스 바인딩, `prepare_flat_coverage`)를 추가했고 앱은 `EngineState::new`, `PreparedScene`, 엔진 피킹·`describe_feature`·리소스 바인딩을 쓴다. 예제 `crates/ferrite-engine/examples/inspect.rs`, 메모리 소스만으로 S-101·S-124를 열고 장면을 준비하는 테스트(`tests/in_memory_open.rs`). **5단계로 넘긴 네이티브 전용 경로**: S-101 서명 검증과 업데이트 계획기(`s101_update_plan`, `dataset_signature_policy`, `ferrite-security`의 경로 기반 스냅샷), 취소 이력(`chart_publication::HistoryStore`), 설치 카탈로그 인벤토리 선택(`s101_catalogue_selection`), S-102 전체(HDF5, 저널, 시험 워커), S-421 입력, S-124/S-129 교환 세트 검증·shapefile 가져오기, Lua 포트레이얼 워커 풀과 앱 로더의 스레드(`parallel` 기능으로 `Executor`에 연결 예정), PC 캡처의 rayon 병렬 읽기 |
-| 5 | 기능 플래그 정리(`parallel`, `lua-native`, `crypto-openssl`/`crypto-rust`, `s102-hdf5`). 순수 Rust 암호 백엔드. `ferrite-cli`(헤드리스 렌더·검증·검사)와 `ferrite-capi`(C ABI, cbindgen 헤더, C 예제) |
+| 5 | 기능 플래그 정리(`parallel`, `lua-native`, `crypto-openssl`/`crypto-rust`, `s102-hdf5`). 순수 Rust 암호 백엔드. `ferrite-cli`(헤드리스 렌더·검증·검사)와 `ferrite-capi`(C ABI, C 헤더, C 예제). **5B 완료**(기능 플래그·CLI·C ABI, 암호 백엔드는 5A). `ferrite-engine` 기능: `parallel`(rayon·스레드. 끄면 `default_executor()`가 `SequentialExecutor`이고 데이터 병렬 반복은 순차로 돌아 결과가 같다. 데이터 병렬은 `ferrite_kernel::par`가 rayon 또는 순차 shim을 고르며 `ferrite-render`·`ferrite-s101`·`ferrite-portrayal-catalog`의 `parallel` 기능이 켠다. Lua 포트레이얼 워커 풀과 사전 계산 페이로드 디코딩은 `Executor`로 실행), `lua-native`(mlua. `lua54`/`lua55`가 켜고 인터프리터를 고른다. 끄면 `ferrite-lua`는 Part 9a 명령 파서와 컨텍스트 모델만 빌드하고 S-101 셀은 `PortrayalSource::Precomputed`로 캐시 저장소의 셀별 사전 계산 페이로드에서 읽는다. 키는 설정·팔레트·캐시 스키마·FC/PC 다이제스트·셀 원본 SHA-256의 SHA-256이라 기계·경로·빌드가 달라도 같다. 페이로드가 없으면 명확한 오류), `s102-hdf5`(HDF5. 끄면 S-102 입력은 미지원으로 보고). 기본 기능은 셋 다 켠 기존 네이티브 동작이다. 암호 백엔드는 `crypto-openssl`(기본)과 `crypto-rust` 중 하나 이상이 필요하다. 워크스페이스의 `ferrite-security`·`ferrite-interoperability` 항목은 기본 기능을 끄고 사용 크레이트(`ferrite-engine`·`ferrite-s101`·`ferrite-s102`·`ferrite-interoperability`·`ferrite-cli`·`ferrite-capi`)가 `crypto-openssl`을 기본으로, `crypto-rust`를 선택으로 넘긴다. `cargo check -p ferrite-engine --no-default-features --features crypto-rust`는 rayon·mlua·hdf5·openssl 없이 빌드된다(`cargo tree`로 확인). `ferrite-gpu`: 서피스 없는 `GpuState::new_headless`, `WgpuRenderer::new_headless`·`render_offscreen`, `headless::{HeadlessSurface, HeadlessUi}`, epaint 차트 글꼴 `headless_text`(기존 테스트 백엔드를 승격). `ferrite-cli`: `ferrite inspect|validate|render|precompute`와 라이브러리 `OffscreenChartRenderer`(뷰어와 같은 방출: 팔레트, 표시 설정, 뷰잉 그룹, 카탈로그 소유자별 셀 리소스, 차트 텍스트). `ferrite-capi`: `include/ferrite.h`(수기, 심볼 일치 테스트), `examples/c/render.c`(테스트에서 `cc`로 빌드·실행). 파사드 추가: `DatasetSource::Bytes`, `View::camera`(`Camera`, `Zoom::Factor`/`Scale`)·`camera_view`, `exchange_set_checks`, `set_portrayal_source`·`set_precomputed_export`, 설치 카탈로그 인벤토리 소유자 선택(로컬 파일 열기), 뷰어와 같은 전체 데이터 여백(10%), `platform::DirectoryCacheStore`. 같은 위치의 CLI 렌더는 앱 스크린샷의 차트 영역과 픽셀 0.04%(SHOM `jersey_z20`), 0.26%(혼합 `portsmouth_z12`)만 다르다(가장자리 클리핑과 세계 지도 해안선). **네이티브 전용으로 남은 것**: 서명 검증·업데이트 계획기의 경로 기반 스냅샷(5A), 취소 이력, 설치 카탈로그 인벤토리(파일 시스템), S-102 전체(파사드 미지원), S-421 입력, S-124/S-129 교환 세트 검증·shapefile 가져오기, PC 캡처의 병렬 읽기(플랫폼이 없는 카탈로그 캡처라 `Executor` 대신 `parallel` 기능으로만 전환), `ferrite-gpu` 내부 rayon(네이티브 렌더러) |
 | 6 | `ferrite-wasm`: wasm32 빌드(파일 없이 바이트로 열기, 순차 실행, WebGPU/WebGL2 렌더), 최소 웹 데모. Lua 포트레이얼은 미리 계산한 Part 9a 결과 또는 WASI/emscripten 빌드 중 선택 |
+
+### 엔진 사용법
+
+**Rust.** `ferrite-engine`(기본 기능)과 렌더링이 필요하면 `ferrite-cli` 라이브러리를 쓴다.
+
+```rust
+use ferrite_engine::chart_engine::{Camera, ChartEngine, DatasetSource, View, Zoom};
+use ferrite_engine::platform::Platform;
+
+let mut engine = ChartEngine::new(ferrite_cli::engine_config(Platform::native(), "Catalogues"))?;
+let report = engine.open_blocking(DatasetSource::Folder("TestData/SHOM-S101".into()))?;
+let camera = Camera { center: Some([49.21, -2.13]), zoom: Zoom::Scale(25_000.) };
+let view = View::camera(1280, 800, camera);
+let (_, zoom) = engine.camera_view(camera, view.viewport)?;
+let mut scene = std::sync::Arc::try_unwrap(engine.prepare(&view)?).ok().unwrap();
+let mut gpu = ferrite_cli::OffscreenChartRenderer::new(1280, 800, 1.0)?;
+gpu.render(&engine, &mut scene, zoom)?.save("chart.png")?;
+let hits = engine.pick(&scene, [640., 400.], 10., None);
+```
+
+메모리 데이터는 `Platform::in_memory`나 `DatasetSource::Bytes`로 연다. Lua 없이 빌드한 호스트는
+네이티브 빌드가 `set_precomputed_export(true)`(또는 `ferrite precompute`)로 만든 페이로드를 캐시
+저장소에 넣고 `set_portrayal_source(PortrayalSource::Precomputed)`로 그린다.
+
+**CLI** (`cargo build -p ferrite-cli`, 실행 파일 `ferrite`):
+
+```
+ferrite inspect  [--json] PATH...                  # 데이터셋, 피처 유형별 개수, 검증 문제
+ferrite validate [--json] [--verify] PATH...       # 검증 + 교환 세트 검사, 오류가 있으면 종료 코드 1
+ferrite render PATH... --out chart.png [--center LAT,LON] [--zoom Z | --scale N]
+               [--size WxH] [--density F] [--palette Day|Dusk|Night] [--precomputed DIR]
+ferrite precompute PATH... --cache-dir DIR [뷰 옵션]   # Lua 없는 호스트용 셀 페이로드
+```
+
+공통 옵션은 `--catalogues DIR`(기본 `./Catalogues` 또는 `FERRITE_CATALOGUES`), `--inventory DIR`,
+`-v`이다. 사용·실행 오류는 종료 코드 2.
+
+**C** (`cargo build -p ferrite-capi` → `libferrite.{dylib,so,a}`, 헤더 `crates/ferrite-capi/include/ferrite.h`):
+
+```c
+FerriteEngine *e = ferrite_engine_create("Catalogues", NULL, NULL);
+ferrite_engine_open_folder(e, "TestData/SHOM-S101");
+FerriteCamera cam = {1, 49.21, -2.13, 20.0, 0.0};
+ferrite_engine_prepare(e, 800, 600, 1.0, &cam);
+ferrite_engine_render_rgba(e, rgba, 800 * 600 * 4);
+char *hits = ferrite_engine_pick_json(e, 400, 300, 10);  /* ferrite_string_free(hits) */
+ferrite_engine_destroy(e);
+```
+
+상태 코드는 `FERRITE_OK`(0) 또는 음수이고 메시지는 `ferrite_last_error()`이다. 핸들은 불투명하고
+패닉은 경계를 넘지 않는다(`FERRITE_PANIC`). 예제는 `crates/ferrite-capi/examples/c/render.c`.
 
 ## 5. 주의 사항
 

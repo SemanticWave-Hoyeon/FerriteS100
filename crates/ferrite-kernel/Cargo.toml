@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 description = "Product-neutral S-100 chart kernel contracts and spatial coverage operations"
 
+[features]
+# Data parallelism through rayon (`par`). Off: the same call sites run
+# sequentially on the calling thread with identical results.
+parallel = ["dep:rayon"]
+
 [dependencies]
 anyhow.workspace = true
+rayon = { workspace = true, optional = true }
 
 serde.workspace = true
 chrono.workspace = true

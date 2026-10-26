@@ -1,5 +1,6 @@
 //! Transport-independent authentication for externally delivered signed payloads.
 use super::*;
+use crypto::MessageHash;
 
 #[derive(Clone, Copy)]
 pub enum DetachedAlgorithm {
@@ -25,15 +26,75 @@ pub fn verify_detached(
     algorithm: DetachedAlgorithm,
     time: i64,
 ) -> Result<()> {
-    let roots = X509::stack_from_pem(trusted_root_pem)?;
+    verify_detached_with(
+        CryptoBackend::default(),
+        data,
+        signature,
+        leaf_der,
+        intermediate_der,
+        trusted_root_pem,
+        root_sha256,
+        algorithm,
+        time,
+    )
+}
+
+#[cfg(feature = "crypto-rust")]
+/// The issuer path from `leaf` through the supplied intermediates (any
+/// order) to `root`, as OpenSSL's chain building finds it: the trusted root
+/// first, otherwise the one intermediate named as issuer. More than one
+/// candidate is ambiguous and rejected (the Rust backend fails closed;
+/// OpenSSL's choice would depend on its search order).
+fn issuer_path(leaf: &Cert, intermediates: &[Cert], root: &Cert) -> Result<Vec<Cert>> {
+    let mut path = Vec::new();
+    let mut current = leaf;
+    loop {
+        if current.issuer_der() == root.subject_der() {
+            return Ok(path);
+        }
+        let mut candidates = intermediates
+            .iter()
+            .filter(|c| c.subject_der() == current.issuer_der());
+        let next = candidates.next().context(
+            "Detached certificate path validation failed: unable to get local issuer certificate",
+        )?;
+        ensure!(
+            candidates.next().is_none(),
+            "Detached certificate path validation failed: ambiguous intermediate certificates"
+        );
+        ensure!(
+            path.len() < intermediates.len(),
+            "Detached certificate path validation failed: issuer cycle"
+        );
+        path.push(next.clone());
+        current = next;
+    }
+}
+
+/// [`verify_detached`] with an explicit [`CryptoBackend`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each transport authentication input is explicit; preserve the public verification API."
+)]
+pub fn verify_detached_with(
+    backend: CryptoBackend,
+    data: &[u8],
+    signature: &[u8],
+    leaf_der: &[u8],
+    intermediate_der: &[Vec<u8>],
+    trusted_root_pem: &[u8],
+    root_sha256: Option<&str>,
+    algorithm: DetachedAlgorithm,
+    time: i64,
+) -> Result<()> {
+    let roots = Cert::stack_from_pem(backend, trusted_root_pem)?;
     ensure!(
         roots.len() == 1,
         "Exactly one independently installed root required"
     );
     let root = &roots[0];
-    let root_key = root.public_key()?;
     ensure!(
-        root.verify(&root_key)? && root.subject_name().to_der()? == root.issuer_name().to_der()?,
+        root.verifies_own_signature()? && root.subject_der() == root.issuer_der(),
         "Root is not self-signed"
     );
     if let Some(expected) = root_sha256 {
@@ -42,7 +103,7 @@ pub fn verify_detached(
             "Invalid root thumbprint"
         );
         ensure!(
-            hex(&root.digest(MessageDigest::sha256())?).eq_ignore_ascii_case(expected),
+            root.sha256_hex()?.eq_ignore_ascii_case(expected),
             "Root thumbprint does not match installed trust anchor"
         );
     }
@@ -50,34 +111,32 @@ pub fn verify_detached(
         intermediate_der.len() <= 16,
         "Certificate chain exceeds limit"
     );
-    let leaf = X509::from_der(leaf_der)?;
+    let leaf = Cert::from_der(backend, leaf_der)?;
     ensure!(
-        leaf.to_der()? == leaf_der,
+        leaf.der() == leaf_der,
         "Trailing or noncanonical certificate DER"
     );
-    let mut chain = Stack::new()?;
+    let mut chain = Vec::new();
     for der in intermediate_der {
-        let cert = X509::from_der(der)?;
+        let cert = Cert::from_der(backend, der)?;
         ensure!(
-            cert.to_der()? == *der,
+            cert.der() == der.as_slice(),
             "Trailing or noncanonical intermediate DER"
         );
-        chain.push(cert)?;
+        chain.push(cert);
     }
-    let mut store = X509StoreBuilder::new()?;
-    store.add_cert(root.clone())?;
-    let mut param = X509VerifyParam::new()?;
-    param.set_time(time);
-    param.set_flags(X509VerifyFlags::CHECK_SS_SIGNATURE)?;
-    store.set_param(&param)?;
-    let mut context = X509StoreContext::new()?;
-    let (valid, error) = context.init(&store.build(), &leaf, &chain, |ctx| {
-        Ok((ctx.verify_cert()?, ctx.error().to_string()))
-    })?;
-    ensure!(
-        valid,
-        "Detached certificate path validation failed: {error}"
-    );
+    let verdict = match backend {
+        // OpenSSL builds the path from the untrusted set itself.
+        #[cfg(feature = "crypto-openssl")]
+        CryptoBackend::OpenSsl => crypto::verify_path(&leaf, &chain, root, time),
+        #[cfg(feature = "crypto-rust")]
+        CryptoBackend::Rust => {
+            crypto::verify_path(&leaf, &issuer_path(&leaf, &chain, root)?, root, time)
+        }
+    };
+    if let Err(error) = verdict {
+        bail!("Detached certificate path validation failed: {error}");
+    }
     let (_, parsed) = x509_parser::parse_x509_certificate(leaf_der)
         .map_err(|e| anyhow::anyhow!("Invalid certificate: {e}"))?;
     ensure!(
@@ -90,26 +149,22 @@ pub fn verify_detached(
             "Certificate does not permit digital signatures"
         );
     }
-    let (curve, digest) = match algorithm {
-        DetachedAlgorithm::Ecdsa256Sha256 => (Nid::X9_62_PRIME256V1, MessageDigest::sha256()),
-        DetachedAlgorithm::Ecdsa256Sha3 => (Nid::X9_62_PRIME256V1, MessageDigest::sha3_256()),
-        DetachedAlgorithm::Ecdsa384Sha384 => (Nid::SECP384R1, MessageDigest::sha384()),
-        DetachedAlgorithm::Ecdsa384Sha3 => (Nid::SECP384R1, MessageDigest::sha3_384()),
+    let (curve, hash) = match algorithm {
+        DetachedAlgorithm::Ecdsa256Sha256 => (Curve::P256, MessageHash::Sha256),
+        DetachedAlgorithm::Ecdsa256Sha3 => (Curve::P256, MessageHash::Sha3_256),
+        DetachedAlgorithm::Ecdsa384Sha384 => (Curve::P384, MessageHash::Sha384),
+        DetachedAlgorithm::Ecdsa384Sha3 => (Curve::P384, MessageHash::Sha3_384),
     };
-    let key = leaf.public_key()?;
     ensure!(
-        key.ec_key()?.group().curve_name() == Some(curve),
+        leaf.ec_curve()? == curve,
         "Signature curve does not match algorithm"
     );
-    let parsed_signature = openssl::ecdsa::EcdsaSig::from_der(signature)?;
     ensure!(
-        parsed_signature.to_der()? == signature,
+        crypto::canonical_ecdsa_der(backend, signature)?,
         "Trailing or noncanonical signature DER"
     );
-    let mut verifier = Verifier::new(digest, &key)?;
-    verifier.update(data)?;
     ensure!(
-        verifier.verify(signature)?,
+        leaf.verify_ecdsa_message(hash, data, signature)?,
         "Invalid detached payload signature"
     );
     Ok(())

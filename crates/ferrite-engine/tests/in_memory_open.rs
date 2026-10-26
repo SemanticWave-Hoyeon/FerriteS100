@@ -123,7 +123,7 @@ fn opens_and_prepares_a_scene_entirely_from_memory() {
 }
 
 #[test]
-fn signature_verification_needs_local_files() {
+fn s101_signature_verification_needs_local_files() {
     let root = repository();
     if !root.join(S101_CELL).is_file() || !root.join(S124_DATASET).is_file() {
         eprintln!("TestData not present; skipped");
@@ -141,4 +141,120 @@ fn signature_verification_needs_local_files() {
         .err()
         .expect("rejected");
     assert!(format!("{error:#}").contains("local files"), "{error:#}");
+}
+
+const S124_EXCHANGE: &str = "TestData/UKHO-S100-2026/ExchangeSets/S-124_GB/S100_ROOT";
+/// 2026-02-17T10:18:33Z, the exchange set's issue time (within the GB00
+/// producer certificate validity 2025-06-16 .. 2026-06-16).
+const S124_ISSUED: u64 = 1_771_323_513;
+
+/// S-124 catalogues and a copy of the signed UKHO S-124 exchange set, in
+/// memory only.
+fn signed_exchange_source(root: &Path) -> MemoryDataSource {
+    let native = NativeDataSource;
+    let mut memory = MemoryDataSource::new();
+    for product in ["FC/S-101", "PC/S-101", "FC/S-124", "PC/S-124"] {
+        memory
+            .copy_tree(
+                &native,
+                &root.join("Catalogues").join(product),
+                &Path::new("/in-memory/Catalogues").join(product),
+            )
+            .unwrap();
+    }
+    let copied = memory
+        .copy_tree(
+            &native,
+            &root.join(S124_EXCHANGE),
+            Path::new("/in-memory/xs/S100_ROOT"),
+        )
+        .unwrap();
+    assert!(copied >= 7, "{copied}");
+    memory
+}
+
+fn open_signed(
+    memory: MemoryDataSource,
+    at: Option<u64>,
+) -> ferrite_engine::chart_engine::OpenReport {
+    use ferrite_engine::platform::FixedClock;
+    let root = repository();
+    let mut platform = Platform::in_memory(memory);
+    if let Some(seconds) = at {
+        platform = platform.with_clock(std::sync::Arc::new(FixedClock(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+        )));
+    }
+    let mut config = EngineConfig::new(platform, "/in-memory/Catalogues");
+    config.signatures = ferrite_engine::chart_engine::SignaturePolicy::Required;
+    config.trust_anchors = vec![(
+        "IHO".into(),
+        std::fs::read(root.join("Trust/IHO-S100-5.2.pem")).unwrap(),
+    )];
+    let mut engine = ChartEngine::new(config).unwrap();
+    let job = engine.open(DatasetSource::Folder("/in-memory/xs".into()));
+    engine.install(job.wait().unwrap()).unwrap()
+}
+
+#[test]
+fn required_signatures_verify_an_in_memory_exchange_set() {
+    let root = repository();
+    if !root.join(S124_EXCHANGE).join("CATALOG.SIGN").is_file()
+        || !root.join("Trust/IHO-S100-5.2.pem").is_file()
+    {
+        eprintln!("TestData not present; skipped");
+        return;
+    }
+    let memory = signed_exchange_source(&root);
+    assert!(!memory.local_paths());
+
+    // Verified at the issue time: every S-124 dataset opens as verified.
+    let report = open_signed(memory.clone(), Some(S124_ISSUED));
+    assert_eq!(report.datasets.len(), 5, "{report:#?}");
+    assert!(
+        report
+            .datasets
+            .iter()
+            .all(|d| d.product == "S-124" && d.provenance == "signature verified"),
+        "{report:#?}"
+    );
+    assert!(
+        report.issues.iter().all(|i| i.check != "GML load"),
+        "{:#?}",
+        report.issues
+    );
+
+    // One altered byte in one dataset: the exchange set no longer verifies.
+    let mut tampered = memory.clone();
+    let dataset = Path::new("/in-memory/xs/S100_ROOT/S-124/DATASET_FILES/124GB00S1Y2026N36.GML");
+    let mut bytes = memory.read(dataset).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0x20;
+    tampered.insert(dataset, bytes);
+    let report = open_signed(tampered, Some(S124_ISSUED));
+    assert!(report.datasets.is_empty(), "{report:#?}");
+    let rejected: Vec<_> = report
+        .issues
+        .iter()
+        .filter(|i| i.check == "GML load")
+        .collect();
+    assert_eq!(rejected.len(), 5, "{:#?}", report.issues);
+    assert!(
+        rejected
+            .iter()
+            .any(|i| i.message.contains("Invalid data signature")),
+        "{rejected:#?}"
+    );
+
+    // Today the producer certificate has expired: rejected, not downgraded.
+    let report = open_signed(memory, None);
+    assert!(report.datasets.is_empty(), "{report:#?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.check == "GML load" && i.message.contains("expired")),
+        "{:#?}",
+        report.issues
+    );
 }

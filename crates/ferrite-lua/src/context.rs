@@ -1127,6 +1127,6 @@ mod owned_context_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 #[path = "direct_cell_data_controls.rs"]
 mod direct_cell_data_controls;

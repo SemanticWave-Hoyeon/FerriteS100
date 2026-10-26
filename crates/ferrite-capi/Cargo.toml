@@ -1,0 +1,25 @@
+[package]
+name = "ferrite-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI over the S-100 ChartEngine: opaque engine handles, opening, offscreen rendering to RGBA, picking and JSON reports (header: include/ferrite.h)"
+
+[lib]
+name = "ferrite"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl"]
+lua54 = ["ferrite-cli/lua54"]
+lua55 = ["ferrite-cli/lua55"]
+parallel = ["ferrite-cli/parallel"]
+s102-hdf5 = ["ferrite-cli/s102-hdf5"]
+crypto-openssl = ["ferrite-cli/crypto-openssl"]
+crypto-rust = ["ferrite-cli/crypto-rust"]
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+ferrite-cli = { path = "../ferrite-cli", default-features = false }
+ferrite-engine.workspace = true

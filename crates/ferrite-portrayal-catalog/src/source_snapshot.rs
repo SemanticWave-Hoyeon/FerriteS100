@@ -67,7 +67,7 @@ impl CatalogueSources {
             // the per-file cap); the cumulative budget and every check below
             // are then applied in the original order with the same results.
             let reads: Vec<Option<std::io::Result<Vec<u8>>>> = {
-                use rayon::prelude::*;
+                use ferrite_kernel::par::prelude::*;
                 children
                     .par_iter()
                     .map(|entry| {

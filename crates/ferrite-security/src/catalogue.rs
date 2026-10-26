@@ -55,21 +55,31 @@ pub fn authorize_catalogue(
     anchors: &TrustAnchors,
     time: i64,
 ) -> Result<AuthorizedCatalogue> {
-    let path = path.as_ref().canonicalize()?;
+    authorize_catalogue_in(&local_files(), path, scope, anchors, time)
+}
+/// [`authorize_catalogue`] reading through an [`ExchangeSource`].
+pub fn authorize_catalogue_in(
+    source: &std::sync::Arc<dyn ExchangeSource>,
+    path: impl AsRef<Path>,
+    scope: CatalogueScope,
+    anchors: &TrustAnchors,
+    time: i64,
+) -> Result<AuthorizedCatalogue> {
+    let path = source.canonicalize(path.as_ref())?;
     let root = path
         .parent()
         .into_iter()
         .flat_map(Path::ancestors)
-        .find(|p| p.join("CATALOG.SIGN").exists())
+        .find(|p| source.exists(&p.join("CATALOG.SIGN")))
         .context("Catalogue requires a signed exchange set")?;
-    let report = verify_exchange(root, anchors, time)?;
+    let report = verify_exchange_in(source, root, anchors, time)?;
     let resource = report
         .resources
         .into_iter()
         .find(|r| r.path == path)
         .context("Requested catalogue is not signed by its exchange catalogue")?;
     let catalogue_snapshot = report.catalogue.snapshot()?;
-    let bytes = read_xml(catalogue_snapshot.path())?;
+    let bytes = catalogue_snapshot.read_bytes(MAX_XML)?;
     let document = xml(&bytes)?;
     let node = document.root_element();
     let mut matches = Vec::new();
@@ -81,7 +91,11 @@ pub fn authorize_catalogue(
             .children()
             .filter(|n| is(*n, XC, "S100_CatalogueDiscoveryMetadata"))
         {
-            let candidate = resource_path(root, text(unique_child(entry, XC, "fileName")?)?)?;
+            let candidate = resource_path(
+                source.as_ref(),
+                root,
+                text(unique_child(entry, XC, "fileName")?)?,
+            )?;
             if candidate == path {
                 matches.push(entry);
             }

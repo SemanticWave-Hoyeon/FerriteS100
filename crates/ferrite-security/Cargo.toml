@@ -3,10 +3,30 @@ name = "ferrite-security"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[features]
+default = ["crypto-openssl"]
+# X.509 path validation, ECDSA and digests through OpenSSL (C, vendored).
+crypto-openssl = ["dep:openssl"]
+# Pure-Rust backend (RustCrypto): builds for wasm32 and other targets without
+# a C toolchain. With both features enabled, OpenSSL stays the default and
+# `CryptoBackend::Rust` can be selected per `TrustAnchors` (cross tests).
+crypto-rust = [
+    "dep:const-oid",
+    "dep:der",
+    "dep:ecdsa",
+    "dep:p256",
+    "dep:p384",
+    "dep:sha2",
+    "dep:sha3",
+    "dep:spki",
+    "dep:x509-cert",
+]
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-openssl = { version = "0.10", features = ["vendored"] }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 roxmltree = "=0.20.0"
 base64 = "=0.22.1"
 percent-encoding = "2"
@@ -15,3 +35,18 @@ x509-parser = "0.18"
 tempfile = "3"
 
 chrono.workspace = true
+
+const-oid = { version = "=0.9.6", optional = true }
+der = { version = "=0.7.10", features = ["std", "oid"], optional = true }
+ecdsa = { version = "=0.16.9", default-features = false, features = ["verifying", "der"], optional = true }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"], optional = true }
+p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa"], optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+sha3 = { version = "=0.10.8", optional = true }
+spki = { version = "=0.7.3", features = ["std"], optional = true }
+x509-cert = { version = "=0.2.5", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+# Test fixtures (certificates, keys, signatures) are generated with OpenSSL
+# for both backends.
+openssl = { version = "0.10", features = ["vendored"] }

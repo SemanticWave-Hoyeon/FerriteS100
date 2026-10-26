@@ -12,6 +12,8 @@ pub struct AuthenticatedExchangeCatalogue {
     pub(super) legacy_namespace: bool,
     /// Listed but unreferenced CATALOG.SIGN certificates (ignored, untrusted).
     pub(super) certificate_warnings: Vec<String>,
+    /// Backend that verified this catalogue (parses copied certificates).
+    pub(super) backend: CryptoBackend,
 }
 impl std::fmt::Debug for AuthenticatedExchangeCatalogue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -149,8 +151,19 @@ pub fn verify_exchange_catalogue(
     anchors: &TrustAnchors,
     time: i64,
 ) -> Result<AuthenticatedExchangeCatalogue> {
-    let root = root.as_ref().canonicalize()?;
-    let sign_bytes = read_xml(&resource_path(&root, "CATALOG.SIGN")?)?;
+    verify_exchange_catalogue_in(&local_files(), root, anchors, time)
+}
+/// [`verify_exchange_catalogue`] reading through an [`ExchangeSource`].
+pub fn verify_exchange_catalogue_in(
+    source: &Arc<dyn ExchangeSource>,
+    root: impl AsRef<Path>,
+    anchors: &TrustAnchors,
+    time: i64,
+) -> Result<AuthenticatedExchangeCatalogue> {
+    let handle = SourceHandle(source.clone());
+    let source = source.as_ref();
+    let root = source.canonicalize(root.as_ref())?;
+    let sign_bytes = read_xml(source, &resource_path(source, &root, "CATALOG.SIGN")?)?;
     let standalone = xml(&sign_bytes)?;
     let node = standalone.root_element();
     ensure!(
@@ -168,7 +181,7 @@ pub fn verify_exchange_catalogue(
         .map(parse_signature)
         .collect::<Result<Vec<_>>>()?;
     let mut certificate_warnings = Vec::new();
-    let certs = Certificates::parse(node)?.verified_referenced(
+    let certs = Certificates::parse(node, anchors.backend)?.verified_referenced(
         signatures.iter().map(|s| s.certificate.as_str()),
         anchors,
         time,
@@ -179,14 +192,15 @@ pub fn verify_exchange_catalogue(
         .map(|w| format!("CATALOG.SIGN: {w}"))
         .collect();
     let catalogue = verify_resource_with_limit(
-        resource_path(&root, filename)?,
+        &handle,
+        resource_path(source, &root, filename)?,
         signatures,
         &certs,
         Some(MAX_XML),
     )?;
-    let bytes = read_xml(&catalogue.path)?;
+    let bytes = read_xml(source, &catalogue.path)?;
     ensure!(
-        hex(&hash(MessageDigest::sha384(), &bytes)?) == catalogue.authentication.sha384,
+        hex(&crypto::sha384(&bytes)?) == catalogue.authentication.sha384,
         "Catalogue changed during verification"
     );
     let bytes: Arc<[u8]> = bytes.into();
@@ -197,7 +211,7 @@ pub fn verify_exchange_catalogue(
         anchors
             .roots
             .iter()
-            .map(|(id, c)| Ok((id.clone(), hex(&c.digest(MessageDigest::sha256())?))))
+            .map(|(id, c)| Ok((id.clone(), c.sha256_hex()?)))
             .collect::<Result<_>>()?,
     );
     Ok(AuthenticatedExchangeCatalogue {
@@ -207,5 +221,6 @@ pub fn verify_exchange_catalogue(
         trust_anchor_sha256,
         legacy_namespace: node.tag_name().namespace() != Some(SE),
         certificate_warnings,
+        backend: anchors.backend,
     })
 }

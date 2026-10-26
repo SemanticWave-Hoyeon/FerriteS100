@@ -2101,7 +2101,23 @@ impl<U: UiLayer> WgpuRenderer<U> {
         window: Arc<dyn crate::SurfaceHost>,
         ui: impl FnOnce(&wgpu::Device, wgpu::TextureFormat) -> U,
     ) -> Result<Self> {
-        let state = GpuState::new(target, window).await?;
+        Self::with_state(GpuState::new(target, window).await?, ui).await
+    }
+
+    /// A renderer without a window surface: frames are drawn only into
+    /// offscreen textures ([`Self::render_offscreen`], screenshots). `window`
+    /// reports the target size and density.
+    pub async fn new_headless(
+        window: Arc<dyn crate::SurfaceHost>,
+        ui: impl FnOnce(&wgpu::Device, wgpu::TextureFormat) -> U,
+    ) -> Result<Self> {
+        Self::with_state(GpuState::new_headless(window).await?, ui).await
+    }
+
+    async fn with_state(
+        state: GpuState,
+        ui: impl FnOnce(&wgpu::Device, wgpu::TextureFormat) -> U,
+    ) -> Result<Self> {
         let pipelines = RenderPipelines::new(&state)?;
         let immutable_line_topology = crate::immutable_line_topology::Cache::prepare(
             std::env::var_os("FERRITE_IMMUTABLE_LINE_TOPOLOGY").as_deref(),
@@ -6839,6 +6855,22 @@ impl<U: UiLayer> WgpuRenderer<U> {
     }
 
     fn save_image<P: AsRef<Path>>(&mut self, path: P, include_panels: bool) -> Result<()> {
+        let image = self.capture_image(include_panels)?;
+        image
+            .save(path.as_ref())
+            .map_err(|e| WgpuError::Render(format!("Failed to save screenshot: {}", e)))?;
+
+        tracing::info!("Screenshot saved to: {}", path.as_ref().display());
+        Ok(())
+    }
+
+    /// Draw the current frame (chart and chart text, no UI panels) into an
+    /// offscreen texture and read it back as RGBA, as an image export does.
+    pub fn render_offscreen(&mut self) -> Result<image::RgbaImage> {
+        self.capture_image(false)
+    }
+
+    fn capture_image(&mut self, include_panels: bool) -> Result<image::RgbaImage> {
         self.prepare_raster_suppression();
         use crate::state::MSAA_SAMPLE_COUNT;
 
@@ -7001,15 +7033,8 @@ impl<U: UiLayer> WgpuRenderer<U> {
             }
         }
 
-        // Save as PNG
-        let image = image::RgbaImage::from_raw(width, height, pixels)
-            .ok_or_else(|| WgpuError::Render("Failed to create image from pixels".to_string()))?;
-        image
-            .save(path.as_ref())
-            .map_err(|e| WgpuError::Render(format!("Failed to save screenshot: {}", e)))?;
-
-        tracing::info!("Screenshot saved to: {}", path.as_ref().display());
-        Ok(())
+        image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| WgpuError::Render("Failed to create image from pixels".to_string()))
     }
 
     /// Get rendering statistics

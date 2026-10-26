@@ -258,7 +258,7 @@ pub fn capture_catalogue_authenticated_incoming_exchange(
             total = total
                 .checked_add(bytes.len() as u64)
                 .context("Incoming total overflow")?;
-            let sha384 = hash(MessageDigest::sha384(), &bytes)?.to_vec();
+            let sha384 = crypto::sha384(&bytes)?;
             ensure!(
                 files
                     .insert(
@@ -288,7 +288,7 @@ pub fn capture_catalogue_authenticated_incoming_exchange(
                 .get(name)
                 .context("Incoming file added after capture")?;
             let mut input = File::open(path)?;
-            let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
+            let mut digest = crypto::Sha384::new()?;
             let mut size = 0u64;
             let mut buffer = [0u8; 64 * 1024];
             loop {
@@ -306,7 +306,7 @@ pub fn capture_catalogue_authenticated_incoming_exchange(
                 digest.update(&buffer[..n])?;
             }
             ensure!(
-                size == retained.bytes.len() as u64 && digest.finish()?.as_ref() == retained.sha384,
+                size == retained.bytes.len() as u64 && digest.finish()? == retained.sha384,
                 "Incoming file differs from captured bytes"
             );
             seen_files.insert(name.to_owned());
@@ -327,7 +327,7 @@ pub fn capture_catalogue_authenticated_incoming_exchange(
         std::fs::write(private.path().join(name), &file.bytes)?;
     }
     let catalogue = verify_exchange_catalogue(private.path(), anchors, time)?;
-    let mut digest = openssl::hash::Hasher::new(MessageDigest::sha384())?;
+    let mut digest = crypto::Sha384::new()?;
     digest.update(b"ferrite-owned-incoming-namespace-v1\0")?;
     for name in &directories {
         digest.update(b"D")?;

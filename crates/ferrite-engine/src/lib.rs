@@ -16,6 +16,13 @@
 //! store, user store, clock, executor) the engine reads through, and the
 //! public facade [`ChartEngine`] ([`chart_engine`]) with renderer-agnostic
 //! prepared scenes ([`scene`]) and picking ([`pick`]).
+//!
+//! Stage 5 puts the native-only dependencies behind features (all on by
+//! default): `parallel` (threads and rayon; off: sequential executor and
+//! iteration with identical results), `lua-native` (mlua portrayal, selected
+//! by `lua54`/`lua55`; off: S-101 cells come from precomputed payloads,
+//! [`PortrayalSource::Precomputed`]) and `s102-hdf5` (off: S-102 inputs are
+//! reported as unsupported).
 
 pub mod catalogue;
 pub mod cell_source_identity;
@@ -43,8 +50,10 @@ pub mod s101_xc_coverage;
 pub mod s101_xc_region;
 pub mod s102_depth_policy;
 pub mod s102_input_capture;
+#[cfg(feature = "s102-hdf5")]
 pub mod s102_journal_admission;
 pub mod s102_original_inputs;
+#[cfg(feature = "s102-hdf5")]
 pub mod s102_trial_worker;
 pub mod s421_dataset_input;
 pub mod scene;
@@ -52,6 +61,9 @@ pub mod secure_instruction_cache;
 
 mod chart_load;
 mod state;
-pub use chart_engine::{ChartEngine, DatasetSource, EngineConfig, SignaturePolicy, View};
+pub use chart_engine::{
+    Camera, ChartEngine, DatasetSource, EngineConfig, SignaturePolicy, View, Zoom,
+};
 pub use chart_load::{CellHydrationSource, ChartLoadResult};
+pub use portrayal::PortrayalSource;
 pub use state::{CellHydration, CellScene, ChangeCellScene, EngineState, ViewportPixels};

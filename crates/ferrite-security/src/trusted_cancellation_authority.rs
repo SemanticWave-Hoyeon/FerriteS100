@@ -71,9 +71,9 @@ impl TrustedCancellationGrant {
             !certificate_der.is_empty() && certificate_der.len() <= 65536,
             "Authority certificate budget"
         );
-        let cert = X509::from_der(certificate_der)?;
+        let cert = Cert::from_der(CryptoBackend::default(), certificate_der)?;
         ensure!(
-            cert.to_der()? == certificate_der,
+            cert.der() == certificate_der,
             "Noncanonical authority certificate DER"
         );
         Ok(Self {
@@ -149,7 +149,7 @@ impl TrustedCancellationPolicy {
             }
         }
         // Length framing prevents concatenation ambiguities in the durable audit ID.
-        let mut hash = openssl::hash::Hasher::new(MessageDigest::sha384())?;
+        let mut hash = crypto::Sha384::new()?;
         let mut field = |value: &[u8]| -> Result<()> {
             hash.update(&(value.len() as u64).to_be_bytes())?;
             hash.update(value)?;

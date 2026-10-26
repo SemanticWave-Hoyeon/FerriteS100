@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 description = "S-100 rendering abstractions and drawing instructions"
 
+[features]
+default = ["parallel"]
+# Data-parallel suppression, sorting and projection (rayon); off: sequential,
+# identical results.
+parallel = ["ferrite-kernel/parallel"]
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
@@ -22,7 +28,6 @@ ferrite-kernel.workspace = true
 sha2.workspace = true
 
 rstar = "0.12.2"
-rayon.workspace = true
 robust = "1.2.0"
 chrono.workspace = true
 

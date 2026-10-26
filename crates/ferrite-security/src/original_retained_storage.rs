@@ -219,6 +219,7 @@ mod tests {
             signature_target: Some("parent".into()),
         };
         let resource = Arc::new(ResourceAuthentication {
+            source: crate::source::SourceHandle(crate::source::local_files()),
             path: PathBuf::from("fixture-resource"),
             sha384: "fixture digest".into(),
             size: 0,

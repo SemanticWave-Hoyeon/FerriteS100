@@ -5,7 +5,10 @@ edition.workspace = true
 description = "S-102 bathymetric surface product adapter"
 
 [features]
-default = ["lua54"]
+default = ["lua54", "crypto-openssl"]
+# Signature backend of ferrite-security (dependents select one).
+crypto-openssl = ["ferrite-security/crypto-openssl"]
+crypto-rust = ["ferrite-security/crypto-rust"]
 lua54 = ["ferrite-lua/lua54"]
 lua55 = ["ferrite-lua/lua55"]
 

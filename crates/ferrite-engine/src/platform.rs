@@ -449,6 +449,81 @@ impl CacheStore for NativeCacheStore {
     }
 }
 
+/// Entries in a host-chosen directory, e.g. precomputed portrayal payloads
+/// shipped with an application ([`crate::portrayal::PrecomputedCells`]):
+/// regular files only (links are rejected), atomic replacement, the native
+/// per-entry byte budget, no pruning. Payload hashes detect corruption; the
+/// directory is not access-checked like the private native cache.
+#[derive(Clone, Debug)]
+pub struct DirectoryCacheStore {
+    root: PathBuf,
+}
+impl DirectoryCacheStore {
+    /// Use (and create) `root`.
+    pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self {
+            root: std::fs::canonicalize(&root)?,
+        })
+    }
+}
+impl CacheStore for DirectoryCacheStore {
+    fn root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cache entry is not a regular file",
+            ));
+        }
+        let limit = crate::secure_instruction_cache::MAX_CACHE_BYTES;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cache exceeds byte budget",
+            ));
+        }
+        Ok(bytes)
+    }
+    fn modified(&self, path: &Path) -> Option<SystemTime> {
+        std::fs::symlink_metadata(path).ok()?.modified().ok()
+    }
+    fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() as u64 > crate::secure_instruction_cache::MAX_CACHE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cache exceeds byte budget",
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Entry has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Entry has no name"))?;
+        let mut temporary = name.to_os_string();
+        temporary.push(format!(".{}.tmp", std::process::id()));
+        let temporary = parent.join(temporary);
+        let result =
+            std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+    fn mark_used(&self, _path: &Path) {}
+    fn prune(&self) {}
+}
+
 /// No cache: every portrayal runs the rules.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoCacheStore;
@@ -854,9 +929,11 @@ pub trait Executor: Send + Sync {
 }
 
 /// Native threads: up to the available parallelism (or one thread per job
-/// when fewer), background jobs on their own thread.
+/// when fewer), background jobs on their own thread (`parallel` feature).
+#[cfg(feature = "parallel")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ThreadExecutor;
+#[cfg(feature = "parallel")]
 impl Executor for ThreadExecutor {
     fn for_each_index(&self, count: usize, job: &(dyn Fn(usize) + Sync)) {
         if count == 0 {
@@ -899,6 +976,19 @@ impl Executor for SequentialExecutor {
     }
     fn parallelism(&self) -> usize {
         1
+    }
+}
+
+/// The executor of [`Platform::native`]: threads with the `parallel`
+/// feature, otherwise sequential.
+pub fn default_executor() -> Arc<dyn Executor> {
+    #[cfg(feature = "parallel")]
+    {
+        Arc::new(ThreadExecutor)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        Arc::new(SequentialExecutor)
     }
 }
 
@@ -954,7 +1044,7 @@ impl Platform {
             cache: Arc::new(NativeCacheStore),
             user: Arc::new(user),
             clock: Arc::new(SystemClock),
-            executor: Arc::new(ThreadExecutor),
+            executor: default_executor(),
         }
     }
     /// No file system: inputs from `data`, a memory cache and user store, the
@@ -974,6 +1064,10 @@ impl Platform {
     }
     pub fn with_executor(mut self, executor: Arc<dyn Executor>) -> Self {
         self.executor = executor;
+        self
+    }
+    pub fn with_data(mut self, data: Arc<dyn DataSource>) -> Self {
+        self.data = data;
         self
     }
     pub fn with_cache(mut self, cache: Arc<dyn CacheStore>) -> Self {
@@ -1046,11 +1140,11 @@ mod tests {
     fn executors_map_in_order() {
         let items: Vec<usize> = (0..37).collect();
         for executor in [
-            &ThreadExecutor as &dyn Executor,
-            &SequentialExecutor as &dyn Executor,
+            default_executor(),
+            Arc::new(SequentialExecutor) as Arc<dyn Executor>,
         ] {
             assert_eq!(
-                parallel_map(executor, &items, |i| i * 2),
+                parallel_map(executor.as_ref(), &items, |i| i * 2),
                 items.iter().map(|i| i * 2).collect::<Vec<_>>()
             );
         }
