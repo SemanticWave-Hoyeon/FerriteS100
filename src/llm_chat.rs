@@ -1312,12 +1312,10 @@ impl super::ChartApp {
     /// "Show on Chart": centre the chart on a position from a reply and mark it.
     fn show_chat_position(&mut self, lat: f64, lon: f64) {
         self.chat_marker = Some([lon, lat]);
-        if let Some(pan) = self
-            .render_context
-            .scaler
-            .projection()
-            .pan_to(self.bounds, ferrite_render::WorldPoint::new(lon, lat))
-        {
+        if let Some(pan) = self.engine.render_context.scaler.projection().pan_to(
+            self.engine.bounds,
+            ferrite_render::WorldPoint::new(lon, lat),
+        ) {
             self.pan_offset = (pan[0], pan[1]);
         }
         // Close enough to see the surrounding features.
@@ -1343,7 +1341,7 @@ impl super::ChartApp {
         });
         let ppp = self.window.as_ref().map_or(1., |w| w.scale_factor()) as f32;
         if let Some((tx, ty)) = target {
-            let scaler = &self.render_context.scaler;
+            let scaler = &self.engine.render_context.scaler;
             let at = scaler.screen_to_world(ferrite_render::ScreenPoint::new(tx * ppp, ty * ppp));
             let projection = scaler.projection();
             let dx = lon - at.x;

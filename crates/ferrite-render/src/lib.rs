@@ -100,3 +100,4 @@ pub use pattern_display_policy::{pattern_display_allows, ShallowPatternContract}
 
 /// Bounded opt-in 2D frame diagnostics; no visibility or render-policy changes.
 pub mod flat_reuse_diagnostics;
+pub mod host_settings;

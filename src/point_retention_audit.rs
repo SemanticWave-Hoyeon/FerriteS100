@@ -74,8 +74,8 @@ impl ChartApp {
             "Hidden point audit required"
         );
         self.ensure_navigation_scene()?;
-        let groups = official_groups(&self.pc, &self.fc)?;
-        let scaler = self.render_context.scaler.clone();
+        let groups = official_groups(&self.engine.pc, &self.engine.fc)?;
+        let scaler = self.engine.render_context.scaler.clone();
         let centre = scaler.screen_to_world(scaler.viewport.center());
         let centre = WorldPoint::new(
             (centre.x * 1e6).floor() / 1e6 + 1e-7,
@@ -246,7 +246,7 @@ impl ChartApp {
             fs::write(
                 output.join("receipt.json"),
                 serde_json::to_vec_pretty(&serde_json::json!({
-                    "passed":true,"bound_pc_digest":self.pc.source_digest(),"official_pc_groups":groups,
+                    "passed":true,"bound_pc_digest":self.engine.pc.source_digest(),"official_pc_groups":groups,
                     "cases":summary,"hidden":true,"focused":false,
                     "scope":"Original PC sounding symbols and actual renderer command/quad retention. Corrected pixels intentionally differ from old thinned output. No physical FPS or full compliance claim; fixture uses no coverage binding. Real mixed-chart coverage/animation is a separate native gate."
                 }))?,

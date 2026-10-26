@@ -2,7 +2,7 @@
 //! Digest ownership is policy identity, not dataset authentication or authority.
 use anyhow::{ensure, Result};
 use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
-use ferrite_wgpu::SettingsState;
+use ferrite_render::host_settings::SettingsState;
 use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -38,10 +38,7 @@ impl<'a> PrimaryLayerPolicy<'a> {
 }
 
 /// Explicit startup/Apply capture. Validate first; mutate only the private candidate.
-pub(crate) fn capture_primary(
-    pc: &BoundPortrayalCatalogue,
-    candidate: &mut SettingsState,
-) -> Result<()> {
+pub fn capture_primary(pc: &BoundPortrayalCatalogue, candidate: &mut SettingsState) -> Result<()> {
     ferrite_s101::viewing_groups_for_layers(
         pc,
         candidate.viewing_layers.iter().map(String::as_str),
@@ -49,19 +46,13 @@ pub(crate) fn capture_primary(
     candidate.viewing_layer_owner = Some(*pc.source_digest());
     Ok(())
 }
-pub(crate) fn resolve(
-    pc: &BoundPortrayalCatalogue,
-    settings: &SettingsState,
-) -> Result<HashSet<u32>> {
+pub fn resolve(pc: &BoundPortrayalCatalogue, settings: &SettingsState) -> Result<HashSet<u32>> {
     PrimaryLayerPolicy::from_settings(settings)?.resolve(pc)
 }
 
 /// A new primary catalogue gets no automatic optional selection inheritance.
 /// The input is retained unchanged, so rejected candidate preparations preserve it.
-pub(crate) fn for_new_primary(
-    pc: &BoundPortrayalCatalogue,
-    settings: &SettingsState,
-) -> SettingsState {
+pub fn for_new_primary(pc: &BoundPortrayalCatalogue, settings: &SettingsState) -> SettingsState {
     let mut next = settings.clone();
     if next.viewing_layer_owner != Some(*pc.source_digest()) {
         next.viewing_layers.clear();
@@ -69,13 +60,10 @@ pub(crate) fn for_new_primary(
     }
     next
 }
-pub(crate) fn validate_new_primary(
-    pc: &BoundPortrayalCatalogue,
-    settings: &SettingsState,
-) -> Result<()> {
+pub fn validate_new_primary(pc: &BoundPortrayalCatalogue, settings: &SettingsState) -> Result<()> {
     resolve(pc, &for_new_primary(pc, settings)).map(|_| ())
 }
-pub(crate) fn hash_identity<H: Hasher>(settings: &SettingsState, hasher: &mut H) {
+pub fn hash_identity<H: Hasher>(settings: &SettingsState, hasher: &mut H) {
     "primary-S-101-optional-layer-policy-v1".hash(hasher);
     settings.viewing_layer_owner.hash(hasher);
     settings.viewing_layers.hash(hasher); // canonical BTreeSet lexical order

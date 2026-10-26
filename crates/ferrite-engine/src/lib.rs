@@ -6,9 +6,15 @@
 //! chain and lifecycle metadata, exchange-set checks, cell publication,
 //! catalogue selection, decoded/instruction caches, the S-102 input and
 //! journal policies, S-421 route input and the non-UI S-124/S-129 overlay
-//! parts. Behaviour is unchanged from the application modules.
+//! parts. Stage 2 adds the chart state ([`EngineState`]) and the S-101
+//! portrayal pipeline ([`portrayal`], [`portrayal_cache`], [`catalogue`],
+//! [`chart_cells`]) and the S-124/S-129 overlay registry; renderer-specific
+//! pieces (area triangulation, overlay symbol sources) are supplied by the
+//! host. Behaviour is unchanged from the application modules.
 
+pub mod catalogue;
 pub mod cell_source_identity;
+pub mod chart_cells;
 pub mod chart_publication;
 pub mod dataset_discovery;
 pub mod dataset_open_plan;
@@ -17,6 +23,9 @@ pub mod dataset_signature_policy;
 pub mod decoded_chart_cache;
 pub mod gml_overlay;
 pub mod interoperability;
+pub mod portrayal;
+pub mod portrayal_cache;
+pub mod primary_viewing_layers;
 pub mod s101_catalogue_selection;
 pub mod s101_lifecycle_metadata;
 pub mod s101_update_plan;
@@ -33,4 +42,6 @@ pub mod s421_dataset_input;
 pub mod secure_instruction_cache;
 
 mod chart_load;
+mod state;
 pub use chart_load::{CellHydrationSource, ChartLoadResult};
+pub use state::{CellHydration, CellScene, ChangeCellScene, EngineState, ViewportPixels};

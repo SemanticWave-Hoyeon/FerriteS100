@@ -14,36 +14,32 @@
 //! Feature keys carry [`OVERLAY_KEY_FLAG`] and cannot collide with S-101
 //! record keys; picking decodes them back to the dataset and object.
 use crate::ChartApp;
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use ferrite_feature_catalog::FeatureCatalogue;
-use ferrite_portrayal_catalog::PortrayalCatalogue;
-use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext, WorldPoint};
-use ferrite_s100_gml::navwarn::{
-    self, NavwarnInput, NavwarnRegistry, NavwarnUserState, PartTiming, PortrayalPolicy, SortOrder,
-    Status, UserClassification,
-};
-use ferrite_s100_gml::portrayal::{
-    self, ConvertOptions, FeatureInstructions, InputOptions, PortrayalInput, XsltPortrayal,
-};
-use ferrite_s100_gml::{Dataset, ObjectKind, Product, Severity, Value};
+use anyhow::Result;
+use chrono::Utc;
+use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext};
+use ferrite_s100_gml::navwarn::{self, SortOrder, Status, UserClassification};
+use ferrite_s100_gml::{Product, Severity};
 use ferrite_wgpu::overlay_ui::{
     ControlPointRow, NavwarnClassification, NavwarnPartRow, NavwarnRow, NavwarnSort, UkcPlanRow,
 };
 use ferrite_wgpu::CatalogueStatus;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tracing::{info, warn};
 
 pub(crate) use ferrite_engine::gml_overlay::{
-    convert, decode_key, discover, geometry_paths, is_import_file, overlay_key, read_user_state,
-    set_aside, sniff_product, viewing_time, write_user_state, StoredUserState, UserStateStore,
+    cancel_reason, decode_key, discover, format_time, is_import_file, timing_label, viewing_time,
+    Added, GmlOverlays, Provenance,
 };
 
-/// Viewing groups used by the S-124 2.0.0 XSLT rules but not declared in its
-/// portrayal_catalogue.xml (TextPlacement text and co-located part counts).
-const S124_IMPLICIT_GROUPS: [u32; 2] = [26, 12210];
+/// The overlay registry with the renderer's symbol sources registered for
+/// each loaded product portrayal catalogue.
+pub(crate) fn load_overlays(base: &Path) -> GmlOverlays {
+    GmlOverlays::load(base, |id, bound| {
+        ferrite_wgpu::register_overlay_symbol_source(
+            id,
+            ferrite_wgpu::OverlaySymbolSource::from_bound(bound),
+        )
+    })
+}
 
 pub(crate) fn is_overlay_instruction(instruction: &DrawingInstruction) -> bool {
     ferrite_wgpu::is_cellless_overlay_instruction(instruction)
@@ -52,1080 +48,76 @@ pub(crate) fn is_overlay_instruction(instruction: &DrawingInstruction) -> bool {
             .is_some_and(|k| decode_key(k).is_some())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Catalogues
-// ─────────────────────────────────────────────────────────────────────────
-
-pub(crate) struct ProductCatalogues {
-    pub fc: Arc<FeatureCatalogue>,
-    xslt: XsltPortrayal,
-    /// Catalogue used for Part 9a conversion: symbol references namespaced
-    /// with the product prefix, implicit viewing groups declared (so the
-    /// errata correction can pass them; literal portrayal never emits them).
-    pc: PortrayalCatalogue,
-    /// Viewing groups the rules use but the catalogue does not declare.
-    /// Instructions in them are not drawn unless the user enables
-    /// [`GmlOverlays::correct_pc_errata`].
-    implicit_groups: HashSet<String>,
-    pub fc_status: CatalogueStatus,
-    pub pc_status: CatalogueStatus,
-}
-
-impl ProductCatalogues {
-    fn load(base: &Path, product: Product) -> Result<Self> {
-        let id = product.identifier();
-        let fc_dir = base.join("Catalogues/FC").join(id);
-        let fc_file = crate::dataset_discovery::feature_catalogue_file(&fc_dir)
-            .with_context(|| format!("{id} feature catalogue in {}", fc_dir.display()))?;
-        let fc = FeatureCatalogue::load(&fc_file)
-            .with_context(|| format!("{id} feature catalogue {}", fc_file.display()))?;
-        anyhow::ensure!(
-            fc.product_id.is_empty() || fc.product_id == id,
-            "Expected {id} feature catalogue, found {}",
-            fc.product_id
-        );
-        let pc_dir = base.join("Catalogues/PC").join(id);
-        let bound = PortrayalCatalogue::load_bound(&pc_dir)
-            .with_context(|| format!("{id} portrayal catalogue {}", pc_dir.display()))?;
-        anyhow::ensure!(
-            ferrite_wgpu::register_overlay_symbol_source(
-                id,
-                ferrite_wgpu::OverlaySymbolSource::from_bound(&bound)
-            ),
-            "Invalid overlay symbol prefix {id}"
-        );
-        let mut pc = PortrayalCatalogue::load(&pc_dir)
-            .with_context(|| format!("{id} portrayal catalogue {}", pc_dir.display()))?;
-        pc.namespace_symbol_references(id);
-        let xslt = XsltPortrayal::load(&pc_dir)?;
-        let declared_groups = pc.viewing_groups.groups.len();
-        let mut implicit_groups = HashSet::new();
-        if product == Product::S124 {
-            for group in S124_IMPLICIT_GROUPS {
-                if xslt.info.viewing_groups.contains(&group.to_string()) {
-                    continue;
-                }
-                // Literal Part 9: the group cannot be enabled, so its
-                // instructions (TextPlacement text, co-located part counts)
-                // are not drawn. The host catalogue declares it anyway so
-                // the errata correction can draw them on request.
-                pc.viewing_groups
-                    .declare_implicit(group, &format!("{id} implicit viewing group {group}"));
-                implicit_groups.insert(group.to_string());
-                warn!(
-                    "Conformance note: {id} {} rules use viewing group {group}, which portrayal_catalogue.xml does not declare; its instructions are not drawn (S-100 Part 9 9-11.2.2). \"Correct known PC errata\" draws them as an implicitly declared overlay group",
-                    pc.version
-                );
-            }
-        }
-        let fc_status = CatalogueStatus {
-            loaded: true,
-            product_id: id.into(),
-            version: fc.version.clone(),
-            path: fc_file.display().to_string(),
-            item_count: fc.feature_types.len(),
-            validation_message: Some(format!("Installed {id} Feature Catalogue")),
-        };
-        let pc_status = CatalogueStatus {
-            loaded: true,
-            product_id: id.into(),
-            version: pc.version.clone(),
-            path: pc_dir.display().to_string(),
-            item_count: pc.symbols.symbols.len(),
-            validation_message: Some(format!(
-                "Installed {id} Portrayal Catalogue (XSLT, {declared_groups} viewing groups)"
-            )),
-        };
-        info!(
-            "{id} catalogues loaded: FC {} · PC {} ({})",
-            fc.version,
-            pc.version,
-            pc_dir.display()
-        );
-        Ok(Self {
-            fc: Arc::new(fc),
-            xslt,
-            pc,
-            implicit_groups,
-            fc_status,
-            pc_status,
+/// Name of the OS user running the application.
+pub(crate) fn os_user_name() -> String {
+    ["USER", "USERNAME", "LOGNAME"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(|v| v.to_string_lossy().trim().to_owned())
+        .find(|v| !v.is_empty())
+        .or_else(|| {
+            dirs::home_dir().and_then(|h| h.file_name().map(|n| n.to_string_lossy().into_owned()))
         })
-    }
+        .unwrap_or_else(|| "unknown".into())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Loaded datasets
-// ─────────────────────────────────────────────────────────────────────────
-
-/// How the dataset entered the system.
-#[derive(Debug, Clone)]
-pub(crate) enum Provenance {
-    /// Exchange set signature verified.
-    Authenticated,
-    /// Signature verification switched off by the user.
-    Unverified,
-    /// Converted from a non-S-100 source; never authoritative.
-    Imported(&'static str),
-}
-
-impl Provenance {
-    fn label(&self) -> String {
-        match self {
-            Self::Authenticated => "signature verified".into(),
-            Self::Unverified => "signature not verified".into(),
-            Self::Imported(format) => {
-                format!("imported from {format}; not an official S-124 dataset, not for navigation")
+/// Per-OS-user location of the S-124 user state, in the same application
+/// data folder as the other persisted state: `FerriteS100/navwarn/<user>.json`
+/// under the user's own data directory. `FERRITE_NAVWARN_STATE_PATH`
+/// overrides it; tests and hidden audits persist nothing.
+pub(crate) fn default_user_state_path(user: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FERRITE_NAVWARN_STATE_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    if cfg!(test) || ferrite_wgpu::background_test::enabled() {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base =
+        std::env::var_os("HOME").map(|p| PathBuf::from(p).join("Library/Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")));
+    let file: String = user
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
             }
-        }
-    }
-}
-
-pub(crate) struct OverlayDataset {
-    pub id: u32,
-    pub dataset: Dataset,
-    pub received: DateTime<Utc>,
-    pub issues: Vec<ferrite_s100_gml::Issue>,
-    pub provenance: Provenance,
-    pub visible: bool,
-    input: Option<PortrayalInput>,
-    /// XSLT result and the context parameters / options it was made with.
-    portrayal: Option<((bool, bool, bool), portrayal::Portrayal)>,
-}
-
-impl OverlayDataset {
-    pub fn product(&self) -> Product {
-        self.dataset.product
-    }
-    pub fn name(&self) -> String {
-        let mut name = self.dataset.display_name();
-        if let Some(title) = self.dataset.identification.title() {
-            if !title.is_empty() && title != name {
-                name = format!("{name} · {title}");
-            }
-        }
-        name
-    }
-    fn bounds(&self, ids: Option<&HashSet<String>>) -> Option<GeoBounds> {
-        let mut bounds: Option<GeoBounds> = None;
-        for object in &self.dataset.objects {
-            if ids.is_some_and(|ids| !ids.contains(&object.id)) {
-                continue;
-            }
-            for c in object.geometry.iter().flat_map(|g| g.coords()) {
-                let p = WorldPoint::new(c[0], c[1]);
-                match &mut bounds {
-                    Some(b) => b.expand(p),
-                    None => bounds = Some(GeoBounds::new(c[0], c[1], c[0], c[1])),
-                }
-            }
-        }
-        bounds
-    }
-}
-
-/// Outcome of [`GmlOverlays::add`].
-pub(crate) enum Added {
-    New,
-    AlreadyOpen,
-}
-
-pub(crate) struct GmlOverlays {
-    pub s124: Option<ProductCatalogues>,
-    pub s129: Option<ProductCatalogues>,
-    pub catalogue_errors: Vec<String>,
-    pub datasets: Vec<OverlayDataset>,
-    next_id: u32,
-    pub user: NavwarnUserState,
-    pub policy: PortrayalPolicy,
-    pub sort: SortOrder,
-    /// S-129 context parameter PlainBoundaries (PC default).
-    pub plain_boundaries: bool,
-    /// Apply S-129 feature `scaleMinimum` (S-129 says it controls visibility).
-    pub apply_scale_minimum: bool,
-    /// "Correct known PC errata" user option, off by default (catalogues
-    /// applied literally per S-100 Part 9). On: S-129 text with transparency
-    /// 1 is drawn opaque and S-124 instructions in undeclared viewing groups
-    /// are drawn. Persisted with the per-user state.
-    correct_pc_errata: bool,
-    /// NavwarnPart chosen from the warning list: portrayed even when filtered,
-    /// so it can be interrogated (S-124 11.2).
-    pub list_selection: Option<(u32, String)>,
-    registry: Option<NavwarnRegistry>,
-    /// Dataset ids in registry input order.
-    registry_ids: Vec<u32>,
-    evaluated: Option<std::time::Instant>,
-    /// New-message indications of the last evaluation (registry order).
-    new_flags: Vec<bool>,
-    /// Viewing time selected by the user (the S-101 date-dependent
-    /// portrayal setting); None evaluates at the system clock.
-    viewing_time: Option<DateTime<Utc>>,
-    /// Where [`Self::user`] is persisted for the current OS user.
-    user_store: Option<UserStateStore>,
-    revision: u64,
-    cache: Option<(String, u64, Arc<Vec<DrawingInstruction>>)>,
-    /// (cache revision, render context geometry revision) last installed.
-    pub installed: Option<(u64, u64)>,
-    pub ui_revision: u64,
-    notes_logged: HashSet<String>,
-}
-
-impl GmlOverlays {
-    pub fn load(base: &Path) -> Self {
-        let mut errors = Vec::new();
-        let mut load = |product| match ProductCatalogues::load(base, product) {
-            Ok(c) => Some(c),
-            Err(error) => {
-                let message = format!("{} catalogues unavailable: {error:#}", product.identifier());
-                warn!("{message}");
-                errors.push(message);
-                None
-            }
-        };
-        let s124 = load(Product::S124);
-        let s129 = load(Product::S129);
-        let plain_boundaries = s129
-            .as_ref()
-            .and_then(|c| {
-                c.xslt
-                    .info
-                    .context
-                    .iter()
-                    .find(|(k, _)| k == "PlainBoundaries")
-                    .map(|(_, v)| v.eq_ignore_ascii_case("true") || v == "1")
-            })
-            .unwrap_or(true);
-        if let Some(c) = &s129 {
-            warn!(
-                "Conformance note: S-129 {} InformationBox rule sets text transparency 1, which is fully transparent by S-100 Part 9 9-12.2.2.3; the text is not visible. \"Correct known PC errata\" draws it opaque",
-                c.pc.version
-            );
-        }
-        Self {
-            s124,
-            s129,
-            catalogue_errors: errors,
-            datasets: Vec::new(),
-            next_id: 1,
-            user: NavwarnUserState::default(),
-            policy: PortrayalPolicy::default(),
-            sort: SortOrder::Received,
-            plain_boundaries,
-            apply_scale_minimum: true,
-            correct_pc_errata: false,
-            list_selection: None,
-            registry: None,
-            registry_ids: Vec::new(),
-            evaluated: None,
-            new_flags: Vec::new(),
-            viewing_time: None,
-            user_store: None,
-            revision: 1,
-            cache: None,
-            installed: None,
-            ui_revision: 0,
-            notes_logged: HashSet::new(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.datasets.is_empty()
-    }
-
-    pub fn catalogues(&self, product: Product) -> Option<&ProductCatalogues> {
-        match product {
-            Product::S124 => self.s124.as_ref(),
-            Product::S129 => self.s129.as_ref(),
-        }
-    }
-
-    /// Something visible changed: re-evaluate and re-portray.
-    pub fn invalidate(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
-        self.registry = None;
-    }
-
-    pub fn dataset(&self, id: u32) -> Option<&OverlayDataset> {
-        self.datasets.iter().find(|d| d.id == id)
-    }
-
-    /// The S-124/S-129 datasets on the system for exchange-set check
-    /// S-158-129 19: file name and datasetFileIdentifier of every
-    /// authoritative dataset (imported KML/GPX/shapefiles are excluded), except S-124 datasets whose
-    /// message status is Cancelled (any reason). S-129 has no cancelled
-    /// state in the overlay; an S-129 dataset stays on the system until
-    /// removed. Products share one set; their file names carry the product
-    /// prefix (124 / 129), so names do not collide in practice.
-    pub fn on_system(&mut self) -> HashSet<String> {
-        let cancelled: HashSet<u32> = if self.datasets.iter().any(|d| d.product() == Product::S124)
-        {
-            self.registry();
-            let registry = self.registry.as_ref().expect("evaluated");
-            registry
-                .messages
-                .iter()
-                .zip(&self.registry_ids)
-                .filter(|(m, _)| m.status.is_cancelled())
-                .map(|(_, id)| *id)
-                .collect()
-        } else {
-            HashSet::new()
-        };
-        let mut names = HashSet::new();
-        for d in &self.datasets {
-            if d.dataset.imported || cancelled.contains(&d.id) {
-                continue;
-            }
-            if let Some(name) = d.dataset.source.as_ref().and_then(|p| p.file_name()) {
-                names.insert(name.to_string_lossy().into_owned());
-            }
-            if let Some(id) = d.dataset.identification.file_identifier() {
-                names.insert(id.to_owned());
-            }
-        }
-        names
-    }
-
-    /// Read an S-124/S-129 GML dataset (from `bytes_path`, the authenticated
-    /// snapshot when verified) or import a KML/GPX/shapefile/ZIP.
-    pub fn read(&self, path: &Path, bytes_path: &Path) -> Result<(Dataset, Option<&'static str>)> {
-        if is_import_file(path, true) {
-            let fc = self.s124.as_ref().map(|c| c.fc.as_ref());
-            let bytes_format = ferrite_s100_gml::import::ImportFormat::detect(
-                path,
-                &std::fs::read(path).with_context(|| path.display().to_string())?,
-            )
-            .context("Unrecognised import format")?;
-            let dataset = ferrite_s100_gml::import::import_path_with(path, fc, Utc::now())?;
-            return Ok((dataset, Some(bytes_format.label())));
-        }
-        let product = sniff_product(path).context("Not an S-124 or S-129 GML dataset")?;
-        let catalogues = self
-            .catalogues(product)
-            .with_context(|| format!("{} catalogues are not installed", product.identifier()))?;
-        let mut dataset = ferrite_s100_gml::read_file(
-            bytes_path,
-            Some(&catalogues.fc),
-            ferrite_s100_gml::ReadLimits::default(),
-        )?;
-        dataset.source = Some(path.to_path_buf());
-        Ok((dataset, None))
-    }
-
-    pub fn add(&mut self, dataset: Dataset, provenance: Provenance) -> Result<Added> {
-        if self
-            .datasets
-            .iter()
-            .any(|d| d.dataset.sha256 == dataset.sha256)
-        {
-            return Ok(Added::AlreadyOpen);
-        }
-        let catalogues = self.catalogues(dataset.product).with_context(|| {
-            format!(
-                "{} catalogues are not installed",
-                dataset.product.identifier()
-            )
-        })?;
-        let size = dataset
-            .source
-            .as_deref()
-            .filter(|_| !dataset.imported)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len());
-        let mut issues = dataset.issues.clone();
-        issues.extend(
-            ferrite_s100_gml::validate::Validator::new(&catalogues.fc).validate(&dataset, size),
-        );
-        let id = self.next_id;
-        self.next_id += 1;
-        let name = dataset.display_name();
-        let errors = issues
-            .iter()
-            .filter(|i| i.severity == Severity::Error)
-            .count();
-        info!(
-            "{} dataset {name} opened ({}): {} objects, {} validation errors, {} warnings",
-            dataset.product.identifier(),
-            provenance.label(),
-            dataset.objects.len(),
-            errors,
-            issues.len() - errors
-        );
-        // One line per check, then the errors themselves; warnings in detail
-        // only at debug level (the S-129 test data alone has hundreds).
-        let mut by_check: std::collections::BTreeMap<(&str, bool), usize> = Default::default();
-        for issue in &issues {
-            *by_check
-                .entry((issue.check.as_str(), issue.severity == Severity::Error))
-                .or_default() += 1;
-        }
-        for ((check, error), count) in by_check {
-            let kind = if error { "errors" } else { "warnings" };
-            warn!(
-                "{} {name}: {count} validation {kind} [{check}]",
-                dataset.product.identifier()
-            );
-        }
-        for issue in issues
-            .iter()
-            .filter(|i| i.severity == Severity::Error)
-            .take(50)
-        {
-            warn!("{} {name}: {issue}", dataset.product.identifier());
-        }
-        for issue in issues.iter().filter(|i| i.severity == Severity::Warning) {
-            tracing::debug!("{} {name}: {issue}", dataset.product.identifier());
-        }
-        // The first receipt survives restarts (11.1.1 c: 24 h indication).
-        let received = if dataset.product == Product::S124 {
-            let (received, recorded) = self
-                .user
-                .receive(&navwarn::dataset_key(&dataset), Utc::now());
-            if recorded {
-                self.persist_user_state();
-            }
-            received
-        } else {
-            Utc::now()
-        };
-        self.datasets.push(OverlayDataset {
-            id,
-            dataset,
-            received,
-            issues,
-            provenance,
-            visible: true,
-            input: None,
-            portrayal: None,
-        });
-        self.invalidate();
-        Ok(Added::New)
-    }
-
-    pub fn remove(&mut self, id: u32) -> bool {
-        let before = self.datasets.len();
-        self.datasets.retain(|d| d.id != id);
-        if self.list_selection.as_ref().is_some_and(|(d, _)| *d == id) {
-            self.list_selection = None;
-        }
-        let removed = self.datasets.len() != before;
-        if removed {
-            self.invalidate();
-        }
-        removed
-    }
-
-    pub fn set_visible(&mut self, id: u32, visible: bool) -> bool {
-        match self.datasets.iter_mut().find(|d| d.id == id) {
-            Some(d) if d.visible != visible => {
-                d.visible = visible;
-                self.invalidate();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Bounds of every visible dataset's geometry.
-    pub fn bounds(&self) -> Option<GeoBounds> {
-        let mut out: Option<GeoBounds> = None;
-        for b in self
-            .datasets
-            .iter()
-            .filter(|d| d.visible)
-            .filter_map(|d| d.bounds(None))
-        {
-            match &mut out {
-                Some(o) => {
-                    o.expand(WorldPoint::new(b.min_x, b.min_y));
-                    o.expand(WorldPoint::new(b.max_x, b.max_y));
-                }
-                None => out = Some(b),
-            }
-        }
-        out
-    }
-
-    // ── S-124 lifecycle ──────────────────────────────────────────────────
-
-    /// Evaluate the S-124 lifecycle now, or reuse the evaluation of the last
-    /// minute. Returns true when the result differs from the previous one.
-    pub fn evaluate(&mut self, force: bool) -> bool {
-        if !force
-            && self.registry.is_some()
-            && self
-                .evaluated
-                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
-        {
-            return false;
-        }
-        let ids: Vec<u32> = self
-            .datasets
-            .iter()
-            .filter(|d| d.product() == Product::S124)
-            .map(|d| d.id)
-            .collect();
-        let inputs: Vec<NavwarnInput> = self
-            .datasets
-            .iter()
-            .filter(|d| d.product() == Product::S124)
-            .map(|d| NavwarnInput {
-                dataset: &d.dataset,
-                received: d.received,
-            })
-            .collect();
-        let registry = navwarn::evaluate(&inputs, self.lifecycle_time());
-        let signature = |r: &NavwarnRegistry| -> Vec<(Status, Vec<String>)> {
-            r.messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    let mut suppress: Vec<String> = r
-                        .feature_filter(i, &self.user, &self.policy, &[])
-                        .suppress
-                        .into_iter()
-                        .collect();
-                    suppress.sort();
-                    (m.status.clone(), suppress)
-                })
-                .collect()
-        };
-        let changed = self.registry_ids != ids
-            || self
-                .registry
-                .as_ref()
-                .is_none_or(|old| signature(old) != signature(&registry));
-        let clock = Utc::now();
-        let new_flags: Vec<bool> = (0..registry.messages.len())
-            .map(|i| {
-                let meets = self.user.classification_of(&registry.messages[i])
-                    != UserClassification::Information;
-                registry.is_new_at(i, &self.user, meets, clock)
-            })
-            .collect();
-        if new_flags != self.new_flags {
-            // The 24 h new-message indication expired (list only).
-            self.new_flags = new_flags;
-            self.ui_revision = 0;
-        }
-        self.registry = Some(registry);
-        self.registry_ids = ids;
-        self.evaluated = Some(std::time::Instant::now());
-        if changed && !force {
-            self.revision = self.revision.wrapping_add(1);
-        }
-        changed
-    }
-
-    /// When the periodic lifecycle re-check is due (None without datasets).
-    pub fn next_check(&self) -> Option<std::time::Instant> {
-        if self.datasets.is_empty() {
-            return None;
-        }
-        let now = std::time::Instant::now();
-        Some(
-            self.evaluated
-                .and_then(|t| t.checked_add(std::time::Duration::from_secs(60)))
-                .unwrap_or(now),
-        )
-    }
-
-    /// Instant the S-124 lifecycle (status, fixedDateRange) is evaluated at:
-    /// the user's viewing time, else the system clock.
-    pub fn lifecycle_time(&self) -> DateTime<Utc> {
-        self.viewing_time.unwrap_or_else(Utc::now)
-    }
-
-    /// Follow the viewing time setting (None: system clock). Returns true
-    /// when it changed; the lifecycle is then re-evaluated and re-portrayed.
-    pub fn set_viewing_time(&mut self, time: Option<DateTime<Utc>>) -> bool {
-        if self.viewing_time == time {
-            return false;
-        }
-        self.viewing_time = time;
-        self.invalidate();
-        self.ui_revision = 0;
-        true
-    }
-
-    // ── Per-user state (11.1.1) ──────────────────────────────────────────
-
-    /// Load the persisted user state from `path` and keep saving it there.
-    /// A missing file starts empty; an unreadable one is set aside and the
-    /// application starts with an empty state (never fails).
-    pub fn attach_user_store(&mut self, path: PathBuf, user: String) {
-        let status = match read_user_state(&path) {
-            Ok(Some(StoredUserState {
-                state: stored,
-                user: stored_user,
-                correct_pc_errata,
-            })) => {
-                if stored_user != user {
-                    warn!(
-                        "S-124 user state {} was saved by user {stored_user:?}, loaded for {user:?}",
-                        path.display()
-                    );
-                }
-                // Loaded state first; anything recorded this session wins.
-                let mut merged = stored;
-                merged
-                    .classification
-                    .extend(self.user.classification.drain());
-                merged.displayed.extend(self.user.displayed.drain());
-                for (k, t) in self.user.received.drain() {
-                    let e = merged.received.entry(k).or_insert(t);
-                    *e = (*e).min(t);
-                }
-                self.user = merged;
-                if correct_pc_errata != self.correct_pc_errata {
-                    self.correct_pc_errata = correct_pc_errata;
-                    self.log_errata_mode();
-                }
-                info!(
-                    "S-124 user state for {user}: {} classifications, {} displayed, {} receipts ({})",
-                    self.user.classification.len(),
-                    self.user.displayed.len(),
-                    self.user.received.len(),
-                    path.display()
-                );
-                format!("User {user} · state restored")
-            }
-            Ok(None) => format!("User {user} · new state"),
-            Err(error) => {
-                warn!(
-                    "S-124 user state {} unreadable, starting empty: {error:#}",
-                    path.display()
-                );
-                set_aside(&path);
-                format!("User {user} · saved state unreadable, started empty")
-            }
-        };
-        // Datasets opened before the store was attached keep their earliest receipt.
-        for d in self
-            .datasets
-            .iter_mut()
-            .filter(|d| d.product() == Product::S124)
-        {
-            let (received, _) = self
-                .user
-                .receive(&navwarn::dataset_key(&d.dataset), d.received);
-            d.received = received;
-        }
-        self.user_store = Some(UserStateStore { path, user, status });
-        self.invalidate();
-        self.ui_revision = 0;
-    }
-
-    /// Status line of the per-user state, for the warning list.
-    pub fn user_status(&self) -> String {
-        self.user_store
-            .as_ref()
-            .map(|s| s.status.clone())
-            .unwrap_or_else(|| "User state not saved".into())
-    }
-
-    /// The "Correct known PC errata" option.
-    pub fn correct_pc_errata(&self) -> bool {
-        self.correct_pc_errata
-    }
-
-    /// Switch the "Correct known PC errata" option; re-portrays and saves it
-    /// with the per-user state.
-    pub fn set_correct_pc_errata(&mut self, on: bool) {
-        if on == self.correct_pc_errata {
-            return;
-        }
-        self.correct_pc_errata = on;
-        self.log_errata_mode();
-        self.invalidate();
-        self.persist_user_state();
-    }
-
-    fn log_errata_mode(&self) {
-        if self.correct_pc_errata {
-            info!("Correct known PC errata: on (S-129 transparency-1 text drawn opaque, S-124 undeclared viewing groups drawn)");
-        } else {
-            info!("Correct known PC errata: off (portrayal catalogues applied literally per S-100 Part 9)");
-        }
-    }
-
-    fn persist_user_state(&mut self) {
-        let Some(store) = &mut self.user_store else {
-            return;
-        };
-        self.user.prune(Utc::now());
-        match write_user_state(&store.path, &store.user, &self.user, self.correct_pc_errata) {
-            Ok(()) => store.status = format!("User {} · state saved", store.user),
-            Err(error) => {
-                warn!(
-                    "S-124 user state not saved to {}: {error:#}",
-                    store.path.display()
-                );
-                store.status = format!("User {} · state NOT saved: {error}", store.user);
-            }
-        }
-        self.ui_revision = 0;
-    }
-
-    fn registry_index(&self, id: u32) -> Option<usize> {
-        self.registry_ids.iter().position(|d| *d == id)
-    }
-
-    pub fn registry(&mut self) -> &NavwarnRegistry {
-        if self.registry.is_none() {
-            self.evaluate(true);
-        }
-        self.registry.as_ref().expect("evaluated")
-    }
-
-    pub fn classify(&mut self, id: u32, class: UserClassification) {
-        self.registry();
-        let Some(index) = self.registry_index(id) else {
-            return;
-        };
-        let registry = self.registry.as_ref().expect("evaluated");
-        if let Some(m) = registry.message(index) {
-            if self.user.classification_of(m) != class {
-                self.user.classify(m, class);
-                self.persist_user_state();
-            }
-            self.invalidate();
-        }
-    }
-
-    pub fn mark_displayed(&mut self, id: u32) {
-        self.registry();
-        if let Some(m) = self
-            .registry_index(id)
-            .and_then(|i| self.registry.as_ref().expect("evaluated").message(i))
-        {
-            if !self.user.displayed.contains(&m.dataset_key) {
-                let m = m.clone();
-                self.user.mark_displayed(&m);
-                self.persist_user_state();
-                self.ui_revision = 0;
-            }
-        }
-    }
-
-    // ── Portrayal ────────────────────────────────────────────────────────
-
-    /// Overlay drawing instructions for the palette, or None when no
-    /// overlay dataset is loaded (the host then behaves exactly as before).
-    pub fn instructions(&mut self, profile: &str) -> Option<(u64, Arc<Vec<DrawingInstruction>>)> {
-        if self.datasets.is_empty() {
-            return None;
-        }
-        self.evaluate(false);
-        if let Some((p, r, list)) = &self.cache {
-            if p == profile && *r == self.revision {
-                return Some((*r, Arc::clone(list)));
-            }
-        }
-        let list = Arc::new(self.portray(profile));
-        self.cache = Some((profile.to_owned(), self.revision, Arc::clone(&list)));
-        self.ui_revision = 0;
-        Some((self.revision, list))
-    }
-
-    fn portray(&mut self, profile: &str) -> Vec<DrawingInstruction> {
-        let started = std::time::Instant::now();
-        self.registry();
-        let mut out = Vec::new();
-        let errata = self.correct_pc_errata;
-        let options_key = (self.plain_boundaries, self.apply_scale_minimum, errata);
-        let plain = if self.plain_boundaries {
-            "true"
-        } else {
-            "false"
-        };
-        let mut notes = Vec::new();
-        for index in 0..self.datasets.len() {
-            let product = self.datasets[index].product();
-            let Some(catalogues) = (match product {
-                Product::S124 => self.s124.as_ref(),
-                Product::S129 => self.s129.as_ref(),
-            }) else {
-                continue;
-            };
-            let entry = &mut self.datasets[index];
-            if !entry.visible {
-                continue;
-            }
-            if entry.input.is_none() {
-                entry.input = Some(portrayal::input_xml(
-                    &entry.dataset,
-                    Some(&catalogues.fc),
-                    &InputOptions::default(),
-                ));
-            }
-            let key = match product {
-                Product::S124 => (true, true, errata),
-                Product::S129 => options_key,
-            };
-            if entry.portrayal.as_ref().is_none_or(|(k, _)| *k != key) {
-                let (overrides, options) = match product {
-                    Product::S124 => (
-                        Vec::new(),
-                        ConvertOptions {
-                            implicit_viewing_groups: if errata {
-                                catalogues.implicit_groups.clone()
-                            } else {
-                                HashSet::new()
-                            },
-                            ..ConvertOptions::default()
-                        },
-                    ),
-                    Product::S129 => (
-                        vec![("PlainBoundaries", plain)],
-                        ConvertOptions {
-                            apply_feature_scale_minimum: self.apply_scale_minimum,
-                            opaque_invisible_text: errata,
-                            ..ConvertOptions::default()
-                        },
-                    ),
-                };
-                match catalogues.xslt.portray(
-                    entry.input.as_ref().expect("input"),
-                    &overrides,
-                    &options,
-                ) {
-                    Ok(p) => {
-                        for note in &p.notes {
-                            notes.push(format!(
-                                "{} {}: {note}",
-                                product.identifier(),
-                                entry.dataset.display_name()
-                            ));
-                        }
-                        entry.portrayal = Some((key, p));
-                    }
-                    Err(error) => {
-                        warn!(
-                            "{} portrayal of {} failed: {error:#}",
-                            product.identifier(),
-                            entry.dataset.display_name()
-                        );
-                        entry.portrayal = None;
-                        continue;
-                    }
-                }
-            }
-            let suppress: HashSet<String> = match product {
-                Product::S124 => {
-                    let selected: Vec<&str> = self
-                        .list_selection
-                        .iter()
-                        .filter(|(d, _)| *d == entry.id)
-                        .map(|(_, f)| f.as_str())
-                        .collect();
-                    match self.registry_ids.iter().position(|d| *d == entry.id) {
-                        Some(i) => {
-                            self.registry
-                                .as_ref()
-                                .expect("evaluated")
-                                .feature_filter(i, &self.user, &self.policy, &selected)
-                                .suppress
-                        }
-                        None => continue,
-                    }
-                }
-                Product::S129 => HashSet::new(),
-            };
-            let (_, portrayal) = entry.portrayal.as_ref().expect("portrayal");
-            let features: Vec<&FeatureInstructions> = portrayal
-                .features
-                .iter()
-                .filter(|f| !suppress.contains(&f.feature_id))
-                .collect();
-            convert(
-                &catalogues.pc,
-                entry.input.as_ref().expect("input"),
-                &features,
-                entry.id,
-                profile,
-                &mut out,
-            );
-        }
-        for note in notes {
-            if self.notes_logged.insert(note.clone()) {
-                info!("Conformance note: {note}");
-            }
-        }
-        info!(
-            "Overlay portrayal: {} instructions from {} datasets in {:.1} ms",
-            out.len(),
-            self.datasets.len(),
-            started.elapsed().as_secs_f64() * 1e3
-        );
-        out
-    }
-
-    // ── Picking ──────────────────────────────────────────────────────────
-
-    fn locate(&self, key: i64) -> Option<(&OverlayDataset, &portrayal::InputFeature)> {
-        let (slot, feature) = decode_key(key)?;
-        let entry = self.dataset(slot)?;
-        let feature = entry.input.as_ref()?.features.get(feature)?;
-        Some((entry, feature))
-    }
-
-    /// Selected-object report of an overlay feature key.
-    pub fn describe(&mut self, key: i64) -> Option<OverlayPick> {
-        self.registry();
-        let (entry, feature) = self.locate(key)?;
-        let catalogues = self.catalogues(entry.product())?;
-        let fc = catalogues.fc.as_ref();
-        let product = entry.product().identifier();
-        let mut attributes = vec![
-            ("Dataset".to_owned(), entry.name()),
-            (
-                "Product".to_owned(),
-                format!(
-                    "{product} {}",
-                    entry.dataset.identification.product_edition().unwrap_or("")
-                )
-                .trim()
-                .to_owned(),
-            ),
-            ("Provenance".to_owned(), entry.provenance.label()),
-        ];
-        if entry.product() == Product::S124 {
-            if let Some(m) = self
-                .registry_index(entry.id)
-                .and_then(|i| self.registry.as_ref()?.message(i))
-            {
-                attributes.push(("Warning".into(), m.caption()));
-                attributes.push(("Warning status".into(), m.status.label().into()));
-                if let Some(t) = m.publication_time {
-                    attributes.push(("Publication time".into(), format_time(t)));
-                }
-            }
-        }
-        let object = feature.object.and_then(|i| entry.dataset.objects.get(i));
-        let mut definition = None;
-        let mut feature_type = feature.code.clone();
-        if let Some(object) = object {
-            if let Some(t) = fc.feature_types.get(&object.code) {
-                definition = t.definition.clone();
-                feature_type = format!("{} ({})", t.name, object.code);
-            }
-            attributes.push(("gml:id".into(), object.id.clone()));
-            attribute_rows(fc, &object.attributes, "", &mut attributes);
-            for r in &object.references {
-                let target = r
-                    .target
-                    .and_then(|t| entry.dataset.objects.get(t))
-                    .map(|t| format!("{} {}", t.code, t.id))
-                    .unwrap_or_else(|| r.href.clone());
-                attributes.push((format!("→ {}", r.role), target));
-            }
-            // S-124 parts: the preamble carries the message identity.
-            for r in object.references.iter().filter_map(|r| r.target) {
-                let Some(info) = entry.dataset.objects.get(r) else {
-                    continue;
-                };
-                if info.kind == ObjectKind::Information && info.code == "NavwarnPreamble" {
-                    attribute_rows(fc, &info.attributes, "Preamble › ", &mut attributes);
-                }
-            }
-        } else {
-            attributes.push((
-                "Feature".into(),
-                format!("{} (portrayal feature)", feature.code),
-            ));
-        }
-        Some(OverlayPick {
-            feature_type,
-            primitive: feature.primitive.to_owned(),
-            source: format!(
-                "{} · {product} overlay · {}",
-                entry
-                    .dataset
-                    .source
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| entry.name()),
-                entry.provenance.label()
-            ),
-            attributes,
-            definition,
-            foid: object.map(|o| o.id.clone()),
         })
+        .collect();
+    let file = file.trim_start_matches('.');
+    let file = if file.is_empty() { "unknown" } else { file };
+    Some(
+        base?
+            .join("FerriteS100/navwarn")
+            .join(format!("{file}.json")),
+    )
+}
+
+pub(crate) fn sort_order(sort: NavwarnSort) -> SortOrder {
+    match sort {
+        NavwarnSort::Received => SortOrder::Received,
+        NavwarnSort::IssueTime => SortOrder::IssueTime,
+        NavwarnSort::WarningType => SortOrder::WarningType,
+        NavwarnSort::ProducerSeries => SortOrder::ProducerSeries,
+        NavwarnSort::Classification => SortOrder::UserClassification,
     }
+}
 
-    /// Selection highlight of an overlay feature key: for S-124 the features
-    /// [`navwarn::FeatureFilter::highlight`] names (the NavwarnPart and its
-    /// NavwarnAreaAffected), else nothing extra.
-    pub fn highlight_geometry(&mut self, key: i64) -> Vec<Vec<WorldPoint>> {
-        self.registry();
-        let Some((entry, feature)) = self.locate(key) else {
-            return Vec::new();
-        };
-        if entry.product() != Product::S124 {
-            return Vec::new();
-        }
-        let Some(index) = self.registry_index(entry.id) else {
-            return Vec::new();
-        };
-        let filter = self.registry.as_ref().expect("evaluated").feature_filter(
-            index,
-            &self.user,
-            &self.policy,
-            &[feature.id.as_str()],
-        );
-        let mut out = Vec::new();
-        for id in &filter.highlight {
-            if let Some(object) = entry.dataset.object(id) {
-                for g in &object.geometry {
-                    geometry_paths(g, &mut out);
-                }
-            }
-        }
-        out
-    }
+/// Rows of the S-124 warning list and the S-129 plan list.
+pub(crate) trait OverlayRows {
+    fn navwarn_rows(&mut self) -> (Vec<NavwarnRow>, Vec<String>, usize);
+    fn ukc_rows(&self) -> Vec<UkcPlanRow>;
+}
 
-    /// The overlay feature key of a dataset object (gml:id), if portrayed input.
-    pub fn key_of(&self, id: u32, object_id: &str) -> Option<i64> {
-        let entry = self.dataset(id)?;
-        let feature = entry.input.as_ref()?.feature_index(object_id)?;
-        Some(overlay_key(id, feature))
-    }
-
-    /// Geographic bounds of a message part (with its associated features) or
-    /// of the whole dataset.
-    pub fn focus_bounds(&mut self, id: u32, part: Option<&str>) -> Option<GeoBounds> {
-        self.registry();
-        let entry = self.dataset(id)?;
-        let ids: Option<HashSet<String>> = match (part, self.registry_index(id)) {
-            (Some(part), Some(index)) => {
-                let m = self.registry.as_ref()?.message(index)?;
-                let p = m.parts.iter().find(|p| p.id == part)?;
-                Some(
-                    std::iter::once(p.id.clone())
-                        .chain(p.areas_affected.iter().cloned())
-                        .chain(p.text_placements.iter().cloned())
-                        .collect(),
-                )
-            }
-            _ => None,
-        };
-        entry.bounds(ids.as_ref()).or_else(|| entry.bounds(None))
-    }
-
-    /// First NavwarnPart with geometry of a message.
-    pub fn first_part(&mut self, id: u32) -> Option<String> {
-        self.registry();
-        let index = self.registry_index(id)?;
-        let m = self.registry.as_ref()?.message(index)?;
-        m.parts
-            .iter()
-            .find(|p| p.has_geometry)
-            .map(|p| p.id.clone())
-    }
-
-    // ── UI rows ──────────────────────────────────────────────────────────
-
-    pub fn navwarn_rows(&mut self) -> (Vec<NavwarnRow>, Vec<String>, usize) {
+impl OverlayRows for GmlOverlays {
+    fn navwarn_rows(&mut self) -> (Vec<NavwarnRow>, Vec<String>, usize) {
         self.evaluate(false);
         let registry = self.registry().clone();
         let mut rows = Vec::new();
@@ -1229,7 +221,7 @@ impl GmlOverlays {
         (rows, missing, new_count)
     }
 
-    pub fn ukc_rows(&self) -> Vec<UkcPlanRow> {
+    fn ukc_rows(&self) -> Vec<UkcPlanRow> {
         let mut out = Vec::new();
         for entry in self
             .datasets
@@ -1306,169 +298,6 @@ impl GmlOverlays {
     }
 }
 
-/// Name of the OS user running the application.
-pub(crate) fn os_user_name() -> String {
-    ["USER", "USERNAME", "LOGNAME"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .map(|v| v.to_string_lossy().trim().to_owned())
-        .find(|v| !v.is_empty())
-        .or_else(|| {
-            dirs::home_dir().and_then(|h| h.file_name().map(|n| n.to_string_lossy().into_owned()))
-        })
-        .unwrap_or_else(|| "unknown".into())
-}
-
-/// Per-OS-user location of the S-124 user state, in the same application
-/// data folder as the other persisted state: `FerriteS100/navwarn/<user>.json`
-/// under the user's own data directory. `FERRITE_NAVWARN_STATE_PATH`
-/// overrides it; tests and hidden audits persist nothing.
-pub(crate) fn default_user_state_path(user: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("FERRITE_NAVWARN_STATE_PATH") {
-        return Some(PathBuf::from(path));
-    }
-    if cfg!(test) || ferrite_wgpu::background_test::enabled() {
-        return None;
-    }
-    #[cfg(target_os = "windows")]
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    let base =
-        std::env::var_os("HOME").map(|p| PathBuf::from(p).join("Library/Application Support"));
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")));
-    let file: String = user
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let file = file.trim_start_matches('.');
-    let file = if file.is_empty() { "unknown" } else { file };
-    Some(
-        base?
-            .join("FerriteS100/navwarn")
-            .join(format!("{file}.json")),
-    )
-}
-
-/// Fields of a selected overlay object.
-pub(crate) struct OverlayPick {
-    pub feature_type: String,
-    pub primitive: String,
-    pub source: String,
-    pub attributes: Vec<(String, String)>,
-    pub definition: Option<String>,
-    pub foid: Option<String>,
-}
-
-pub(crate) fn sort_order(sort: NavwarnSort) -> SortOrder {
-    match sort {
-        NavwarnSort::Received => SortOrder::Received,
-        NavwarnSort::IssueTime => SortOrder::IssueTime,
-        NavwarnSort::WarningType => SortOrder::WarningType,
-        NavwarnSort::ProducerSeries => SortOrder::ProducerSeries,
-        NavwarnSort::Classification => SortOrder::UserClassification,
-    }
-}
-
-fn format_time(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%d %H:%MZ").to_string()
-}
-
-fn timing_label(t: PartTiming) -> String {
-    match t {
-        PartTiming::NoRange => "in force".into(),
-        PartTiming::InRange => "in its date range".into(),
-        PartTiming::BeforeRange { starts } => format!("starts {}", format_time(starts)),
-        PartTiming::AfterRange { ended } => format!("ended {}", format_time(ended)),
-        PartTiming::OutsideRecurring => "outside its recurring dates".into(),
-    }
-}
-
-fn cancel_reason(reason: &navwarn::CancelReason, registry: &NavwarnRegistry) -> String {
-    let caption = |i: usize| {
-        registry
-            .message(i)
-            .map(|m| m.caption())
-            .unwrap_or_else(|| format!("dataset {i}"))
-    };
-    match reason {
-        navwarn::CancelReason::CancellationDate(t) => {
-            format!("cancellation date {}", format_time(*t))
-        }
-        navwarn::CancelReason::CancelledBy { dataset } => format!("by {}", caption(*dataset)),
-        navwarn::CancelReason::NotInForceBulletin { bulletin } => {
-            format!("not in force per {}", caption(*bulletin))
-        }
-        navwarn::CancelReason::SupersededInForceBulletin { by } => {
-            format!("superseded by {}", caption(*by))
-        }
-        navwarn::CancelReason::ReplacedByAuthoritative { by } => {
-            format!("replaced by official {}", caption(*by))
-        }
-    }
-}
-
-/// FC names and enumeration labels for attribute values.
-fn attribute_rows(
-    fc: &FeatureCatalogue,
-    attributes: &[ferrite_s100_gml::Attribute],
-    prefix: &str,
-    out: &mut Vec<(String, String)>,
-) {
-    for a in attributes {
-        let simple = fc.simple_attributes.get(&a.code);
-        let name = simple
-            .map(|s| s.name.clone())
-            .or_else(|| fc.complex_attributes.get(&a.code).map(|c| c.name.clone()))
-            .unwrap_or_else(|| a.code.clone());
-        match &a.value {
-            Value::Simple { text, code } => {
-                let listed = code
-                    .as_deref()
-                    .or(Some(text.as_str()))
-                    .and_then(|c| c.trim().parse::<u32>().ok())
-                    .and_then(|c| {
-                        simple?
-                            .listed_values
-                            .iter()
-                            .find(|v| v.code == c)
-                            .map(|v| format!("{} ({c})", v.label))
-                    });
-                let value = listed.unwrap_or_else(|| {
-                    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                    match code {
-                        Some(c) if !t.is_empty() && t != *c => format!("{t} ({c})"),
-                        Some(c) => c.clone(),
-                        None => t,
-                    }
-                });
-                out.push((format!("{prefix}{name}"), value));
-            }
-            Value::Complex(children) => {
-                attribute_rows(fc, children, &format!("{prefix}{name} › "), out)
-            }
-            Value::Nil { reason } => out.push((
-                format!("{prefix}{name}"),
-                format!(
-                    "unknown{}",
-                    reason
-                        .as_ref()
-                        .map(|r| format!(" ({r})"))
-                        .unwrap_or_default()
-                ),
-            )),
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // Application glue
 // ─────────────────────────────────────────────────────────────────────────
@@ -1480,30 +309,37 @@ impl ChartApp {
     /// or the scene changed.
     pub(crate) fn sync_host_overlay_instructions(&mut self) {
         self.sync_overlay_viewing_time();
-        let overlays = self.gml_overlays.instructions(&self.current_profile_name);
+        let overlays = self
+            .gml_overlays
+            .instructions(&self.engine.current_profile_name);
         let plugin = self.plugin_system.get_render_instructions();
         let Some((revision, list)) = overlays else {
             self.gml_overlays.installed = None;
-            self.render_context.remove_coverage_exempt_instructions();
+            self.engine
+                .render_context
+                .remove_coverage_exempt_instructions();
             for mut instr in plugin {
                 instr.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
-                self.render_context.add_instruction(instr);
+                self.engine.render_context.add_instruction(instr);
             }
             return;
         };
         if plugin.is_empty()
             && self.gml_overlays.installed
-                == Some((revision, self.render_context.geometry_revision()))
+                == Some((revision, self.engine.render_context.geometry_revision()))
         {
             return;
         }
-        self.render_context.remove_coverage_exempt_instructions();
+        self.engine
+            .render_context
+            .remove_coverage_exempt_instructions();
         for mut instr in plugin {
             instr.set_portrayal_origin(ferrite_render::PortrayalOrigin::CoverageExempt);
-            self.render_context.add_instruction(instr);
+            self.engine.render_context.add_instruction(instr);
         }
-        self.render_context.append_converted(list.to_vec());
-        self.gml_overlays.installed = Some((revision, self.render_context.geometry_revision()));
+        self.engine.render_context.append_converted(list.to_vec());
+        self.gml_overlays.installed =
+            Some((revision, self.engine.render_context.geometry_revision()));
     }
 
     /// Overlay instructions for a context being prepared with `profile`.
@@ -1521,7 +357,7 @@ impl ChartApp {
     /// S-124 status and fixedDateRange follow the viewing time selected for
     /// the S-101 date-dependent portrayal (system clock when live).
     pub(crate) fn sync_overlay_viewing_time(&mut self) -> bool {
-        let time = viewing_time(&self.render_context.settings);
+        let time = viewing_time(&self.engine.render_context.settings);
         self.gml_overlays.set_viewing_time(time)
     }
 
@@ -1575,14 +411,14 @@ impl ChartApp {
                 Some(mut b) if fit_without_charts => {
                     let pad = (b.width().max(b.height()) * 0.1).max(0.01);
                     b = GeoBounds::new(b.min_x - pad, b.min_y - pad, b.max_x + pad, b.max_y + pad);
-                    self.bounds = b;
+                    self.engine.bounds = b;
                     self.zoom_level = 1.0;
                     self.zoom_target = 1.0;
                     self.pan_offset = (0.0, 0.0);
-                    self.render_context.set_bounds(b);
+                    self.engine.render_context.set_bounds(b);
                 }
                 None if self.gml_overlays.is_empty() => {
-                    self.bounds = GeoBounds::new(-180.0, -90.0, 180.0, 90.0);
+                    self.engine.bounds = GeoBounds::new(-180.0, -90.0, 180.0, 90.0);
                 }
                 _ => {}
             }
@@ -1600,16 +436,17 @@ impl ChartApp {
     pub(crate) fn focus_geo_bounds(&mut self, b: GeoBounds) {
         let c = b.center();
         if let Some(pan) = self
+            .engine
             .render_context
             .scaler
             .projection()
-            .pan_to(self.bounds, c)
+            .pan_to(self.engine.bounds, c)
         {
             self.pan_offset = (pan[0], pan[1]);
         }
         let w = b.width().max(0.005);
         let h = b.height().max(0.005);
-        let zoom = (self.bounds.width() / w).min(self.bounds.height() / h) * 0.6;
+        let zoom = (self.engine.bounds.width() / w).min(self.engine.bounds.height() / h) * 0.6;
         if zoom.is_finite() {
             let zoom = zoom.clamp(crate::navigation::MIN_ZOOM, crate::navigation::MAX_ZOOM);
             self.zoom_level = zoom;
@@ -1875,7 +712,13 @@ impl ChartApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrite_engine::gml_overlay::{exchange_set_reports, OVERLAY_VIEWING_GROUP};
+    use chrono::DateTime;
+    use ferrite_engine::gml_overlay::{
+        exchange_set_reports, read_user_state, OVERLAY_VIEWING_GROUP,
+    };
+    use ferrite_s100_gml::navwarn::PartTiming;
+    use ferrite_s100_gml::Dataset;
+    use std::collections::HashSet;
 
     fn root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1891,7 +734,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = GmlOverlays::load(&base);
+        let mut g = load_overlays(&base);
         assert!(g.catalogue_errors.is_empty(), "{:?}", g.catalogue_errors);
         let mut paths = discover(
             &data.join("UKHO-S100-2026/ExchangeSets/S-124_GB"),
@@ -2008,7 +851,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = GmlOverlays::load(&base);
+        let mut g = load_overlays(&base);
         let text = std::fs::read_to_string(&path).unwrap().replace(
             "</S124:members>",
             "<S124:TextPlacement gml:id=\"TP1\"><S124:text>TEST LABEL</S124:text>\
@@ -2047,7 +890,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = GmlOverlays::load(&base);
+        let mut g = load_overlays(&base);
         let (dataset, _) = g.read(&path, &path).unwrap();
         assert!(matches!(
             g.add(dataset, Provenance::Unverified).unwrap(),
@@ -2103,7 +946,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("navwarn").join("alice.json");
         let start = |path: &Path| {
-            let mut g = GmlOverlays::load(&root());
+            let mut g = load_overlays(&root());
             g.attach_user_store(path.to_path_buf(), "alice".into());
             g
         };
@@ -2210,7 +1053,7 @@ mod tests {
         .unwrap();
         assert!(!read_user_state(&path).unwrap().unwrap().correct_pc_errata);
         // No store: nothing written, startup unaffected.
-        let mut g = GmlOverlays::load(&root());
+        let mut g = load_overlays(&root());
         assert_eq!(g.user_status(), "User state not saved");
         let c = s124_dataset(&g, 72, "", "");
         assert!(matches!(
@@ -2233,7 +1076,7 @@ mod tests {
     /// 24 h new-message indication keeps running on the real clock.
     #[test]
     fn navwarn_lifecycle_follows_viewing_time() {
-        let mut g = GmlOverlays::load(&root());
+        let mut g = load_overlays(&root());
         let range = "<S124:fixedDateRange><S124:dateEnd>2026-02-12</S124:dateEnd>\
                      <S124:dateStart>2026-02-10</S124:dateStart></S124:fixedDateRange>";
         let ds = s124_dataset(
@@ -2295,7 +1138,7 @@ mod tests {
     /// source (no source cell).
     #[test]
     fn overlay_symbol_preview_resolves_registered_source() {
-        let mut g = GmlOverlays::load(&root());
+        let mut g = load_overlays(&root());
         let ds = s124_dataset(&g, 90, "", "");
         assert!(matches!(
             g.add(ds, Provenance::Unverified).unwrap(),
@@ -2350,7 +1193,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = GmlOverlays::load(&base);
+        let mut g = load_overlays(&base);
         let (dataset, _) = g.read(&path, &path).unwrap();
         assert!(matches!(
             g.add(dataset, Provenance::Unverified).unwrap(),
@@ -2374,7 +1217,7 @@ mod tests {
     /// one is reported, and a dataset opened in the same batch counts.
     #[test]
     fn exchange_set_cancellation_sees_loaded_datasets() {
-        let mut g = GmlOverlays::load(&root());
+        let mut g = load_overlays(&root());
         let mut loaded = s124_dataset(&g, 90, "", "");
         loaded.source = Some(PathBuf::from("/charts/124GB00LOADED.GML"));
         g.add(loaded, Provenance::Unverified).unwrap();

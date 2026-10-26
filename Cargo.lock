@@ -1419,6 +1419,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bincode",
  "chrono",
  "ferrite-feature-catalog",
  "ferrite-interoperability",
@@ -1436,6 +1437,7 @@ dependencies = [
  "libc",
  "openssl",
  "quick-xml 0.37.5",
+ "rayon",
  "roxmltree",
  "serde",
  "serde_json",

@@ -14,8 +14,10 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
+bincode.workspace = true
 chrono.workspace = true
 quick-xml.workspace = true
+rayon.workspace = true
 roxmltree = "=0.20.0"
 serde.workspace = true
 serde_json.workspace = true
