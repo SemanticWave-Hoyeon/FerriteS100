@@ -3,7 +3,6 @@ use ferrite_render::{
     Color, DrawingInstruction, GeoBounds, LineInstruction, LineStyle, RenderContext, TemporalView,
     TemporalViewMode, Viewport, WorldPoint,
 };
-use ferrite_wgpu::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -27,7 +26,7 @@ impl ApplicationHandler for Smoke {
         );
         let size = window.inner_size();
         let pixels_per_mm = 96.0 / 25.4 * window.scale_factor() as f32;
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         ctx.set_bounds(GeoBounds::new(0., 0., 10., 10.));

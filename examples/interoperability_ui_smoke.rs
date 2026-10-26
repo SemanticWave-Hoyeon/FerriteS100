@@ -1,9 +1,9 @@
 //! Native GPU rendering of the IC Settings control and unchanged pending/active state.
 //! Does not emulate mouse/menu events or verify OS accessibility.
+use ferrite_gpu::SelectedFeature;
 use ferrite_render::{
     Color, DrawingInstruction, GeoBounds, RenderContext, TextInstruction, Viewport, WorldPoint,
 };
-use ferrite_wgpu::{SelectedFeature, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -27,7 +27,7 @@ impl ApplicationHandler for Smoke {
         );
         let size = window.inner_size();
         let ppp = window.scale_factor() as f32;
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         ctx.set_bounds(GeoBounds::new(0., 0., 10., 10.));
@@ -42,8 +42,9 @@ impl ApplicationHandler for Smoke {
         renderer
             .save_screenshot(self.output.join("chart-text.png"))
             .unwrap();
-        renderer.ui_state.chart_area = (0., 0., size.width as f32 / ppp, size.height as f32 / ppp);
-        renderer.ui_state.selected_feature = Some(SelectedFeature {
+        renderer.ui.ui_state.chart_area =
+            (0., 0., size.width as f32 / ppp, size.height as f32 / ppp);
+        renderer.ui.ui_state.selected_feature = Some(SelectedFeature {
             feature_type: "Selection export".into(),
             feature_id: 1,
             foid: None,
@@ -73,17 +74,17 @@ impl ApplicationHandler for Smoke {
                 .count()
                 > 200
         );
-        renderer.ui_state.selected_feature = None;
+        renderer.ui.ui_state.selected_feature = None;
         renderer.update_selection(&ctx.scaler);
-        renderer.ui_state.version = "Time UI regression".into();
-        renderer.ui_state.show_temporal = false;
-        renderer.ui_state.show_settings = true;
-        renderer.ui_state.interoperability_available = true;
-        renderer.ui_state.interoperability_status =
+        renderer.ui.ui_state.version = "Time UI regression".into();
+        renderer.ui.ui_state.show_temporal = false;
+        renderer.ui.ui_state.show_settings = true;
+        renderer.ui.ui_state.interoperability_available = true;
+        renderer.ui.ui_state.interoperability_status =
             "Interoperability on: authenticated local test".into();
         let mut pending = renderer.settings().clone();
         pending.interoperability_enabled = false;
-        renderer.ui_state.pending_settings = Some(pending);
+        renderer.ui.ui_state.pending_settings = Some(pending);
         let file = self.output.join("interoperability-settings.png");
         renderer.save_screenshot_with_ui(&file).unwrap();
         renderer.save_screenshot_with_ui(&file).unwrap();
@@ -93,13 +94,14 @@ impl ApplicationHandler for Smoke {
         );
         assert!(
             !renderer
+                .ui
                 .ui_state
                 .pending_settings
                 .as_ref()
                 .unwrap()
                 .interoperability_enabled
         );
-        assert!(!renderer.ui_state.settings_changed);
+        assert!(!renderer.ui.ui_state.settings_changed);
         el.exit();
     }
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}

@@ -83,9 +83,50 @@ trait ProductAdapter {
 | 0 | 픽셀 회귀 하네스와 기준 위치를 `tools/`에 고정 | 낮음 |
 | 1 | 순수 도메인 모듈을 `ferrite-engine`으로 이동, 애플리케이션은 import만 변경. 동작 변경 없음 | 낮음 |
 | 2 | `main.rs`의 포트레이얼 파이프라인을 `engine::portrayal`로 이동, `ChartApp`의 해도 상태를 `EngineState`로 분리 | 높음 |
-| 3 | `ferrite-wgpu`를 `ferrite-gpu`(렌더러)와 `ferrite-ui`(egui)로 분리, 렌더러는 `PreparedScene`만 입력 | 중간 |
-| 4 | `ChartEngine` 파사드, 문서, 예제(`headless_render`, `pick`), 기능 플래그(`lua54`/`lua55`, `s102`, `gml`) | 낮음 |
-| 5 (선택) | C ABI(`ferrite-engine-capi`), S-57/S-52 어댑터 | 별도 프로젝트 규모 |
+| 3 | `ferrite-wgpu`를 `ferrite-gpu`(렌더러, egui·winit·s421 비의존, 차트 텍스트는 epaint)와 `ferrite-ui`(egui)로 분리. 렌더러는 `SurfaceHost`·`UiLayer`·차트 텍스트 백엔드를 주입받음 | 완료 |
+| 4~6 | 파사드·플랫폼 서비스, 기능 플래그·CLI·C ABI, 웹(wasm). 4a절 참고 | 중간 |
+| 7 (선택) | S-57/S-52 어댑터 | 별도 프로젝트 규모 |
+
+## 4a. 이식성 목표 (단계 4~6으로 재편)
+
+같은 커널을 여러 호스트에 붙인다.
+
+```
+                 ┌──────────── 호스트 ────────────┐
+ferrite-engine ──┤ Rust 뷰어 (ferrite-s100, winit+egui+wgpu)
+ (ECDIS 커널)    ├ CLI·라이브러리 (ferrite-cli: 렌더·검증·검사·내보내기)
+                 ├ C ABI (ferrite-capi: cbindgen 헤더, C/C++/C#/Python에서 호출)
+                 └ 웹 (ferrite-wasm: wasm-bindgen + WebGPU/WebGL2)
+```
+
+### 현재 이식성을 막는 것
+
+| 의존 | 위치 | 웹(wasm) | C ABI·CLI | 대응 |
+|---|---|---|---|---|
+| 파일 시스템 직접 접근 (`std::fs`, `walkdir`, `tempfile`) | engine 23개 파일, s102 10, gml 6, security 4 | 불가 | 가능 | 플랫폼 서비스 트레이트 `DataSource`/`CacheStore`로 추상화. 네이티브는 파일, 웹은 메모리·IndexedDB·fetch |
+| 스레드 (`std::thread`, `rayon`) | engine, render, s101 | 제한(SharedArrayBuffer 필요) | 가능 | `parallel` 기능 플래그. 끄면 순차 실행, 작업 핸들 API는 동일 |
+| Lua (`mlua`, C 라이브러리) | lua-runtime → s101/s102 포트레이얼 | wasm32-unknown-unknown 불가 | 가능 | `lua-native` 기능. 웹은 (1) emscripten/WASI로 Lua C 빌드, (2) 포트레이얼 결과(Part 9a 명령) 캐시를 서버에서 미리 만들어 전달 중 선택 |
+| OpenSSL (`openssl`, C) | security(X.509·ECDSA) | 불가 | 가능 | `crypto-openssl`(기본)과 순수 Rust 구현(`x509-cert`+`p384`/`p256`) 백엔드 분리. 검증 결과가 같은지 교차 테스트 |
+| HDF5 (`hdf5-metno`, C) | s102 | 불가 | 가능 | `s102-hdf5` 기능. 웹은 S-102 제외 또는 순수 Rust HDF5 판독기 검토 |
+| 시계·사용자 디렉터리·환경 변수 | engine(취소 이력, NAVWARN 상태, 캐시 경로) | 불가 | 가능 | `Clock`, `UserStore` 서비스로 주입 |
+| GPU (`wgpu`) | ferrite-gpu | WebGPU/WebGL2 가능 | 오프스크린 가능 | 렌더러는 서피스를 주입받고, 헤드리스 오프스크린 경로 제공 |
+
+XSLT(`ferrite-xslt`), GML(`ferrite-s100-gml`), 커널(`ferrite-kernel`), ISO 8211, 카탈로그 파서는 이미 순수 Rust라 그대로 이식된다.
+
+### 원칙
+
+- 커널은 경로가 아니라 바이트와 서비스 트레이트를 받는다. `EngineConfig`에 `Arc<dyn Platform>`(데이터 소스, 캐시 저장소, 사용자 저장소, 시계, 실행기)을 넣는다.
+- 네이티브 전용 의존성은 모두 기능 플래그 뒤로 보낸다. 기본 기능은 지금의 네이티브 동작과 같다.
+- 호스트별 바인딩은 얇게 유지한다. 커널 API(`ChartEngine`)만 감싸고 로직을 두지 않는다.
+- 보안 동작은 백엔드가 바뀌어도 같아야 한다. 같은 교환 세트에 대해 두 암호 백엔드의 판정이 일치하는지 테스트한다.
+
+### 재편한 단계
+
+| 단계 | 내용 |
+|---|---|
+| 4 | `ChartEngine` 파사드와 플랫폼 서비스 트레이트(`DataSource`, `CacheStore`, `UserStore`, `Clock`, `Executor`). 엔진·s102·gml·security의 파일·스레드·시계 접근을 서비스로 치환. 네이티브 구현은 기존 동작과 동일 |
+| 5 | 기능 플래그 정리(`parallel`, `lua-native`, `crypto-openssl`/`crypto-rust`, `s102-hdf5`). 순수 Rust 암호 백엔드. `ferrite-cli`(헤드리스 렌더·검증·검사)와 `ferrite-capi`(C ABI, cbindgen 헤더, C 예제) |
+| 6 | `ferrite-wasm`: wasm32 빌드(파일 없이 바이트로 열기, 순차 실행, WebGPU/WebGL2 렌더), 최소 웹 데모. Lua 포트레이얼은 미리 계산한 Part 9a 결과 또는 WASI/emscripten 빌드 중 선택 |
 
 ## 5. 주의 사항
 

@@ -1,6 +1,5 @@
 //! Render the application's real coverage-query transcript in the information panel.
 use ferrite_render::Color;
-use ferrite_wgpu::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -23,7 +22,7 @@ impl ApplicationHandler for Smoke {
             )
             .unwrap(),
         );
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         let data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&self.input).unwrap()).unwrap();
@@ -38,14 +37,14 @@ impl ApplicationHandler for Smoke {
             })
             .unwrap_or(&probes[0]);
         let information = probe["displayed_information"].as_str().unwrap().to_string();
-        renderer.ui_state.bathymetry_count = 7;
-        renderer.ui_state.zoom_level = 1.;
-        renderer.ui_state.coverage_info = Some(information.clone());
-        renderer.ui_state.security_status = "Dataset signatures verified".into();
+        renderer.ui.ui_state.bathymetry_count = 7;
+        renderer.ui.ui_state.zoom_level = 1.;
+        renderer.ui.ui_state.coverage_info = Some(information.clone());
+        renderer.ui.ui_state.security_status = "Dataset signatures verified".into();
         renderer.save_screenshot_with_ui(&self.output).unwrap();
         renderer.save_screenshot_with_ui(&self.output).unwrap();
         assert_eq!(
-            renderer.ui_state.coverage_info.as_deref(),
+            renderer.ui.ui_state.coverage_info.as_deref(),
             Some(information.as_str())
         );
         el.exit();

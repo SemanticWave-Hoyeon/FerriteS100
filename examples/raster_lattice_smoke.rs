@@ -4,7 +4,6 @@ use ferrite_kernel::{CoverageSample, CoverageSource, CoverageTile, GridGeometry,
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{Color, RenderContext, Viewport, WorldPoint};
 use ferrite_s102::{BathymetryPortrayal, DepthSettings};
-use ferrite_wgpu::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -52,7 +51,7 @@ impl ApplicationHandler for Smoke {
             .unwrap(),
         );
         let size = w.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let pc = PortrayalCatalogue::load(
             "Standards/S102-PC-3.0.0/S-102-Portrayal-Catalogue-3.0.0.20241216/PortrayalCatalog",

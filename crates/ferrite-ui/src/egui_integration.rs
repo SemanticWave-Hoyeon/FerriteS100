@@ -14,6 +14,7 @@ use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+pub use ferrite_gpu::{CoverageScaleIndication, DebugGpuStats, SelectedFeature};
 pub use ferrite_render::host_settings::{CatalogueStatus, DisplayMode, SettingsState};
 
 /// Plugin toolbar button state
@@ -66,16 +67,6 @@ pub struct DatasetCatalogueLayer {
     pub product: String,
     pub fc: CatalogueStatus,
     pub pc: CatalogueStatus,
-}
-
-/// Coverage-owner numerical scale and actual active-PC SCLBR colour.
-#[derive(Debug, Clone, Copy)]
-pub struct CoverageScaleIndication {
-    pub viewing_denominator: f64,
-    pub overscale_factor: f64,
-    pub physical_viewport: ferrite_render::Viewport,
-    /// None is a missing portrayal resource, never a theme-colour substitution.
-    pub sclbr: Option<egui::Color32>,
 }
 
 /// S-101 2.0.0 4.6 own-ship indication.
@@ -256,44 +247,6 @@ pub struct AppUiState {
     pub debug_symbol_count: usize,
 }
 
-/// Actual renderer adapter and completed timestamp sample. Utilization is a
-/// distinct device-wide OS metric and is never synthesized from pass timing.
-#[derive(Debug, Clone, Default)]
-pub struct DebugGpuStats {
-    pub adapter: String,
-    pub backend: String,
-    pub timestamp_supported: bool,
-    pub timing_enabled: bool,
-    /// Mean GPU chart execution time from samples completed in the last window.
-    pub chart_ms: Option<f64>,
-    pub chart_max_ms: Option<f64>,
-    pub chart_window_samples: u64,
-    pub chart_window_seconds: f64,
-    pub sample_age_seconds: Option<f64>,
-    pub completed_samples: u64,
-    pub utilization_percent: Option<f32>,
-}
-impl DebugGpuStats {
-    fn timing_label(&self) -> String {
-        if !self.timestamp_supported {
-            return "GPU chart: unsupported".into();
-        }
-        if !self.timing_enabled {
-            return "GPU chart: profiling off".into();
-        }
-        match (self.chart_ms, self.chart_max_ms, self.sample_age_seconds) {
-            (Some(mean), Some(max), Some(age)) if age <= 2.0 => format!(
-                "GPU chart mean/max: {mean:.2}/{max:.2} ms · n={}",
-                self.chart_window_samples
-            ),
-            (Some(mean), Some(max), Some(age)) => {
-                format!("GPU chart mean/max: {mean:.2}/{max:.2} ms (last {age:.0}s ago)",)
-            }
-            _ => "GPU chart: waiting for completed window".into(),
-        }
-    }
-}
-
 /// Fixed-size sampling history with allocation-free recording.
 #[derive(Debug, Clone)]
 pub struct DebugHistory {
@@ -349,25 +302,6 @@ impl DebugHistory {
             });
         }
     }
-}
-
-/// Information about a selected feature
-#[derive(Debug, Clone)]
-pub struct SelectedFeature {
-    pub feature_type: String,
-    pub feature_id: i64,
-    pub foid: Option<String>,
-    pub cell_index: Option<u32>,
-    pub primitive_type: String,
-    pub source: Option<String>,
-    pub attributes: Vec<(String, String)>,
-    pub world_pos: (f64, f64),
-    /// Display copy; source coordinates and identity remain unchanged.
-    pub longitude_shift: f64,
-    /// Definition from Feature Catalogue
-    pub definition: Option<String>,
-    /// Symbol name (e.g., "ISODGR01", "SOUNDG10")
-    pub symbol_name: Option<String>,
 }
 
 /// Convert decimal degrees to degrees, minutes, seconds format

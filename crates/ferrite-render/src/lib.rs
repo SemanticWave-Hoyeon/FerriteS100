@@ -84,7 +84,9 @@ mod scene_spatial;
 pub use scene_spatial::SceneSpatialIndex;
 
 mod portrayal_origin;
-pub use portrayal_origin::{PointOriginCrs, PointOriginGeometry, PortrayalOrigin};
+pub use portrayal_origin::{
+    is_cellless_overlay_instruction, PointOriginCrs, PointOriginGeometry, PortrayalOrigin,
+};
 
 pub mod prepared_coverage;
 pub use prepared_coverage::{InstructionCoverageClass, PreparedCoverage, PreparedCoveragePass};

@@ -54,7 +54,7 @@ impl OverlaySymbolSource {
     pub fn profiles(&self) -> &ColorProfiles {
         &self.profiles
     }
-    pub(crate) fn sources(&self) -> Option<&Arc<CatalogueSources>> {
+    pub fn sources(&self) -> Option<&Arc<CatalogueSources>> {
         self.sources.as_ref()
     }
     pub(crate) fn svg_path(&self, symbol: &str) -> PathBuf {
@@ -166,7 +166,7 @@ pub(crate) fn valid_local_symbol(symbol: &str) -> bool {
 
 /// Resolve an overlay id to its registered source and local symbol id.
 /// None for plain ids, unregistered prefixes, or path-like local ids.
-pub(crate) fn resolve_overlay_symbol(id: &str) -> Option<(Arc<OverlaySymbolSource>, &str)> {
+pub fn resolve_overlay_symbol(id: &str) -> Option<(Arc<OverlaySymbolSource>, &str)> {
     let (prefix, local) = split_overlay_symbol_id(id)?;
     if !valid_local_symbol(local) {
         return None;

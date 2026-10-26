@@ -3,7 +3,7 @@ use ferrite_render::{
     Color, DrawingInstruction, GeoBounds, LineInstruction, LineStyle, RenderContext, Viewport,
     WorldPoint,
 };
-use ferrite_wgpu::WgpuRenderer;
+use ferrite_ui::WgpuRenderer;
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -61,7 +61,7 @@ impl ApplicationHandler for Live {
             .unwrap(),
         );
         let size = window.inner_size();
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         ctx.set_bounds(GeoBounds::new(0., 0., 10., 10.));

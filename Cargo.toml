@@ -13,7 +13,8 @@ members = [
     "crates/ferrite-feature-catalog",
     "crates/ferrite-portrayal-catalog",
     "crates/ferrite-render",
-    "crates/ferrite-wgpu",
+    "crates/ferrite-gpu",
+    "crates/ferrite-ui",
     "crates/ferrite-lua",
     "crates/ferrite-lua-runtime",
     "crates/ferrite-plugin-api",
@@ -77,6 +78,7 @@ resvg = "0.45"  # SVG rendering library
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = "0.31"
+epaint = "0.31"
 rfd = "0.15"  # Native file dialogs
 
 # Scripting
@@ -100,7 +102,8 @@ ferrite-security = { path = "crates/ferrite-security" }
 ferrite-feature-catalog = { path = "crates/ferrite-feature-catalog" }
 ferrite-portrayal-catalog = { path = "crates/ferrite-portrayal-catalog" }
 ferrite-render = { path = "crates/ferrite-render" }
-ferrite-wgpu = { path = "crates/ferrite-wgpu" }
+ferrite-gpu = { path = "crates/ferrite-gpu" }
+ferrite-ui = { path = "crates/ferrite-ui" }
 ferrite-lua = { path = "crates/ferrite-lua", default-features = false }
 ferrite-plugin-api = { path = "crates/ferrite-plugin-api" }
 ferrite-plugin-loader = { path = "crates/ferrite-plugin-loader" }
@@ -122,8 +125,8 @@ winres = "0.1"
 
 [features]
 default = ["lua54"]
-lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferrite-wgpu/lua54", "ferrite-engine/lua54"]
-lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-wgpu/lua55", "ferrite-engine/lua55"]
+lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferrite-gpu/lua54", "ferrite-ui/lua54", "ferrite-engine/lua54"]
+lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-gpu/lua55", "ferrite-ui/lua55", "ferrite-engine/lua55"]
 
 [dependencies]
 ferrite-engine.workspace = true
@@ -142,7 +145,8 @@ ferrite-feature-catalog.workspace = true
 ferrite-portrayal-catalog.workspace = true
 ferrite-s100-gml = { path = "crates/ferrite-s100-gml" }
 ferrite-render.workspace = true
-ferrite-wgpu = { workspace = true, features = ["s102-portrayal"] }
+ferrite-gpu = { workspace = true, features = ["s102-portrayal"] }
+ferrite-ui = { workspace = true, features = ["s102-portrayal"] }
 ferrite-lua.workspace = true
 ferrite-plugin-api.workspace = true
 ferrite-plugin-loader.workspace = true

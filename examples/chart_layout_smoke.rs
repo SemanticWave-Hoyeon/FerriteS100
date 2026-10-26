@@ -1,5 +1,6 @@
 //! Independent UI-panel geometry and pixel-density oracle on the native GPU.
-use ferrite_wgpu::{AppUiState, EguiIntegration, GpuState, PluginButton};
+use ferrite_gpu::GpuState;
+use ferrite_ui::{AppUiState, EguiIntegration, PluginButton};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -133,7 +134,11 @@ impl ApplicationHandler for Smoke {
             )
             .unwrap(),
         );
-        let state = pollster::block_on(GpuState::new(window.clone())).unwrap();
+        let state = pollster::block_on(GpuState::new(
+            window.clone().into(),
+            Arc::new(ferrite_ui::WinitSurface(window.clone())),
+        ))
+        .unwrap();
         let mut integration = EguiIntegration::new(&state.device, state.format(), 1, window);
         std::fs::create_dir_all(&self.out).unwrap();
         let mut checks = Vec::new();

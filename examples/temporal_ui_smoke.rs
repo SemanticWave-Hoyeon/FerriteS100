@@ -1,10 +1,10 @@
 //! Native GPU artifact rendering of time dialogs and chart text export.
 //! Does not emulate mouse/menu events or verify OS accessibility.
+use ferrite_gpu::SelectedFeature;
 use ferrite_render::{
     Color, DrawingInstruction, GeoBounds, RenderContext, TemporalView, TemporalViewMode,
     TextInstruction, Viewport, WorldPoint,
 };
-use ferrite_wgpu::{SelectedFeature, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -28,7 +28,7 @@ impl ApplicationHandler for Smoke {
         );
         let size = window.inner_size();
         let ppp = window.scale_factor() as f32;
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         let mut ctx = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         ctx.set_bounds(GeoBounds::new(0., 0., 10., 10.));
@@ -43,8 +43,9 @@ impl ApplicationHandler for Smoke {
         renderer
             .save_screenshot(self.output.join("chart-text.png"))
             .unwrap();
-        renderer.ui_state.chart_area = (0., 0., size.width as f32 / ppp, size.height as f32 / ppp);
-        renderer.ui_state.selected_feature = Some(SelectedFeature {
+        renderer.ui.ui_state.chart_area =
+            (0., 0., size.width as f32 / ppp, size.height as f32 / ppp);
+        renderer.ui.ui_state.selected_feature = Some(SelectedFeature {
             feature_type: "Selection export".into(),
             feature_id: 1,
             foid: None,
@@ -74,9 +75,9 @@ impl ApplicationHandler for Smoke {
                 .count()
                 > 200
         );
-        renderer.ui_state.selected_feature = None;
+        renderer.ui.ui_state.selected_feature = None;
         renderer.update_selection(&ctx.scaler);
-        renderer.ui_state.version = "Time UI regression".into();
+        renderer.ui.ui_state.version = "Time UI regression".into();
         for (index, mode) in [
             TemporalViewMode::Live,
             TemporalViewMode::Date,
@@ -97,15 +98,15 @@ impl ApplicationHandler for Smoke {
                 },
                 source_offset: "+09:00".into(),
             };
-            renderer.ui_state.show_temporal = true;
-            renderer.ui_state.pending_temporal_view = Some(view.clone());
+            renderer.ui.ui_state.show_temporal = true;
+            renderer.ui.ui_state.pending_temporal_view = Some(view.clone());
             let file = self.output.join(format!("dialog-{index}.png"));
             // egui first pass measures; second pass paints the same static state.
             renderer.save_screenshot_with_ui(&file).unwrap();
             renderer.save_screenshot_with_ui(&file).unwrap();
-            assert!(!renderer.ui_state.temporal_changed);
+            assert!(!renderer.ui.ui_state.temporal_changed);
             assert_eq!(
-                renderer.ui_state.pending_temporal_view.as_ref(),
+                renderer.ui.ui_state.pending_temporal_view.as_ref(),
                 Some(&view)
             );
         }

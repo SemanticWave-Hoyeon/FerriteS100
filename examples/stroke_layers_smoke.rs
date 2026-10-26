@@ -1,6 +1,5 @@
 //! PC/Lua -> S101 adapter -> native GPU proof for multiple stroke styles and transparency.
 use ferrite_render::{Color, DrawingInstruction, GeoBounds, RenderContext, Viewport, WorldPoint};
-use ferrite_wgpu::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -40,7 +39,7 @@ impl ApplicationHandler for App {
         );
         let density = w.scale_factor();
         let size = w.inner_size();
-        let mut renderer = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         renderer.background_color = Color::WHITE;
         let mut context = RenderContext::new(Viewport::new(
             size.width as f32 - 1.,

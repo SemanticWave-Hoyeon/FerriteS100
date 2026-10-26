@@ -1,7 +1,6 @@
 //! Real S-101 adapter and GPU text comparison with an independent geodesic basis.
 use ferrite_kernel::geodesy::{direct, GeographicPosition};
 use ferrite_render::*;
-use ferrite_wgpu::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -34,7 +33,7 @@ impl ApplicationHandler for App {
             )
             .unwrap(),
         );
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let cell = ferrite_s100_core::S101Cell::load(&self.cell).unwrap();
         let pc = ferrite_portrayal_catalog::PortrayalCatalogue::load(&self.pc).unwrap();

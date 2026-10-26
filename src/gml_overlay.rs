@@ -16,13 +16,13 @@
 use crate::ChartApp;
 use anyhow::Result;
 use chrono::Utc;
+use ferrite_gpu::CatalogueStatus;
 use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext};
 use ferrite_s100_gml::navwarn::{self, SortOrder, Status, UserClassification};
 use ferrite_s100_gml::{Product, Severity};
-use ferrite_wgpu::overlay_ui::{
+use ferrite_ui::overlay_ui::{
     ControlPointRow, NavwarnClassification, NavwarnPartRow, NavwarnRow, NavwarnSort, UkcPlanRow,
 };
-use ferrite_wgpu::CatalogueStatus;
 use std::path::{Path, PathBuf};
 
 pub(crate) use ferrite_engine::gml_overlay::{
@@ -34,15 +34,15 @@ pub(crate) use ferrite_engine::gml_overlay::{
 /// each loaded product portrayal catalogue.
 pub(crate) fn load_overlays(base: &Path) -> GmlOverlays {
     GmlOverlays::load(base, |id, bound| {
-        ferrite_wgpu::register_overlay_symbol_source(
+        ferrite_gpu::register_overlay_symbol_source(
             id,
-            ferrite_wgpu::OverlaySymbolSource::from_bound(bound),
+            ferrite_gpu::OverlaySymbolSource::from_bound(bound),
         )
     })
 }
 
 pub(crate) fn is_overlay_instruction(instruction: &DrawingInstruction) -> bool {
-    ferrite_wgpu::is_cellless_overlay_instruction(instruction)
+    ferrite_render::is_cellless_overlay_instruction(instruction)
         && instruction
             .feature_id()
             .is_some_and(|k| decode_key(k).is_some())
@@ -69,7 +69,7 @@ pub(crate) fn default_user_state_path(user: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FERRITE_NAVWARN_STATE_PATH") {
         return Some(PathBuf::from(path));
     }
-    if cfg!(test) || ferrite_wgpu::background_test::enabled() {
+    if cfg!(test) || ferrite_ui::background_test::enabled() {
         return None;
     }
     #[cfg(target_os = "windows")]
@@ -470,7 +470,7 @@ impl ChartApp {
                 Some((c[0], c[1]))
             })
             .unwrap_or((0.0, 0.0));
-        let selected = ferrite_wgpu::SelectedFeature {
+        let selected = ferrite_gpu::SelectedFeature {
             feature_type: pick.feature_type,
             feature_id: key,
             foid: pick.foid,
@@ -496,9 +496,9 @@ impl ChartApp {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        let requests = renderer.ui_state.overlays.take_requests();
-        let visibility = renderer.ui_state.overlay_visibility_requested.take();
-        let ui = &renderer.ui_state.overlays;
+        let requests = renderer.ui.ui_state.overlays.take_requests();
+        let visibility = renderer.ui.ui_state.overlay_visibility_requested.take();
+        let ui = &renderer.ui.ui_state.overlays;
         let options = (
             ui.plain_boundaries,
             ui.apply_scale_minimum,
@@ -598,7 +598,7 @@ impl ChartApp {
             .map(|d| d.id)
             .collect();
         if let Some(renderer) = &mut self.renderer {
-            let ui = &mut renderer.ui_state.overlays;
+            let ui = &mut renderer.ui.ui_state.overlays;
             ui.messages = messages;
             ui.missing = missing;
             ui.new_count = new_count;
@@ -610,7 +610,7 @@ impl ChartApp {
             ui.show_information = g.policy.show_information;
             ui.user_status = g.user_status();
             ui.lifecycle_time = lifecycle_time;
-            renderer.ui_state.overlay_hidden = hidden;
+            renderer.ui.ui_state.overlay_hidden = hidden;
         }
     }
 
@@ -618,8 +618,8 @@ impl ChartApp {
     pub(crate) fn overlay_tree(
         &self,
     ) -> (
-        Vec<ferrite_wgpu::DatasetProductLayer>,
-        Vec<ferrite_wgpu::DatasetCatalogueLayer>,
+        Vec<ferrite_ui::DatasetProductLayer>,
+        Vec<ferrite_ui::DatasetCatalogueLayer>,
     ) {
         let g = &self.gml_overlays;
         let mut layers = Vec::new();
@@ -636,8 +636,8 @@ impl ChartApp {
                         .iter()
                         .filter(|i| i.severity == Severity::Error)
                         .count();
-                    ferrite_wgpu::DatasetLayerEntry {
-                        id: ferrite_wgpu::DatasetLayerId::Overlay {
+                    ferrite_ui::DatasetLayerEntry {
+                        id: ferrite_ui::DatasetLayerId::Overlay {
                             product: id.into(),
                             id: d.id,
                         },
@@ -664,7 +664,7 @@ impl ChartApp {
                 .collect();
             let c = g.catalogues(product);
             match c {
-                Some(c) => catalogues.push(ferrite_wgpu::DatasetCatalogueLayer {
+                Some(c) => catalogues.push(ferrite_ui::DatasetCatalogueLayer {
                     product: id.into(),
                     fc: c.fc_status.clone(),
                     pc: c.pc_status.clone(),
@@ -679,7 +679,7 @@ impl ChartApp {
                             .cloned(),
                         ..Default::default()
                     };
-                    catalogues.push(ferrite_wgpu::DatasetCatalogueLayer {
+                    catalogues.push(ferrite_ui::DatasetCatalogueLayer {
                         product: id.into(),
                         fc: failed.clone(),
                         pc: failed,
@@ -689,7 +689,7 @@ impl ChartApp {
             if files.is_empty() {
                 continue;
             }
-            layers.push(ferrite_wgpu::DatasetProductLayer {
+            layers.push(ferrite_ui::DatasetProductLayer {
                 product: id.into(),
                 fc: c
                     .map(|c| format!("FC {} · {}", c.fc_status.version, c.fc_status.path))
@@ -1155,7 +1155,7 @@ mod tests {
             })
             .expect("S-124 point symbol");
         let pick = g.describe(key).unwrap();
-        let feature = ferrite_wgpu::SelectedFeature {
+        let feature = ferrite_gpu::SelectedFeature {
             feature_type: pick.feature_type,
             feature_id: key,
             foid: pick.foid,
@@ -1168,14 +1168,14 @@ mod tests {
             definition: pick.definition,
             symbol_name: Some(symbol),
         };
-        let source = ferrite_wgpu::overlay_symbol_source("S-124").unwrap();
+        let source = ferrite_gpu::overlay_symbol_source("S-124").unwrap();
         let active = source
             .profiles()
             .get_default()
             .or_else(|| source.profiles().profiles.values().next())
             .unwrap()
             .clone();
-        let preview = ferrite_wgpu::prepare_overlay_symbol_preview(&feature, &active)
+        let preview = ferrite_ui::prepare_overlay_symbol_preview(&feature, &active)
             .unwrap()
             .expect("overlay preview");
         assert!(preview.matches(&feature, &active.id));

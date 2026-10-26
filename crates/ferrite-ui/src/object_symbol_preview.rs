@@ -264,7 +264,7 @@ pub fn prepare_overlay_symbol_preview(
             "Selected symbol preview identity budget rejected".into(),
         ));
     }
-    let (source, _) = crate::overlay_symbols::resolve_overlay_symbol(name).ok_or_else(|| {
+    let (source, _) = ferrite_gpu::resolve_overlay_symbol(name).ok_or_else(|| {
         WgpuError::Render(format!("Overlay symbol source not registered: {name}"))
     })?;
     let (background, background_token) =

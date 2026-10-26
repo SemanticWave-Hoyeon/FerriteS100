@@ -3,7 +3,6 @@ use ferrite_render::{
     Color, DrawingInstruction, FlatProjection, GeoBounds, LineInstruction, LineStyle,
     RenderContext, Viewport, WorldPoint,
 };
-use ferrite_wgpu::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -26,7 +25,7 @@ impl ApplicationHandler for App {
             .unwrap(),
         );
         let size = w.inner_size();
-        let mut renderer = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         renderer.background_color = Color::WHITE;
         std::fs::create_dir_all(&self.out).unwrap();
         let mut rows = Vec::new();

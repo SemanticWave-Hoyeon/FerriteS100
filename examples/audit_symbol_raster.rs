@@ -1,7 +1,7 @@
 //! Cold catalogue raster audit; logs identify library warnings per symbol.
 use anyhow::{Context, Result};
+use ferrite_gpu::SymbolCache;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
-use ferrite_wgpu::SymbolCache;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 fn main() -> Result<()> {

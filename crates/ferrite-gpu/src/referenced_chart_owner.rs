@@ -1,4 +1,7 @@
 //! Owner-private text atlas. No UI Context clone/font mutation or global reference aliases.
+use crate::chart_text_backend::{
+    ChartFontContext, ChartTextAtlas, FontPassInput, FontPassOutput, PrivateFontSpec,
+};
 use crate::{Result, WgpuError};
 use ferrite_portrayal_catalog::BoundFontReference;
 use std::collections::BTreeMap;
@@ -14,8 +17,8 @@ const MAX_DELTA_BYTES: usize = 32 * 1024 * 1024;
 fn bad(s: impl Into<String>) -> WgpuError {
     WgpuError::Render(s.into())
 }
-pub(crate) fn font_family(font: &BoundFontReference) -> egui::FontFamily {
-    egui::FontFamily::Name(font.render_family_name().clone())
+pub(crate) fn font_family(font: &BoundFontReference) -> epaint::FontFamily {
+    epaint::FontFamily::Name(font.render_family_name().clone())
 }
 /// Charge complete distinct set BEFORE owned copies/backend parse. Snapshot already retained.
 fn font_inventory<'a>(
@@ -72,11 +75,11 @@ pub(crate) fn validate_all_text<'a>(
 pub(crate) struct ReferencedChartOwner {
     preparation_identity: std::sync::Arc<()>,
     atlas_generation: u64,
-    pub(crate) context: egui::Context,
-    atlas: egui_wgpu::Renderer,
+    pub(crate) context: std::sync::Arc<dyn ChartFontContext>,
+    atlas: Box<dyn ChartTextAtlas>,
     fonts: BTreeMap<FontKey, (BoundFontReference, ab_glyph::FontArc)>,
-    pending: egui::TexturesDelta,
-    raw: egui::RawInput,
+    pending: epaint::textures::TexturesDelta,
+    raw: FontPassInput,
     ppp: f32,
     side: usize,
     extent: [u32; 2],
@@ -88,7 +91,7 @@ impl ReferencedChartOwner {
     pub(crate) fn prepare<'a>(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        source: &egui::Context,
+        source: &dyn ChartFontContext,
         extent: [u32; 2],
         density: f32,
         requests: impl IntoIterator<Item = (&'a BoundFontReference, &'a str)>,
@@ -120,27 +123,22 @@ impl ReferencedChartOwner {
             );
             prepared.install(&mut definitions);
         }
-        let context = egui::Context::default();
-        context.options_mut(|o| *o = source.options(Clone::clone));
-        context.set_zoom_factor(zoom);
-        context.set_fonts(definitions);
+        let context: std::sync::Arc<dyn ChartFontContext> = source
+            .new_private(PrivateFontSpec {
+                zoom_factor: zoom,
+                fonts: definitions,
+            })
+            .into();
         let side = MAX_ATLAS_SIDE.min(device.limits().max_texture_dimension_2d as usize);
         if side == 0 {
             return Err(bad("Device has no referenced font atlas capacity"));
         }
-        let mut raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(extent[0] as f32 / density, extent[1] as f32 / density),
-            )),
+        let raw = FontPassInput {
+            screen_size_points: Some([extent[0] as f32 / density, extent[1] as f32 / density]),
             max_texture_side: Some(side),
-            ..Default::default()
+            native_pixels_per_point: Some(density),
         };
-        raw.viewports
-            .entry(context.viewport_id())
-            .or_default()
-            .native_pixels_per_point = Some(density);
-        context.begin_pass(raw.clone());
+        context.begin_pass(&raw);
         if context.pixels_per_point().to_bits() != ppp.to_bits() {
             return Err(bad("Referenced chart font DPI differs from active layout"));
         }
@@ -148,8 +146,8 @@ impl ReferencedChartOwner {
             preparation_identity: std::sync::Arc::new(()),
             atlas_generation: 0,
             fonts: retained_fonts,
+            atlas: source.new_atlas(device, format),
             context,
-            atlas: egui_wgpu::Renderer::new(device, format, None, 1, false),
             pending: Default::default(),
             raw,
             ppp,
@@ -199,7 +197,7 @@ impl ReferencedChartOwner {
         Ok(true)
     }
     pub(crate) fn begin_metrics(&self) {
-        self.context.begin_pass(self.raw.clone());
+        self.context.begin_pass(&self.raw);
     }
     /// End metrics pass before exposing owner; validate without any live/GPU writes.
     pub(crate) fn end_metrics(&mut self) -> Result<()> {
@@ -215,15 +213,15 @@ impl ReferencedChartOwner {
                 "Referenced chart fonts require fresh view/DPI preparation",
             ));
         }
-        self.context.begin_pass(self.raw.clone());
+        self.context.begin_pass(&self.raw);
         Ok(())
     }
     pub(crate) fn end_display(&mut self) -> Result<()> {
         let output = self.context.end_pass();
         self.accept_output(output)
     }
-    fn accept_output(&mut self, output: egui::FullOutput) -> Result<()> {
-        if self.context.fonts(|fonts| fonts.font_atlas_fill_ratio()) >= 0.8 {
+    fn accept_output(&mut self, output: FontPassOutput) -> Result<()> {
+        if self.context.font_atlas_fill_ratio() >= 0.8 {
             return Err(bad(
                 "Referenced chart atlas requires larger admitted capacity",
             ));
@@ -260,20 +258,19 @@ impl ReferencedChartOwner {
     pub(crate) fn preparation_identity(&self) -> (&std::sync::Arc<()>, u64) {
         (&self.preparation_identity, self.atlas_generation)
     }
-    pub(crate) fn bind_group(&self, id: egui::TextureId) -> Result<wgpu::BindGroup> {
+    pub(crate) fn bind_group(&self, id: epaint::TextureId) -> Result<wgpu::BindGroup> {
         self.atlas
-            .texture(&id)
-            .map(|texture| texture.bind_group.clone())
+            .bind_group(id)
             .ok_or_else(|| bad("Referenced chart atlas binding missing"))
     }
 }
 fn validate_delta<'a>(
-    deltas: impl IntoIterator<Item = &'a (egui::TextureId, egui::epaint::ImageDelta)>,
+    deltas: impl IntoIterator<Item = &'a (epaint::TextureId, epaint::ImageDelta)>,
     side: usize,
 ) -> Result<()> {
     let mut bytes = 0usize;
     for (id, delta) in deltas {
-        if *id != egui::TextureId::Managed(0) {
+        if *id != epaint::TextureId::Managed(0) {
             return Err(bad("Unexpected referenced chart texture namespace"));
         }
         let size = delta.image.size();
@@ -314,13 +311,13 @@ mod tests {
     }
     #[test]
     fn unknown_texture_and_oversize_rejected_before_upload() {
-        let delta = egui::epaint::ImageDelta::full(
-            egui::ColorImage::new([2, 2], egui::Color32::WHITE),
-            egui::TextureOptions::LINEAR,
+        let delta = epaint::ImageDelta::full(
+            epaint::ColorImage::new([2, 2], epaint::Color32::WHITE),
+            epaint::textures::TextureOptions::LINEAR,
         );
-        assert!(validate_delta([&(egui::TextureId::User(0), delta.clone())], 2).is_err());
-        assert!(validate_delta([&(egui::TextureId::Managed(0), delta.clone())], 1).is_err());
-        assert!(validate_delta([&(egui::TextureId::Managed(0), delta)], 2).is_ok());
+        assert!(validate_delta([&(epaint::TextureId::User(0), delta.clone())], 2).is_err());
+        assert!(validate_delta([&(epaint::TextureId::Managed(0), delta.clone())], 1).is_err());
+        assert!(validate_delta([&(epaint::TextureId::Managed(0), delta)], 2).is_ok());
     }
 }
 

@@ -6,7 +6,7 @@ pub(crate) fn default_history_path() -> PathBuf {
     if let Some(path) = std::env::var_os("FERRITE_S101_HISTORY_PATH") {
         return PathBuf::from(path);
     }
-    if cfg!(test) || ferrite_wgpu::background_test::enabled() {
+    if cfg!(test) || ferrite_ui::background_test::enabled() {
         return std::env::temp_dir()
             .join(format!("ferrite-s101-history-{}", std::process::id()))
             .join("history.json");

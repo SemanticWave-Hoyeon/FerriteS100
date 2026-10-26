@@ -162,12 +162,12 @@ fn policy_bits(settings: VectorEmissionSettings) -> [u32; 8] {
     ]
 }
 impl ExpectedPublishedVector {
-    pub(super) fn capture(renderer: &WgpuRenderer) -> Self {
+    pub(super) fn capture<U: UiLayer>(renderer: &WgpuRenderer<U>) -> Self {
         let size = renderer.state.window.inner_size();
         Self {
             policy: policy_bits(renderer.vector_emission_settings()),
-            ui_settings: renderer.ui_state.settings.clone(),
-            ui_profile: renderer.ui_state.color_profile.clone(),
+            ui_settings: renderer.ui.settings().clone(),
+            ui_profile: renderer.ui.color_profile().to_owned(),
             window_extent: [size.width, size.height],
             cpu_owner: Arc::clone(&renderer.vector_emission.vector_frame.frame_cpu.owner),
             scene_epoch: renderer.vector_scene_epoch.clone(),
@@ -194,12 +194,12 @@ impl ExpectedPublishedVector {
             instance: renderer.pipelines.symbol_instance_pipeline.clone(),
         }
     }
-    pub(super) fn matches(&self, renderer: &WgpuRenderer) -> bool {
+    pub(super) fn matches<U: UiLayer>(&self, renderer: &WgpuRenderer<U>) -> bool {
         let size = renderer.state.window.inner_size();
         self.scene_epoch.matches(&renderer.vector_scene_epoch)
             && self.policy == policy_bits(renderer.vector_emission_settings())
-            && self.ui_settings == renderer.ui_state.settings
-            && self.ui_profile == renderer.ui_state.color_profile
+            && self.ui_settings == *renderer.ui.settings()
+            && self.ui_profile == renderer.ui.color_profile()
             && self.window_extent == [size.width, size.height]
             && Arc::ptr_eq(
                 &self.cpu_owner,
@@ -264,7 +264,7 @@ impl ReadyVectorGpuFrame {
         self.gpu.symbols.len()
     }
 }
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     pub fn prepare_private_single_pc_vector_gpu(
         &self,
         prepared: PreparedSinglePcVectorEmission,
@@ -299,11 +299,13 @@ impl WgpuRenderer {
             return Err(bad("Private vector viewport is unavailable"));
         }
         validate_frame(&prepared)?;
-        let metrics = prepared.environment.private_metric_source(&self.egui.ctx)?;
+        let metrics = prepared
+            .environment
+            .private_metric_source(self.ui.fonts())?;
         let mut services = EmissionServices {
             state: &self.state,
             pipelines: &self.pipelines,
-            fonts: EmissionFonts::Private(&metrics),
+            fonts: EmissionFonts::Private(metrics.as_ref()),
             cpu_profiler: None,
             overscale_program_reuse: &self.overscale_program_reuse,
             symbol_scale: prepared.settings.symbol_scale,
@@ -653,8 +655,8 @@ fn validate_frame(prepared: &PreparedVectorEmission) -> Result<()> {
     }
     Ok(())
 }
-fn private_line(
-    renderer: &WgpuRenderer,
+fn private_line<U: UiLayer>(
+    renderer: &WgpuRenderer<U>,
     emission: &mut VectorEmissionOwned,
     charge: &mut BufferCharge,
 ) -> Result<(
@@ -732,8 +734,8 @@ fn private_line(
         None,
     ))
 }
-fn private_symbols(
-    renderer: &WgpuRenderer,
+fn private_symbols<U: UiLayer>(
+    renderer: &WgpuRenderer<U>,
     emission: &VectorEmissionOwned,
     services: &mut EmissionServices<'_>,
     charge: &mut BufferCharge,
@@ -822,8 +824,8 @@ fn private_symbols(
     }
     Ok((batches, quad))
 }
-fn private_text(
-    renderer: &WgpuRenderer,
+fn private_text<U: UiLayer>(
+    renderer: &WgpuRenderer<U>,
     emission: &mut VectorEmissionOwned,
     services: &mut EmissionServices<'_>,
     charge: &mut BufferCharge,
@@ -852,7 +854,7 @@ fn private_text(
     owner.upload(&renderer.state.device, &renderer.state.queue)?;
     let mut groups = std::collections::BTreeMap::<
         (CompositionPlane, i32, Option<usize>, u8),
-        Vec<egui::epaint::ClippedShape>,
+        Vec<epaint::ClippedShape>,
     >::new();
     for (plane, priority, source, wrap, shape) in shapes {
         groups
@@ -867,7 +869,7 @@ fn private_text(
     for ((plane, priority, source, wrap_pass), shapes) in groups {
         for job in owner.context.tessellate(shapes, ppp) {
             match job.primitive {
-                egui::epaint::Primitive::Mesh(mesh) => {
+                epaint::Primitive::Mesh(mesh) => {
                     if mesh.indices.is_empty() {
                         continue;
                     }
@@ -913,7 +915,7 @@ fn private_text(
                         index_count: mesh.indices.len() as u32,
                     });
                 }
-                egui::epaint::Primitive::Callback(_) => {
+                epaint::Primitive::Callback(_) => {
                     return Err(bad("Private chart text callback unsupported"))
                 }
             }
@@ -1043,10 +1045,10 @@ pub struct PrivateVectorReadback {
     pub samples: u32,
 }
 impl ReadyVectorGpuFrame {
-    fn draw_scene<'a>(
+    fn draw_scene<'a, U: UiLayer>(
         &'a self,
-        renderer: &'a WgpuRenderer,
-    ) -> super::vector_scene_draw::VectorDrawScene<'a> {
+        renderer: &'a WgpuRenderer<U>,
+    ) -> super::vector_scene_draw::VectorDrawScene<'a, U> {
         use super::vector_scene_draw::{PairRef, VectorDrawScene};
         let g = &self.gpu;
         VectorDrawScene {
@@ -1135,7 +1137,7 @@ fn readback_layout(
             .map_err(|_| bad("Private offscreen host capacity overflow"))?,
     })
 }
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     /// Explicit blocking GPU audit; never called by normal render/prepare. Uses wholly private attachments.
     /// The borrowed Ready owner survives all encoding/readback. No publication or old-scene repair occurs.
     /// Explicit blocking audit of the sealed SinglePc wrapper; never normal rendering.
@@ -1227,7 +1229,7 @@ impl WgpuRenderer {
 
     fn audit_vector_scene(
         &self,
-        scene: super::vector_scene_draw::VectorDrawScene<'_>,
+        scene: super::vector_scene_draw::VectorDrawScene<'_, U>,
         retained: Option<&crate::retained_world_area::RetainedWorldAreas>,
     ) -> Result<PrivateVectorReadback> {
         if !crate::background_test::enabled()
@@ -1584,7 +1586,7 @@ fn require_vector_activation_scope(
     }
     Ok(())
 }
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     /// Renderer-only, current-camera/current-policy activation boundary.
     /// All fallible preparation and expected-old checks precede any displayed owner move.
     /// No public unchecked commit, UI font setter, GPU upload, scene repair or raster activation.
@@ -1642,8 +1644,8 @@ impl WgpuRenderer {
                     || self.continuous_layer_count != 0
                     || self.continuous_frame.is_some()),
             self.native_route_gpu.is_some(),
-            self.ui_state.selected_feature.is_some()
-                || !self.ui_state.selection_candidates.is_empty()
+            self.ui.selected_feature().is_some()
+                || self.ui.has_selection_candidates()
                 || self.vector_emission.vector_frame.selection_anchor.is_some()
                 || !self
                     .vector_emission
@@ -1659,13 +1661,13 @@ impl WgpuRenderer {
         )?;
         match &candidate.prepared.resources {
             PrivateVectorResources::OwnedCells(resources) => require_current_vector_palettes(
-                &self.ui_state.color_profile,
+                self.ui.color_profile(),
                 resources
                     .cell_profiles()
                     .map(|(_, profile)| profile.id.as_str()),
             )?,
             PrivateVectorResources::SinglePc(resources) => require_current_vector_palettes(
-                &self.ui_state.color_profile,
+                self.ui.color_profile(),
                 std::iter::once(resources.profile().id.as_str()),
             )?,
         }
@@ -1903,7 +1905,7 @@ impl WgpuRenderer {
                 deep_contour: current.deep_contour,
                 four_shades: !current.two_shades,
             };
-            if target.profile != self.ui_state.color_profile
+            if target.profile != self.ui.color_profile()
                 || key(target.settings) != key(current_depth)
             {
                 return Err(bad(
@@ -2099,7 +2101,7 @@ pub struct PreparedTargetVectorRaster {
     s102_target: Option<BoundS102Target>,
 }
 pub struct PreparedTargetSinglePcVectorRaster(PreparedTargetVectorRaster);
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     pub fn prepare_target_vector_raster_publication(
         &self,
         vector: ReadyVectorGpuFrame,
@@ -2330,7 +2332,7 @@ impl PreparedTargetSinglePcVectorRaster {
         self.0.target_emission_settings()
     }
 }
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     #[cfg(feature = "s102-portrayal")]
     #[expect(
         clippy::too_many_arguments,
@@ -2415,7 +2417,7 @@ fn validate_target_zoom(zoom: f64) -> Result<()> {
     }
     Ok(())
 }
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     fn validate_target_activation_scope(
         &self,
         candidate: &PreparedTargetVectorRaster,
@@ -2425,8 +2427,8 @@ impl WgpuRenderer {
         require_vector_activation_scope(
             false,
             self.native_route_gpu.is_some(),
-            self.ui_state.selected_feature.is_some()
-                || !self.ui_state.selection_candidates.is_empty()
+            self.ui.selected_feature().is_some()
+                || self.ui.has_selection_candidates()
                 || self.vector_emission.vector_frame.selection_anchor.is_some()
                 || !self
                     .vector_emission
@@ -2543,9 +2545,8 @@ impl WgpuRenderer {
         // call setters after installation: they invalidate the newly installed epoch.
         let next_raster_epoch = Arc::new(());
         let ruler = self
-            .ui_state
-            .coordinate_ruler_scaler
-            .as_ref()
+            .ui
+            .coordinate_ruler_scaler()
             .map(|_| candidate.context().scaler.clone());
         let frame = &candidate
             .installation
@@ -2573,8 +2574,8 @@ impl WgpuRenderer {
                             ]
                     })
                     .and_then(|a| {
-                        a.reference().map(|reference| {
-                            crate::egui_integration::CoverageScaleIndication {
+                        a.reference()
+                            .map(|reference| crate::CoverageScaleIndication {
                                 viewing_denominator: a.viewing_denominator,
                                 overscale_factor: reference.state.factor,
                                 physical_viewport: viewport,
@@ -2583,8 +2584,7 @@ impl WgpuRenderer {
                                     .get(&reference.dataset_id)
                                     .copied()
                                     .or(frame.coverage_scale_colour),
-                            }
-                        })
+                            })
                     })
             });
         self.validate_target_activation_scope(&candidate)?;
@@ -2614,14 +2614,14 @@ impl WgpuRenderer {
         self.show_soundings = target.emission.show_soundings;
         self.animation_mode = target.emission.animation_mode;
         self.background_color = target.emission.background_color;
-        self.ui_state.settings = target.settings;
-        self.ui_state.color_profile = target.profile;
+        *self.ui.settings_mut() = target.settings;
+        *self.ui.color_profile_mut() = target.profile;
         self.zoom_level = zoom;
         // Zero retains the existing unknown-scale state for legacy producer metadata.
         self.compilation_scale = compilation_scale;
-        self.ui_state.zoom_level = zoom;
-        self.ui_state.coordinate_ruler_scaler = ruler;
-        self.ui_state.coverage_scale_indication = indication;
+        self.ui.set_zoom_level(zoom);
+        self.ui.set_coordinate_ruler_scaler(ruler);
+        self.ui.set_coverage_scale_indication(indication);
         Ok(installed)
     }
 }

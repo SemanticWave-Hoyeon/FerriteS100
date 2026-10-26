@@ -1,6 +1,7 @@
 //! Native resource transaction regression; no continuous numerical certificate.
+use ferrite_gpu::PreparedRasterMaterialBatch;
 use ferrite_render::{Color, GeoBounds, RasterLayer, RasterMaterialLayer, RenderContext, Viewport};
-use ferrite_wgpu::{PreparedRasterMaterialBatch, WgpuRenderer};
+use ferrite_ui::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -37,15 +38,15 @@ fn capture(r: &mut WgpuRenderer, path: &std::path::Path) -> Vec<u8> {
 }
 impl ApplicationHandler for Smoke {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        assert!(ferrite_wgpu::background_test::enabled());
-        let attrs = ferrite_wgpu::background_test::window_attributes(
+        assert!(ferrite_ui::background_test::enabled());
+        let attrs = ferrite_ui::background_test::window_attributes(
             Window::default_attributes().with_inner_size(PhysicalSize::new(960, 640)),
         );
         let window = Arc::new(el.create_window(attrs.clone()).unwrap());
         assert_eq!(window.is_visible(), Some(false));
         assert!(!window.has_focus());
         let size = window.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         r.background_color = Color::WHITE;
         let mut c = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         c.set_bounds(GeoBounds::new(0., 0., 10., 10.));
@@ -89,7 +90,7 @@ impl ApplicationHandler for Smoke {
             capture(&mut r, &self.out.join("stale-inventory.png"))
         );
         let other_window = Arc::new(el.create_window(attrs).unwrap());
-        let other = pollster::block_on(WgpuRenderer::new(other_window)).unwrap();
+        let other = pollster::block_on(ferrite_ui::create_renderer(other_window)).unwrap();
         let batch = stage(&mut r, &c);
         assert!(other
             .prepare_raster_material_publication(batch, true, None)
@@ -128,7 +129,7 @@ impl ApplicationHandler for Smoke {
 }
 fn main() {
     let mut builder = EventLoop::builder();
-    ferrite_wgpu::background_test::configure_event_loop(&mut builder);
+    ferrite_ui::background_test::configure_event_loop(&mut builder);
     builder
         .build()
         .unwrap()

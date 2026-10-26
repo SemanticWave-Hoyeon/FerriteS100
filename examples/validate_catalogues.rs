@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::FeatureCatalogue;
+use ferrite_gpu::SymbolCache;
 use ferrite_lua::{PortrayalEngine, TypeCatalogue};
 use ferrite_portrayal_catalog::PortrayalCatalogue;
-use ferrite_wgpu::SymbolCache;
 use std::path::PathBuf;
 fn main() -> Result<()> {
     let root = PathBuf::from(std::env::args().nth(1).context("Pass catalogue root")?);

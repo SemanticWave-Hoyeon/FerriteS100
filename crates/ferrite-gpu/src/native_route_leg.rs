@@ -21,22 +21,24 @@ pub struct NativeRouteLegDeclaration {
     pub source_gml_id: String,
     pub original_geometry_text: String,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! { static SOLVER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(test)]
-pub(crate) fn solver_call_count() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn solver_call_count() -> usize {
     SOLVER_CALLS.with(|count| count.get())
 }
 /// Return a continuous drawing longitude sheet; canonical original endpoints
 /// remain outside this transient copy. Endpoint latitude and lifted longitude
 /// are exact, and interiors use the existing WGS84 solvers.
-pub(crate) fn sample_leg(
+#[doc(hidden)]
+pub fn sample_leg(
     start: [f64; 2],
     end: [f64; 2],
     geometry: NativeRouteLegGeometry,
     max_vertices: usize,
 ) -> Result<Vec<[f64; 2]>, String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     SOLVER_CALLS.with(|count| count.set(count.get() + 1));
     let a = GeographicPosition::new(start[1], start[0]).map_err(|e| e.to_string())?;
     let b = GeographicPosition::new(end[1], end[0]).map_err(|e| e.to_string())?;

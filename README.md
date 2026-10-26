@@ -167,7 +167,8 @@ crates/ferrite-kernel/        Product-independent geometry and geodesy
 crates/ferrite-lua/           S-100 Lua host and portrayal rules
 crates/ferrite-lua-runtime/   Build-time Lua interpreter selection
 crates/ferrite-render/        Rendering instructions and geometry
-crates/ferrite-wgpu/          GPU renderer and egui integration
+crates/ferrite-gpu/           GPU renderer (no windowing or GUI toolkit)
+crates/ferrite-ui/            egui panels, winit host and overlay compositing
 crates/ferrite-mcp/           Built-in S-100 MCP service
 crates/ferrite-security/      Exchange-set authentication
 crates/ferrite-secom/         SECOM receive client

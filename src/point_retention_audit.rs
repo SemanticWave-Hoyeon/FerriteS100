@@ -70,7 +70,7 @@ fn official_groups(
 impl ChartApp {
     pub(super) fn audit_point_retention(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden point audit required"
         );
         self.ensure_navigation_scene()?;

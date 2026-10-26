@@ -634,3 +634,18 @@ mod northing_source_conversion_tests {
         }
     }
 }
+
+/// Overlay-product instruction (S-124, S-129, ...): appended without a source
+/// cell and exempt from ENC coverage. Such instructions have no cell PC owner;
+/// they are drawn with the designated overlay owner (the owner of the lowest
+/// bound cell, which only selects the palette name and hosts the cache —
+/// namespaced `<prefix>/<id>` symbols resolve from the registered overlay
+/// source) and are not restricted by any cell's viewing-group selection.
+/// Instructions that carry a cell index are never treated as overlays.
+pub fn is_cellless_overlay_instruction(instruction: &crate::DrawingInstruction) -> bool {
+    instruction.cell_index().is_none()
+        && matches!(
+            instruction.portrayal_origin(),
+            PortrayalOrigin::CoverageExempt
+        )
+}

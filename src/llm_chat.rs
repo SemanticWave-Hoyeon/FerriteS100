@@ -11,7 +11,7 @@
 //!   configuration files are never written.
 //! - Output, prompt size and run time are bounded; Stop, window close, service stop and app
 //!   exit kill the whole process group and reap it.
-use ferrite_wgpu::llm_chat_ui::{self, Provider, Role, Status};
+use ferrite_ui::llm_chat_ui::{self, Provider, Role, Status};
 use serde_json::Value;
 use std::{
     ffi::{OsStr, OsString},
@@ -1274,7 +1274,7 @@ impl super::ChartApp {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
-        let state = &mut renderer.ui_state;
+        let state = &mut renderer.ui.ui_state;
         let enabled = state.s100_mcp.enabled;
         if !enabled
             && !state.llm_chat.open
@@ -1303,7 +1303,7 @@ impl super::ChartApp {
         );
         let show = chat.show_position.take();
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.llm_chat = chat;
+            renderer.ui.ui_state.llm_chat = chat;
         }
         if let Some([lat, lon]) = show {
             self.show_chat_position(lat, lon);
@@ -1327,8 +1327,8 @@ impl super::ChartApp {
         // Put the position in the middle of the chart area the chat window
         // leaves uncovered, rather than behind the window.
         let target = self.renderer.as_ref().and_then(|r| {
-            let (x, y, w, h) = r.ui_state.chart_area;
-            let [left, _, right, _] = r.ui_state.llm_chat.window_rect?;
+            let (x, y, w, h) = r.ui.ui_state.chart_area;
+            let [left, _, right, _] = r.ui.ui_state.llm_chat.window_rect?;
             let (free_left, free_right) = ((left - x).max(0.), (x + w - right).max(0.));
             let tx = if free_left.max(free_right) < 160. {
                 return None;

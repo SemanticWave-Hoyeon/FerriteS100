@@ -1,13 +1,15 @@
 [package]
-name = "ferrite-wgpu"
+name = "ferrite-gpu"
 version.workspace = true
 edition.workspace = true
-description = "wgpu-based renderer for S-100 charts"
+description = "wgpu renderer for S-100 charts, independent of windowing and GUI toolkits"
 
 [features]
 s102-portrayal = ["dep:ferrite-s102"]
 lua54 = ["ferrite-s102?/lua54"]
 lua55 = ["ferrite-s102?/lua55"]
+# Test-only hooks used by ferrite-ui tests.
+test-support = []
 
 [dependencies]
 ferrite-kernel.workspace = true
@@ -21,7 +23,6 @@ wgpu-profiler = "0.20"
 
 # Graphics
 wgpu.workspace = true
-winit.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
 image.workspace = true
@@ -29,18 +30,16 @@ lyon_tessellation = "=1.0.20"
 earcutr.workspace = true  # Polygon triangulation
 resvg.workspace = true  # SVG rendering
 
-# GUI
+# Chart text: shapes, galleys and font definitions. Layout contexts and atlas
+# uploads are supplied by the host through `ChartFontContext`.
 ab_glyph = "=0.2.32"
-egui.workspace = true
-egui-wgpu.workspace = true
-egui-winit.workspace = true
+epaint.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
 # Internal crates
 ferrite-render = { workspace = true }
 ferrite-portrayal-catalog = { workspace = true }
-ferrite-s421 = { path = "../ferrite-s421" }
 serde.workspace = true
 
 # Typed S102 material owner; preserve workspace-selected Lua backend.

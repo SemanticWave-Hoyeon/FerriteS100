@@ -1,5 +1,5 @@
 //! Bounded UI warning/error capture, including worker threads and DebugOFF.
-use ferrite_wgpu::diagnostics::{DiagnosticLevel, DiagnosticLog};
+use ferrite_ui::diagnostics::{DiagnosticLevel, DiagnosticLog};
 use std::fmt::{self, Write};
 use std::sync::{
     atomic::{AtomicU64, Ordering},

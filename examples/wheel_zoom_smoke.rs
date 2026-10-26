@@ -1,11 +1,11 @@
 //! Programmatic wheel calculation -> GPU zoom -> official PC symbol parity.
 #[path = "../src/navigation.rs"]
 mod navigation;
+use ferrite_gpu::SymbolCache;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{
     Color, DrawingInstruction, GeoBounds, PointInstruction, RenderContext, Viewport, WorldPoint,
 };
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -30,7 +30,7 @@ impl ApplicationHandler for App {
         );
         let density = w.scale_factor();
         let size = w.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let pc = PortrayalCatalogue::load(&self.pc).unwrap();
         let profile = pc.color_profiles.profiles.get("Day").unwrap();

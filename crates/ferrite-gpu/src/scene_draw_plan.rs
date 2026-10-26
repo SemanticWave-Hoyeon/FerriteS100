@@ -114,7 +114,10 @@ impl Cache {
             p.as_ref().expect("installed plan")
         }))
     }
-    pub(super) fn prepare<'a>(&'a self, scene: &VectorDrawScene<'_>) -> Option<Ref<'a, Plan>> {
+    pub(super) fn prepare<'a, U: UiLayer>(
+        &'a self,
+        scene: &VectorDrawScene<'_, U>,
+    ) -> Option<Ref<'a, Plan>> {
         if !self.enabled {
             return None;
         }
@@ -150,7 +153,9 @@ fn row(kind: u8, key: Key, ordinal: usize, start: usize, end: usize, source: Opt
         extra: [0; 6],
     }
 }
-fn rows<'a>(scene: &'a VectorDrawScene<'a>) -> impl Iterator<Item = Input<'a>> + Clone + 'a {
+fn rows<'a, U: UiLayer>(
+    scene: &'a VectorDrawScene<'a, U>,
+) -> impl Iterator<Item = Input<'a>> + Clone + 'a {
     let c = &scene.emission.vector_frame.frame_cpu;
     c.area_priority_ranges
         .iter()

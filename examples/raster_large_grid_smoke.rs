@@ -5,7 +5,6 @@ use ferrite_kernel::{CoverageSample, CoverageSource, GridGeometry, GridWindow};
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{Color, RenderContext, ScreenPoint, Viewport};
 use ferrite_s102::{hdf5, BathymetryCoverage, BathymetryPortrayal, DepthSettings};
-use ferrite_wgpu::WgpuRenderer;
 use hdf5::types::VarLenAscii;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
@@ -260,7 +259,7 @@ impl ApplicationHandler for Smoke {
         assert!(!w.is_visible().unwrap_or(true));
         assert!(!w.has_focus());
         let size = w.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(w.clone())).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w.clone())).unwrap();
         r.background_color = Color::WHITE;
         let limit = r.raster_texture_limit() as usize;
         let width = limit + 1;

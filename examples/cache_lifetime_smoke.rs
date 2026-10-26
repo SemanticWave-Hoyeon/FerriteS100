@@ -2,7 +2,6 @@
 use ferrite_render::{
     AreaInstruction, Color, DrawingInstruction, GeoBounds, RenderContext, Viewport, WorldPoint,
 };
-use ferrite_wgpu::WgpuRenderer;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -33,7 +32,7 @@ impl ApplicationHandler for Smoke {
             .unwrap(),
         );
         let size = window.inner_size();
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         std::fs::create_dir_all(&self.output).unwrap();
         let mut previous = HashMap::new();

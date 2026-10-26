@@ -1,7 +1,7 @@
 //! CPU-only real catalogue SVG asset proof; no Window/Surface/Device/EventLoop.
 use anyhow::{ensure, Context, Result};
+use ferrite_gpu::SymbolCache;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
-use ferrite_wgpu::SymbolCache;
 use sha2::{Digest, Sha256};
 fn main() -> Result<()> {
     let path = std::env::args_os()

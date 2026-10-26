@@ -1,7 +1,10 @@
 //! wgpu-based Renderer for S-100 Charts
 //!
 //! This crate provides GPU-accelerated rendering of S-100/S-101 charts
-//! using the wgpu graphics API (WebGPU).
+//! using the wgpu graphics API (WebGPU). It does not depend on a windowing or
+//! GUI toolkit: the host supplies the presentation surface ([`SurfaceHost`]),
+//! the chart text system ([`ChartFontContext`]) and the overlay compositor
+//! ([`UiLayer`]). `ferrite-ui` provides the egui/winit implementation.
 //!
 //! ## Architecture
 //!
@@ -14,18 +17,17 @@
 //!                      Area Renderer
 //! ```
 
-mod egui_integration;
-mod object_details;
-pub use object_details::{draw_selected_object_details, ObjectDetailSections};
 mod draw_range_index;
 mod error;
-mod native_route_leg;
-mod native_route_overlay;
+#[doc(hidden)]
+pub mod native_route_leg;
+#[doc(hidden)]
+pub mod native_route_overlay;
 pub use native_route_leg::{NativeRouteLegDeclaration, NativeRouteLegGeometry};
 mod area_candidates;
 mod area_index_upload_reuse;
 mod audit_buffer_export;
-mod chart_fonts;
+pub mod chart_fonts;
 mod emitter_wave_diagnostics;
 mod exact_line_quad;
 pub use area_index_upload_reuse::Work as AreaIndexUploadReuseWork;
@@ -49,7 +51,6 @@ mod symbol_cache;
 mod vertex;
 pub mod whole_motif;
 
-pub use egui_integration::*;
 pub use error::*;
 pub use pipeline::*;
 pub use profiler::*;
@@ -60,21 +61,25 @@ pub use symbol_cache::*;
 mod overlay_symbols;
 pub use overlay_symbols::{
     is_overlay_symbol_id, overlay_symbol_source, register_overlay_catalogue,
-    register_overlay_symbol_source, registered_overlay_prefixes, unregister_overlay_symbol_source,
-    OverlaySymbolSource,
+    register_overlay_symbol_source, registered_overlay_prefixes, resolve_overlay_symbol,
+    unregister_overlay_symbol_source, OverlaySymbolSource,
 };
 pub use vertex::*;
 
-/// Initialize wgpu for the given window
-pub async fn create_renderer(
-    window: std::sync::Arc<winit::window::Window>,
-) -> Result<WgpuRenderer> {
-    WgpuRenderer::new(window).await
-}
-
-mod coordinate_rulers;
-mod ui_chrome;
-mod ui_overlay_layout;
+/// Host-supplied chart text system (layout contexts and glyph atlases).
+pub mod chart_text_backend;
+pub use chart_text_backend::{
+    ChartFontContext, ChartTextAtlas, FontPassInput, FontPassOutput, PrivateFontSpec,
+};
+#[cfg(test)]
+mod test_text_backend;
+/// Host-supplied presentation surface and overlay compositor.
+pub mod ui_layer;
+pub use ferrite_render::host_settings::{CatalogueStatus, DisplayMode, SettingsState};
+pub use ui_layer::{
+    CoverageScaleIndication, DebugGpuStats, PhysicalSize, SelectedFeature, SelectionOverlay,
+    SurfaceHost, UiLayer,
+};
 
 pub mod screen_stroke;
 
@@ -86,7 +91,12 @@ pub mod coverage_pipeline;
 pub mod coverage_gpu_frame;
 
 /// Native diagnostics that leave the user desktop alone.
-pub mod background_test;
+pub mod background_test {
+    /// `FERRITE_BACKGROUND_TEST=1`: hidden native test presentation.
+    pub fn enabled() -> bool {
+        std::env::var_os("FERRITE_BACKGROUND_TEST").is_some_and(|v| v == "1")
+    }
+}
 
 mod symbol_instance;
 
@@ -100,10 +110,6 @@ mod raster_suppression;
 
 mod immutable_payload_cache;
 
-/// Bounded diagnostic log and view model for the external tracing adapter.
-pub mod diagnostics;
-pub use diagnostics::{DiagnosticEntry, DiagnosticLevel, DiagnosticLog, DiagnosticView};
-
 mod accepted_screen_line_packet;
 mod moving_line_northing;
 mod source_batch_parallel;
@@ -113,19 +119,11 @@ mod overscale_annotation;
 
 mod portrayal_resource_owners;
 pub use portrayal_resource_owners::{
-    is_cellless_overlay_instruction, CellPortrayalResourceBinding, CellPortrayalResources,
-    OwnedSymbolKey, PortrayalResourceOwner, ResolvedPortrayalResources,
+    CellPortrayalResourceBinding, CellPortrayalResources, OwnedSymbolKey, PortrayalResourceOwner,
+    ResolvedPortrayalResources,
 };
-
-mod dataset_catalogue_ui;
-pub use dataset_catalogue_ui::DatasetCatalogueBinding;
 
 mod coverage_trial;
-
-mod object_symbol_preview;
-pub use object_symbol_preview::{
-    prepare_overlay_symbol_preview, prepare_selected_symbol_preview, SelectedSymbolPreview,
-};
 
 mod static_line_bounds;
 
@@ -145,11 +143,3 @@ mod referenced_chart_owner;
 
 /// Bounded, explicitly scoped debug performance metrics.
 pub mod debug_metrics;
-
-mod route_turn_radius_ui;
-
-pub mod mcp_ui;
-
-/// Chat with locally installed LLM command-line clients.
-pub mod llm_chat_ui;
-pub mod overlay_ui;

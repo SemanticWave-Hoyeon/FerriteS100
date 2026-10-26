@@ -1,6 +1,6 @@
 //! Native overlapping A,B,A sprites must retain portrayal order through texture batching.
+use ferrite_gpu::SymbolCache;
 use ferrite_render::*;
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -36,7 +36,7 @@ impl ApplicationHandler for App {
         let size = w.inner_size();
         let density = w.scale_factor() as f32;
         let mm = (96. / 25.4) * density;
-        let mut renderer = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         renderer.background_color = Color::WHITE;
         let pc = ferrite_portrayal_catalog::PortrayalCatalogue::load(&self.pc).unwrap();
         let profile = pc.color_profiles.profiles.get("Day").unwrap();

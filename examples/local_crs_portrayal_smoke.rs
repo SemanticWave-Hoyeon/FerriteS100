@@ -1,11 +1,11 @@
 //! Actual flat renderer coverage bindings; synthetic geometry isolates each primitive.
+use ferrite_gpu::SymbolCache;
 use ferrite_kernel::{
     coverage_frame::CoverageFrame,
     coverage_selection::{CoverageFootprint, Region, SelectedCoverage, Selection},
     scale_policy::CoverageScaleRange,
 };
 use ferrite_render::*;
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -91,7 +91,7 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let density = window.scale_factor();
         let extent = [size.width, size.height];
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         renderer.set_lon_wrap_pixels(0.);
         let pc = ferrite_portrayal_catalog::PortrayalCatalogue::load(&self.pc).unwrap();

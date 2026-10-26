@@ -3,7 +3,7 @@
 //! state fields and event JSON as the egui controls; nothing here runs in an
 //! ordinary session.
 use anyhow::{ensure, Context, Result};
-use ferrite_wgpu::llm_chat_ui::{Role, Status};
+use ferrite_ui::llm_chat_ui::{Role, Status};
 use std::{
     path::Path,
     time::{Duration, Instant},
@@ -81,7 +81,7 @@ impl super::ChartApp {
             }
         }
         {
-            let ui = &mut self.renderer.as_mut().context("Renderer")?.ui_state;
+            let ui = &mut self.renderer.as_mut().context("Renderer")?.ui.ui_state;
             ui.s100_mcp.enabled = true;
             ui.s100_mcp.restart = true;
             ui.llm_chat.open = true;
@@ -90,11 +90,12 @@ impl super::ChartApp {
         self.audit_wait("MCP endpoint", Duration::from_secs(60), |app| {
             app.renderer
                 .as_ref()
-                .is_some_and(|r| !r.ui_state.s100_mcp.url.is_empty())
+                .is_some_and(|r| !r.ui.ui_state.s100_mcp.url.is_empty())
         })?;
         self.audit_wait("client detection", Duration::from_secs(90), |app| {
             app.renderer.as_ref().is_some_and(|r| {
-                r.ui_state.llm_chat.detected && r.ui_state.llm_chat.status != Status::Detecting
+                r.ui.ui_state.llm_chat.detected
+                    && r.ui.ui_state.llm_chat.status != Status::Detecting
             })
         })?;
         self.audit_capture(&output.join("detected.png"))?;
@@ -102,6 +103,7 @@ impl super::ChartApp {
             .renderer
             .as_ref()
             .unwrap()
+            .ui
             .ui_state
             .llm_chat
             .providers
@@ -127,7 +129,7 @@ impl super::ChartApp {
             .filter(|id| only.as_ref().is_none_or(|o| o == *id))
         {
             {
-                let chat = &mut self.renderer.as_mut().unwrap().ui_state.llm_chat;
+                let chat = &mut self.renderer.as_mut().unwrap().ui.ui_state.llm_chat;
                 if chat.selected.as_deref() != Some(id) {
                     chat.selected = Some(id.clone());
                 }
@@ -136,20 +138,20 @@ impl super::ChartApp {
             self.audit_frame()?;
             {
                 // The same request the Send button records.
-                let chat = &mut self.renderer.as_mut().unwrap().ui_state.llm_chat;
+                let chat = &mut self.renderer.as_mut().unwrap().ui.ui_state.llm_chat;
                 chat.input = prompt.clone();
                 chat.send = Some(std::mem::take(&mut chat.input).trim().to_owned());
             }
             self.audit_wait("reply start", Duration::from_secs(30), |app| {
                 app.renderer
                     .as_ref()
-                    .is_some_and(|r| r.ui_state.llm_chat.running())
+                    .is_some_and(|r| r.ui.ui_state.llm_chat.running())
             })?;
             self.audit_capture(&output.join(format!("{id}-running.png")))?;
             self.audit_wait("reply", Duration::from_secs(300), |app| {
                 app.renderer
                     .as_ref()
-                    .is_some_and(|r| !r.ui_state.llm_chat.running())
+                    .is_some_and(|r| !r.ui.ui_state.llm_chat.running())
             })?;
             self.audit_capture(&output.join(format!("{id}-reply.png")))?;
             // The same request the reply's first "Show on Chart" button records.
@@ -157,6 +159,7 @@ impl super::ChartApp {
                 .renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .llm_chat
                 .messages
@@ -164,7 +167,7 @@ impl super::ChartApp {
                 .rev()
                 .find(|m| m.role == Role::Assistant)
                 .and_then(|m| {
-                    ferrite_wgpu::llm_chat_ui::find_positions(&m.text)
+                    ferrite_ui::llm_chat_ui::find_positions(&m.text)
                         .into_iter()
                         .next()
                 });
@@ -172,6 +175,7 @@ impl super::ChartApp {
                 self.renderer
                     .as_mut()
                     .unwrap()
+                    .ui
                     .ui_state
                     .llm_chat
                     .show_position = Some([lat, lon]);
@@ -179,7 +183,7 @@ impl super::ChartApp {
                 self.update_chat_marker();
                 self.audit_capture(&output.join(format!("{id}-shown.png")))?;
             }
-            let chat = &self.renderer.as_ref().unwrap().ui_state.llm_chat;
+            let chat = &self.renderer.as_ref().unwrap().ui.ui_state.llm_chat;
             let reply = chat
                 .messages
                 .iter()
@@ -205,13 +209,13 @@ impl super::ChartApp {
             .find(|id| only.as_ref().is_none_or(|o| o == *id))
         {
             {
-                let chat = &mut self.renderer.as_mut().unwrap().ui_state.llm_chat;
+                let chat = &mut self.renderer.as_mut().unwrap().ui.ui_state.llm_chat;
                 chat.selected = Some(id.clone());
                 chat.new_conversation = true;
             }
             self.audit_frame()?;
             {
-                let chat = &mut self.renderer.as_mut().unwrap().ui_state.llm_chat;
+                let chat = &mut self.renderer.as_mut().unwrap().ui.ui_state.llm_chat;
                 chat.send = Some(
                     "Write a detailed 3000-word history of nautical charting, step by step.".into(),
                 );
@@ -219,7 +223,7 @@ impl super::ChartApp {
             self.audit_wait("long reply start", Duration::from_secs(30), |app| {
                 app.renderer
                     .as_ref()
-                    .is_some_and(|r| r.ui_state.llm_chat.running())
+                    .is_some_and(|r| r.ui.ui_state.llm_chat.running())
             })?;
             // Let the client process tree start.
             let started = Instant::now();
@@ -229,11 +233,11 @@ impl super::ChartApp {
             }
             let before = client_processes();
             // The same request the Stop button records.
-            self.renderer.as_mut().unwrap().ui_state.llm_chat.stop = true;
+            self.renderer.as_mut().unwrap().ui.ui_state.llm_chat.stop = true;
             self.audit_wait("stop", Duration::from_secs(20), |app| {
                 app.renderer
                     .as_ref()
-                    .is_some_and(|r| !r.ui_state.llm_chat.running())
+                    .is_some_and(|r| !r.ui.ui_state.llm_chat.running())
             })?;
             let settled = Instant::now();
             while settled.elapsed() < Duration::from_secs(3) {
@@ -253,8 +257,8 @@ impl super::ChartApp {
             )?,
         )?;
         // Turning the service off must stop clients and close the session.
-        self.renderer.as_mut().unwrap().ui_state.s100_mcp.enabled = false;
-        self.renderer.as_mut().unwrap().ui_state.s100_mcp.restart = true;
+        self.renderer.as_mut().unwrap().ui.ui_state.s100_mcp.enabled = false;
+        self.renderer.as_mut().unwrap().ui.ui_state.s100_mcp.restart = true;
         self.audit_frame()?;
         self.audit_capture(&output.join("service-off.png"))?;
         Ok(())
@@ -308,13 +312,17 @@ impl super::ChartApp {
         let json = self.native_s421.ui_json().to_owned();
         let visible = self.native_s421.panel_visible();
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_plugin_buttons(vec![ferrite_wgpu::PluginButton {
-                plugin_id: super::native_s421::PROVIDER_ID.into(),
-                label: "S-421 Routes".into(),
-                tooltip: None,
-                active: visible,
-            }]);
-            renderer.set_plugin_ui_data(vec![(super::native_s421::PROVIDER_ID.into(), json)]);
+            renderer
+                .ui
+                .set_plugin_buttons(vec![ferrite_ui::PluginButton {
+                    plugin_id: super::native_s421::PROVIDER_ID.into(),
+                    label: "S-421 Routes".into(),
+                    tooltip: None,
+                    active: visible,
+                }]);
+            renderer
+                .ui
+                .set_plugin_ui_data(vec![(super::native_s421::PROVIDER_ID.into(), json)]);
         }
     }
 }

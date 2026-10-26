@@ -1,6 +1,6 @@
 //! Native GPU visibility for all vector kinds and PC-derived coverage groups.
+use ferrite_gpu::SymbolCache;
 use ferrite_render::*;
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -66,7 +66,7 @@ impl ApplicationHandler for App {
             .unwrap(),
         );
         let size = w.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let mut c = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         c.set_bounds(GeoBounds::new(0., 0., 10., 10.));

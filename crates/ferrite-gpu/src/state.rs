@@ -3,9 +3,8 @@
 //! Manages wgpu device, surface, and render state.
 
 use std::sync::Arc;
-use winit::window::Window;
 
-use crate::{Result, ViewUniforms, WgpuError};
+use crate::{PhysicalSize, Result, SurfaceHost, ViewUniforms, WgpuError};
 
 /// MSAA sample count for antialiasing
 pub const MSAA_SAMPLE_COUNT: u32 = 4;
@@ -17,8 +16,8 @@ pub struct GpuState {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
-    pub size: winit::dpi::PhysicalSize<u32>,
-    pub window: Arc<Window>,
+    pub size: PhysicalSize<u32>,
+    pub window: Arc<dyn SurfaceHost>,
     /// Window density sampled on the UI thread (creation and resize). Scene
     /// emission reads this; a worker must never call into the macOS window,
     /// which synchronously dispatches to the main thread.
@@ -48,8 +47,11 @@ pub(crate) struct PrebuiltBuffer {
 }
 
 impl GpuState {
-    /// Create new GPU state for the given window
-    pub async fn new(window: Arc<Window>) -> Result<Self> {
+    /// Create new GPU state presenting to `target`, which belongs to `window`.
+    pub async fn new(
+        target: wgpu::SurfaceTarget<'static>,
+        window: Arc<dyn SurfaceHost>,
+    ) -> Result<Self> {
         let size = window.inner_size();
 
         // Create instance
@@ -60,7 +62,7 @@ impl GpuState {
 
         // Create surface
         let surface = instance
-            .create_surface(window.clone())
+            .create_surface(target)
             .map_err(|e| WgpuError::SurfaceCreation(e.to_string()))?;
 
         // Request adapter
@@ -211,7 +213,7 @@ impl GpuState {
     }
 
     /// Resize the surface
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+    pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         self.scale_factor = self.window.scale_factor();
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;

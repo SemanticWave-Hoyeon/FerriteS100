@@ -18,7 +18,7 @@ impl Environment {
         }
     }
 }
-fn options(o: egui::epaint::TessellationOptions) -> [u32; 14] {
+fn options(o: epaint::TessellationOptions) -> [u32; 14] {
     [
         o.feathering as u32,
         o.feathering_size_in_pixels.to_bits(),
@@ -36,7 +36,7 @@ fn options(o: egui::epaint::TessellationOptions) -> [u32; 14] {
         o.validate_meshes as u32,
     ]
 }
-fn rect(r: egui::Rect) -> [u32; 4] {
+fn rect(r: epaint::Rect) -> [u32; 4] {
     [
         r.min.x.to_bits(),
         r.min.y.to_bits(),
@@ -44,7 +44,7 @@ fn rect(r: egui::Rect) -> [u32; 4] {
         r.max.y.to_bits(),
     ]
 }
-fn text_bits(t: &egui::epaint::TextShape) -> [u32; 5] {
+fn text_bits(t: &epaint::TextShape) -> [u32; 5] {
     [
         t.pos.x.to_bits(),
         t.pos.y.to_bits(),
@@ -55,7 +55,7 @@ fn text_bits(t: &egui::epaint::TextShape) -> [u32; 5] {
 }
 enum ShapeKey {
     Text {
-        galley: Weak<egui::Galley>,
+        galley: Weak<epaint::Galley>,
         bits: [u32; 5],
         colors: [[u8; 4]; 2],
         override_color: Option<[u8; 4]>,
@@ -71,15 +71,15 @@ enum ShapeKey {
     },
 }
 impl ShapeKey {
-    fn capture(shape: &egui::Shape) -> Option<Self> {
+    fn capture(shape: &epaint::Shape) -> Option<Self> {
         match shape {
-            egui::Shape::Text(t) => Some(Self::Text {
+            epaint::Shape::Text(t) => Some(Self::Text {
                 galley: Arc::downgrade(&t.galley),
                 bits: text_bits(t),
                 colors: [t.underline.color.to_array(), t.fallback_color.to_array()],
                 override_color: t.override_text_color.map(|c| c.to_array()),
             }),
-            egui::Shape::LineSegment { points, stroke } => Some(Self::Line {
+            epaint::Shape::LineSegment { points, stroke } => Some(Self::Line {
                 points: [
                     points[0].x.to_bits(),
                     points[0].y.to_bits(),
@@ -89,12 +89,12 @@ impl ShapeKey {
                 width: stroke.width.to_bits(),
                 color: stroke.color.to_array(),
             }),
-            egui::Shape::Path(p)
+            epaint::Shape::Path(p)
                 if p.closed
                     && p.points.len() == 4
                     && p.stroke.width.to_bits() == 0
-                    && p.stroke.kind == egui::StrokeKind::Middle
-                    && matches!(p.stroke.color,egui::epaint::ColorMode::Solid(c) if c==egui::Color32::TRANSPARENT) =>
+                    && p.stroke.kind == epaint::StrokeKind::Middle
+                    && matches!(p.stroke.color,epaint::ColorMode::Solid(c) if c==epaint::Color32::TRANSPARENT) =>
             {
                 Some(Self::Polygon {
                     points: std::array::from_fn(|i| {
@@ -106,7 +106,7 @@ impl ShapeKey {
             _ => None, // Whole original path; no unsupported callbacks/shapes omitted.
         }
     }
-    fn matches(&self, shape: &egui::Shape) -> bool {
+    fn matches(&self, shape: &epaint::Shape) -> bool {
         match (self, shape) {
             (
                 Self::Text {
@@ -115,7 +115,7 @@ impl ShapeKey {
                     colors,
                     override_color,
                 },
-                egui::Shape::Text(t),
+                epaint::Shape::Text(t),
             ) =>
             // Weak holds the allocation, preventing ABA; current Arc proves it is alive.
             {
@@ -130,7 +130,7 @@ impl ShapeKey {
                     width,
                     color,
                 },
-                egui::Shape::LineSegment { points: p, stroke },
+                epaint::Shape::LineSegment { points: p, stroke },
             ) => {
                 *points
                     == [
@@ -142,12 +142,12 @@ impl ShapeKey {
                     && *width == stroke.width.to_bits()
                     && *color == stroke.color.to_array()
             }
-            (Self::Polygon { points, fill }, egui::Shape::Path(p)) => {
+            (Self::Polygon { points, fill }, epaint::Shape::Path(p)) => {
                 p.closed
                     && p.points.len() == 4
                     && p.stroke.width.to_bits() == 0
-                    && p.stroke.kind == egui::StrokeKind::Middle
-                    && matches!(p.stroke.color,egui::epaint::ColorMode::Solid(c) if c==egui::Color32::TRANSPARENT)
+                    && p.stroke.kind == epaint::StrokeKind::Middle
+                    && matches!(p.stroke.color,epaint::ColorMode::Solid(c) if c==epaint::Color32::TRANSPARENT)
                     && *points
                         == std::array::from_fn(|i| {
                             [p.points[i].x.to_bits(), p.points[i].y.to_bits()]
@@ -183,10 +183,10 @@ impl Key {
             identity,
             epoch,
             environment,
-            options(owner.context.tessellation_options(|o| *o)),
+            options(owner.context.tessellation_options()),
             shapes,
         )?;
-        let size = owner.context.fonts(|f| f.font_image_size());
+        let size = owner.context.font_image_size();
         key.atlas_bytes = u64::try_from(size[0])
             .ok()?
             .checked_mul(u64::try_from(size[1]).ok()?)?
@@ -209,8 +209,8 @@ impl Key {
         let weak_charge = shapes
             .iter()
             .try_fold(2 * std::mem::size_of::<usize>(), |n, s| {
-                if matches!(s.4.shape, egui::Shape::Text(_)) {
-                    n.checked_add(std::mem::size_of::<egui::Galley>())?
+                if matches!(s.4.shape, epaint::Shape::Text(_)) {
+                    n.checked_add(std::mem::size_of::<epaint::Galley>())?
                         .checked_add(2 * std::mem::size_of::<usize>())
                 } else {
                     Some(n)
@@ -278,7 +278,7 @@ impl Key {
                 })
     }
 }
-pub(super) fn record_lookup(trace: &mut Option<Vec<egui::TextureId>>, id: egui::TextureId) {
+pub(super) fn record_lookup(trace: &mut Option<Vec<epaint::TextureId>>, id: epaint::TextureId) {
     let Some(ids) = trace.as_mut() else {
         return;
     };
@@ -287,7 +287,7 @@ pub(super) fn record_lookup(trace: &mut Option<Vec<egui::TextureId>>, id: egui::
         || (ids.capacity() == 0 && ids.try_reserve_exact(16_384).is_err())
         || ids
             .capacity()
-            .checked_mul(std::mem::size_of::<egui::TextureId>())
+            .checked_mul(std::mem::size_of::<epaint::TextureId>())
             .is_none_or(|bytes| bytes > 256 * 1024)
     {
         *trace = None;
@@ -299,7 +299,7 @@ pub(super) struct Cache {
     enabled: bool,
     key: Option<Key>,
     meshes: Vec<GpuChartText>,
-    lookups: Vec<egui::TextureId>,
+    lookups: Vec<epaint::TextureId>,
     hits: u64,
     reused_draws: u64,
     builds: u64,
@@ -344,7 +344,7 @@ impl Cache {
                 identity,
                 epoch,
                 environment,
-                options(owner.context.tessellation_options(|o| *o)),
+                options(owner.context.tessellation_options()),
                 shapes,
             )
         })
@@ -372,7 +372,7 @@ impl Cache {
     pub(super) fn store(
         &mut self,
         key: Option<Key>,
-        lookups: Option<Vec<egui::TextureId>>,
+        lookups: Option<Vec<epaint::TextureId>>,
         meshes: &[GpuChartText],
     ) {
         if !self.enabled {
@@ -387,17 +387,19 @@ impl Cache {
             return;
         };
         // Current private font atlas admits Managed(0) only. Unknown namespaces wholly decline.
-        if lookups.iter().any(|id| *id != egui::TextureId::Managed(0))
+        if lookups
+            .iter()
+            .any(|id| *id != epaint::TextureId::Managed(0))
             || meshes
                 .iter()
-                .any(|m| m.texture_id != egui::TextureId::Managed(0))
+                .any(|m| m.texture_id != epaint::TextureId::Managed(0))
         {
             self.declines = self.declines.saturating_add(1);
             return;
         }
         let Some(trace_charge) = lookups
             .capacity()
-            .checked_mul(std::mem::size_of::<egui::TextureId>())
+            .checked_mul(std::mem::size_of::<epaint::TextureId>())
         else {
             return;
         };
@@ -464,20 +466,20 @@ mod tests {
             std::num::NonZeroI32::new(n).unwrap(),
         )
     }
-    fn fixture() -> (egui::Context, Vec<ChartTextShape>) {
-        let ctx = egui::Context::default();
-        ctx.begin_pass(egui::RawInput::default());
-        let galley = ctx.fonts(|f| {
-            f.layout_no_wrap(
-                "Names 52".into(),
-                egui::FontId::default(),
-                egui::Color32::WHITE,
-            )
-        });
+    use crate::chart_text_backend::{ChartFontContext, FontPassInput};
+    use crate::test_text_backend::TestFonts;
+    fn fixture() -> (TestFonts, Vec<ChartTextShape>) {
+        let ctx = TestFonts::default();
+        ctx.begin_pass(&FontPassInput::default());
+        let galley = ctx.layout_no_wrap(
+            "Names 52".into(),
+            epaint::FontId::default(),
+            epaint::Color32::WHITE,
+        );
         let _ = ctx.end_pass();
-        let shape = egui::epaint::ClippedShape {
-            clip_rect: egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(800., 600.)),
-            shape: egui::epaint::TextShape::new(egui::pos2(10., 20.), galley, egui::Color32::WHITE)
+        let shape = epaint::ClippedShape {
+            clip_rect: epaint::Rect::from_min_max(epaint::pos2(0., 0.), epaint::pos2(800., 600.)),
+            shape: epaint::TextShape::new(epaint::pos2(10., 20.), galley, epaint::Color32::WHITE)
                 .into(),
         };
         (ctx, vec![(plane(1), 3, Some(7), 0, shape)])
@@ -489,7 +491,7 @@ mod tests {
     fn identical_producer_is_positive_and_epoch_is_not_frame_counter() {
         let (ctx, s) = fixture();
         let owner = Arc::new(());
-        let o = options(ctx.tessellation_options(|o| *o));
+        let o = options(ctx.tessellation_options());
         let key = Key::capture_parts(&owner, 8, environment(), o, &s).unwrap();
         for _ in 0..500 {
             assert!(key.matches_parts(&owner, 8, environment(), o, &s));
@@ -499,7 +501,7 @@ mod tests {
             ctx.tessellate(shapes.into_iter().map(|s| s.4).collect(), 1.)
                 .into_iter()
                 .filter_map(|p| {
-                    if let egui::epaint::Primitive::Mesh(m) = p.primitive {
+                    if let epaint::Primitive::Mesh(m) = p.primitive {
                         Some((super::super::chart_text_vertices(&m, 1.), m.indices))
                     } else {
                         None
@@ -523,7 +525,7 @@ mod tests {
         let (ctx, s) = fixture();
         let a = Arc::new(());
         let b = Arc::new(());
-        let o = options(ctx.tessellation_options(|o| *o));
+        let o = options(ctx.tessellation_options());
         let key = Key::capture_parts(&a, 0, environment(), o, &s).unwrap();
         assert!(!key.matches_parts(&b, 0, environment(), o, &s));
         assert!(!key.matches_parts(&a, 1, environment(), o, &s));
@@ -539,7 +541,7 @@ mod tests {
     fn order_mask_subset_source_wrap_plane_priority_and_clip_are_not_count_keys() {
         let (ctx, mut s) = fixture();
         let owner = Arc::new(());
-        let o = options(ctx.tessellation_options(|o| *o));
+        let o = options(ctx.tessellation_options());
         let mut second = s[0].clone();
         second.2 = Some(8);
         s.push(second);
@@ -564,11 +566,11 @@ mod tests {
     fn glyph_ownership_and_all_text_scalars_including_signedzero_are_exact() {
         let (ctx, s) = fixture();
         let owner = Arc::new(());
-        let o = options(ctx.tessellation_options(|o| *o));
+        let o = options(ctx.tessellation_options());
         let key = Key::capture_parts(&owner, 0, environment(), o, &s).unwrap();
         for change in 0..8 {
             let mut changed = s.clone();
-            let egui::Shape::Text(t) = &mut changed[0].4.shape else {
+            let epaint::Shape::Text(t) = &mut changed[0].4.shape else {
                 panic!("text")
             };
             match change {
@@ -576,9 +578,9 @@ mod tests {
                 1 => t.angle = 0.1,
                 2 => t.opacity_factor = 0.5,
                 3 => t.underline.width = -0.,
-                4 => t.underline.color = egui::Color32::RED,
-                5 => t.fallback_color = egui::Color32::RED,
-                6 => t.override_text_color = Some(egui::Color32::WHITE),
+                4 => t.underline.color = epaint::Color32::RED,
+                5 => t.fallback_color = epaint::Color32::RED,
+                6 => t.override_text_color = Some(epaint::Color32::WHITE),
                 _ => t.galley = Arc::new((*t.galley).clone()),
             };
             assert!(!key.matches_parts(&owner, 0, environment(), o, &changed));
@@ -588,10 +590,10 @@ mod tests {
     fn unsupported_shape_and_actual_key_capacity_whole_decline() {
         let (ctx, mut s) = fixture();
         let owner = Arc::new(());
-        let o = options(ctx.tessellation_options(|o| *o));
+        let o = options(ctx.tessellation_options());
         let key = Key::capture_parts(&owner, 0, environment(), o, &s).unwrap();
         assert!(key.charge <= KEY_CAP);
-        s[0].4.shape = egui::Shape::Noop;
+        s[0].4.shape = epaint::Shape::Noop;
         assert!(Key::capture_parts(&owner, 0, environment(), o, &s).is_none());
         let (_, shape) = fixture();
         let over = vec![shape[0].clone(); KEY_CAP / std::mem::size_of::<Slot>() + 1];
@@ -613,7 +615,7 @@ mod tests {
             &owner,
             0,
             environment(),
-            options(ctx.tessellation_options(|o| *o)),
+            options(ctx.tessellation_options()),
             &s,
         );
         drop(owner);
@@ -625,14 +627,14 @@ mod tests {
     #[test]
     fn complete_lookup_trace_retains_clipped_jobs_and_never_caches_prefix() {
         let mut trace = Some(Vec::new());
-        record_lookup(&mut trace, egui::TextureId::Managed(0)); // original job later clipped
-        record_lookup(&mut trace, egui::TextureId::Managed(0)); // visible job
+        record_lookup(&mut trace, epaint::TextureId::Managed(0)); // original job later clipped
+        record_lookup(&mut trace, epaint::TextureId::Managed(0)); // visible job
         assert_eq!(trace.as_ref().unwrap().len(), 2);
         for _ in 2..16_384 {
-            record_lookup(&mut trace, egui::TextureId::Managed(0));
+            record_lookup(&mut trace, epaint::TextureId::Managed(0));
         }
         assert!(trace.is_some());
-        record_lookup(&mut trace, egui::TextureId::Managed(0));
+        record_lookup(&mut trace, epaint::TextureId::Managed(0));
         assert!(trace.is_none()); // Full original execution, no cached truncated lookup sequence.
     }
 }

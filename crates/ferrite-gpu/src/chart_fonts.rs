@@ -1,16 +1,16 @@
 //! Shared chart font definitions with independently owned layout contexts.
-pub(crate) fn chart_font_definitions() -> egui::FontDefinitions {
-    let mut fonts = egui::FontDefinitions::default();
+pub fn chart_font_definitions() -> epaint::text::FontDefinitions {
+    let mut fonts = epaint::text::FontDefinitions::default();
     fonts.font_data.insert(
         "ChartBold".into(),
-        egui::FontData::from_static(include_bytes!(
+        epaint::text::FontData::from_static(include_bytes!(
             "../../../Catalogues/PC/S-421/Fonts/OpenSans-Bold.ttf"
         ))
         .into(),
     );
     fonts.font_data.insert(
         "ChartMedium".into(),
-        egui::FontData::from_static(include_bytes!(
+        epaint::text::FontData::from_static(include_bytes!(
             "../../../Catalogues/PC/S-421/Fonts/OpenSans-Regular.ttf"
         ))
         .into(),
@@ -24,27 +24,31 @@ pub(crate) fn chart_font_definitions() -> egui::FontDefinitions {
         fonts
             .font_data
             .insert(key.clone(), std::sync::Arc::new(data.clone()));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        for family in [
+            epaint::FontFamily::Proportional,
+            epaint::FontFamily::Monospace,
+        ] {
             fonts.families.entry(family).or_default().push(key.clone());
         }
     }
-    let mut medium_fallback = fonts.families[&egui::FontFamily::Proportional].clone();
+    let mut medium_fallback = fonts.families[&epaint::FontFamily::Proportional].clone();
     medium_fallback.insert(0, "ChartMedium".into());
     fonts.families.insert(
-        egui::FontFamily::Name("ChartMedium".into()),
+        epaint::FontFamily::Name("ChartMedium".into()),
         medium_fallback,
     );
-    let mut fallback = fonts.families[&egui::FontFamily::Proportional].clone();
+    let mut fallback = fonts.families[&epaint::FontFamily::Proportional].clone();
     fallback.insert(0, "ChartBold".into());
     fonts
         .families
-        .insert(egui::FontFamily::Name("ChartBold".into()), fallback);
+        .insert(epaint::FontFamily::Name("ChartBold".into()), fallback);
     fonts
 }
 
 /// First readable face per script group, read once per process.
-fn system_cjk_fallbacks() -> &'static [(String, egui::FontData)] {
-    static FONTS: std::sync::OnceLock<Vec<(String, egui::FontData)>> = std::sync::OnceLock::new();
+fn system_cjk_fallbacks() -> &'static [(String, epaint::text::FontData)] {
+    static FONTS: std::sync::OnceLock<Vec<(String, epaint::text::FontData)>> =
+        std::sync::OnceLock::new();
     FONTS.get_or_init(|| {
         // One Korean face: KS X 1001 faces also carry kana and the common
         // Hanja, so a separate 50+ MB Chinese face is not kept resident.
@@ -70,7 +74,7 @@ fn system_cjk_fallbacks() -> &'static [(String, egui::FontData)] {
                     // Read once per process and borrowed by every font
                     // context, so a new context never copies the face.
                     let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-                    Some((name, egui::FontData::from_static(bytes)))
+                    Some((name, epaint::text::FontData::from_static(bytes)))
                 })
             })
             .collect()
@@ -106,19 +110,19 @@ impl ChartCharacteristicFace {
         }
     }
 
-    pub(crate) fn family(self) -> egui::FontFamily {
+    pub(crate) fn family(self) -> epaint::FontFamily {
         // Retain one immutable family identifier instead of allocating it per label.
-        static MEDIUM: std::sync::OnceLock<egui::FontFamily> = std::sync::OnceLock::new();
-        static BOLD: std::sync::OnceLock<egui::FontFamily> = std::sync::OnceLock::new();
+        static MEDIUM: std::sync::OnceLock<epaint::FontFamily> = std::sync::OnceLock::new();
+        static BOLD: std::sync::OnceLock<epaint::FontFamily> = std::sync::OnceLock::new();
         match self {
-            Self::ProportionalLight => egui::FontFamily::Proportional,
+            Self::ProportionalLight => epaint::FontFamily::Proportional,
             Self::ProportionalMedium => MEDIUM
-                .get_or_init(|| egui::FontFamily::Name("ChartMedium".into()))
+                .get_or_init(|| epaint::FontFamily::Name("ChartMedium".into()))
                 .clone(),
             Self::ProportionalBold => BOLD
-                .get_or_init(|| egui::FontFamily::Name("ChartBold".into()))
+                .get_or_init(|| epaint::FontFamily::Name("ChartBold".into()))
                 .clone(),
-            Self::MonospaceMedium => egui::FontFamily::Monospace,
+            Self::MonospaceMedium => epaint::FontFamily::Monospace,
         }
     }
 }
@@ -147,7 +151,7 @@ pub(crate) struct ChartFontMatch {
     pub(crate) synthetic_italic: bool,
 }
 impl ChartFontMatch {
-    pub(crate) fn family(self) -> egui::FontFamily {
+    pub(crate) fn family(self) -> epaint::FontFamily {
         debug_assert_eq!(self.distance, self.mismatch.count());
         self.face.family()
     }
@@ -300,9 +304,9 @@ mod tests {
         );
         assert_eq!(
             &chain[1..],
-            fonts.families[&egui::FontFamily::Proportional].as_slice()
+            fonts.families[&epaint::FontFamily::Proportional].as_slice()
         );
-        if let (egui::FontFamily::Name(a), egui::FontFamily::Name(b)) =
+        if let (epaint::FontFamily::Name(a), epaint::FontFamily::Name(b)) =
             (family, ChartCharacteristicFace::ProportionalMedium.family())
         {
             assert!(std::sync::Arc::ptr_eq(&a, &b));
@@ -387,107 +391,12 @@ mod tests {
     #[test]
     fn new_chart_fonts_preserve_bold_family_and_original_fallback_order() {
         let fonts = chart_font_definitions();
-        let bold = &fonts.families[&egui::FontFamily::Name("ChartBold".into())];
+        let bold = &fonts.families[&epaint::FontFamily::Name("ChartBold".into())];
         assert_eq!(bold.first().map(String::as_str), Some("ChartBold"));
         assert_eq!(
             &bold[1..],
-            fonts.families[&egui::FontFamily::Proportional].as_slice()
+            fonts.families[&epaint::FontFamily::Proportional].as_slice()
         );
         assert!(fonts.font_data.contains_key("ChartBold"));
-    }
-    #[test]
-    fn independent_context_shaping_does_not_append_live_font_texture_deltas() {
-        let live = egui::Context::default();
-        live.set_fonts(chart_font_definitions());
-        live.begin_pass(egui::RawInput::default());
-        let _ = live.end_pass(); // Clear initial live atlas delta.
-        let private = egui::Context::default();
-        private.set_fonts(chart_font_definitions());
-        private.begin_pass(egui::RawInput::default());
-        let _ = private
-            .layer_painter(egui::LayerId::background())
-            .layout_no_wrap(
-                "independent 12345".into(),
-                egui::FontId::proportional(16.),
-                egui::Color32::WHITE,
-            );
-        let output = private.end_pass();
-        assert!(!output.textures_delta.set.is_empty());
-        live.begin_pass(egui::RawInput::default());
-        assert!(live.end_pass().textures_delta.set.is_empty());
-    }
-    #[test]
-    fn warmed_and_fresh_font_owners_keep_layout_metrics_at_different_dpi_and_zoom() {
-        fn context(density: f32, zoom: f32) -> egui::Context {
-            let ctx = egui::Context::default();
-            ctx.set_fonts(chart_font_definitions());
-            ctx.set_zoom_factor(zoom);
-            let mut input = egui::RawInput::default();
-            input
-                .viewports
-                .entry(ctx.viewport_id())
-                .or_default()
-                .native_pixels_per_point = Some(density);
-            ctx.begin_pass(input);
-            ctx
-        }
-        for (density, zoom) in [(1., 1.), (2., 1.), (2., 1.25)] {
-            let live = context(density, zoom);
-            let private = context(density, zoom);
-            // Warm only the existing owner, changing glyph atlas allocation order.
-            let _ = live
-                .layer_painter(egui::LayerId::background())
-                .layout_no_wrap(
-                    "Menus ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789".into(),
-                    egui::FontId::proportional(13.),
-                    egui::Color32::WHITE,
-                );
-            for bold in [false, true] {
-                for italic in [false, true] {
-                    let mut job = egui::text::LayoutJob::single_section(
-                        "Depth 12.3 m / 수심 / 水深".into(),
-                        egui::TextFormat {
-                            font_id: egui::FontId {
-                                size: 16. / live.pixels_per_point(),
-                                family: if bold {
-                                    egui::FontFamily::Name("ChartBold".into())
-                                } else {
-                                    egui::FontFamily::Proportional
-                                },
-                            },
-                            color: egui::Color32::WHITE,
-                            italics: italic,
-                            ..Default::default()
-                        },
-                    );
-                    job.wrap = egui::text::TextWrapping {
-                        max_rows: 1,
-                        break_anywhere: false,
-                        ..Default::default()
-                    };
-                    let a = live
-                        .layer_painter(egui::LayerId::background())
-                        .layout_job(job.clone());
-                    let b = private
-                        .layer_painter(egui::LayerId::background())
-                        .layout_job(job);
-                    assert_eq!(a.rect, b.rect);
-                    assert_eq!(a.mesh_bounds, b.mesh_bounds);
-                    assert_eq!(a.rows.len(), b.rows.len());
-                    for (x, y) in a.rows.iter().zip(&b.rows) {
-                        assert_eq!(x.rect, y.rect);
-                        assert_eq!(x.glyphs.len(), y.glyphs.len());
-                        for (u, v) in x.glyphs.iter().zip(&y.glyphs) {
-                            assert_eq!(
-                                (u.chr, u.pos, u.advance_width, u.font_height),
-                                (v.chr, v.pos, v.advance_width, v.font_height)
-                            );
-                        }
-                    }
-                }
-            }
-            let _ = live.end_pass();
-            let _ = private.end_pass();
-        }
     }
 }

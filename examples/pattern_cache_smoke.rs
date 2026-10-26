@@ -1,9 +1,9 @@
 //! Warm/cold GPU equivalence for physical pattern periods and UI profile changes.
+use ferrite_gpu::SymbolCache;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{
     AreaInstruction, Color, DrawingInstruction, GeoBounds, RenderContext, ScreenPoint, Viewport,
 };
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -52,7 +52,7 @@ impl ApplicationHandler for App {
                 .unwrap(),
             )
         };
-        let mut warm = pollster::block_on(WgpuRenderer::new(make())).unwrap();
+        let mut warm = pollster::block_on(ferrite_ui::create_renderer(make())).unwrap();
         warm.background_color = Color::WHITE;
 
         let pc = PortrayalCatalogue::load(&self.pc).unwrap();
@@ -80,7 +80,7 @@ impl ApplicationHandler for App {
                 warm.clear_symbol_textures();
                 previous = profile;
             }
-            let mut cold = pollster::block_on(WgpuRenderer::new(make())).unwrap();
+            let mut cold = pollster::block_on(ferrite_ui::create_renderer(make())).unwrap();
             cold.background_color = Color::WHITE;
             instructions(&mut c, width, height);
             let cp = pc.color_profiles.profiles.get(profile).unwrap();

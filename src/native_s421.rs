@@ -21,11 +21,11 @@ pub struct NativeS421 {
     gpu_error: Option<String>,
     ui_json: String,
     editing_pc_root: PathBuf,
-    editing_resources: Option<std::sync::Arc<ferrite_wgpu::NativeRouteOverlayResources>>,
+    editing_resources: Option<std::sync::Arc<ferrite_gpu::NativeRouteOverlayResources>>,
     editing_resource_error: Option<String>,
-    prepared_overlay: Option<std::sync::Arc<ferrite_wgpu::PreparedNativeRouteOverlay>>,
+    prepared_overlay: Option<std::sync::Arc<ferrite_gpu::PreparedNativeRouteOverlay>>,
     overlay_prepare_error: Option<String>,
-    world_samples: Option<std::sync::Arc<ferrite_wgpu::NativeRouteWorldSamples>>,
+    world_samples: Option<std::sync::Arc<ferrite_gpu::NativeRouteWorldSamples>>,
     overlay_cache_hits: u64,
     overlay_preparations: u64,
     world_sample_preparations: u64,
@@ -60,7 +60,7 @@ impl NativeS421 {
     fn fork_local_edit(&self, palette: &str) -> Result<Self> {
         let resources = match &self.editing_resources {
             Some(resources) if resources.palette() == palette => resources.clone(),
-            _ => ferrite_wgpu::NativeRouteOverlayResources::load(&self.editing_pc_root, palette)
+            _ => ferrite_ui::load_native_route_overlay_resources(&self.editing_pc_root, palette)
                 .map_err(anyhow::Error::msg)?,
         };
         Ok(Self {
@@ -87,7 +87,7 @@ impl NativeS421 {
     fn publish_local_edit(
         &mut self,
         mut next: Self,
-        renderer: &mut ferrite_wgpu::WgpuRenderer,
+        renderer: &mut ferrite_ui::WgpuRenderer,
         scaler: &ferrite_render::Scaler,
         palette: &str,
     ) -> Result<()> {
@@ -120,7 +120,7 @@ impl NativeS421 {
     }
     pub fn begin_local_edit(
         &mut self,
-        renderer: &mut ferrite_wgpu::WgpuRenderer,
+        renderer: &mut ferrite_ui::WgpuRenderer,
         scaler: &ferrite_render::Scaler,
         palette: &str,
     ) -> Result<()> {
@@ -134,7 +134,7 @@ impl NativeS421 {
         &mut self,
         lon: f64,
         lat: f64,
-        renderer: &mut ferrite_wgpu::WgpuRenderer,
+        renderer: &mut ferrite_ui::WgpuRenderer,
         scaler: &ferrite_render::Scaler,
         palette: &str,
     ) -> Result<()> {
@@ -146,7 +146,7 @@ impl NativeS421 {
     }
     pub fn finish_local_edit(
         &mut self,
-        renderer: &mut ferrite_wgpu::WgpuRenderer,
+        renderer: &mut ferrite_ui::WgpuRenderer,
         scaler: &ferrite_render::Scaler,
         palette: &str,
     ) -> Result<()> {
@@ -160,7 +160,7 @@ impl NativeS421 {
         &mut self,
         id: u32,
         geometry: ferrite_s421::s421::LegGeometry,
-        renderer: &mut ferrite_wgpu::WgpuRenderer,
+        renderer: &mut ferrite_ui::WgpuRenderer,
         scaler: &ferrite_render::Scaler,
         palette: &str,
     ) -> Result<()> {
@@ -225,7 +225,7 @@ impl NativeS421 {
         &mut self,
         scaler: &ferrite_render::Scaler,
         palette: &str,
-    ) -> Result<Option<std::sync::Arc<ferrite_wgpu::PreparedNativeRouteOverlay>>> {
+    ) -> Result<Option<std::sync::Arc<ferrite_gpu::PreparedNativeRouteOverlay>>> {
         let result = self.prepare_overlay_inner(scaler, palette);
         self.overlay_prepare_error = result.as_ref().err().map(|error| format!("{error:#}"));
         result
@@ -234,7 +234,7 @@ impl NativeS421 {
         &mut self,
         scaler: &ferrite_render::Scaler,
         palette: &str,
-    ) -> Result<Option<std::sync::Arc<ferrite_wgpu::PreparedNativeRouteOverlay>>> {
+    ) -> Result<Option<std::sync::Arc<ferrite_gpu::PreparedNativeRouteOverlay>>> {
         if self.controller.routes().is_empty() {
             self.world_samples = None;
             self.prepared_overlay = None;
@@ -270,12 +270,12 @@ impl NativeS421 {
             .controller
             .routes()
             .iter()
-            .map(|route| ferrite_wgpu::NativeRoutePath {
+            .map(|route| ferrite_gpu::NativeRoutePath {
                 route_id: route.id,
                 waypoints: route
                     .waypoints
                     .iter()
-                    .map(|point| ferrite_wgpu::NativeRouteWaypoint {
+                    .map(|point| ferrite_gpu::NativeRouteWaypoint {
                         waypoint_id: point.id,
                         longitude: point.lon,
                         latitude: point.lat,
@@ -304,7 +304,7 @@ impl NativeS421 {
                         ));
                     }
                     for leg in &imported.legs {
-                        declarations.push(ferrite_wgpu::NativeRouteLegDeclaration {
+                        declarations.push(ferrite_gpu::NativeRouteLegDeclaration {
                             route_id: route.id,
                             from: leg.from_waypoint_id,
                             to: leg.to_waypoint_id,
@@ -316,10 +316,10 @@ impl NativeS421 {
                             original_geometry_text: leg.original_geometry_text.clone(),
                             geometry: match leg.geometry {
                                 ferrite_s421::s421::LegGeometry::Loxodrome => {
-                                    ferrite_wgpu::NativeRouteLegGeometry::Loxodrome
+                                    ferrite_gpu::NativeRouteLegGeometry::Loxodrome
                                 }
                                 ferrite_s421::s421::LegGeometry::Orthodrome => {
-                                    ferrite_wgpu::NativeRouteLegGeometry::Orthodrome
+                                    ferrite_gpu::NativeRouteLegGeometry::Orthodrome
                                 }
                             },
                         });
@@ -336,16 +336,16 @@ impl NativeS421 {
         {
             for pair in route.waypoints.windows(2) {
                 if let Some(geometry) = pair[1].incoming_geometry {
-                    declarations.push(ferrite_wgpu::NativeRouteLegDeclaration {
+                    declarations.push(ferrite_gpu::NativeRouteLegDeclaration {
                         route_id: route.id,
                         from: pair[0].id,
                         to: pair[1].id,
                         geometry: match geometry {
                             ferrite_s421::s421::LegGeometry::Loxodrome => {
-                                ferrite_wgpu::NativeRouteLegGeometry::Loxodrome
+                                ferrite_gpu::NativeRouteLegGeometry::Loxodrome
                             }
                             ferrite_s421::s421::LegGeometry::Orthodrome => {
-                                ferrite_wgpu::NativeRouteLegGeometry::Orthodrome
+                                ferrite_gpu::NativeRouteLegGeometry::Orthodrome
                             }
                         },
                         source_profile: 0,
@@ -363,14 +363,14 @@ impl NativeS421 {
             Some(samples) if samples.matches(&paths, &declarations, self.overlay_revision) => {
                 samples.clone()
             }
-            _ => ferrite_wgpu::NativeRouteWorldSamples::prepare(
+            _ => ferrite_gpu::NativeRouteWorldSamples::prepare(
                 &paths,
                 &declarations,
                 self.overlay_revision,
             )
             .map_err(anyhow::Error::msg)?,
         };
-        let prepared = ferrite_wgpu::PreparedNativeRouteOverlay::prepare_with_world_samples(
+        let prepared = ferrite_gpu::PreparedNativeRouteOverlay::prepare_with_world_samples(
             resources.clone(),
             self.overlay_revision,
             &paths,
@@ -469,7 +469,7 @@ impl NativeS421 {
         // does not prevent route inspection and must never enable map editing.
         // Day is explicit preparation metadata; nothing is rendered under it.
         if self.editing_resources.is_none() && self.editing_resource_error.is_none() {
-            match ferrite_wgpu::NativeRouteOverlayResources::load(&self.editing_pc_root, "Day") {
+            match ferrite_ui::load_native_route_overlay_resources(&self.editing_pc_root, "Day") {
                 Ok(resources) => self.editing_resources = Some(resources),
                 Err(error) => self.editing_resource_error = Some(error),
             }
@@ -480,12 +480,12 @@ impl NativeS421 {
         self.refresh();
         Ok(id)
     }
-    pub fn catalogue_layer(&self) -> ferrite_wgpu::DatasetCatalogueLayer {
+    pub fn catalogue_layer(&self) -> ferrite_ui::DatasetCatalogueLayer {
         fn status(
             raw: &ferrite_s421::catalogue::CatalogueStatus,
             path: PathBuf,
-        ) -> ferrite_wgpu::CatalogueStatus {
-            let mut out = ferrite_wgpu::CatalogueStatus {
+        ) -> ferrite_gpu::CatalogueStatus {
+            let mut out = ferrite_gpu::CatalogueStatus {
                 product_id: "S-421".into(),
                 path: path.display().to_string(),
                 ..Default::default()
@@ -520,13 +520,13 @@ impl NativeS421 {
                 resources.palette()
             ));
         }
-        ferrite_wgpu::DatasetCatalogueLayer {
+        ferrite_ui::DatasetCatalogueLayer {
             product: "S-421".into(),
             fc: status(self.controller.fc_status(), base.join("FC/S-421")),
             pc,
         }
     }
-    pub fn dataset_rows(&self) -> Vec<ferrite_wgpu::DatasetLayerEntry> {
+    pub fn dataset_rows(&self) -> Vec<ferrite_ui::DatasetLayerEntry> {
         self.controller
             .routes()
             .iter()
@@ -544,8 +544,8 @@ impl NativeS421 {
                         ferrite_s421::s421::Profile::Candidate2 => "2.0CDV subset",
                     })
                     .unwrap_or("locally authored");
-                ferrite_wgpu::DatasetLayerEntry {
-                    id: ferrite_wgpu::DatasetLayerId::S421 { route_id: route.id },
+                ferrite_ui::DatasetLayerEntry {
+                    id: ferrite_ui::DatasetLayerId::S421 { route_id: route.id },
                     name: route
                         .name
                         .clone()
@@ -1135,7 +1135,7 @@ mod tests {
         assert_eq!(host.controller.routes().len(), 1);
         assert_eq!(
             host.dataset_rows()[0].id,
-            ferrite_wgpu::DatasetLayerId::S421 { route_id: id }
+            ferrite_ui::DatasetLayerId::S421 { route_id: id }
         );
     }
     #[test]

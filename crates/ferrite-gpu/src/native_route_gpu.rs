@@ -526,7 +526,7 @@ fn prepare_geometry(
             if !dx.is_finite() || !dy.is_finite() {
                 return Err("Native clip delta overflow".into());
             }
-            if let Some((a, b, c, d)) = crate::WgpuRenderer::clip_line_segment(
+            if let Some((a, b, c, d)) = crate::renderer::RendererGeometry::clip_line_segment(
                 p[0][0] as f32,
                 p[0][1] as f32,
                 p[1][0] as f32,
@@ -629,7 +629,7 @@ fn push_line(
     clip: [f32; 4],
     id: NativeRoutePickId,
 ) -> Result<(), String> {
-    let Some((x0, y0, x1, y1)) = crate::WgpuRenderer::clip_line_segment(
+    let Some((x0, y0, x1, y1)) = crate::renderer::RendererGeometry::clip_line_segment(
         a.x, a.y, b.x, b.y, clip[0], clip[1], clip[2], clip[3],
     ) else {
         return Ok(());

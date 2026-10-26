@@ -543,10 +543,7 @@ impl GpuProfilerWrapper {
         self.enabled
     }
 
-    pub(crate) fn update_debug_stats(
-        &mut self,
-        target: &mut crate::egui_integration::DebugGpuStats,
-    ) {
+    pub(crate) fn update_debug_stats(&mut self, target: &mut crate::DebugGpuStats) {
         target.timestamp_supported = self.supported;
         target.timing_enabled = self.enabled;
         if let Some(window) = self.debug_chart_window.take_if_due(Instant::now()) {

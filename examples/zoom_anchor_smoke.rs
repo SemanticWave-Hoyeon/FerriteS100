@@ -1,10 +1,10 @@
 //! Native GPU check for changing off-centre scroll pivots, fast view -> rebuild.
+use ferrite_gpu::SymbolCache;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{
     anchored_zoom_bounds_projected, Color, DrawingInstruction, GeoBounds, PointInstruction,
     RenderContext, ScreenPoint, Viewport,
 };
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -30,7 +30,7 @@ impl ApplicationHandler for App {
         );
         let density = w.scale_factor();
         let size = w.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let pc = PortrayalCatalogue::load(&self.pc).unwrap();
         let profile = pc.color_profiles.profiles.get("Day").unwrap();

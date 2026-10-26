@@ -88,7 +88,7 @@ type ChartTextShape = (
     i32,
     Option<usize>,
     u8,
-    egui::epaint::ClippedShape,
+    epaint::ClippedShape,
 );
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -97,35 +97,33 @@ type TextLabelGroup = (i64, u64, u64);
 struct PlacedTextCopy {
     wrap_pass: usize,
     coverage_wrap_pass: u8,
-    origin: egui::Pos2,
+    origin: epaint::Pos2,
     angle: f32,
     footprint: ferrite_render::TextFootprint,
 }
 struct MeasuredTextLabel {
-    galley: std::sync::Arc<egui::Galley>,
-    color: egui::Color32,
+    galley: std::sync::Arc<epaint::Galley>,
+    color: epaint::Color32,
     copies: Vec<PlacedTextCopy>,
 }
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
-use winit::event::WindowEvent;
-use winit::window::Window;
 
 use crate::draw_range_index::{selected_indices, DrawKind, DrawRangeIndex};
-use crate::egui_integration;
 use crate::profiler::{CpuProfiler, GpuProfilerWrapper, ScopeTimer};
 use ferrite_portrayal_catalog::ColorProfile;
 use ferrite_render::{
     intern_symbol, Color, DrawingInstruction, RenderContext, ScreenPoint, SymbolId, WorldPoint,
 };
 
-use crate::egui_integration::{AppUiState, EguiIntegration, SettingsState};
+use crate::chart_text_backend::{ChartFontContext, FontPassInput, PrivateFontSpec};
 use crate::pipeline::{PatternVertex, TextureVertex};
 use crate::{
     GpuState, LineVertex, RenderPipelines, Result, SymbolCache, Vertex2D, ViewUniforms, WgpuError,
 };
+use crate::{SelectionOverlay, SettingsState, UiLayer};
 
 // === Symbol Classification Flags ===
 // Cached per SymbolId to avoid repeated starts_with() string matching in hot paths.
@@ -271,7 +269,7 @@ impl AreaTriangulationRetention {
             else {
                 continue;
             };
-            let key = WgpuRenderer::area_geometry_key(area, record.projection);
+            let key = RendererGeometry::area_geometry_key(area, record.projection);
             match &record.result {
                 AreaRetainedResult::Ready(v) => {
                     out.insert(key, TriangulationStorage::Shared(Arc::clone(v)));
@@ -408,10 +406,10 @@ mod area_retention_tests {
         let ferrite_render::DrawingInstruction::Area(b) = &old.raw_instructions()[0] else {
             unreachable!()
         };
-        let key = WgpuRenderer::area_geometry_key(a, next.scaler.projection());
+        let key = RendererGeometry::area_geometry_key(a, next.scaler.projection());
         assert_ne!(
             key,
-            WgpuRenderer::area_geometry_key(b, old.scaler.projection())
+            RendererGeometry::area_geometry_key(b, old.scaler.projection())
         );
         let actual = &out[&key];
         assert_eq!(actual.indices, v.indices);
@@ -622,7 +620,7 @@ struct SymbolInstance {
 /// Pending text label to render via egui painter overlay
 struct TextLabel {
     referenced_font: Option<ferrite_portrayal_catalog::BoundFontReference>,
-    font_family_override: Option<egui::FontFamily>,
+    font_family_override: Option<epaint::FontFamily>,
     font_style: ferrite_render::TextFontStyle,
     source: Option<usize>,
     plane: CompositionPlane,
@@ -655,7 +653,7 @@ enum CoveragePrimitive {
 }
 #[derive(Clone)]
 struct GpuChartText {
-    texture_id: egui::TextureId,
+    texture_id: epaint::TextureId,
     source: Option<usize>,
     wrap_pass: u8,
     plane: CompositionPlane,
@@ -1098,7 +1096,7 @@ impl ChartTextLayoutEnvironment<'_> {
 
 fn layout_chart_text_with_fonts(
     environment: ChartTextLayoutEnvironment<'_>,
-    chart_fonts: &egui::Context,
+    chart_fonts: &dyn ChartFontContext,
     text_labels: &[TextLabel],
     mut shapes: Vec<ChartTextShape>,
     capture_shapes: bool,
@@ -1111,7 +1109,8 @@ fn layout_chart_text_with_fonts(
     };
     let [width, height] = environment.physical_extent;
     let ppp = chart_fonts.pixels_per_point();
-    let clip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width / ppp, height / ppp));
+    let clip =
+        epaint::Rect::from_min_size(epaint::Pos2::ZERO, epaint::vec2(width / ppp, height / ppp));
     // Apply the same GPU pan/zoom offset so text tracks with chart geometry during drag
     if !text_labels.is_empty() {
         let pan_x = environment.pan[0];
@@ -1119,7 +1118,6 @@ fn layout_chart_text_with_fonts(
         let zoom = environment.zoom[0];
         let (pivot_x, pivot_y) = (environment.pivot[0], environment.pivot[1]);
 
-        let painter = chart_fonts.layer_painter(egui::LayerId::background());
         let mut placement = ferrite_render::TextPlacement::default();
         let mut labels: Vec<_> = (0..text_labels.len()).collect();
         // Higher planes/priorities retain text on collisions; stable source
@@ -1137,7 +1135,7 @@ fn layout_chart_text_with_fonts(
             }
         }
         let measure = |label: &TextLabel| -> MeasuredTextLabel {
-            let color = egui::Color32::from_rgba_unmultiplied(
+            let color = epaint::Color32::from_rgba_unmultiplied(
                 (label.color[0] * 255.0) as u8,
                 (label.color[1] * 255.0) as u8,
                 (label.color[2] * 255.0) as u8,
@@ -1156,10 +1154,10 @@ fn layout_chart_text_with_fonts(
                 (matching.family(), matching.synthetic_italic)
             };
             // Build a LayoutJob to support bold/italic font variants
-            let mut job = egui::text::LayoutJob::single_section(
+            let mut job = epaint::text::LayoutJob::single_section(
                 label.text.clone(),
-                egui::TextFormat {
-                    font_id: egui::FontId {
+                epaint::text::TextFormat {
+                    font_id: epaint::FontId {
                         size: label.font_size / chart_fonts.pixels_per_point(),
                         family,
                     },
@@ -1168,25 +1166,25 @@ fn layout_chart_text_with_fonts(
                     // reports the actual upright-face mismatch separately.
                     italics: synthetic_italic,
                     underline: if label.font_style.underline && color.a() > 0 {
-                        egui::Stroke::new(1_f32, color)
+                        epaint::Stroke::new(1_f32, color)
                     } else {
-                        egui::Stroke::NONE
+                        epaint::Stroke::NONE
                     },
                     strikethrough: if label.font_style.strikethrough && color.a() > 0 {
-                        egui::Stroke::new(1_f32, color)
+                        epaint::Stroke::new(1_f32, color)
                     } else {
-                        egui::Stroke::NONE
+                        epaint::Stroke::NONE
                     },
                     ..Default::default()
                 },
             );
-            job.wrap = egui::text::TextWrapping {
+            job.wrap = epaint::text::TextWrapping {
                 max_rows: 1,
                 break_anywhere: false,
                 ..Default::default()
             };
 
-            let galley = painter.layout_job(job);
+            let galley = chart_fonts.layout_job(job);
             let text_width = galley.rect.width();
             let text_height = galley.rect.height();
 
@@ -1231,7 +1229,7 @@ fn layout_chart_text_with_fonts(
                 let angle = label.rotation.to_radians();
                 let dx = x - sx;
                 let dy = y - sy;
-                let origin = egui::pos2(
+                let origin = epaint::pos2(
                     sx + dx * angle.cos() - dy * angle.sin(),
                     sy + dx * angle.sin() + dy * angle.cos(),
                 );
@@ -1241,9 +1239,9 @@ fn layout_chart_text_with_fonts(
                     galley.mesh_bounds
                 };
                 if label.font_style.upperline && color.a() > 0 {
-                    bounds = bounds.union(egui::Rect::from_min_max(
-                        galley.rect.min - egui::vec2(0.5, 0.5),
-                        egui::pos2(galley.rect.max.x + 0.5, galley.rect.min.y + 0.5),
+                    bounds = bounds.union(epaint::Rect::from_min_max(
+                        galley.rect.min - epaint::vec2(0.5, 0.5),
+                        epaint::pos2(galley.rect.max.x + 0.5, galley.rect.min.y + 0.5),
                     ));
                 }
                 if !bounds.is_finite() || !bounds.is_positive() {
@@ -1260,9 +1258,9 @@ fn layout_chart_text_with_fonts(
                     angle,
                 );
                 let [min, max] = footprint.bounds();
-                if !clip.intersects(egui::Rect::from_min_max(
-                    egui::pos2(min[0], min[1]),
-                    egui::pos2(max[0], max[1]),
+                if !clip.intersects(epaint::Rect::from_min_max(
+                    epaint::pos2(min[0], min[1]),
+                    epaint::pos2(max[0], max[1]),
                 )) {
                     continue;
                 }
@@ -1297,7 +1295,7 @@ fn layout_chart_text_with_fonts(
             );
             let galley = &measured.galley;
             if let Some(background) = label.background {
-                let color = egui::Color32::from_rgba_unmultiplied(
+                let color = epaint::Color32::from_rgba_unmultiplied(
                     (background[0] * 255.) as u8,
                     (background[1] * 255.) as u8,
                     (background[2] * 255.) as u8,
@@ -1306,22 +1304,22 @@ fn layout_chart_text_with_fonts(
                 let corners = footprint
                     .corners
                     .iter()
-                    .map(|p| egui::pos2(p[0], p[1]))
+                    .map(|p| epaint::pos2(p[0], p[1]))
                     .collect();
                 shapes.push((
                     label.plane,
                     label.priority,
                     label.source,
                     coverage_wrap_pass,
-                    egui::epaint::ClippedShape {
+                    epaint::ClippedShape {
                         clip_rect: clip,
-                        shape: egui::Shape::convex_polygon(corners, color, egui::Stroke::NONE),
+                        shape: epaint::Shape::convex_polygon(corners, color, epaint::Stroke::NONE),
                     },
                 ));
             }
             if label.font_style.upperline && color.a() > 0 {
-                let rotate = |p: egui::Pos2| {
-                    egui::pos2(
+                let rotate = |p: epaint::Pos2| {
+                    epaint::pos2(
                         origin.x + p.x * angle.cos() - p.y * angle.sin(),
                         origin.y + p.x * angle.sin() + p.y * angle.cos(),
                     )
@@ -1331,14 +1329,14 @@ fn layout_chart_text_with_fonts(
                     label.priority,
                     label.source,
                     coverage_wrap_pass,
-                    egui::epaint::ClippedShape {
+                    epaint::ClippedShape {
                         clip_rect: clip,
-                        shape: egui::Shape::line_segment(
+                        shape: epaint::Shape::line_segment(
                             [
                                 rotate(galley.rect.min),
-                                rotate(egui::pos2(galley.rect.max.x, galley.rect.min.y)),
+                                rotate(epaint::pos2(galley.rect.max.x, galley.rect.min.y)),
                             ],
-                            egui::Stroke::new(1_f32, color),
+                            epaint::Stroke::new(1_f32, color),
                         ),
                     },
                 ));
@@ -1348,9 +1346,9 @@ fn layout_chart_text_with_fonts(
                 label.priority,
                 label.source,
                 coverage_wrap_pass,
-                egui::epaint::ClippedShape {
+                epaint::ClippedShape {
                     clip_rect: clip,
-                    shape: egui::epaint::TextShape::new(origin, galley.clone(), color)
+                    shape: epaint::TextShape::new(origin, galley.clone(), color)
                         .with_angle(angle)
                         .into(),
                 },
@@ -1404,10 +1402,11 @@ fn layout_chart_text_with_fonts(
 #[cfg(test)]
 mod detached_text_layout_tests {
     use super::*;
-    fn context() -> egui::Context {
-        let ctx = egui::Context::default();
+    use crate::test_text_backend::TestFonts;
+    fn context() -> TestFonts {
+        let ctx = TestFonts::default();
         ctx.set_fonts(crate::chart_fonts::chart_font_definitions());
-        ctx.begin_pass(egui::RawInput::default());
+        ctx.begin_pass(&FontPassInput::default());
         ctx
     }
     fn label(source: usize, priority: i32, position: [f32; 2]) -> TextLabel {
@@ -1451,13 +1450,11 @@ mod detached_text_layout_tests {
     fn independent_font_owner_keeps_parent_collision_mask_and_priority() {
         let live = context();
         let private = context();
-        let _ = live
-            .layer_painter(egui::LayerId::background())
-            .layout_no_wrap(
-                "Warm UI cache different atlas packing".into(),
-                egui::FontId::proportional(13.),
-                egui::Color32::WHITE,
-            );
+        let _ = live.layout_no_wrap(
+            "Warm UI cache different atlas packing".into(),
+            epaint::FontId::proportional(13.),
+            epaint::Color32::WHITE,
+        );
         let labels = [
             label(0, 1, [100., 100.]),
             label(1, 2, [100., 100.]),
@@ -1547,18 +1544,18 @@ mod detached_text_layout_tests {
                 .0;
         assert_eq!(shapes.len(), 2);
         assert!(shapes.iter().all(|s| s.2 == Some(3) && s.1 == 4));
-        let egui::Shape::LineSegment { points, stroke } = &shapes[0].4.shape else {
+        let epaint::Shape::LineSegment { points, stroke } = &shapes[0].4.shape else {
             panic!("upperline")
         };
         assert!(stroke.width > 0.);
         let delta = points[1] - points[0];
         assert!(delta.x > 0. && delta.y > 0.);
         assert!((delta.y / delta.x - 30_f32.to_radians().tan()).abs() < 1e-5);
-        let egui::Shape::Text(text) = &shapes[1].4.shape else {
+        let epaint::Shape::Text(text) = &shapes[1].4.shape else {
             panic!("glyphs")
         };
         let format = &text.galley.job.sections[0].format;
-        assert_eq!(format.font_id.family, egui::FontFamily::Monospace);
+        assert_eq!(format.font_id.family, epaint::FontFamily::Monospace);
         assert!(format.underline.width > 0. && format.strikethrough.width > 0.);
         let _ = ctx.end_pass();
     }
@@ -1616,8 +1613,8 @@ struct VectorFrameState {
     temporal_visibility_counts: (usize, usize),
     temporal_visibility_mask: Vec<bool>,
     display_scale: u32,
-    coverage_scale_colour: Option<egui::Color32>,
-    coverage_scale_colours: std::collections::BTreeMap<usize, egui::Color32>,
+    coverage_scale_colour: Option<epaint::Color32>,
+    coverage_scale_colours: std::collections::BTreeMap<usize, epaint::Color32>,
     /// Screen-space pan offset (pixels) for fast panning during drag
     screen_pan_offset: (f32, f32),
     selection_anchor: Option<[f32; 2]>,
@@ -1709,7 +1706,7 @@ impl VectorFrameState {
     }
 }
 
-pub struct WgpuRenderer {
+pub struct WgpuRenderer<U> {
     vector_emission: VectorEmissionOwned,
 
     draw_range_index_enabled: bool,
@@ -1754,10 +1751,8 @@ pub struct WgpuRenderer {
     /// rendered — silently swallowing this would hide chart-data quality issues.
     empty_selection_stats: ferrite_render::SelectionIndexStats,
 
-    /// egui integration for UI overlay
-    egui: EguiIntegration,
-    /// UI state shared with main app
-    pub ui_state: AppUiState,
+    /// Overlay compositor, UI state and live chart text context.
+    pub ui: U,
     // === OPTIMIZATION FIELDS ===
     /// Geometry allocations are unique only within an unchanged instruction lifetime.
     /// Batched symbols by texture (optimization, keyed by interned SymbolId)
@@ -1786,7 +1781,7 @@ pub struct WgpuRenderer {
     preview_refresh_due: bool,
     /// Independent chart-font metrics for background builds. Sharing the live
     /// UI context would make every UI pass wait on the worker's layout lock.
-    worker_fonts: Option<(PrivateEmissionEnvironment, egui::Context)>,
+    worker_fonts: Option<(PrivateEmissionEnvironment, Arc<dyn ChartFontContext>)>,
 
     // Sampled once: coarse OFF changes observers only, not rendering or collectors.
     overscale_program_reuse: Arc<crate::overscale_annotation::ProgramReuse>,
@@ -1810,7 +1805,7 @@ pub struct WgpuRenderer {
         i32,
         Option<usize>,
         u8,
-        egui::epaint::ClippedShape,
+        epaint::ClippedShape,
     )>,
     chart_text_meshes: Vec<GpuChartText>,
     chart_text_buffers: ChartTextBufferPool,
@@ -1897,10 +1892,216 @@ impl GpuRasterLayer {
     }
 }
 
-impl WgpuRenderer {
-    /// Create new renderer for window
-    pub async fn new(window: Arc<Window>) -> Result<Self> {
-        let state = GpuState::new(window.clone()).await?;
+/// Geometry helpers that do not depend on the overlay layer.
+pub(crate) type RendererGeometry = WgpuRenderer<()>;
+impl<U> WgpuRenderer<U> {
+    /// Cohen-Sutherland outcode for line clipping
+    #[inline]
+    fn cs_outcode(x: f32, y: f32, x_min: f32, y_min: f32, x_max: f32, y_max: f32) -> u8 {
+        let mut code = 0u8;
+        if x < x_min {
+            code |= 1;
+        }
+        // LEFT
+        else if x > x_max {
+            code |= 2;
+        } // RIGHT
+        if y < y_min {
+            code |= 4;
+        }
+        // TOP
+        else if y > y_max {
+            code |= 8;
+        } // BOTTOM
+        code
+    }
+    fn is_ring_visible_static(
+        ring: &[WorldPoint],
+        bounds: Option<(f64, f64, f64, f64)>,
+        wrapping: bool,
+    ) -> bool {
+        let mut aabb = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for p in ring {
+            aabb.0 = aabb.0.min(p.x);
+            aabb.1 = aabb.1.min(p.y);
+            aabb.2 = aabb.2.max(p.x);
+            aabb.3 = aabb.3.max(p.y);
+        }
+        longitude_bounds_visible(aabb, bounds, wrapping)
+    }
+    /// O(1) allocation key, valid only within the bound context geometry revision.
+    /// Interior rings cannot change through the context's immutable instruction API.
+    fn area_geometry_key(
+        area: &ferrite_render::AreaInstruction,
+        projection: ferrite_render::FlatProjection,
+    ) -> (usize, usize, ferrite_render::FlatProjection) {
+        (
+            area.exterior.as_ptr() as usize,
+            area.exterior.len(),
+            projection,
+        )
+    }
+    /// Pre-computed world→screen transform parameters (avoids per-area scaler lookups)
+    #[inline]
+    fn scaler_transform(scaler: &ferrite_render::Scaler) -> ferrite_render::FlatTransform {
+        scaler.flat_transform()
+    }
+    /// Clip a line segment to a polygon, returning visible sub-segments.
+    /// Uses scanline intersection: find all intersection points of the line
+    /// with polygon edges, sort them along the line, then emit inside segments.
+    fn clip_line_to_polygon(
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        ring: &[(f32, f32)],
+    ) -> Vec<(f32, f32, f32, f32)> {
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let line_len_sq = dx * dx + dy * dy;
+        if line_len_sq < 1e-10 {
+            return Vec::new();
+        }
+
+        // Find parametric t values where line intersects each polygon edge
+        let mut t_values: Vec<f32> = Vec::with_capacity(8);
+        let n = ring.len();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (ex0, ey0) = ring[i];
+            let (ex1, ey1) = ring[j];
+
+            let edx = ex1 - ex0;
+            let edy = ey1 - ey0;
+
+            let denom = dx * edy - dy * edx;
+            if denom.abs() < 1e-10 {
+                continue; // Parallel
+            }
+
+            let t = ((ex0 - x0) * edy - (ey0 - y0) * edx) / denom;
+            let u = ((ex0 - x0) * dy - (ey0 - y0) * dx) / denom;
+
+            if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&t) {
+                t_values.push(t);
+            }
+        }
+
+        if t_values.is_empty() {
+            // Line might be entirely inside or outside
+            let mid_x = (x0 + x1) * 0.5;
+            let mid_y = (y0 + y1) * 0.5;
+            if point_in_ring(mid_x, mid_y, ring) {
+                return vec![(x0, y0, x1, y1)];
+            }
+            return Vec::new();
+        }
+
+        t_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Remove near-duplicates
+        t_values.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+        // Emit segments between consecutive intersection pairs that are inside
+        let mut segments = Vec::with_capacity(t_values.len() / 2 + 1);
+        let start_inside = point_in_ring(x0, y0, ring);
+
+        let mut prev_t = 0.0_f32;
+        let mut inside = start_inside;
+
+        for &t in &t_values {
+            if inside {
+                let seg_x0 = x0 + prev_t * dx;
+                let seg_y0 = y0 + prev_t * dy;
+                let seg_x1 = x0 + t * dx;
+                let seg_y1 = y0 + t * dy;
+                segments.push((seg_x0, seg_y0, seg_x1, seg_y1));
+            }
+            inside = !inside;
+            prev_t = t;
+        }
+
+        // Handle remaining segment to end
+        if inside {
+            let seg_x0 = x0 + prev_t * dx;
+            let seg_y0 = y0 + prev_t * dy;
+            segments.push((seg_x0, seg_y0, x1, y1));
+        }
+
+        segments
+    }
+    /// Clip a line segment to a rectangle using Cohen-Sutherland.
+    /// Returns Some((x0,y0,x1,y1)) if any portion is visible, None if fully outside.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn clip_line_segment(
+        mut x0: f32,
+        mut y0: f32,
+        mut x1: f32,
+        mut y1: f32,
+        x_min: f32,
+        y_min: f32,
+        x_max: f32,
+        y_max: f32,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let mut code0 = Self::cs_outcode(x0, y0, x_min, y_min, x_max, y_max);
+        let mut code1 = Self::cs_outcode(x1, y1, x_min, y_min, x_max, y_max);
+
+        loop {
+            if (code0 | code1) == 0 {
+                // Both inside
+                return Some((x0, y0, x1, y1));
+            }
+            if (code0 & code1) != 0 {
+                // Both on same outside side
+                return None;
+            }
+            // Pick the point that is outside
+            let code_out = if code0 != 0 { code0 } else { code1 };
+            let (x, y);
+            if code_out & 8 != 0 {
+                // Below
+                x = x0 + (x1 - x0) * (y_max - y0) / (y1 - y0);
+                y = y_max;
+            } else if code_out & 4 != 0 {
+                // Above
+                x = x0 + (x1 - x0) * (y_min - y0) / (y1 - y0);
+                y = y_min;
+            } else if code_out & 2 != 0 {
+                // Right
+                y = y0 + (y1 - y0) * (x_max - x0) / (x1 - x0);
+                x = x_max;
+            } else {
+                // Left
+                y = y0 + (y1 - y0) * (x_min - x0) / (x1 - x0);
+                x = x_min;
+            }
+            if code_out == code0 {
+                x0 = x;
+                y0 = y;
+                code0 = Self::cs_outcode(x0, y0, x_min, y_min, x_max, y_max);
+            } else {
+                x1 = x;
+                y1 = y;
+                code1 = Self::cs_outcode(x1, y1, x_min, y_min, x_max, y_max);
+            }
+        }
+    }
+}
+
+impl<U: UiLayer> WgpuRenderer<U> {
+    /// Create a renderer presenting to `target`, which belongs to `window`.
+    /// `ui` builds the overlay layer on the renderer's device and format.
+    pub async fn new(
+        target: wgpu::SurfaceTarget<'static>,
+        window: Arc<dyn crate::SurfaceHost>,
+        ui: impl FnOnce(&wgpu::Device, wgpu::TextureFormat) -> U,
+    ) -> Result<Self> {
+        let state = GpuState::new(target, window).await?;
         let pipelines = RenderPipelines::new(&state)?;
         let immutable_line_topology = crate::immutable_line_topology::Cache::prepare(
             std::env::var_os("FERRITE_IMMUTABLE_LINE_TOPOLOGY").as_deref(),
@@ -1940,13 +2141,8 @@ impl WgpuRenderer {
         let view_bind_group_right =
             pipelines.create_view_bind_group(&state.device, &view_buffer_right);
 
-        // Create egui integration (render without MSAA for crisp text)
-        let egui = EguiIntegration::new(
-            &state.device,
-            state.format(),
-            1, // No MSAA for egui
-            window,
-        );
+        // Create the overlay layer (rendered without MSAA for crisp text)
+        let ui = ui(&state.device, state.format());
 
         let suppression_tail_enabled =
             std::env::var("FERRITE_SUPPRESSION_TAIL_DIAGNOSTICS").as_deref() == Ok("1");
@@ -2141,8 +2337,7 @@ impl WgpuRenderer {
             compilation_scale: 22000, // Default compilation scale (1:22000)
 
             empty_selection_stats: ferrite_render::SelectionIndexStats::default(),
-            egui,
-            ui_state: AppUiState::default(),
+            ui,
             // Optimization fields
             packed_symbol_vertices: Vec::with_capacity(4000),
             packed_symbol_indices: Vec::with_capacity(6000),
@@ -2227,11 +2422,12 @@ impl WgpuRenderer {
     pub fn set_profiling_enabled(&mut self, enabled: bool) {
         crate::profiler::set_profiling_enabled(enabled);
         self.cpu_profiler.reset_debug_metrics();
-        self.ui_state.debug_cpu_frames = Default::default();
-        self.ui_state.debug_gpu.chart_ms = None;
-        self.ui_state.debug_gpu.chart_max_ms = None;
-        self.ui_state.debug_gpu.chart_window_samples = 0;
-        self.ui_state.debug_gpu.sample_age_seconds = None;
+        *self.ui.debug_cpu_frames_mut() = Default::default();
+        let debug_gpu = self.ui.debug_gpu_mut();
+        debug_gpu.chart_ms = None;
+        debug_gpu.chart_max_ms = None;
+        debug_gpu.chart_window_samples = 0;
+        debug_gpu.sample_age_seconds = None;
         self.gpu_profiler.set_enabled(enabled);
     }
 
@@ -2262,41 +2458,23 @@ impl WgpuRenderer {
     /// Update viewport world bounds for frustum culling
     pub fn update_viewport_bounds(&mut self, scaler: &ferrite_render::Scaler) {
         self.vector_scene_epoch.advance();
+        let shallow = self.ui.settings().show_shallow_pattern;
         let mut services = EmissionServices::live(
             &self.state,
             &self.pipelines,
-            &mut self.egui,
+            &mut self.ui,
             &mut self.cpu_profiler,
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            shallow,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
         );
         self.vector_emission
             .update_viewport_bounds(&mut services, scaler)
-    }
-    fn is_ring_visible_static(
-        ring: &[WorldPoint],
-        bounds: Option<(f64, f64, f64, f64)>,
-        wrapping: bool,
-    ) -> bool {
-        let mut aabb = (
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        );
-        for p in ring {
-            aabb.0 = aabb.0.min(p.x);
-            aabb.1 = aabb.1.min(p.y);
-            aabb.2 = aabb.2.max(p.x);
-            aabb.3 = aabb.3.max(p.y);
-        }
-        longitude_bounds_visible(aabb, bounds, wrapping)
     }
 
     /// Clear triangulation cache (call when chart data changes)
@@ -2317,16 +2495,17 @@ impl WgpuRenderer {
     }
 
     fn bind_triangulation_context(&mut self, context: &RenderContext) {
+        let shallow = self.ui.settings().show_shallow_pattern;
         let mut services = EmissionServices::live(
             &self.state,
             &self.pipelines,
-            &mut self.egui,
+            &mut self.ui,
             &mut self.cpu_profiler,
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            shallow,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -2518,18 +2697,14 @@ impl WgpuRenderer {
     }
 
     pub fn update_selection(&mut self, scaler: &ferrite_render::Scaler) {
-        if self.ui_state.selected_feature.is_none() {
+        if self.ui.selected_feature().is_none() {
             self.vector_emission
                 .vector_frame
                 .selection_world_geometry
                 .clear();
         }
 
-        let shift = self
-            .ui_state
-            .selected_feature
-            .as_ref()
-            .map_or(0., |f| f.longitude_shift);
+        let shift = self.ui.selected_feature().map_or(0., |f| f.longitude_shift);
         self.vector_emission.vector_frame.selection_screen_geometry = self
             .vector_emission
             .vector_frame
@@ -2544,14 +2719,13 @@ impl WgpuRenderer {
                     .collect()
             })
             .collect();
-        self.vector_emission.vector_frame.selection_anchor =
-            self.ui_state.selected_feature.as_ref().map(|f| {
-                let p = scaler.world_to_screen(ferrite_render::WorldPoint::new(
-                    f.world_pos.0 + f.longitude_shift,
-                    f.world_pos.1,
-                ));
-                [p.x, p.y]
-            });
+        self.vector_emission.vector_frame.selection_anchor = self.ui.selected_feature().map(|f| {
+            let p = scaler.world_to_screen(ferrite_render::WorldPoint::new(
+                f.world_pos.0 + f.longitude_shift,
+                f.world_pos.1,
+            ));
+            [p.x, p.y]
+        });
     }
 
     /// Upload a product-neutral raster. CPU pixels are released after upload.
@@ -3336,12 +3510,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -3355,12 +3529,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -3615,7 +3789,7 @@ impl WgpuRenderer {
                 "scope": "Actual retained source-only ordinal classification; no native hit count or visibility/permission reuse claim",
             },
             "coverage_trial_reuse": self.coverage_trial_statistics(),
-            "coverage_scale_indication": self.ui_state.coverage_scale_indication.map(|indication| serde_json::json!({
+            "coverage_scale_indication": self.ui.coverage_scale_indication().map(|indication| serde_json::json!({
                 "viewing_denominator": indication.viewing_denominator,
                 "overscale_factor": indication.overscale_factor,
                 "sclbr_rgba": indication.sclbr.map(|colour| colour.to_array()),
@@ -3797,8 +3971,8 @@ impl WgpuRenderer {
 
     /// Chart rectangle in physical pixels, matching GPU and pointer coordinates.
     pub fn chart_viewport_pixels(&self) -> (f32, f32, f32, f32) {
-        let (x, y, width, height) = self.ui_state.chart_area;
-        let pixels_per_point = self.egui.ctx.pixels_per_point();
+        let (x, y, width, height) = self.ui.chart_area();
+        let pixels_per_point = self.ui.fonts().pixels_per_point();
         (
             x * pixels_per_point,
             y * pixels_per_point,
@@ -3808,7 +3982,7 @@ impl WgpuRenderer {
     }
 
     pub fn ui_pixels_per_point(&self) -> f32 {
-        self.egui.ctx.pixels_per_point()
+        self.ui.fonts().pixels_per_point()
     }
     pub fn fast_view_transform(&self) -> ((f32, f32), f32, (f32, f32)) {
         (
@@ -3819,178 +3993,31 @@ impl WgpuRenderer {
     }
 
     /// Handle window resize
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+    pub fn resize(&mut self, new_size: crate::PhysicalSize<u32>) {
         self.scene_generation = self.scene_generation.wrapping_add(1);
         self.vector_emission.native_route_target_camera = None;
         self.state.resize(new_size);
         self.update_view_uniforms();
     }
 
-    /// Handle winit window event for egui, returns true if egui consumed the event
-    pub fn handle_egui_event(&mut self, event: &WindowEvent) -> bool {
-        self.egui.handle_event(&self.state.window, event)
-    }
-
-    /// Check if egui wants pointer input (mouse is over UI element)
-    /// Call this before handling clicks to avoid clicking through UI
-    pub fn egui_wants_pointer(&self) -> bool {
-        self.egui.wants_pointer_input()
-    }
-
-    /// Check if egui has requested a repaint (e.g., animations, hover effects)
-    #[inline]
-    pub fn egui_needs_repaint(&self) -> bool {
-        self.egui.ctx.has_requested_repaint()
-    }
-
-    /// Update cursor position in UI state (world coordinates)
-    #[inline]
-    pub fn set_cursor_world(&mut self, x: f64, y: f64) {
-        self.ui_state.cursor_world = (x, y);
-    }
-
-    /// Update cursor position in UI state (screen coordinates)
-    #[inline]
-    pub fn set_cursor_screen(&mut self, x: f32, y: f32) {
-        self.ui_state.cursor_screen = (x, y);
-    }
-
-    /// Check and clear UI action requests
-    #[inline]
-    pub fn take_open_file_request(&mut self) -> bool {
-        let requested = self.ui_state.open_file_requested;
-        self.ui_state.open_file_requested = false;
-        requested
-    }
-
-    #[inline]
-    pub fn take_screenshot_request(&mut self) -> bool {
-        let requested = self.ui_state.screenshot_requested;
-        self.ui_state.screenshot_requested = false;
-        requested
-    }
-
-    #[inline]
-    pub fn take_chart_image_request(&mut self) -> bool {
-        std::mem::take(&mut self.ui_state.chart_image_requested)
-    }
-
-    #[inline]
-    pub fn take_open_fc_request(&mut self) -> bool {
-        let requested = self.ui_state.open_fc_requested;
-        self.ui_state.open_fc_requested = false;
-        requested
-    }
-
-    #[inline]
-    pub fn take_open_pc_request(&mut self) -> bool {
-        let requested = self.ui_state.open_pc_requested;
-        self.ui_state.open_pc_requested = false;
-        requested
-    }
-
-    #[inline]
-    pub fn take_zoom_in_request(&mut self) -> bool {
-        let requested = self.ui_state.zoom_in_requested;
-        self.ui_state.zoom_in_requested = false;
-        requested
-    }
-
-    #[inline]
-    pub fn take_zoom_out_request(&mut self) -> bool {
-        let requested = self.ui_state.zoom_out_requested;
-        self.ui_state.zoom_out_requested = false;
-        requested
-    }
-
-    #[inline]
-    pub fn take_reset_view_request(&mut self) -> bool {
-        let requested = self.ui_state.reset_view_requested;
-        self.ui_state.reset_view_requested = false;
-        requested
-    }
-
-    /// Take and reset clear charts request
-    #[inline]
-    pub fn take_clear_charts_request(&mut self) -> bool {
-        let requested = self.ui_state.clear_charts_requested;
-        self.ui_state.clear_charts_requested = false;
-        requested
-    }
-
-    /// Take color profile change request, returns new profile name if changed
-    #[inline]
-    pub fn take_color_profile_change(&mut self) -> Option<String> {
-        if self.ui_state.color_profile_changed {
-            self.ui_state.color_profile_changed = false;
-            Some(self.ui_state.color_profile.clone())
-        } else {
-            None
-        }
-    }
-
     /// Set the current color profile name in UI state
     #[inline]
     pub fn set_color_profile(&mut self, profile: &str) {
         self.vector_scene_epoch.advance();
-        self.ui_state.color_profile = profile.to_string();
-    }
-
-    /// Take settings change request, returns current settings if changed
-    #[inline]
-    pub fn take_settings_change(&mut self) -> Option<SettingsState> {
-        if self.ui_state.settings_changed {
-            self.ui_state.settings_changed = false;
-            Some(self.ui_state.settings.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Take pan adjustment (in pixels) when panel state changes
-    #[inline]
-    pub fn take_pan_adjust_pixels(&mut self) -> Option<f32> {
-        self.ui_state
-            .pan_adjust_pixels
-            .take()
-            .map(|adjust| adjust * self.egui.ctx.pixels_per_point())
+        *self.ui.color_profile_mut() = profile.to_string();
     }
 
     /// Get current settings state (read-only)
     #[inline]
     pub fn settings(&self) -> &SettingsState {
-        &self.ui_state.settings
+        self.ui.settings()
     }
 
     /// Update settings state
     #[inline]
     pub fn set_settings(&mut self, settings: SettingsState) {
         self.vector_scene_epoch.advance();
-        self.ui_state.settings = settings;
-    }
-
-    /// Take plugin toggle request, returns plugin_id if a toggle was requested
-    #[inline]
-    pub fn take_plugin_toggle_request(&mut self) -> Option<String> {
-        self.ui_state.plugin_toggle_requested.take()
-    }
-
-    /// Update plugin toolbar buttons
-    #[inline]
-    pub fn set_plugin_buttons(&mut self, buttons: Vec<egui_integration::PluginButton>) {
-        self.ui_state.plugin_buttons = buttons;
-    }
-
-    /// Update plugin UI data
-    #[inline]
-    pub fn set_plugin_ui_data(&mut self, data: Vec<(String, String)>) {
-        self.ui_state.publish_plugin_ui_data(data);
-    }
-
-    /// Take pending plugin UI events
-    #[inline]
-    pub fn take_plugin_ui_events(&mut self) -> Vec<(String, String)> {
-        std::mem::take(&mut self.ui_state.plugin_ui_events)
+        *self.ui.settings_mut() = settings;
     }
 
     /// Update view uniforms after resize or zoom
@@ -4018,12 +4045,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4083,16 +4110,17 @@ impl WgpuRenderer {
     }
 
     fn update_coverage_transform(&mut self) {
+        let shallow = self.ui.settings().show_shallow_pattern;
         let mut services = EmissionServices::live(
             &self.state,
             &self.pipelines,
-            &mut self.egui,
+            &mut self.ui,
             &mut self.cpu_profiler,
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            shallow,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4293,12 +4321,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4314,12 +4342,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4387,12 +4415,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4565,7 +4593,7 @@ impl WgpuRenderer {
         self.state.sync_scale_factor();
         self.motion_preview_active = false;
         self.vector_scene_epoch.advance();
-        self.ui_state.coverage_scale_indication = None;
+        self.ui.set_coverage_scale_indication(None);
         self.vector_emission
             .begin_frame(self.exact_line_quad_enabled);
     }
@@ -4592,12 +4620,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4664,16 +4692,17 @@ impl WgpuRenderer {
     /// Renders at lon offsets -360°, 0°, +360° for seamless wrapping.
     pub fn add_world_map_lines(&mut self, scaler: &ferrite_render::Scaler) {
         self.vector_scene_epoch.advance();
+        let shallow = self.ui.settings().show_shallow_pattern;
         let mut services = EmissionServices::live(
             &self.state,
             &self.pipelines,
-            &mut self.egui,
+            &mut self.ui,
             &mut self.cpu_profiler,
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            shallow,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4822,16 +4851,17 @@ impl WgpuRenderer {
         resource_owners: Option<&mut crate::CellPortrayalResources>,
     ) -> Result<()> {
         self.vector_scene_epoch.advance();
+        let shallow = self.ui.settings().show_shallow_pattern;
         let mut services = EmissionServices::live(
             &self.state,
             &self.pipelines,
-            &mut self.egui,
+            &mut self.ui,
             &mut self.cpu_profiler,
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            shallow,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -4846,19 +4876,6 @@ impl WgpuRenderer {
         )
     }
 
-    /// O(1) allocation key, valid only within the bound context geometry revision.
-    /// Interior rings cannot change through the context's immutable instruction API.
-    fn area_geometry_key(
-        area: &ferrite_render::AreaInstruction,
-        projection: ferrite_render::FlatProjection,
-    ) -> (usize, usize, ferrite_render::FlatProjection) {
-        (
-            area.exterior.as_ptr() as usize,
-            area.exterior.len(),
-            projection,
-        )
-    }
-
     /// Get or compute cached triangulation for an area polygon.
     /// Triangulation is done in world coordinates so it only needs to run once per unique polygon.
     /// Ensure triangulation is cached for this area, returning the cache key.
@@ -4868,191 +4885,23 @@ impl WgpuRenderer {
         area: &ferrite_render::AreaInstruction,
         projection: ferrite_render::FlatProjection,
     ) -> Option<(usize, usize, ferrite_render::FlatProjection)> {
+        let shallow = self.ui.settings().show_shallow_pattern;
         let mut services = EmissionServices::live(
             &self.state,
             &self.pipelines,
-            &mut self.egui,
+            &mut self.ui,
             &mut self.cpu_profiler,
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            shallow,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
         );
         self.vector_emission
             .ensure_triangulated(&mut services, area, projection)
-    }
-
-    /// Pre-computed world→screen transform parameters (avoids per-area scaler lookups)
-    #[inline]
-    fn scaler_transform(scaler: &ferrite_render::Scaler) -> ferrite_render::FlatTransform {
-        scaler.flat_transform()
-    }
-
-    /// Clip a line segment to a polygon, returning visible sub-segments.
-    /// Uses scanline intersection: find all intersection points of the line
-    /// with polygon edges, sort them along the line, then emit inside segments.
-    fn clip_line_to_polygon(
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        ring: &[(f32, f32)],
-    ) -> Vec<(f32, f32, f32, f32)> {
-        let dx = x1 - x0;
-        let dy = y1 - y0;
-        let line_len_sq = dx * dx + dy * dy;
-        if line_len_sq < 1e-10 {
-            return Vec::new();
-        }
-
-        // Find parametric t values where line intersects each polygon edge
-        let mut t_values: Vec<f32> = Vec::with_capacity(8);
-        let n = ring.len();
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let (ex0, ey0) = ring[i];
-            let (ex1, ey1) = ring[j];
-
-            let edx = ex1 - ex0;
-            let edy = ey1 - ey0;
-
-            let denom = dx * edy - dy * edx;
-            if denom.abs() < 1e-10 {
-                continue; // Parallel
-            }
-
-            let t = ((ex0 - x0) * edy - (ey0 - y0) * edx) / denom;
-            let u = ((ex0 - x0) * dy - (ey0 - y0) * dx) / denom;
-
-            if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&t) {
-                t_values.push(t);
-            }
-        }
-
-        if t_values.is_empty() {
-            // Line might be entirely inside or outside
-            let mid_x = (x0 + x1) * 0.5;
-            let mid_y = (y0 + y1) * 0.5;
-            if point_in_ring(mid_x, mid_y, ring) {
-                return vec![(x0, y0, x1, y1)];
-            }
-            return Vec::new();
-        }
-
-        t_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // Remove near-duplicates
-        t_values.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-
-        // Emit segments between consecutive intersection pairs that are inside
-        let mut segments = Vec::with_capacity(t_values.len() / 2 + 1);
-        let start_inside = point_in_ring(x0, y0, ring);
-
-        let mut prev_t = 0.0_f32;
-        let mut inside = start_inside;
-
-        for &t in &t_values {
-            if inside {
-                let seg_x0 = x0 + prev_t * dx;
-                let seg_y0 = y0 + prev_t * dy;
-                let seg_x1 = x0 + t * dx;
-                let seg_y1 = y0 + t * dy;
-                segments.push((seg_x0, seg_y0, seg_x1, seg_y1));
-            }
-            inside = !inside;
-            prev_t = t;
-        }
-
-        // Handle remaining segment to end
-        if inside {
-            let seg_x0 = x0 + prev_t * dx;
-            let seg_y0 = y0 + prev_t * dy;
-            segments.push((seg_x0, seg_y0, x1, y1));
-        }
-
-        segments
-    }
-
-    /// Cohen-Sutherland outcode for line clipping
-    #[inline]
-    fn cs_outcode(x: f32, y: f32, x_min: f32, y_min: f32, x_max: f32, y_max: f32) -> u8 {
-        let mut code = 0u8;
-        if x < x_min {
-            code |= 1;
-        }
-        // LEFT
-        else if x > x_max {
-            code |= 2;
-        } // RIGHT
-        if y < y_min {
-            code |= 4;
-        }
-        // TOP
-        else if y > y_max {
-            code |= 8;
-        } // BOTTOM
-        code
-    }
-
-    /// Clip a line segment to a rectangle using Cohen-Sutherland.
-    /// Returns Some((x0,y0,x1,y1)) if any portion is visible, None if fully outside.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn clip_line_segment(
-        mut x0: f32,
-        mut y0: f32,
-        mut x1: f32,
-        mut y1: f32,
-        x_min: f32,
-        y_min: f32,
-        x_max: f32,
-        y_max: f32,
-    ) -> Option<(f32, f32, f32, f32)> {
-        let mut code0 = Self::cs_outcode(x0, y0, x_min, y_min, x_max, y_max);
-        let mut code1 = Self::cs_outcode(x1, y1, x_min, y_min, x_max, y_max);
-
-        loop {
-            if (code0 | code1) == 0 {
-                // Both inside
-                return Some((x0, y0, x1, y1));
-            }
-            if (code0 & code1) != 0 {
-                // Both on same outside side
-                return None;
-            }
-            // Pick the point that is outside
-            let code_out = if code0 != 0 { code0 } else { code1 };
-            let (x, y);
-            if code_out & 8 != 0 {
-                // Below
-                x = x0 + (x1 - x0) * (y_max - y0) / (y1 - y0);
-                y = y_max;
-            } else if code_out & 4 != 0 {
-                // Above
-                x = x0 + (x1 - x0) * (y_min - y0) / (y1 - y0);
-                y = y_min;
-            } else if code_out & 2 != 0 {
-                // Right
-                y = y0 + (y1 - y0) * (x_max - x0) / (x1 - x0);
-                x = x_max;
-            } else {
-                // Left
-                y = y0 + (y1 - y0) * (x_min - x0) / (x1 - x0);
-                x = x_min;
-            }
-            if code_out == code0 {
-                x0 = x;
-                y0 = y;
-                code0 = Self::cs_outcode(x0, y0, x_min, y_min, x_max, y_max);
-            } else {
-                x1 = x;
-                y1 = y;
-                code1 = Self::cs_outcode(x1, y1, x_min, y_min, x_max, y_max);
-            }
-        }
     }
 
     pub fn displayed_line_spans(&self, index: usize) -> Option<&[ferrite_render::LineSpan]> {
@@ -5230,8 +5079,8 @@ impl WgpuRenderer {
                     seq.end()
                 }
             }
-            struct RasterOrder<'a>(&'a WgpuRenderer);
-            impl serde::Serialize for RasterOrder<'_> {
+            struct RasterOrder<'a, U>(&'a WgpuRenderer<U>);
+            impl<U> serde::Serialize for RasterOrder<'_, U> {
                 fn serialize<S: serde::Serializer>(
                     &self,
                     serializer: S,
@@ -5253,14 +5102,15 @@ impl WgpuRenderer {
                 }
             }
             #[derive(serde::Serialize)]
-            struct DrawOrderInputs<'a, A: serde::Serialize, P: serde::Serialize> {
+            #[serde(bound(serialize = "A: serde::Serialize, P: serde::Serialize"))]
+            struct DrawOrderInputs<'a, A: serde::Serialize, P: serde::Serialize, U> {
                 scope: &'static str,
                 area_ranges: &'a A,
                 line_ranges: &'a A,
                 symbol_ranges: &'a A,
                 pattern_ranges: &'a P,
                 text: TextOrder<'a>,
-                raster: RasterOrder<'a>,
+                raster: RasterOrder<'a, U>,
                 world_map_line_vertices: usize,
                 world_map_line_indices: usize,
                 wrap_pixels_bits: u32,
@@ -5379,12 +5229,12 @@ impl WgpuRenderer {
         let mut services = EmissionServices::read_only(
             &self.state,
             &self.pipelines,
-            &self.egui.ctx,
+            self.ui.fonts(),
             &self.overscale_program_reuse,
             self.symbol_scale,
             self.show_soundings,
             self.animation_mode,
-            self.ui_state.settings.show_shallow_pattern,
+            self.ui.settings().show_shallow_pattern,
             &self.world_map_coastlines,
             &self.world_map_detailed,
             self.background_color,
@@ -5397,17 +5247,18 @@ impl WgpuRenderer {
         )
     }
     /// Shared text/selection overlay; optionally includes application panels.
-    fn prepare_overlay(&mut self, include_panels: bool) -> Result<egui::FullOutput> {
+    /// Returns the overlay frame's pixels per point.
+    fn prepare_overlay(&mut self, include_panels: bool) -> Result<f32> {
         if let Some(owner) = self.vector_emission.referenced_chart_owner.as_ref() {
             owner.begin_display(
                 [self.state.size.width, self.state.size.height],
                 self.state.window.scale_factor() as f32,
-                self.egui.ctx.pixels_per_point(),
+                self.ui.fonts().pixels_per_point(),
             )?;
         }
         self.chart_text_shapes.clear();
-        // Begin egui frame
-        self.egui.begin_frame(&self.state.window);
+        // Begin overlay frame
+        self.ui.begin_frame();
 
         // Read exactly the committed draw/pick CoverageFrame. Resized or affine
         // preview geometry is not a new coverage owner/reference; withhold its
@@ -5418,7 +5269,7 @@ impl WgpuRenderer {
             && self.vector_emission.vector_frame.screen_pan_offset == (0.0, 0.0)
             && self.vector_emission.vector_frame.screen_zoom_scale == 1.0
             && self.vector_emission.vector_frame.screen_zoom_scale_y == 1.0;
-        self.ui_state.coverage_scale_indication = if let (true, Some(viewport)) = (
+        let coverage_scale_indication = if let (true, Some(viewport)) = (
             authoritative,
             self.vector_emission.vector_frame.chart_geometry_viewport,
         ) {
@@ -5437,8 +5288,9 @@ impl WgpuRenderer {
                         ]
                 })
                 .and_then(|annotation| {
-                    annotation.reference().map(|reference| {
-                        crate::egui_integration::CoverageScaleIndication {
+                    annotation
+                        .reference()
+                        .map(|reference| crate::CoverageScaleIndication {
                             viewing_denominator: annotation.viewing_denominator,
                             overscale_factor: reference.state.factor,
                             physical_viewport: viewport,
@@ -5449,17 +5301,18 @@ impl WgpuRenderer {
                                 .get(&reference.dataset_id)
                                 .copied()
                                 .or(self.vector_emission.vector_frame.coverage_scale_colour),
-                        }
-                    })
+                        })
                 })
         } else {
             None
         };
+        self.ui
+            .set_coverage_scale_indication(coverage_scale_indication);
 
         // Adapter is the actual selected device, not a guessed platform label.
-        if include_panels && self.ui_state.debug_mode {
-            self.ui_state
-                .debug_gpu
+        if include_panels && self.ui.debug_mode() {
+            self.ui
+                .debug_gpu_mut()
                 .adapter
                 .clone_from(&self.state.gpu_name);
             let backend = match self.state.adapter_backend {
@@ -5470,97 +5323,67 @@ impl WgpuRenderer {
                 wgpu::Backend::BrowserWebGpu => "WebGPU",
                 _ => "Other",
             };
-            if self.ui_state.debug_gpu.backend != backend {
-                self.ui_state.debug_gpu.backend.clear();
-                self.ui_state.debug_gpu.backend.push_str(backend);
+            let debug_gpu = self.ui.debug_gpu_mut();
+            if debug_gpu.backend != backend {
+                debug_gpu.backend.clear();
+                debug_gpu.backend.push_str(backend);
             }
             self.gpu_profiler
-                .update_debug_stats(&mut self.ui_state.debug_gpu);
+                .update_debug_stats(self.ui.debug_gpu_mut());
             self.cpu_profiler
-                .update_debug_stats(&mut self.ui_state.debug_cpu_frames);
+                .update_debug_stats(self.ui.debug_cpu_frames_mut());
         }
 
-        // Draw egui UI
+        // Draw UI panels
         if include_panels {
-            self.egui.draw_ui(&mut self.ui_state);
+            self.ui.draw_panels();
         }
 
         // Selection is an application overlay, separate from IHO portrayal symbols.
         if let Some([x, y]) = self.vector_emission.vector_frame.selection_anchor {
             let (pivot_x, pivot_y) = self.vector_emission.vector_frame.screen_zoom_pivot;
-            let ppp = self.egui.ctx.pixels_per_point();
-            let pos = egui::pos2(
-                ((x + self.vector_emission.vector_frame.screen_pan_offset.0 - pivot_x)
+            let anchor = [
+                (x + self.vector_emission.vector_frame.screen_pan_offset.0 - pivot_x)
                     * self.vector_emission.vector_frame.screen_zoom_scale
-                    + pivot_x)
-                    / ppp,
-                ((y + self.vector_emission.vector_frame.screen_pan_offset.1 - pivot_y)
+                    + pivot_x,
+                (y + self.vector_emission.vector_frame.screen_pan_offset.1 - pivot_y)
                     * self.vector_emission.vector_frame.screen_zoom_scale_y
-                    + pivot_y)
-                    / ppp,
-            );
-            let (x, y, w, h) = self.ui_state.chart_area;
-            let clip = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
-            let painter = self
-                .egui
-                .ctx
-                .layer_painter(egui::LayerId::background())
-                .with_clip_rect(clip);
-            for path in &self.vector_emission.vector_frame.selection_screen_geometry {
-                let points: Vec<_> = path
-                    .iter()
-                    .map(|p| {
-                        egui::pos2(
-                            ((p[0] + self.vector_emission.vector_frame.screen_pan_offset.0
-                                - pivot_x)
-                                * self.vector_emission.vector_frame.screen_zoom_scale
-                                + pivot_x)
-                                / ppp,
-                            ((p[1] + self.vector_emission.vector_frame.screen_pan_offset.1
-                                - pivot_y)
-                                * self.vector_emission.vector_frame.screen_zoom_scale_y
-                                + pivot_y)
-                                / ppp,
-                        )
-                    })
-                    .collect();
-                if points.len() >= 2 {
-                    painter.add(egui::Shape::line(
-                        points.clone(),
-                        egui::Stroke::new(5.0_f32, egui::Color32::BLACK),
-                    ));
-                    painter.add(egui::Shape::line(
-                        points,
-                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 230, 255)),
-                    ));
-                }
-            }
-            painter.circle_stroke(pos, 18.0, egui::Stroke::new(5.0_f32, egui::Color32::BLACK));
-            painter.circle_stroke(
-                pos,
-                18.0,
-                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 230, 255)),
-            );
-            if let Some(f) = &self.ui_state.selected_feature {
-                painter.text(
-                    pos + egui::vec2(23.0, -22.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    &f.feature_type,
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::BLACK,
-                );
-            }
+                    + pivot_y,
+            ];
+            let paths = self
+                .vector_emission
+                .vector_frame
+                .selection_screen_geometry
+                .iter()
+                .map(|path| {
+                    path.iter()
+                        .map(|p| {
+                            [
+                                (p[0] + self.vector_emission.vector_frame.screen_pan_offset.0
+                                    - pivot_x)
+                                    * self.vector_emission.vector_frame.screen_zoom_scale
+                                    + pivot_x,
+                                (p[1] + self.vector_emission.vector_frame.screen_pan_offset.1
+                                    - pivot_y)
+                                    * self.vector_emission.vector_frame.screen_zoom_scale_y
+                                    + pivot_y,
+                            ]
+                        })
+                        .collect()
+                })
+                .collect();
+            self.ui.draw_selection(SelectionOverlay { anchor, paths });
         }
 
         let shapes = std::mem::take(&mut self.chart_text_shapes);
         self.chart_text_shapes = self.layout_chart_text(shapes, true).0;
 
-        // End egui frame and get output
-        let output = self.egui.end_frame(&self.state.window);
+        // End overlay frame
+        let pixels_per_point = self.ui.end_frame();
         if let Some(owner) = self.vector_emission.referenced_chart_owner.as_mut() {
             owner.end_display()?;
         }
-        Ok(output)
+        Ok(pixels_per_point)
     }
 
     /// Reuse exact immutable40B payloads only. Changed content always allocates;
@@ -6291,16 +6114,16 @@ impl WgpuRenderer {
 
     /// Tessellate each ordered glyph group into its own immutable GPU buffers.
     /// The egui atlas is shared; no per-priority atlas copies or repeated job scans.
-    fn prepare_chart_text(&mut self, output: &mut egui::FullOutput) -> Result<()> {
+    fn prepare_chart_text(&mut self, pixels_per_point: f32) -> Result<()> {
         self.vector_scene_epoch.advance();
         if let Some(owner) = self.vector_emission.referenced_chart_owner.as_mut() {
             owner.upload(&self.state.device, &self.state.queue)?;
         } else {
-            self.egui
-                .prepare_chart_atlas(&self.state.device, &self.state.queue, output);
+            self.ui
+                .upload_chart_atlas(&self.state.device, &self.state.queue);
         }
         let cache_environment = immutable_text_preparation::Environment::new(
-            output.pixels_per_point,
+            pixels_per_point,
             [self.state.size.width, self.state.size.height],
         );
         if self.immutable_text_preparation.enabled() {
@@ -6338,7 +6161,7 @@ impl WgpuRenderer {
         self.chart_text_buffers.begin();
         let mut groups = std::collections::BTreeMap::<
             (CompositionPlane, i32, Option<usize>, u8),
-            Vec<egui::epaint::ClippedShape>,
+            Vec<epaint::ClippedShape>,
         >::new();
         for (plane, priority, source, wrap_pass, shape) in self.chart_text_shapes.drain(..) {
             groups
@@ -6346,15 +6169,15 @@ impl WgpuRenderer {
                 .or_default()
                 .push(shape);
         }
-        let ppp = output.pixels_per_point;
+        let ppp = pixels_per_point;
         for ((plane, priority, source, wrap_pass), shapes) in groups {
             let font_context = self
                 .vector_emission
                 .referenced_chart_owner
                 .as_ref()
-                .map_or(&self.egui.ctx, |owner| &owner.context);
+                .map_or(self.ui.fonts(), |owner| owner.context.as_ref());
             for job in font_context.tessellate(shapes, ppp) {
-                if let egui::epaint::Primitive::Mesh(mesh) = job.primitive {
+                if let epaint::Primitive::Mesh(mesh) = job.primitive {
                     if mesh.indices.is_empty() {
                         continue;
                     }
@@ -6366,7 +6189,7 @@ impl WgpuRenderer {
                         if let Some(owner) = self.vector_emission.referenced_chart_owner.as_ref() {
                             owner.bind_group(mesh.texture_id)?
                         } else {
-                            self.egui
+                            self.ui
                                 .chart_atlas_bind_group(mesh.texture_id)
                                 .ok_or_else(|| {
                                     WgpuError::Render(format!(
@@ -6711,11 +6534,11 @@ impl WgpuRenderer {
             None
         };
         let overlay_cpu_timer = self.state.surface_pacing_clock();
-        let mut egui_output = self.prepare_overlay(true)?;
+        let overlay_pixels_per_point = self.prepare_overlay(true)?;
         self.state
             .surface_pacing_record(crate::surface_pacing::Stage::OverlayCpu, overlay_cpu_timer);
         let chart_text_host_timer = self.state.surface_pacing_clock();
-        self.prepare_chart_text(&mut egui_output)?;
+        self.prepare_chart_text(overlay_pixels_per_point)?;
         self.state.surface_pacing_record(
             crate::surface_pacing::Stage::ChartTextHost,
             chart_text_host_timer,
@@ -6835,25 +6658,21 @@ impl WgpuRenderer {
             self.cpu_profiler.record("render_pass", t.elapsed());
         }
 
-        // Render egui UI overlay (after chart rendering, to surface texture directly)
+        // Render the UI overlay (after chart rendering, to surface texture directly)
         let (width, height) = self.state.viewport_size();
-        let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [width as u32, height as u32],
-            pixels_per_point: self.state.window.scale_factor() as f32,
-        };
 
         let egui_render_timer = if profiling {
             Some(ScopeTimer::new("egui_gpu_render"))
         } else {
             None
         };
-        self.egui.render(
+        self.ui.render(
             &self.state.device,
             &self.state.queue,
             &mut encoder,
             &view,
-            screen_descriptor,
-            egui_output,
+            [width as u32, height as u32],
+            self.state.window.scale_factor() as f32,
         );
         if let Some(t) = egui_render_timer {
             self.cpu_profiler.record("egui_gpu_render", t.elapsed());
@@ -7003,8 +6822,9 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    pub fn window(&self) -> &Window {
-        &self.state.window
+    /// The presentation window or target the surface belongs to.
+    pub fn window(&self) -> &dyn crate::SurfaceHost {
+        self.state.window.as_ref()
     }
 
     /// Save screenshot to file
@@ -7097,8 +6917,8 @@ impl WgpuRenderer {
                     label: Some("screenshot_encoder"),
                 });
 
-        let mut overlay = self.prepare_overlay(include_panels)?;
-        self.prepare_chart_text(&mut overlay)?;
+        let overlay_pixels_per_point = self.prepare_overlay(include_panels)?;
+        self.prepare_chart_text(overlay_pixels_per_point)?;
         self.prepare_geometry_buffers()?;
         let (target_view, resolve_target) = if let Some(ref mv) = msaa_view {
             (mv, Some(&resolve_view))
@@ -7113,16 +6933,13 @@ impl WgpuRenderer {
         self.encode_chart(&mut encoder, target_view, resolve_target, None, None);
 
         // Screen and exported images share chart text and selection overlays.
-        self.egui.render(
+        self.ui.render(
             &self.state.device,
             &self.state.queue,
             &mut encoder,
             &resolve_view,
-            egui_wgpu::ScreenDescriptor {
-                size_in_pixels: [width, height],
-                pixels_per_point: self.state.window.scale_factor() as f32,
-            },
-            overlay,
+            [width, height],
+            self.state.window.scale_factor() as f32,
         );
 
         // Copy resolved texture to buffer
@@ -7474,9 +7291,9 @@ mod pattern_emission_audit_tests {
     }
 }
 
-fn coverage_scale_sclbr(profile: Option<&ColorProfile>) -> Option<egui::Color32> {
+fn coverage_scale_sclbr(profile: Option<&ColorProfile>) -> Option<epaint::Color32> {
     let colour = profile?.get_srgb("SCLBR")?;
-    Some(egui::Color32::from_rgb(colour.r, colour.g, colour.b))
+    Some(epaint::Color32::from_rgb(colour.r, colour.g, colour.b))
 }
 #[cfg(test)]
 mod coverage_scale_colour_tests {
@@ -7500,7 +7317,7 @@ mod coverage_scale_colour_tests {
             );
             assert_eq!(
                 coverage_scale_sclbr(Some(&profile)),
-                Some(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
+                Some(epaint::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
             );
             profile.colors.remove("SCLBR");
             assert_eq!(coverage_scale_sclbr(Some(&profile)), None);
@@ -7723,23 +7540,23 @@ struct VectorEmissionOwned {
 
 /// A metric source is never a shallow clone of the live UI Context.
 enum EmissionFonts<'a> {
-    Live(&'a mut EguiIntegration),
-    ReadOnly(&'a egui::Context),
-    Private(&'a egui::Context),
+    Live(&'a mut dyn UiLayer),
+    ReadOnly(&'a dyn ChartFontContext),
+    Private(&'a dyn ChartFontContext),
 }
 impl EmissionFonts<'_> {
-    fn context(&self) -> &egui::Context {
+    fn context(&self) -> &dyn ChartFontContext {
         match self {
-            Self::Live(ui) => &ui.ctx,
-            Self::ReadOnly(ctx) | Self::Private(ctx) => ctx,
+            Self::Live(ui) => ui.fonts(),
+            Self::ReadOnly(ctx) | Self::Private(ctx) => *ctx,
         }
     }
     fn is_private(&self) -> bool {
         matches!(self, Self::Private(_))
     }
-    fn ensure_font_metrics(&mut self, window: &Window) {
+    fn ensure_font_metrics(&mut self) {
         match self {
-            Self::Live(ui) => ui.ensure_font_metrics(window),
+            Self::Live(ui) => ui.ensure_font_metrics(),
             // Private metric source is independently initialized before emission.
             // All actual chart labels are laid out by its independently prepared owner.
             Self::Private(_) => {}
@@ -7771,7 +7588,7 @@ impl<'a> EmissionServices<'a> {
     fn live(
         state: &'a GpuState,
         pipelines: &'a RenderPipelines,
-        egui: &'a mut EguiIntegration,
+        ui: &'a mut dyn UiLayer,
         cpu: &'a mut CpuProfiler,
         programs: &'a crate::overscale_annotation::ProgramReuse,
         symbol_scale: f32,
@@ -7785,7 +7602,7 @@ impl<'a> EmissionServices<'a> {
         Self {
             state,
             pipelines,
-            fonts: EmissionFonts::Live(egui),
+            fonts: EmissionFonts::Live(ui),
             cpu_profiler: Some(cpu),
             overscale_program_reuse: programs,
             symbol_scale,
@@ -7804,7 +7621,7 @@ impl<'a> EmissionServices<'a> {
     fn read_only(
         state: &'a GpuState,
         pipelines: &'a RenderPipelines,
-        ctx: &'a egui::Context,
+        ctx: &'a dyn ChartFontContext,
         programs: &'a crate::overscale_annotation::ProgramReuse,
         symbol_scale: f32,
         show_soundings: bool,
@@ -8218,7 +8035,7 @@ impl VectorEmissionOwned {
                         continue;
                     }
 
-                    if let Some((cx0, cy0, cx1, cy1)) = WgpuRenderer::clip_line_segment(
+                    if let Some((cx0, cy0, cx1, cy1)) = RendererGeometry::clip_line_segment(
                         prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max,
                         clip_y_max,
                     ) {
@@ -8514,7 +8331,7 @@ impl VectorEmissionOwned {
             .scaler
             .set_pixel_ratio(services.state.scale_factor());
         let scaler = context.scaler.clone();
-        self.vector_frame.geometry_transform = Some(WgpuRenderer::scaler_transform(&scaler));
+        self.vector_frame.geometry_transform = Some(RendererGeometry::scaler_transform(&scaler));
         self.vector_frame.display_scale =
             scaler.display_scale.round().clamp(1.0, u32::MAX as f64) as u32;
         context.get_sorted_instructions();
@@ -9093,7 +8910,7 @@ impl VectorEmissionOwned {
         });
 
         // Pre-compute world→screen transform once for all areas
-        let area_transform = WgpuRenderer::scaler_transform(&scaler);
+        let area_transform = RendererGeometry::scaler_transform(&scaler);
 
         // Track skipped counts for debugging
         let mut _culled_count = 0usize;
@@ -9774,7 +9591,7 @@ impl VectorEmissionOwned {
                     .iter()
                     .map(|label| (label.text.as_str(), label.font_size)),
             )?;
-            services.fonts.ensure_font_metrics(&services.state.window);
+            services.fonts.ensure_font_metrics();
             let extent = [services.state.size.width, services.state.size.height];
             let density = services.state.scale_factor() as f32;
             let requests = || {
@@ -9825,7 +9642,7 @@ impl VectorEmissionOwned {
         };
         if let (Some(indices), Some(mask)) = (text_instruction_indices, execution) {
             if !self.vector_frame.frame_cpu.text_labels.is_empty() {
-                services.fonts.ensure_font_metrics(&services.state.window);
+                services.fonts.ensure_font_metrics();
                 let (_, accepted) = self.layout_chart_text_with_owner(
                     services,
                     next_chart_owner.as_ref(),
@@ -9927,7 +9744,7 @@ impl VectorEmissionOwned {
         area: &ferrite_render::AreaInstruction,
         projection: ferrite_render::FlatProjection,
     ) -> Option<(usize, usize, ferrite_render::FlatProjection)> {
-        let cache_key = WgpuRenderer::area_geometry_key(area, projection);
+        let cache_key = RendererGeometry::area_geometry_key(area, projection);
 
         // Check cache first
         if self.triangulation_cache.contains_key(&cache_key) {
@@ -10107,7 +9924,7 @@ impl VectorEmissionOwned {
         let mut seen = std::collections::HashSet::new();
         let pending: Vec<_> = areas
             .iter()
-            .map(|area| (WgpuRenderer::area_geometry_key(area, projection), *area))
+            .map(|area| (RendererGeometry::area_geometry_key(area, projection), *area))
             .filter(|(key, _)| {
                 !self.triangulation_cache.contains_key(key)
                     && !self.triangulation_failures.contains(key)
@@ -10166,7 +9983,7 @@ impl VectorEmissionOwned {
             | ferrite_render::AreaFillType::CentroidSymbol(_) => return,
         };
 
-        let cache_key = WgpuRenderer::area_geometry_key(area, transform.projection);
+        let cache_key = RendererGeometry::area_geometry_key(area, transform.projection);
 
         // Fast path: triangulation already cached — use cached AABB for O(1) frustum culling
         // (avoids re-scanning entire exterior ring just to compute AABB)
@@ -10283,7 +10100,7 @@ impl VectorEmissionOwned {
         }
 
         // Cold path: first-time triangulation — fall back to ring-scan culling
-        if !WgpuRenderer::is_ring_visible_static(
+        if !RendererGeometry::is_ring_visible_static(
             &area.exterior,
             self.vector_frame.viewport_world_bounds,
             self.vector_frame.lon_wrap_screen_px > 0.0,
@@ -10320,7 +10137,7 @@ impl VectorEmissionOwned {
         source_ordinal: usize,
     ) {
         // Frustum culling: quick AABB check on exterior ring
-        if !WgpuRenderer::is_ring_visible_static(
+        if !RendererGeometry::is_ring_visible_static(
             &area.exterior,
             self.vector_frame.viewport_world_bounds,
             self.vector_frame.lon_wrap_screen_px > 0.0,
@@ -10575,7 +10392,7 @@ impl VectorEmissionOwned {
         _priority: i32,
     ) -> crate::Result<()> {
         // Frustum culling: quick AABB check on exterior ring
-        if !WgpuRenderer::is_ring_visible_static(
+        if !RendererGeometry::is_ring_visible_static(
             &area.exterior,
             self.vector_frame.viewport_world_bounds,
             self.vector_frame.lon_wrap_screen_px > 0.0,
@@ -10666,7 +10483,7 @@ impl VectorEmissionOwned {
             let ly1 = cy + sin_a * diag;
 
             // Clip this line segment to the polygon using intersection tests
-            let segments = WgpuRenderer::clip_line_to_polygon(lx0, ly0, lx1, ly1, &screen_ring);
+            let segments = RendererGeometry::clip_line_to_polygon(lx0, ly0, lx1, ly1, &screen_ring);
             for (sx, sy, ex, ey) in segments {
                 // Reject hatch segments outside viewport + margin
                 if sx < hatch_clip_min_x
@@ -11034,7 +10851,7 @@ impl VectorEmissionOwned {
         }
 
         // Clip to viewport bounds for clean edges
-        if let Some((cx0, cy0, cx1, cy1)) = WgpuRenderer::clip_line_segment(
+        if let Some((cx0, cy0, cx1, cy1)) = RendererGeometry::clip_line_segment(
             prev.x, prev.y, curr.x, curr.y, clip_x_min, clip_y_min, clip_x_max, clip_y_max,
         ) {
             let dx = cx1 - cx0;
@@ -11215,7 +11032,7 @@ impl VectorEmissionOwned {
                 source_classification: self.vector_frame.static_source_classification.as_deref(),
                 device_fixed_sources: &self.vector_frame.device_fixed_sources,
             },
-            owner.map_or(services.fonts.context(), |owner| &owner.context),
+            owner.map_or(services.fonts.context(), |owner| owner.context.as_ref()),
             &self.vector_frame.frame_cpu.text_labels,
             shapes,
             capture_shapes,
@@ -11526,14 +11343,14 @@ struct PrivateEmissionEnvironment {
     format: wgpu::TextureFormat,
 }
 impl PrivateEmissionEnvironment {
-    fn capture(renderer: &WgpuRenderer) -> Self {
+    fn capture<U: UiLayer>(renderer: &WgpuRenderer<U>) -> Self {
         let (w, h) = renderer.state.viewport_size();
         Self {
             extent: [renderer.state.size.width, renderer.state.size.height],
             viewport: [w.to_bits(), h.to_bits()],
             density: renderer.state.window.scale_factor().to_bits(),
-            ppp: renderer.egui.ctx.pixels_per_point().to_bits(),
-            zoom: renderer.egui.ctx.zoom_factor().to_bits(),
+            ppp: renderer.ui.fonts().pixels_per_point().to_bits(),
+            zoom: renderer.ui.fonts().zoom_factor().to_bits(),
             format: renderer.state.format(),
         }
     }
@@ -11543,7 +11360,10 @@ impl PrivateEmissionEnvironment {
             f32::from_bits(self.viewport[1]),
         )
     }
-    fn private_metric_source(self, source: &egui::Context) -> Result<egui::Context> {
+    fn private_metric_source(
+        self,
+        source: &dyn ChartFontContext,
+    ) -> Result<Box<dyn ChartFontContext>> {
         let density = f64::from_bits(self.density) as f32;
         let ppp = f32::from_bits(self.ppp);
         let zoom = f32::from_bits(self.zoom);
@@ -11560,26 +11380,18 @@ impl PrivateEmissionEnvironment {
             ));
         }
         // Read options only. No Context clone, live begin_pass, live font definitions or atlas writes.
-        let context = egui::Context::default();
-        context.options_mut(|o| *o = source.options(Clone::clone));
-        context.set_zoom_factor(zoom);
-        context.set_fonts(crate::chart_fonts::chart_font_definitions());
-        let mut raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(
-                    self.extent[0] as f32 / density,
-                    self.extent[1] as f32 / density,
-                ),
-            )),
+        let context = source.new_private(PrivateFontSpec {
+            zoom_factor: zoom,
+            fonts: crate::chart_fonts::chart_font_definitions(),
+        });
+        context.begin_pass(&FontPassInput {
+            screen_size_points: Some([
+                self.extent[0] as f32 / density,
+                self.extent[1] as f32 / density,
+            ]),
             max_texture_side: Some(2048),
-            ..Default::default()
-        };
-        raw.viewports
-            .entry(context.viewport_id())
-            .or_default()
-            .native_pixels_per_point = Some(density);
-        context.begin_pass(raw);
+            native_pixels_per_point: Some(density),
+        });
         let actual_ppp = context.pixels_per_point().to_bits();
         let _output = context.end_pass();
         if actual_ppp != self.ppp {
@@ -11590,7 +11402,7 @@ impl PrivateEmissionEnvironment {
         Ok(context)
     }
 }
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     pub fn capture_publication_origin(&self) -> RendererPublicationOrigin {
         RendererPublicationOrigin {
             expected_old: private_vector_gpu::ExpectedPublishedVector::capture(self),
@@ -11737,7 +11549,7 @@ impl WgpuRenderer {
             old_scene_epoch,
             environment,
         } = origin.unwrap_or_else(|| self.capture_publication_origin());
-        let metrics = environment.private_metric_source(&self.egui.ctx)?;
+        let metrics = environment.private_metric_source(self.ui.fonts())?;
         let mut emission = self.vector_emission.fork_private();
         emission.vector_frame.lon_wrap_screen_px = longitude_wrap_pixels;
         emission.vector_frame.world_map_chart_boxes = world_map_chart_boxes;
@@ -11745,7 +11557,7 @@ impl WgpuRenderer {
         let mut services = EmissionServices {
             state: &self.state,
             pipelines: &self.pipelines,
-            fonts: EmissionFonts::Private(&metrics),
+            fonts: EmissionFonts::Private(metrics.as_ref()),
             cpu_profiler: None,
             overscale_program_reuse: &self.overscale_program_reuse,
             symbol_scale: settings.symbol_scale,
@@ -11958,20 +11770,13 @@ mod private_vector_emitter_ownership_tests {
     }
     #[test]
     fn private_font_source_covers_no_reference_labels_and_is_not_ui_source() {
-        let source = egui::Context::default();
+        let source = crate::test_text_backend::TestFonts::default();
         source.set_fonts(crate::chart_fonts::chart_font_definitions());
-        let mut raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(400., 300.),
-            )),
+        source.begin_pass(&FontPassInput {
+            screen_size_points: Some([400., 300.]),
+            native_pixels_per_point: Some(1.),
             ..Default::default()
-        };
-        raw.viewports
-            .entry(source.viewport_id())
-            .or_default()
-            .native_pixels_per_point = Some(1.);
-        source.begin_pass(raw);
+        });
         let _ = source.end_pass();
         let env = PrivateEmissionEnvironment {
             extent: [400, 300],
@@ -11982,7 +11787,7 @@ mod private_vector_emitter_ownership_tests {
             format: wgpu::TextureFormat::Rgba8Unorm,
         };
         let private = env.private_metric_source(&source).unwrap();
-        let fonts = EmissionFonts::Private(&private);
+        let fonts = EmissionFonts::Private(private.as_ref());
         assert!(fonts.is_private());
         assert!(!EmissionFonts::ReadOnly(&source).is_private());
         assert_eq!(
@@ -12004,14 +11809,14 @@ pub struct VectorEmissionSettings {
     pub show_shallow_pattern: bool,
     pub background_color: Color,
 }
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     pub fn vector_emission_settings(&self) -> VectorEmissionSettings {
         VectorEmissionSettings {
             symbol_scale: self.symbol_scale,
             background_color: self.background_color,
             show_soundings: self.show_soundings,
             animation_mode: self.animation_mode,
-            show_shallow_pattern: self.ui_state.settings.show_shallow_pattern,
+            show_shallow_pattern: self.ui.settings().show_shallow_pattern,
         }
     }
 }
@@ -12119,14 +11924,14 @@ impl VectorFrameState {
         output
     }
 }
-fn chart_text_scissor(clip: egui::Rect, ppp: f32, [width, height]: [u32; 2]) -> Option<[u32; 4]> {
+fn chart_text_scissor(clip: epaint::Rect, ppp: f32, [width, height]: [u32; 2]) -> Option<[u32; 4]> {
     let x = (clip.min.x * ppp).round().clamp(0., width as f32) as u32;
     let y = (clip.min.y * ppp).round().clamp(0., height as f32) as u32;
     let right = (clip.max.x * ppp).round().clamp(x as f32, width as f32) as u32;
     let bottom = (clip.max.y * ppp).round().clamp(y as f32, height as f32) as u32;
     (x != right && y != bottom).then_some([x, y, right - x, bottom - y])
 }
-fn chart_text_vertices(mesh: &egui::epaint::Mesh, ppp: f32) -> Vec<crate::ChartTextVertex> {
+fn chart_text_vertices(mesh: &epaint::Mesh, ppp: f32) -> Vec<crate::ChartTextVertex> {
     mesh.vertices
         .iter()
         .map(|v| crate::ChartTextVertex {
@@ -12142,22 +11947,22 @@ mod private_gpu_shared_math_tests {
     use super::*;
     #[test]
     fn scissor_and_glyph_vertices_keep_original_rounding_and_colour_bytes() {
-        let clip = egui::Rect::from_min_max(egui::pos2(-2.5, 3.25), egui::pos2(19.75, 1000.));
+        let clip = epaint::Rect::from_min_max(epaint::pos2(-2.5, 3.25), epaint::pos2(19.75, 1000.));
         assert_eq!(
             chart_text_scissor(clip, 2., [31, 100]),
             Some([0, 7, 31, 93])
         );
         assert!(chart_text_scissor(
-            egui::Rect::from_min_max(egui::pos2(40., 0.), egui::pos2(50., 1.)),
+            epaint::Rect::from_min_max(epaint::pos2(40., 0.), epaint::pos2(50., 1.)),
             1.0,
             [31, 100]
         )
         .is_none());
-        let mesh = egui::epaint::Mesh {
-            vertices: vec![egui::epaint::Vertex {
-                pos: egui::pos2(1.25, -3.5),
-                uv: egui::pos2(0.1, 0.9),
-                color: egui::Color32::from_rgba_premultiplied(1, 2, 3, 4),
+        let mesh = epaint::Mesh {
+            vertices: vec![epaint::Vertex {
+                pos: epaint::pos2(1.25, -3.5),
+                uv: epaint::pos2(0.1, 0.9),
+                color: epaint::Color32::from_rgba_premultiplied(1, 2, 3, 4),
             }],
             ..Default::default()
         };
@@ -12170,7 +11975,7 @@ mod private_gpu_shared_math_tests {
 
 #[path = "vector_scene_draw.rs"]
 mod vector_scene_draw;
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     /// Opt-in upload-only counters; permission/emission and CPU indices remain original.
     pub fn area_index_upload_reuse_enabled(&self) -> bool {
         self.area_index_upload_reuse.enabled()
@@ -12181,7 +11986,7 @@ impl WgpuRenderer {
     pub fn area_index_upload_reuse_work(&self) -> &crate::AreaIndexUploadReuseWork {
         self.area_index_upload_reuse.work()
     }
-    fn displayed_vector_draw_scene(&self) -> vector_scene_draw::VectorDrawScene<'_> {
+    fn displayed_vector_draw_scene(&self) -> vector_scene_draw::VectorDrawScene<'_, U> {
         use vector_scene_draw::{PairRef, VectorDrawScene};
         VectorDrawScene {
             emission: &self.vector_emission,
@@ -12223,7 +12028,7 @@ impl WgpuRenderer {
     }
 }
 
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     /// Immutable current chart-box inputs for a one-shot independently owned rebuild audit.
     /// No GPU resources or permission decisions are exposed.
     pub fn vector_world_map_chart_boxes(&self) -> &[(f64, f64, f64, f64)] {
@@ -12320,7 +12125,7 @@ pub struct SceneBuildJob {
     programs: Arc<crate::overscale_annotation::ProgramReuse>,
     coastlines: Arc<ferrite_render::BackgroundCoastlines>,
     coastlines_detailed: Arc<ferrite_render::BackgroundCoastlines>,
-    fonts: egui::Context,
+    fonts: Arc<dyn ChartFontContext>,
     settings: VectorEmissionSettings,
     exact_line_quad: bool,
     generation: u64,
@@ -12385,7 +12190,7 @@ impl SceneBuildJob {
             let mut services = EmissionServices {
                 state: &self.gpu,
                 pipelines: &self.pipelines,
-                fonts: EmissionFonts::Private(&self.fonts),
+                fonts: EmissionFonts::Private(self.fonts.as_ref()),
                 cpu_profiler: None,
                 overscale_program_reuse: &self.programs,
                 symbol_scale: self.settings.symbol_scale,
@@ -12448,7 +12253,7 @@ impl BuiltScene {
     }
 }
 
-impl WgpuRenderer {
+impl<U: UiLayer> WgpuRenderer<U> {
     fn invalidate_scene_builder(&mut self) {
         self.scene_generation = self.scene_generation.wrapping_add(1);
         self.idle_builder = None;
@@ -12489,9 +12294,9 @@ impl WgpuRenderer {
         {
             return true;
         }
-        match environment.private_metric_source(&self.egui.ctx) {
+        match environment.private_metric_source(self.ui.fonts()) {
             Ok(ctx) => {
-                self.worker_fonts = Some((environment, ctx));
+                self.worker_fonts = Some((environment, Arc::from(ctx)));
                 true
             }
             Err(error) => {
@@ -12671,6 +12476,6 @@ mod worker_input_send_contract {
         send::<crate::GpuState>();
         send::<super::RenderPipelines>();
         sync::<crate::overscale_annotation::ProgramReuse>();
-        send::<egui::Context>();
+        send::<std::sync::Arc<dyn crate::ChartFontContext>>();
     }
 }

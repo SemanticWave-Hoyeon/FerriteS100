@@ -1,6 +1,6 @@
 //! Actual GPU selection overlay at the chosen longitude copy.
+use ferrite_gpu::SelectedFeature;
 use ferrite_render::{Color, GeoBounds, RenderContext, Viewport, WorldPoint};
-use ferrite_wgpu::{SelectedFeature, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -23,7 +23,7 @@ impl ApplicationHandler for Smoke {
             .unwrap(),
         );
         let size = window.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         r.background_color = Color::WHITE;
         std::fs::create_dir_all(&self.output).unwrap();
         let mut probes = Vec::new();
@@ -34,7 +34,7 @@ impl ApplicationHandler for Smoke {
             r.begin_frame();
             r.add_instructions(&mut ctx);
 
-            r.ui_state.selected_feature = Some(SelectedFeature {
+            r.ui.ui_state.selected_feature = Some(SelectedFeature {
                 feature_type: "Line".into(),
                 feature_id: 1,
                 foid: Some("1:2:3".into()),
@@ -76,7 +76,7 @@ impl ApplicationHandler for Smoke {
                     "shift {shift} zoom {zoom}: highlight absent ({cyan})"
                 );
                 assert_eq!(
-                    r.ui_state.selected_feature.as_ref().unwrap().world_pos,
+                    r.ui.ui_state.selected_feature.as_ref().unwrap().world_pos,
                     (5., 3.)
                 );
                 assert_eq!(r.selected_geometry_vertex_count(), 2);

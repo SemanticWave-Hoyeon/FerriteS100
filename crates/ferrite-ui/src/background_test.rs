@@ -2,9 +2,7 @@
 //! metrics and a Metal surface; snapshots use the renderer's texture readback.
 use winit::{event_loop::EventLoopBuilder, window::WindowAttributes};
 
-pub fn enabled() -> bool {
-    std::env::var_os("FERRITE_BACKGROUND_TEST").is_some_and(|v| v == "1")
-}
+pub use ferrite_gpu::background_test::enabled;
 
 fn hidden_attributes(attributes: WindowAttributes) -> WindowAttributes {
     attributes

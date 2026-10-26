@@ -1460,6 +1460,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-gpu"
+version = "2.0.0"
+dependencies = [
+ "ab_glyph",
+ "bytemuck",
+ "earcutr",
+ "epaint",
+ "ferrite-kernel",
+ "ferrite-portrayal-catalog",
+ "ferrite-render",
+ "ferrite-s102",
+ "image",
+ "lyon_tessellation",
+ "pollster",
+ "rayon",
+ "resvg",
+ "rustc-hash 2.1.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.17",
+ "tracing",
+ "wgpu",
+ "wgpu-profiler",
+]
+
+[[package]]
 name = "ferrite-interoperability"
 version = "2.0.0"
 dependencies = [
@@ -1625,6 +1652,7 @@ dependencies = [
  "egui-winit",
  "ferrite-engine",
  "ferrite-feature-catalog",
+ "ferrite-gpu",
  "ferrite-interoperability",
  "ferrite-iso8211",
  "ferrite-kernel",
@@ -1640,7 +1668,7 @@ dependencies = [
  "ferrite-s102",
  "ferrite-s421",
  "ferrite-security",
- "ferrite-wgpu",
+ "ferrite-ui",
  "hdf5-metno",
  "image",
  "libc",
@@ -1781,33 +1809,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrite-wgpu"
+name = "ferrite-ui"
 version = "2.0.0"
 dependencies = [
  "ab_glyph",
  "bytemuck",
- "earcutr",
  "egui",
  "egui-wgpu",
  "egui-winit",
- "ferrite-kernel",
+ "ferrite-gpu",
  "ferrite-portrayal-catalog",
  "ferrite-render",
- "ferrite-s102",
  "ferrite-s421",
- "image",
- "lyon_tessellation",
  "pollster",
- "rayon",
- "resvg",
- "rustc-hash 2.1.1",
- "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.17",
  "tracing",
  "wgpu",
- "wgpu-profiler",
  "winit",
 ]
 

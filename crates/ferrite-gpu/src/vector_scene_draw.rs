@@ -28,7 +28,7 @@ pub(super) struct PairRef<'a> {
     pub vertices: &'a Option<wgpu::Buffer>,
     pub indices: &'a Option<wgpu::Buffer>,
 }
-pub(super) struct VectorDrawScene<'a> {
+pub(super) struct VectorDrawScene<'a, U> {
     pub emission: &'a VectorEmissionOwned,
     pub pipelines: &'a RenderPipelines,
     pub area: PairRef<'a>,
@@ -44,9 +44,9 @@ pub(super) struct VectorDrawScene<'a> {
     pub extent: [u32; 2],
     pub background: Color,
     pub draw_range_index_enabled: bool,
-    pub raster_renderer: Option<&'a WgpuRenderer>,
+    pub raster_renderer: Option<&'a WgpuRenderer<U>>,
 }
-impl VectorDrawScene<'_> {
+impl<U: UiLayer> VectorDrawScene<'_, U> {
     fn raster_layers(&self) -> &[GpuRasterLayer] {
         self.raster_renderer
             .map_or(&[], |r| r.raster_layers.as_slice())

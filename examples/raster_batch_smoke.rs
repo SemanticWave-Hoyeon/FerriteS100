@@ -1,5 +1,4 @@
 use ferrite_render::{Color, GeoBounds, RasterGrid, RasterLayer, RenderContext, Viewport};
-use ferrite_wgpu::WgpuRenderer;
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -32,7 +31,7 @@ impl ApplicationHandler for Smoke {
             .unwrap(),
         );
         let size = w.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let mut c = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         c.set_bounds(GeoBounds::new(0., 0., 10., 10.));

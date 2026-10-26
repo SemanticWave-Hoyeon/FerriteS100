@@ -184,7 +184,7 @@ impl Audit {
         }
         ensure!(
             files.contains_key("frame.png")
-                && files.contains_key(if ferrite_wgpu::audit_digest_only_enabled() {
+                && files.contains_key(if ferrite_gpu::audit_digest_only_enabled() {
                     "instructions.sha256.json"
                 } else {
                     "instructions.bin"
@@ -193,7 +193,7 @@ impl Audit {
                 && files.contains_key("gpu/metadata.json"),
             "Missing captured outputs"
         );
-        if ferrite_wgpu::audit_digest_only_enabled() {
+        if ferrite_gpu::audit_digest_only_enabled() {
             validate_digest_buffers(path, &files)?;
         }
         self.captures.push(serde_json::json!({"frame":frame,"path":path,"files_sha256":files,"camera_bits":self.rows[frame].final_camera_bits}));

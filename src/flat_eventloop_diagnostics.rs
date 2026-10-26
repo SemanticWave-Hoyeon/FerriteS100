@@ -17,8 +17,8 @@ pub struct Audit {
     pub gpu_coverage_host: [u64; FRAME_COUNT],
     prepare: [u64; FRAME_COUNT],
     render: [u64; FRAME_COUNT],
-    line_before: Option<ferrite_wgpu::LinePreparationWork>,
-    line_children: [Option<ferrite_wgpu::LinePreparationWork>; FRAME_COUNT],
+    line_before: Option<ferrite_gpu::LinePreparationWork>,
+    line_children: [Option<ferrite_gpu::LinePreparationWork>; FRAME_COUNT],
 }
 fn ns(d: std::time::Duration) -> u64 {
     d.as_nanos().min(u64::MAX as u128) as u64
@@ -68,12 +68,12 @@ impl Audit {
     }
     /// Snapshot before the first ordered motion. Counters belong to this renderer
     /// lifetime and include all rebuilds in the callback, not just the final one.
-    pub fn begin_line_work(&mut self, work: Option<ferrite_wgpu::LinePreparationWork>) {
+    pub fn begin_line_work(&mut self, work: Option<ferrite_gpu::LinePreparationWork>) {
         self.line_before = work;
     }
     pub fn finish_line_work(
         &mut self,
-        work: Option<ferrite_wgpu::LinePreparationWork>,
+        work: Option<ferrite_gpu::LinePreparationWork>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.next < FRAME_COUNT,
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn line_callback_records_every_rebuild_and_rejects_lifetime_changes() {
         let mut a = Audit::new(PathBuf::new(), [0., 0., 1., 1.], 1., (0., 0.));
-        let before = ferrite_wgpu::LinePreparationWork::default();
+        let before = ferrite_gpu::LinePreparationWork::default();
         let mut after = before.clone();
         after.calls[0] = 4;
         after.host_ns[0] = 40;

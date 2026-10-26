@@ -1,8 +1,8 @@
 use anyhow::{ensure, Context, Result};
-use ferrite_wgpu::coverage_clip::{create_clip_layout, fragment_clipped_shader, FragmentEntry};
+use ferrite_gpu::coverage_clip::{create_clip_layout, fragment_clipped_shader, FragmentEntry};
 
 async fn run() -> Result<()> {
-    let source = include_str!("../crates/ferrite-wgpu/src/pipeline.rs");
+    let source = include_str!("../crates/ferrite-gpu/src/pipeline.rs");
     let instance = wgpu::Instance::new(&Default::default());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -72,11 +72,11 @@ async fn run() -> Result<()> {
         wgpu::TextureFormat::Rgba8UnormSrgb,
     ] {
         for samples in [1, 4] {
-            let _legacy = ferrite_wgpu::coverage_pipeline::CoveragePipelines::new(
+            let _legacy = ferrite_gpu::coverage_pipeline::CoveragePipelines::new(
                 &device, format, samples, &view, &asset, &asset,
             )?;
             let _instanced =
-                ferrite_wgpu::coverage_pipeline::CoveragePipelines::new_with_symbol_instancing(
+                ferrite_gpu::coverage_pipeline::CoveragePipelines::new_with_symbol_instancing(
                     &device, format, samples, &view, &asset, &asset, true,
                 )?;
         }

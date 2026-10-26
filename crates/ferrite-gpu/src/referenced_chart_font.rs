@@ -4,9 +4,9 @@ use ferrite_portrayal_catalog::BoundFontReference;
 /// The explicit reference has a single-font family; no system/ChartBold fallback.
 /// Glyph availability must be checked for each final text before any live publication.
 pub(crate) struct PreparedReferencedChartFont {
-    pub family: egui::FontFamily,
+    pub family: epaint::FontFamily,
     name: String,
-    font_data: egui::FontData,
+    font_data: epaint::text::FontData,
     parsed: ab_glyph::FontArc,
 }
 impl PreparedReferencedChartFont {
@@ -30,11 +30,11 @@ impl PreparedReferencedChartFont {
         // FontDefinitions owns String keys; this occurs only for a newly prepared owner.
         // Repeated labels use the shared Arc family name without formatting/allocation.
         let name = font.render_family_name().to_string();
-        let family = egui::FontFamily::Name(font.render_family_name().clone());
+        let family = epaint::FontFamily::Name(font.render_family_name().clone());
         Ok(Self {
             family,
             name,
-            font_data: egui::FontData::from_owned(font.bytes().to_vec()),
+            font_data: epaint::text::FontData::from_owned(font.bytes().to_vec()),
             parsed,
         })
     }
@@ -52,7 +52,7 @@ impl PreparedReferencedChartFont {
         }
         Ok(())
     }
-    pub fn install(self, definitions: &mut egui::FontDefinitions) -> egui::FontFamily {
+    pub fn install(self, definitions: &mut epaint::text::FontDefinitions) -> epaint::FontFamily {
         definitions
             .font_data
             .insert(self.name.clone(), self.font_data.into());

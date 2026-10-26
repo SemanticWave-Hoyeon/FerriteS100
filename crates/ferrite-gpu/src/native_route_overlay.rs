@@ -7,8 +7,27 @@ use ferrite_portrayal_catalog::{
     SimpleLineStyle, SrgbColor,
 };
 use ferrite_render::{Scaler, ScreenPoint, WorldPoint};
-use ferrite_s421::editing_style_contract::{read_editing_palette, EditingStyleContract};
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
+
+/// Declared editing resources, validated by the host's S-421 reader.
+#[derive(Debug, Clone)]
+pub struct EditingStyle {
+    pub product: String,
+    pub version: String,
+    /// Colour tokens the waypoint SVG uses, in ascending order.
+    pub svg_color_tokens: Vec<String>,
+}
+/// Requested editing palette: colour token to sRGB.
+pub type EditingPalette = BTreeMap<String, [u8; 3]>;
+/// Host S-421 readers: the editing PC/SVG contract and the requested palette.
+pub struct EditingStyleReader {
+    pub contract: fn(pc: &str, waypoint_svg: &str) -> Result<EditingStyle, String>,
+    pub palette: fn(xml: &str, requested: &str) -> Result<EditingPalette, String>,
+}
 
 pub const NATIVE_S421_PROVIDER: &str = "native:s421-route";
 const MAX_ROUTES: usize = 128;
@@ -18,14 +37,18 @@ const MAX_SYMBOL_PAYLOAD: usize = 32 * 1024 * 1024;
 /// Immutable, independent PC owner. No shared ENC palette/cache is accepted.
 pub struct NativeRouteOverlayResources {
     sources: Arc<CatalogueSources>,
-    contract: EditingStyleContract,
+    contract: EditingStyle,
     profile: ColorProfile,
     waypoint: Arc<SymbolGeometry>,
     leg: SimpleLineStyle,
     leg_rgba: [u8; 4],
 }
 impl NativeRouteOverlayResources {
-    pub fn load(pc_root: &Path, requested_palette: &str) -> Result<Arc<Self>, String> {
+    pub fn load(
+        pc_root: &Path,
+        requested_palette: &str,
+        reader: &EditingStyleReader,
+    ) -> Result<Arc<Self>, String> {
         // Legacy public editing adjuncts do not declare modern display-plane
         // metadata. Capture original resources without fabricating that metadata
         // or treating this host illustration as a full product portrayal.
@@ -36,7 +59,7 @@ impl NativeRouteOverlayResources {
         let svg = sources
             .read_relative(Path::new("Symbols/RTEWPT01.svg"))
             .map_err(|e| e.to_string())?;
-        let contract = EditingStyleContract::from_declared_pc(
+        let contract = (reader.contract)(
             std::str::from_utf8(&pc).map_err(|e| e.to_string())?,
             std::str::from_utf8(&svg).map_err(|e| e.to_string())?,
         )?;
@@ -44,7 +67,7 @@ impl NativeRouteOverlayResources {
         let color_bytes = sources
             .read_relative(Path::new("ColorProfiles/colorProfile.xml"))
             .map_err(|e| e.to_string())?;
-        let colors = read_editing_palette(
+        let colors = (reader.palette)(
             std::str::from_utf8(&color_bytes).map_err(|e| e.to_string())?,
             requested_palette,
         )?;
@@ -60,7 +83,7 @@ impl NativeRouteOverlayResources {
                 },
             );
         }
-        for token in contract.svg_color_tokens() {
+        for token in &contract.svg_color_tokens {
             if profile.get_srgb(token).is_none() {
                 return Err(format!("S421 palette lacks SVG token {token}"));
             }
@@ -105,10 +128,10 @@ impl NativeRouteOverlayResources {
         self.sources.digest()
     }
     pub fn actual_product(&self) -> &str {
-        self.contract.product()
+        &self.contract.product
     }
     pub fn actual_version(&self) -> &str {
-        self.contract.version()
+        &self.contract.version
     }
     pub fn palette(&self) -> &str {
         &self.profile.name
@@ -165,11 +188,13 @@ pub struct NativeRouteWorldSamples {
     declarations: Vec<NativeRouteLegDeclaration>,
     step_bits: u64,
     vertex_limit: usize,
-    samples: std::collections::BTreeMap<(u32, u32), Vec<[f64; 2]>>,
+    #[doc(hidden)]
+    pub samples: std::collections::BTreeMap<(u32, u32), Vec<[f64; 2]>>,
     payload_bytes: usize,
     solver_invocations: usize,
 }
-const MAX_WORLD_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
+#[doc(hidden)]
+pub const MAX_WORLD_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
 impl NativeRouteWorldSamples {
     pub fn prepare(
         paths: &[NativeRoutePath],
@@ -595,54 +620,6 @@ mod tests {
             latitude: y,
         }
     }
-    struct Fixture(std::path::PathBuf);
-    impl Fixture {
-        fn new() -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "ferrite-native-own-pc-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&root).unwrap();
-            for directory in ["Symbols", "LineStyles", "ColorProfiles"] {
-                std::fs::create_dir(root.join(directory)).unwrap();
-            }
-            // Original public catalogue and resource bytes, no invented plane
-            // metadata. Only the three declared resources consumed here exist.
-            std::fs::write(
-                root.join("portrayal_catalogue.xml"),
-                include_bytes!("../../ferrite-s421/tests/fixtures/editing/portrayal_catalogue.xml"),
-            )
-            .unwrap();
-            for (file, bytes) in [
-                (
-                    "Symbols/RTEWPT01.svg",
-                    include_bytes!("../../ferrite-s421/tests/fixtures/editing/RTEWPT01.svg")
-                        .as_slice(),
-                ),
-                (
-                    "LineStyles/RTEACTLEGLINE.xml",
-                    include_bytes!("../../ferrite-s421/tests/fixtures/editing/RTEACTLEGLINE.xml")
-                        .as_slice(),
-                ),
-                (
-                    "ColorProfiles/colorProfile.xml",
-                    include_bytes!("../../ferrite-s421/tests/fixtures/editing/colorProfile.xml")
-                        .as_slice(),
-                ),
-            ] {
-                std::fs::write(root.join(file), bytes).unwrap();
-            }
-            Self(root)
-        }
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     #[test]
     fn authored_curve_uses_wgs84_and_rejects_fabricated_original_provenance() {
         let paths = [NativeRoutePath {
@@ -676,67 +653,6 @@ mod tests {
         assert!(NativeRouteWorldSamples::prepare(&paths, &legs, 2).is_err());
     }
     #[test]
-    fn immutable_world_samples_match_original_solver_and_do_not_recompute_for_cameras() {
-        use crate::NativeRouteLegGeometry;
-        use ferrite_render::{GeoBounds, Viewport};
-        let fixture = Fixture::new();
-        let resources = NativeRouteOverlayResources::load(&fixture.0, "Day").unwrap();
-        let paths = [NativeRoutePath {
-            route_id: 7,
-            waypoints: vec![point(9, 1., 70.), point(3, 3., 70.)],
-        }];
-        let legs = [NativeRouteLegDeclaration {
-            route_id: 7,
-            from: 9,
-            to: 3,
-            geometry: NativeRouteLegGeometry::Orthodrome,
-            source_profile: 1,
-            source_gml_id: "LEG.1".into(),
-            original_geometry_text: "2".into(),
-        }];
-        let world = NativeRouteWorldSamples::prepare(&paths, &legs, 11).unwrap();
-        let legacy = sample_leg([1., 70.], [3., 70.], legs[0].geometry, MAX_LEG_VERTICES).unwrap();
-        let actual = world.samples.get(&(7, 3)).unwrap();
-        assert_eq!(actual.len(), legacy.len());
-        assert!(actual
-            .iter()
-            .zip(&legacy)
-            .all(|(a, b)| a[0].to_bits() == b[0].to_bits() && a[1].to_bits() == b[1].to_bits()));
-        assert_eq!(world.solver_invocations(), 1);
-        let calls = crate::native_route_leg::solver_call_count();
-        for (width, x) in [(800., 0.), (1000., 0.1)] {
-            let scaler = Scaler::new(
-                GeoBounds::new(x, 68., 4. + x, 72.),
-                Viewport::new(width, 600.),
-            );
-            let packet = PreparedNativeRouteOverlay::prepare_with_world_samples(
-                resources.clone(),
-                11,
-                &paths,
-                &legs,
-                &world,
-                &scaler,
-                scaler.pixels_per_mm(),
-            )
-            .unwrap();
-            packet
-                .validate(&resources, 11, &scaler, scaler.pixels_per_mm())
-                .unwrap();
-        }
-        assert_eq!(crate::native_route_leg::solver_call_count(), calls);
-        assert!(world.payload_bytes() <= MAX_WORLD_SAMPLE_BYTES);
-        let mut altered = paths.clone();
-        altered[0].waypoints[1].latitude = 70.00000000000001;
-        assert!(!world.matches(&altered, &legs, 11));
-        assert!(!world.matches(&paths, &legs, 12));
-        let mut profile = legs.clone();
-        profile[0].source_profile = 2;
-        assert!(!world.matches(&paths, &profile, 11));
-        let mut lexical = legs.clone();
-        lexical[0].original_geometry_text = "02".into();
-        assert!(!world.matches(&paths, &lexical, 11));
-    }
-    #[test]
     fn world_sample_metadata_cap_and_vertex_exhaustion_decline_explicitly() {
         use crate::NativeRouteLegGeometry;
         let paths = [NativeRoutePath {
@@ -767,212 +683,6 @@ mod tests {
         legs.truncate(1);
         legs[0].source_gml_id = "x".repeat(MAX_WORLD_SAMPLE_BYTES + 1);
         assert!(NativeRouteWorldSamples::prepare(&paths, &legs, 11).is_err());
-    }
-    #[test]
-    fn semantic_packet_has_curve_vertices_original_pick_owners_and_stale_camera_guard() {
-        use crate::NativeRouteLegGeometry;
-        use ferrite_render::{GeoBounds, Viewport};
-        let fixture = Fixture::new();
-        let resources = NativeRouteOverlayResources::load(&fixture.0, "Day").unwrap();
-        let scaler = Scaler::new(
-            GeoBounds::new(-35., 65., 35., 77.),
-            Viewport::new(800., 600.),
-        );
-        let paths = [NativeRoutePath {
-            route_id: 7,
-            waypoints: vec![point(9, -30., 70.), point(3, 30., 70.)],
-        }];
-        let leg = NativeRouteLegDeclaration {
-            route_id: 7,
-            from: 9,
-            to: 3,
-            geometry: NativeRouteLegGeometry::Orthodrome,
-            source_profile: 1,
-            source_gml_id: "LEG.1".into(),
-            original_geometry_text: "2".into(),
-        };
-        let packet = PreparedNativeRouteOverlay::prepare_with_leg_semantics(
-            resources.clone(),
-            11,
-            &paths,
-            &[leg.clone()],
-            &scaler,
-            scaler.pixels_per_mm(),
-        )
-        .unwrap();
-        let path = &packet.paths()[0];
-        assert!(path.line_points.len() > 2);
-        assert_eq!(path.segment_owners.len() + 1, path.line_points.len());
-        assert!(path.segment_owners.iter().all(|owner| *owner == (9, 3)));
-        assert_eq!(path.waypoints.len(), 2);
-        assert!(path.line_points[path.line_points.len() / 2].y < path.waypoints[0].1.y);
-        let other = Scaler::new(
-            GeoBounds::new(-34., 65., 36., 77.),
-            Viewport::new(800., 600.),
-        );
-        assert!(packet
-            .validate(&resources, 11, &other, other.pixels_per_mm())
-            .is_err());
-        let reversed = NativeRouteLegDeclaration {
-            from: 3,
-            to: 9,
-            ..leg
-        };
-        assert!(PreparedNativeRouteOverlay::prepare_with_leg_semantics(
-            resources,
-            11,
-            &paths,
-            &[reversed],
-            &scaler,
-            scaler.pixels_per_mm()
-        )
-        .is_err());
-    }
-    #[test]
-    fn declared_seam_packet_uses_continuous_copy_and_legacy_still_declines() {
-        use ferrite_render::{GeoBounds, Viewport};
-        let fixture = Fixture::new();
-        let resources = NativeRouteOverlayResources::load(&fixture.0, "Day").unwrap();
-        let scaler = Scaler::new(
-            GeoBounds::new(178., 58., 182., 62.),
-            Viewport::new(800., 600.),
-        );
-        let paths = [NativeRoutePath {
-            route_id: 7,
-            waypoints: vec![point(9, 179., 60.), point(3, -179., 60.)],
-        }];
-        assert!(PreparedNativeRouteOverlay::prepare(
-            resources.clone(),
-            11,
-            &paths,
-            &scaler,
-            scaler.pixels_per_mm()
-        )
-        .is_err());
-        let legs = [NativeRouteLegDeclaration {
-            route_id: 7,
-            from: 9,
-            to: 3,
-            geometry: crate::NativeRouteLegGeometry::Loxodrome,
-            source_profile: 1,
-            source_gml_id: "LEG.1".into(),
-            original_geometry_text: "1".into(),
-        }];
-        let packet = PreparedNativeRouteOverlay::prepare_with_leg_semantics(
-            resources.clone(),
-            11,
-            &paths,
-            &legs,
-            &scaler,
-            scaler.pixels_per_mm(),
-        )
-        .unwrap();
-        let expected = scaler.world_to_screen(WorldPoint::new(181., 60.));
-        assert_eq!(
-            packet.paths()[0].waypoints[1].1.x.to_bits(),
-            expected.x.to_bits()
-        );
-        assert_eq!(
-            paths[0].waypoints[1].longitude.to_bits(),
-            (-179_f64).to_bits()
-        );
-        let opposite = Scaler::new(
-            GeoBounds::new(-182., 58., -178., 62.),
-            Viewport::new(800., 600.),
-        );
-        let world = NativeRouteWorldSamples::prepare(&paths, &legs, 11).unwrap();
-        let opposite_packet = PreparedNativeRouteOverlay::prepare_with_world_samples(
-            resources,
-            11,
-            &paths,
-            &legs,
-            &world,
-            &opposite,
-            opposite.pixels_per_mm(),
-        )
-        .unwrap();
-        let opposite_path = &opposite_packet.paths()[0];
-        for (i, longitude) in [-181., -179.].into_iter().enumerate() {
-            assert_eq!(
-                opposite_path.waypoints[i].1,
-                opposite.world_to_screen(WorldPoint::new(longitude, 60.))
-            );
-        }
-        assert!(opposite_path
-            .line_points
-            .iter()
-            .all(|p| p.x >= 0. && p.x <= 800.));
-        assert!(world.matches(&paths, &legs, 11));
-    }
-    #[test]
-    fn own_public_assets_prepare_exact_camera_and_refuse_stale_candidates() {
-        use ferrite_render::{GeoBounds, Viewport};
-        let fixture = Fixture::new();
-        let resources = NativeRouteOverlayResources::load(&fixture.0, "Day").unwrap();
-        assert_eq!(resources.actual_version(), "");
-        assert_eq!(resources.palette(), "Day");
-        assert_eq!(resources.leg_style().pen.width, 0.64);
-        assert_eq!(resources.leg_style().dashes[0].start, 2.2);
-        assert!(resources.waypoint_symbol().pixels.iter().any(|v| *v != 0));
-        assert!(NativeRouteOverlayResources::load(&fixture.0, "Night").is_err());
-        let scaler = Scaler::new(GeoBounds::new(-1., 49., 3., 52.), Viewport::new(800., 600.));
-        let paths = [NativeRoutePath {
-            route_id: 7,
-            waypoints: vec![point(9, 2., 50.), point(3, 1., 51.)],
-        }];
-        let packet = PreparedNativeRouteOverlay::prepare(
-            resources.clone(),
-            11,
-            &paths,
-            &scaler,
-            scaler.pixels_per_mm(),
-        )
-        .unwrap();
-        for ((id, screen), original) in packet.paths()[0].waypoints.iter().zip(&paths[0].waypoints)
-        {
-            let expected =
-                scaler.world_to_screen(WorldPoint::new(original.longitude, original.latitude));
-            assert_eq!(*id, original.waypoint_id);
-            assert_eq!(
-                [screen.x.to_bits(), screen.y.to_bits()],
-                [expected.x.to_bits(), expected.y.to_bits()]
-            );
-        }
-        packet
-            .validate(&resources, 11, &scaler, scaler.pixels_per_mm())
-            .unwrap();
-        assert!(packet
-            .validate(&resources, 12, &scaler, scaler.pixels_per_mm())
-            .is_err());
-        assert!(packet
-            .validate(&resources, 11, &scaler, scaler.pixels_per_mm() * 2.)
-            .is_err());
-        let other_owner = NativeRouteOverlayResources::load(&fixture.0, "Day").unwrap();
-        assert!(packet
-            .validate(&other_owner, 11, &scaler, scaler.pixels_per_mm())
-            .is_err());
-        let invalid_view = Scaler::new(GeoBounds::new(-1., 49., 3., 52.), Viewport::new(0., 600.));
-        assert!(PreparedNativeRouteOverlay::prepare(
-            resources.clone(),
-            11,
-            &paths,
-            &invalid_view,
-            scaler.pixels_per_mm()
-        )
-        .is_err());
-        let mut changed = scaler.clone();
-        changed.pan(1., 0.);
-        assert!(packet
-            .validate(&resources, 11, &changed, changed.pixels_per_mm())
-            .is_err());
-        // Filesystem mutations cannot change resources already captured by owner.
-        let digest = *resources.source_digest();
-        std::fs::write(fixture.0.join("Symbols/RTEWPT01.svg"), b"broken").unwrap();
-        assert_eq!(*resources.source_digest(), digest);
-        assert!(NativeRouteOverlayResources::load(&fixture.0, "Day").is_err());
-        packet
-            .validate(&resources, 11, &scaler, scaler.pixels_per_mm())
-            .unwrap();
     }
     #[test]
     fn original_order_and_coincident_points_valid() {

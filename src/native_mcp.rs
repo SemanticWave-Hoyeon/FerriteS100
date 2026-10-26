@@ -19,14 +19,14 @@ impl super::ChartApp {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
-        if !renderer.ui_state.s100_mcp.open
-            && !renderer.ui_state.s100_mcp.enabled
-            && !renderer.ui_state.s100_mcp.restart
+        if !renderer.ui.ui_state.s100_mcp.open
+            && !renderer.ui.ui_state.s100_mcp.enabled
+            && !renderer.ui.ui_state.s100_mcp.restart
             && self.s100_mcp.server.is_none()
         {
             return;
         }
-        let mut ui = std::mem::take(&mut renderer.ui_state.s100_mcp);
+        let mut ui = std::mem::take(&mut renderer.ui.ui_state.s100_mcp);
         if ui.restart {
             ui.restart = false;
             ui.error = false;
@@ -58,6 +58,7 @@ impl super::ChartApp {
                 .renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .dataset_layers
                 .clone();
@@ -169,7 +170,7 @@ impl super::ChartApp {
             }
         }
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.s100_mcp = ui;
+            renderer.ui.ui_state.s100_mcp = ui;
         }
     }
 }

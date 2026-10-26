@@ -1,8 +1,8 @@
 //! Native signed-plane rendering with two rules resolved from a locally authored IC XML.
 //! This is not full S-98/catalogue-trust or real-feature adapter validation.
+use ferrite_gpu::SymbolCache;
 use ferrite_kernel::CompositionStage;
 use ferrite_render::*;
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{num::NonZeroI32, path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -31,7 +31,7 @@ impl ApplicationHandler for App {
         );
         let size = w.inner_size();
         let density = w.scale_factor();
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let pc = ferrite_portrayal_catalog::PortrayalCatalogue::load(&self.pc).unwrap();
         let profile = pc.color_profiles.profiles.get("Day").unwrap();

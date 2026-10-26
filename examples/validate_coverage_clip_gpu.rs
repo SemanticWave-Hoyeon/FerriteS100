@@ -1,7 +1,7 @@
 use anyhow::{ensure, Context, Result};
+use ferrite_gpu::coverage_clip::{clip_wgsl, create_clip_layout, ClipTransform, CoverageClip};
 use ferrite_kernel::coverage_raster::{rasterize, PixelMask};
 use ferrite_kernel::coverage_selection::Region;
-use ferrite_wgpu::coverage_clip::{clip_wgsl, create_clip_layout, ClipTransform, CoverageClip};
 
 fn trace(message: &str) {
     if std::env::var_os("FERRITE_CLIP_TRACE").is_some() {

@@ -1,9 +1,9 @@
 //! Render one official symbol at three animation zoom factors on the real GPU.
+use ferrite_gpu::SymbolCache;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{
     Color, DrawingInstruction, GeoBounds, PointInstruction, RenderContext, Viewport, WorldPoint,
 };
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -27,7 +27,7 @@ impl ApplicationHandler for Smoke {
         );
         let size = window.inner_size();
         let dpi = window.scale_factor();
-        let mut renderer = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut renderer = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         renderer.background_color = Color::WHITE;
         let pc = PortrayalCatalogue::load("Catalogues/PC/S-101").unwrap();
         let profile = pc

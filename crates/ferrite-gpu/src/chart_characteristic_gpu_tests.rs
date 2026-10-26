@@ -2,25 +2,19 @@
 use super::*;
 use ferrite_render::{TextFontProportion as P, TextFontStyle, TextFontWeight as W};
 
-fn input(context: &egui::Context, extent: [u32; 2], density: f32) -> egui::RawInput {
-    let mut raw = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(extent[0] as f32 / density, extent[1] as f32 / density),
-        )),
+use crate::chart_text_backend::ChartTextAtlas;
+use crate::test_text_backend::{TestAtlas, TestFonts};
+fn input(_context: &TestFonts, extent: [u32; 2], density: f32) -> FontPassInput {
+    FontPassInput {
+        screen_size_points: Some([extent[0] as f32 / density, extent[1] as f32 / density]),
         max_texture_side: Some(2048),
-        ..Default::default()
-    };
-    raw.viewports
-        .entry(context.viewport_id())
-        .or_default()
-        .native_pixels_per_point = Some(density);
-    raw
+        native_pixels_per_point: Some(density),
+    }
 }
-fn context(extent: [u32; 2], density: f32) -> egui::Context {
-    let ctx = egui::Context::default();
+fn context(extent: [u32; 2], density: f32) -> TestFonts {
+    let ctx = TestFonts::default();
     ctx.set_fonts(crate::chart_fonts::chart_font_definitions());
-    ctx.begin_pass(input(&ctx, extent, density));
+    ctx.begin_pass(&input(&ctx, extent, density));
     ctx
 }
 fn label(source: usize, priority: i32, style: TextFontStyle, italic: bool) -> TextLabel {
@@ -50,7 +44,7 @@ fn label(source: usize, priority: i32, style: TextFontStyle, italic: bool) -> Te
     }
 }
 fn layout(
-    ctx: &egui::Context,
+    ctx: &TestFonts,
     extent: [u32; 2],
     labels: &[TextLabel],
     capture: bool,
@@ -85,37 +79,35 @@ fn cases() -> [(W, P, bool, bool); 8] {
     ]
 }
 /// Independent expected family: no call to production matcher or family selector.
-fn oracle_family(weight: W, proportion: P) -> egui::FontFamily {
+fn oracle_family(weight: W, proportion: P) -> epaint::FontFamily {
     if proportion == P::MonoSpaced {
-        egui::FontFamily::Monospace
+        epaint::FontFamily::Monospace
     } else {
         match weight {
-            W::Light => egui::FontFamily::Proportional,
-            W::Medium => egui::FontFamily::Name("ChartMedium".into()),
-            W::Bold => egui::FontFamily::Name("ChartBold".into()),
+            W::Light => epaint::FontFamily::Proportional,
+            W::Medium => epaint::FontFamily::Name("ChartMedium".into()),
+            W::Bold => epaint::FontFamily::Name("ChartBold".into()),
         }
     }
 }
 fn oracle_job(
-    ctx: &egui::Context,
+    ctx: &TestFonts,
     weight: W,
     proportion: P,
     italic: bool,
-) -> std::sync::Arc<egui::Galley> {
-    ctx.layer_painter(egui::LayerId::background()).layout_job(
-        egui::text::LayoutJob::single_section(
-            "Map 12.3 AB".into(),
-            egui::TextFormat {
-                font_id: egui::FontId {
-                    size: 22. / ctx.pixels_per_point(),
-                    family: oracle_family(weight, proportion),
-                },
-                color: egui::Color32::WHITE,
-                italics: italic,
-                ..Default::default()
+) -> std::sync::Arc<epaint::Galley> {
+    ctx.layout_job(epaint::text::LayoutJob::single_section(
+        "Map 12.3 AB".into(),
+        epaint::text::TextFormat {
+            font_id: epaint::FontId {
+                size: 22. / ctx.pixels_per_point(),
+                family: oracle_family(weight, proportion),
             },
-        ),
-    )
+            color: epaint::Color32::WHITE,
+            italics: italic,
+            ..Default::default()
+        },
+    ))
 }
 #[test]
 fn text_positive_characteristics_keep_slant_and_original_priority_collision() {
@@ -136,7 +128,7 @@ fn text_positive_characteristics_keep_slant_and_original_priority_collision() {
             let shapes = layout(&ctx, extent, &labels, true).0;
             assert_eq!(shapes.len(), 1);
             assert_eq!((shapes[0].1, shapes[0].2), (2, Some(1)));
-            let egui::Shape::Text(text) = &shapes[0].4.shape else {
+            let epaint::Shape::Text(text) = &shapes[0].4.shape else {
                 panic!("actual text shape required")
             };
             let oracle = oracle_job(&ctx, weight, proportion, italic);
@@ -171,14 +163,14 @@ fn medium_is_text_positive_distinct_from_light_and_explicit_override_never_shear
     );
     // Branch-isolation fixture, not a fabricated captured PC proof. Original
     // same-ID/different-PC test separately exercises real capture and resolution.
-    explicit.font_family_override = Some(egui::FontFamily::Name("ChartBold".into()));
+    explicit.font_family_override = Some(epaint::FontFamily::Name("ChartBold".into()));
     let shapes = layout(&ctx, [256, 128], &[explicit], true).0;
-    let egui::Shape::Text(text) = &shapes[0].4.shape else {
+    let epaint::Shape::Text(text) = &shapes[0].4.shape else {
         panic!("actual text shape required")
     };
     assert_eq!(
         text.galley.job.sections[0].format.font_id.family,
-        egui::FontFamily::Name("ChartBold".into())
+        epaint::FontFamily::Name("ChartBold".into())
     );
     assert!(!text.galley.job.sections[0].format.italics);
     let _ = ctx.end_pass();
@@ -213,13 +205,7 @@ fn characteristic_fonts_actual_layout_collision_chart_gpu() {
         for (extent, density) in [([256, 128], 1.), ([384, 160], 2.)] {
             for (weight, proportion, serifs, italic) in cases() {
                 let ctx = context(extent, density);
-                let mut atlas = egui_wgpu::Renderer::new(
-                    &device,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                    None,
-                    1,
-                    false,
-                );
+                let mut atlas = TestAtlas::new(&device);
                 let style = TextFontStyle {
                     weight,
                     proportion,
@@ -234,7 +220,7 @@ fn characteristic_fonts_actual_layout_collision_chart_gpu() {
                 let mut repeats = Vec::new();
                 for repetition in 0..2 {
                     if repetition != 0 {
-                        ctx.begin_pass(input(&ctx, extent, density));
+                        ctx.begin_pass(&input(&ctx, extent, density));
                     }
                     let shapes = layout(&ctx, extent, &labels, true)
                         .0
@@ -259,13 +245,11 @@ fn characteristic_fonts_actual_layout_collision_chart_gpu() {
                     let draw = draw_chart_fixture(
                         &device,
                         &queue,
-                        (&ctx, density, extent),
+                        (&ctx as &dyn ChartFontContext, density, extent),
                         shapes,
                         |ids| {
                             ids.iter()
-                                .map(|id| {
-                                    atlas.texture(id).expect("owned atlas").bind_group.clone()
-                                })
+                                .map(|id| atlas.bind_group(*id).expect("owned atlas"))
                                 .collect()
                         },
                     );
@@ -280,42 +264,30 @@ fn characteristic_fonts_actual_layout_collision_chart_gpu() {
                 // original requested synthetic slant, same physical size and anchor.
                 let oracle_ctx = context(extent, density);
                 let galley = oracle_job(&oracle_ctx, weight, proportion, italic);
-                let shape = egui::epaint::ClippedShape {
-                    clip_rect: egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(extent[0] as f32 / density, extent[1] as f32 / density),
+                let shape = epaint::ClippedShape {
+                    clip_rect: epaint::Rect::from_min_size(
+                        epaint::Pos2::ZERO,
+                        epaint::vec2(extent[0] as f32 / density, extent[1] as f32 / density),
                     ),
-                    shape: egui::Shape::galley(
-                        egui::pos2(16. / density, 16. / density),
+                    shape: epaint::Shape::galley(
+                        epaint::pos2(16. / density, 16. / density),
                         galley,
-                        egui::Color32::WHITE,
+                        epaint::Color32::WHITE,
                     ),
                 };
                 let output = oracle_ctx.end_pass();
-                let mut oracle_atlas = egui_wgpu::Renderer::new(
-                    &device,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                    None,
-                    1,
-                    false,
-                );
+                let mut oracle_atlas = TestAtlas::new(&device);
                 for (id, delta) in &output.textures_delta.set {
                     oracle_atlas.update_texture(&device, &queue, *id, delta);
                 }
                 let oracle = draw_chart_fixture(
                     &device,
                     &queue,
-                    (&oracle_ctx, density, extent),
+                    (&oracle_ctx as &dyn ChartFontContext, density, extent),
                     vec![shape],
                     |ids| {
                         ids.iter()
-                            .map(|id| {
-                                oracle_atlas
-                                    .texture(id)
-                                    .expect("oracle atlas")
-                                    .bind_group
-                                    .clone()
-                            })
+                            .map(|id| oracle_atlas.bind_group(*id).expect("oracle atlas"))
                             .collect()
                     },
                 );

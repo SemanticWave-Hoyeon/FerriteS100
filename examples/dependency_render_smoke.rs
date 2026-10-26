@@ -1,6 +1,6 @@
 //! Local native fixtures for S-100 Parent execution, not an official IHO test set.
+use ferrite_gpu::SymbolCache;
 use ferrite_render::*;
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -67,7 +67,7 @@ impl ApplicationHandler for App {
         );
         let density = window.scale_factor();
         let size = window.inner_size();
-        let mut r = pollster::block_on(WgpuRenderer::new(window)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(window)).unwrap();
         r.background_color = Color::WHITE;
         let pc = ferrite_portrayal_catalog::PortrayalCatalogue::load(&self.pc).unwrap();
         let profile = pc.color_profiles.profiles.get("Day").unwrap();

@@ -1,0 +1,31 @@
+[package]
+name = "ferrite-ui"
+version.workspace = true
+edition.workspace = true
+description = "egui panels and compositing for the S-100 chart renderer"
+
+[features]
+s102-portrayal = ["ferrite-gpu/s102-portrayal"]
+lua54 = ["ferrite-gpu/lua54"]
+lua55 = ["ferrite-gpu/lua55"]
+
+[dependencies]
+ferrite-gpu.workspace = true
+ferrite-render.workspace = true
+ferrite-portrayal-catalog.workspace = true
+ferrite-s421 = { path = "../ferrite-s421" }
+tracing.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+ab_glyph = "=0.2.32"
+
+[dev-dependencies]
+ferrite-gpu = { workspace = true, features = ["test-support"] }

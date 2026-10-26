@@ -37,54 +37,47 @@ impl Drop for Temp {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-fn input(context: &egui::Context, extent: [u32; 2], density: f32) -> egui::RawInput {
-    let mut input = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(extent[0] as f32 / density, extent[1] as f32 / density),
-        )),
+use crate::chart_text_backend::{ChartFontContext, ChartTextAtlas, FontPassInput};
+use crate::test_text_backend::{layout_no_wrap, TestAtlas, TestFonts};
+fn input(_context: &dyn ChartFontContext, extent: [u32; 2], density: f32) -> FontPassInput {
+    FontPassInput {
+        screen_size_points: Some([extent[0] as f32 / density, extent[1] as f32 / density]),
         max_texture_side: Some(2048),
-        ..Default::default()
-    };
-    input
-        .viewports
-        .entry(context.viewport_id())
-        .or_default()
-        .native_pixels_per_point = Some(density);
-    input
+        native_pixels_per_point: Some(density),
+    }
 }
-fn ui_context(extent: [u32; 2], density: f32) -> egui::Context {
-    let context = egui::Context::default();
+fn ui_context(extent: [u32; 2], density: f32) -> TestFonts {
+    let context = TestFonts::default();
     context.set_fonts(crate::chart_fonts::chart_font_definitions());
-    context.begin_pass(input(&context, extent, density));
+    context.begin_pass(&input(&context, extent, density));
     let _ = context.end_pass();
     context
 }
 fn glyph_jobs(
     owner: &ReferencedChartOwner,
     font: &BoundFontReference,
-) -> Vec<egui::epaint::ClippedShape> {
+) -> Vec<epaint::ClippedShape> {
     let ppp = owner.ppp;
-    let painter = owner.context.layer_painter(egui::LayerId::background());
-    let galley = painter.layout_no_wrap(
+    let galley = layout_no_wrap(
+        owner.context.as_ref(),
         "Map 12.3 AB".into(),
-        egui::FontId {
+        epaint::FontId {
             size: 22. / ppp,
             family: font_family(font),
         },
-        egui::Color32::WHITE,
+        epaint::Color32::WHITE,
     );
     assert!(!galley.rows.is_empty());
     assert!(galley.rect.width() > 0.);
-    let shape = egui::epaint::ClippedShape {
-        clip_rect: egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(owner.extent[0] as f32 / ppp, owner.extent[1] as f32 / ppp),
+    let shape = epaint::ClippedShape {
+        clip_rect: epaint::Rect::from_min_size(
+            epaint::Pos2::ZERO,
+            epaint::vec2(owner.extent[0] as f32 / ppp, owner.extent[1] as f32 / ppp),
         ),
-        shape: egui::Shape::galley(
-            egui::pos2(12. / ppp, 12. / ppp),
+        shape: epaint::Shape::galley(
+            epaint::pos2(12. / ppp, 12. / ppp),
             galley,
-            egui::Color32::WHITE,
+            epaint::Color32::WHITE,
         ),
     };
     vec![shape]
@@ -98,10 +91,10 @@ fn draw(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     owner: &mut ReferencedChartOwner,
-    shapes: Vec<egui::epaint::ClippedShape>,
+    shapes: Vec<epaint::ClippedShape>,
 ) -> DrawResult {
     let context = owner.context.clone(); // Same exclusively owned test Context, not a UI owner.
-    let frame = (&context, owner.ppp, owner.extent);
+    let frame = (context.as_ref(), owner.ppp, owner.extent);
     draw_chart_fixture(device, queue, frame, shapes, |ids| {
         owner.upload(device, queue).unwrap();
         ids.iter()
@@ -113,9 +106,9 @@ fn draw(
 pub(crate) fn draw_chart_fixture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    (context, ppp, extent): (&egui::Context, f32, [u32; 2]),
-    shapes: Vec<egui::epaint::ClippedShape>,
-    prepare_bindings: impl FnOnce(&[egui::TextureId]) -> Vec<wgpu::BindGroup>,
+    (context, ppp, extent): (&dyn ChartFontContext, f32, [u32; 2]),
+    shapes: Vec<epaint::ClippedShape>,
+    prepare_bindings: impl FnOnce(&[epaint::TextureId]) -> Vec<wgpu::BindGroup>,
 ) -> DrawResult {
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("font-probe-view"),
@@ -199,10 +192,10 @@ pub(crate) fn draw_chart_fixture(
         .checked_add((extent[0] * extent[1] * 4) as usize)
         .unwrap();
     for job in context.tessellate(shapes, ppp) {
-        let egui::epaint::Primitive::Mesh(mesh) = job.primitive else {
+        let epaint::Primitive::Mesh(mesh) = job.primitive else {
             panic!("Unexpected glyph callback");
         };
-        assert_eq!(mesh.texture_id, egui::TextureId::Managed(0));
+        assert_eq!(mesh.texture_id, epaint::TextureId::Managed(0));
         if mesh.indices.is_empty() {
             continue;
         }
@@ -423,13 +416,13 @@ fn referenced_pc_fonts_actual_chart_pipeline_gpu() {
             fresh.end_display().unwrap();
             let b = draw(&device, &queue, &mut fresh, jobs);
             assert_eq!(a.bytes, b.bytes);
-            fresh_ui.begin_pass(input(&fresh_ui, size, density));
+            fresh_ui.begin_pass(&input(&fresh_ui, size, density));
             assert!(
                 fresh_ui.end_pass().textures_delta.set.is_empty(),
                 "Private glyph shaping must not dirty live UI atlas"
             );
         }
-        source.begin_pass(input(&source, extent, 1.));
+        source.begin_pass(&input(&source, extent, 1.));
         assert!(source.end_pass().textures_delta.set.is_empty());
         assert!(device.pop_error_scope().await.is_none());
         let rows=results.iter().map(|r| serde_json::json!({"rgba_bytes":r.bytes.len(),"sha256":format!("{:x}",Sha256::digest(&r.bytes)),"vertices":r.vertices,"indices":r.indices})).collect::<Vec<_>>();
@@ -441,36 +434,36 @@ fn referenced_pc_fonts_actual_chart_pipeline_gpu() {
 }
 
 fn bundled_jobs(
-    context: &egui::Context,
+    context: &dyn ChartFontContext,
     extent: [u32; 2],
     text: &str,
-) -> Vec<egui::epaint::ClippedShape> {
+) -> Vec<epaint::ClippedShape> {
     let ppp = context.pixels_per_point();
-    let painter = context.layer_painter(egui::LayerId::background());
     [
-        egui::FontFamily::Proportional,
-        egui::FontFamily::Name("ChartMedium".into()),
-        egui::FontFamily::Name("ChartBold".into()),
-        egui::FontFamily::Monospace,
+        epaint::FontFamily::Proportional,
+        epaint::FontFamily::Name("ChartMedium".into()),
+        epaint::FontFamily::Name("ChartBold".into()),
+        epaint::FontFamily::Monospace,
     ]
     .into_iter()
     .enumerate()
-    .map(|(row, family)| egui::epaint::ClippedShape {
-        clip_rect: egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(extent[0] as f32 / ppp, extent[1] as f32 / ppp),
+    .map(|(row, family)| epaint::ClippedShape {
+        clip_rect: epaint::Rect::from_min_size(
+            epaint::Pos2::ZERO,
+            epaint::vec2(extent[0] as f32 / ppp, extent[1] as f32 / ppp),
         ),
-        shape: egui::Shape::galley(
-            egui::pos2(12. / ppp, (12. + row as f32 * 26.) / ppp),
-            painter.layout_no_wrap(
+        shape: epaint::Shape::galley(
+            epaint::pos2(12. / ppp, (12. + row as f32 * 26.) / ppp),
+            layout_no_wrap(
+                context,
                 text.to_owned(),
-                egui::FontId {
+                epaint::FontId {
                     size: 22. / ppp,
                     family,
                 },
-                egui::Color32::WHITE,
+                epaint::Color32::WHITE,
             ),
-            egui::Color32::WHITE,
+            epaint::Color32::WHITE,
         ),
     })
     .collect()
@@ -506,12 +499,12 @@ fn bundled_chart_fonts_private_candidate_preserves_old_gpu_atlas() {
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut rows = Vec::new();
         for (extent, density) in [([256, 128], 1.), ([512, 256], 2.)] {
-            let source = egui::Context::default();
+            let source = TestFonts::default();
             source.set_fonts(crate::chart_fonts::chart_font_definitions());
-            source.begin_pass(input(&source, extent, density));
+            source.begin_pass(&input(&source, extent, density));
             let baseline_jobs = bundled_jobs(&source, extent, "Map 12.3 AB");
             let baseline_output = source.end_pass();
-            let mut baseline_atlas = egui_wgpu::Renderer::new(&device, FORMAT, None, 1, false);
+            let mut baseline_atlas = TestAtlas::new(&device);
             for (id, delta) in &baseline_output.textures_delta.set {
                 baseline_atlas.update_texture(&device, &queue, *id, delta);
             }
@@ -522,7 +515,7 @@ fn bundled_chart_fonts_private_candidate_preserves_old_gpu_atlas() {
                 baseline_jobs,
                 |ids| {
                     ids.iter()
-                        .map(|id| baseline_atlas.texture(id).unwrap().bind_group.clone())
+                        .map(|id| baseline_atlas.bind_group(*id).unwrap())
                         .collect()
                 },
             );
@@ -535,7 +528,7 @@ fn bundled_chart_fonts_private_candidate_preserves_old_gpu_atlas() {
                 std::iter::empty(),
             )
             .unwrap();
-            let jobs = bundled_jobs(&published.context, extent, "Map 12.3 AB");
+            let jobs = bundled_jobs(published.context.as_ref(), extent, "Map 12.3 AB");
             published.end_metrics().unwrap();
             let first = draw(&device, &queue, &mut published, jobs);
             assert!(
@@ -558,7 +551,7 @@ fn bundled_chart_fonts_private_candidate_preserves_old_gpu_atlas() {
                 std::iter::empty(),
             )
             .unwrap();
-            let jobs = bundled_jobs(&candidate.context, extent, "xyz 9876 QWERTY");
+            let jobs = bundled_jobs(candidate.context.as_ref(), extent, "xyz 9876 QWERTY");
             candidate.end_metrics().unwrap();
             let other = draw(&device, &queue, &mut candidate, jobs);
             assert!(
@@ -577,7 +570,7 @@ fn bundled_chart_fonts_private_candidate_preserves_old_gpu_atlas() {
             .is_err());
             drop(candidate);
             published.begin_display(extent, density, density).unwrap();
-            let jobs = bundled_jobs(&published.context, extent, "Map 12.3 AB");
+            let jobs = bundled_jobs(published.context.as_ref(), extent, "Map 12.3 AB");
             published.end_display().unwrap();
             let retained = draw(&device, &queue, &mut published, jobs);
             assert!(
@@ -588,7 +581,7 @@ fn bundled_chart_fonts_private_candidate_preserves_old_gpu_atlas() {
                 (first.vertices, first.indices),
                 (retained.vertices, retained.indices)
             );
-            source.begin_pass(input(&source, extent, density));
+            source.begin_pass(&input(&source, extent, density));
             assert!(
                 source.end_pass().textures_delta.set.is_empty(),
                 "Private shaping dirtied source UI atlas"

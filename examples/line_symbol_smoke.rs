@@ -1,7 +1,7 @@
 //! Native S-101/Lua -> physical line placement -> SVG/GPU evidence.
+use ferrite_gpu::SymbolCache;
 use ferrite_render::*;
 use ferrite_s100_core::*;
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -88,7 +88,7 @@ impl ApplicationHandler for App {
         );
         let ratio = w.scale_factor();
         let mm = 96. / 25.4 * ratio;
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         let pc = ferrite_portrayal_catalog::PortrayalCatalogue::load(&self.pc).unwrap();
         let profile = pc.color_profiles.profiles.get("Day").unwrap();
         let mut cache = SymbolCache::new(dir);

@@ -1,10 +1,10 @@
 //! Actual GPU oracle: large pattern footprints against bounded coverage at 200x.
+use ferrite_gpu::SymbolCache;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{
     AreaInstruction, Color, DrawingInstruction, FlatProjection, GeoBounds, RenderContext,
     ScreenPoint, Viewport, WorldPoint,
 };
-use ferrite_wgpu::{SymbolCache, WgpuRenderer};
 use std::{path::PathBuf, sync::Arc};
 use winit::{
     application::ApplicationHandler,
@@ -40,7 +40,7 @@ impl ApplicationHandler for App {
         );
         let size = w.inner_size();
         let density = w.scale_factor();
-        let mut r = pollster::block_on(WgpuRenderer::new(w)).unwrap();
+        let mut r = pollster::block_on(ferrite_ui::create_renderer(w)).unwrap();
         r.background_color = Color::WHITE;
         let pc = PortrayalCatalogue::load(&self.pc).unwrap();
         let profile = pc.color_profiles.profiles.get("Day").unwrap();

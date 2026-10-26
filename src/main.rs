@@ -238,6 +238,7 @@ use winit::{
 };
 
 use ferrite_feature_catalog::BoundFeatureCatalogue;
+use ferrite_gpu::{CatalogueStatus, DisplayMode, SelectedFeature, SettingsState, SymbolCache};
 use ferrite_kernel::{depth_selection::DepthReference, NumericCoverageSource};
 use ferrite_lua::{PortrayalEngine, TypeCatalogue};
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
@@ -250,9 +251,7 @@ use ferrite_security::{
     authorize_datasets, AuthenticatedSnapshot, AuthorizedDatasets, TrustAnchors,
     UnauthenticatedSnapshot, UnsignedPolicy,
 };
-use ferrite_wgpu::{
-    CatalogueStatus, DisplayMode, SelectedFeature, SettingsState, SymbolCache, WgpuRenderer,
-};
+use ferrite_ui::WgpuRenderer;
 use s102_depth_policy::DepthPolicy;
 
 /// Embedded public-domain reference coastlines (map scales, not accuracy).
@@ -739,11 +738,11 @@ enum ChartPublicationResult {
 struct PreparedPortrayal {
     context: RenderContext,
     catalogue_registry: s101_catalogue_selection::DatasetCatalogueRegistry,
-    cell_resources: Option<ferrite_wgpu::CellPortrayalResources>,
+    cell_resources: Option<ferrite_gpu::CellPortrayalResources>,
     coverage: Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>,
     ic_changed: usize,
 
-    raster_scene: Option<ferrite_wgpu::PreparedRasterScenePublication>,
+    raster_scene: Option<ferrite_gpu::PreparedRasterScenePublication>,
 }
 
 fn coalesce_portrayal_request(
@@ -782,8 +781,8 @@ fn portrayal_navigation_pending(
 }
 // Hidden qualification only: owns sealed TARGET preparation; never activates it.
 enum TargetAuditCapsule {
-    TargetOwned(ferrite_wgpu::PreparedTargetVectorRaster),
-    TargetSingle(ferrite_wgpu::PreparedTargetSinglePcVectorRaster),
+    TargetOwned(ferrite_gpu::PreparedTargetVectorRaster),
+    TargetSingle(ferrite_gpu::PreparedTargetSinglePcVectorRaster),
 }
 
 struct PreparedPortrayalChange {
@@ -1012,7 +1011,7 @@ struct ChartApp {
     symbol_cache_lent: Option<u64>,
     /// Rebuild picking once the background build of a new portrayal installs.
     hit_test_after_scene_build: bool,
-    cell_resources: Option<ferrite_wgpu::CellPortrayalResources>,
+    cell_resources: Option<ferrite_gpu::CellPortrayalResources>,
     /// Current color profile name (Day, Dusk, Night)
     pending_portrayal_change: Option<PortrayalChangeRequest>,
     /// Current mouse position
@@ -1083,7 +1082,7 @@ struct ChartApp {
     debug_mode: bool,
     navigation_scene_pending: flat_event_coalescing::Pending,
     /// Navigation scene emission running on a worker; owns `cell_resources`.
-    scene_build: Option<std::thread::JoinHandle<ferrite_wgpu::BuiltScene>>,
+    scene_build: Option<std::thread::JoinHandle<ferrite_gpu::BuiltScene>>,
     /// `FERRITE_BACKGROUND_SCENE_BUILD=0` (or `FERRITE_MOTION_PREVIEW=0`) keeps
     /// every rebuild on the UI thread.
     background_scene_builds: bool,
@@ -1381,7 +1380,7 @@ impl ChartApp {
             frame_times: std::collections::VecDeque::with_capacity(60),
             process_stats: process_stats::ProcessStats::default(),
             thread_stats: thread_stats::ThreadStats::default(),
-            debug_stats_audit: ferrite_wgpu::background_test::enabled()
+            debug_stats_audit: ferrite_ui::background_test::enabled()
                 .then(|| std::env::var_os("FERRITE_DEBUG_STATS_AUDIT").map(PathBuf::from))
                 .flatten(),
             debug_stats_samples: Vec::new(),
@@ -1493,7 +1492,7 @@ impl ChartApp {
             return;
         };
         let Some(position) = self.own_ship else {
-            renderer.ui_state.own_ship = None;
+            renderer.ui.ui_state.own_ship = None;
             return;
         };
         let (pan, zoom, _) = renderer.fast_view_transform();
@@ -1515,19 +1514,20 @@ impl ChartApp {
                 inventory.larger_scale_at(position, msvs)
             }
             Some(_) => renderer
+                .ui
                 .ui_state
                 .own_ship
                 .and_then(|previous| previous.larger_scale),
             None => None,
         };
-        let previous = renderer.ui_state.own_ship.and_then(|o| o.larger_scale);
+        let previous = renderer.ui.ui_state.own_ship.and_then(|o| o.larger_scale);
         if previous != larger_scale {
             match larger_scale {
                 Some(d) => info!("Own ship: larger scale data available (1:{d})"),
                 None => info!("Own ship: no larger scale data at the viewing scale"),
             }
         }
-        renderer.ui_state.own_ship = Some(ferrite_wgpu::OwnShipIndication {
+        renderer.ui.ui_state.own_ship = Some(ferrite_ui::OwnShipIndication {
             screen,
             larger_scale,
         });
@@ -1539,7 +1539,7 @@ impl ChartApp {
             return;
         };
         let (pan, zoom, _) = renderer.fast_view_transform();
-        renderer.ui_state.chat_marker = self
+        renderer.ui.ui_state.chat_marker = self
             .chat_marker
             .filter(|_| pan == (0., 0.) && zoom == 1.)
             .map(|[lon, lat]| {
@@ -1581,8 +1581,8 @@ impl ChartApp {
     }
     fn update_interoperability_status(&mut self) {
         if let (Some(ic), Some(r)) = (&self.engine.ic, &mut self.renderer) {
-            r.ui_state.interoperability_active = r.settings().interoperability_enabled;
-            r.ui_state.interoperability_status = format!(
+            r.ui.ui_state.interoperability_active = r.settings().interoperability_enabled;
+            r.ui.ui_state.interoperability_status = format!(
                 "Interoperability {}: {} {} (signature verified)",
                 if r.settings().interoperability_enabled {
                     "on"
@@ -1606,6 +1606,7 @@ impl ChartApp {
             self.renderer
                 .as_mut()
                 .context("Renderer not initialized")?
+                .ui
                 .ui_state
                 .settings
                 .interoperability_enabled = enabled;
@@ -1669,7 +1670,7 @@ impl ChartApp {
         dataset_signature_policy::verification_enabled(
             self.renderer
                 .as_ref()
-                .map(|r| r.ui_state.verify_dataset_signatures),
+                .map(|r| r.ui.ui_state.verify_dataset_signatures),
             self.engine.require_signatures,
             self.engine.operational_mode,
         )
@@ -1680,13 +1681,13 @@ impl ChartApp {
         if !verify_signatures {
             let result = dataset_signature_policy::unchecked_datasets(paths);
             if let Some(r) = &mut self.renderer {
-                r.ui_state.security_status = if result.is_ok() {
+                r.ui.ui_state.security_status = if result.is_ok() {
                     "Digital signature verification OFF: datasets opened without verification"
                         .into()
                 } else {
                     "Dataset could not be opened".into()
                 };
-                r.ui_state.security_details = result
+                r.ui.ui_state.security_details = result
                     .as_ref()
                     .err()
                     .map(|e| format!("{e:#}"))
@@ -1715,17 +1716,18 @@ impl ChartApp {
                     warn!("Signature metadata: {warning}");
                 }
                 if let Some(r) = &mut self.renderer {
-                    r.ui_state.security_status = format!(
+                    r.ui.ui_state.security_status = format!(
                         "Data signatures: {} verified / {} unsigned evaluation",
                         self.engine.verified_count, self.engine.unsigned_count
                     );
-                    r.ui_state.security_details = report.metadata_warnings.join("\n");
+                    r.ui.ui_state.security_details = report.metadata_warnings.join("\n");
                 }
             }
             Err(e) => {
                 if let Some(r) = &mut self.renderer {
-                    r.ui_state.security_status = "Data authentication failed; load rejected".into();
-                    r.ui_state.security_details = format!("{e:#}");
+                    r.ui.ui_state.security_status =
+                        "Data authentication failed; load rejected".into();
+                    r.ui.ui_state.security_details = format!("{e:#}");
                 }
             }
         }
@@ -2073,7 +2075,7 @@ impl ChartApp {
                     }
                     for window in numeric.numeric_geometry().windows(edge, edge)? {
                         let layer = if active_ic.is_none() {
-                            ferrite_wgpu::S102RasterMaterial::Bound(portrayal.bound_raster_window(
+                            ferrite_gpu::S102RasterMaterial::Bound(portrayal.bound_raster_window(
                                 numeric,
                                 window,
                                 format!(
@@ -2084,7 +2086,7 @@ impl ChartApp {
                                 ),
                             )?)
                         } else {
-                            ferrite_wgpu::S102RasterMaterial::LegacyIc(
+                            ferrite_gpu::S102RasterMaterial::LegacyIc(
                                 interoperability::compose_raster(
                                     portrayal.raster_window(
                                         numeric,
@@ -2139,7 +2141,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .is_some_and(|r| r.settings() == &self.applied_settings)
-                && !(ferrite_wgpu::background_test::enabled()
+                && !(ferrite_ui::background_test::enabled()
                     && std::env::var("FERRITE_S102_APPEND_REBUILD_REFERENCE").as_deref() == Ok("1"))
             {
                 RasterPreparation::CallerStagedRaster
@@ -2181,8 +2183,8 @@ impl ChartApp {
         prepare_flat_coverage(
             Some(prepared.coverage.as_ref()),
             &mut prepared.context,
-            renderer.window().inner_size(),
-            renderer.window().scale_factor(),
+            renderer.ui.window().inner_size(),
+            renderer.ui.window().scale_factor(),
         )?;
         renderer.reproject_raster_material_batch(&mut batch, &prepared.context.scaler)?;
         let mut raster = renderer.prepare_raster_material_publication(batch, false, None)?;
@@ -2197,7 +2199,7 @@ impl ChartApp {
         );
         if std::env::var("FERRITE_ROOT_S102_FAIL_SCENE").as_deref() == Ok("1") {
             anyhow::ensure!(
-                ferrite_wgpu::background_test::enabled(),
+                ferrite_ui::background_test::enabled(),
                 "Scene failure injection requires hidden background test"
             );
             anyhow::bail!("Injected bathymetry failure after complete material staging");
@@ -2266,8 +2268,9 @@ impl ChartApp {
         self.chart_loaded = true;
         self.publish_instructions(prepared);
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.bathymetry_count = self.engine.bathymetry.len();
-            renderer.ui_state.chart_count = self.engine.cells.len() + self.engine.bathymetry.len();
+            renderer.ui.ui_state.bathymetry_count = self.engine.bathymetry.len();
+            renderer.ui.ui_state.chart_count =
+                self.engine.cells.len() + self.engine.bathymetry.len();
             renderer.update_selection(&self.engine.render_context.scaler);
         }
         if self.auto_screenshot.is_some() {
@@ -2347,7 +2350,7 @@ impl ChartApp {
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_settings(self.applied_settings.clone());
                 renderer.set_color_profile(&self.engine.current_profile_name);
-                renderer.ui_state.notice = Some(format!(
+                renderer.ui.ui_state.notice = Some(format!(
                     "Portrayal change rejected; previous display retained: {error:#}"
                 ));
             }
@@ -2456,11 +2459,11 @@ impl ChartApp {
         self.engine.fc_status = fc_status;
         self.engine.pc_status = pc_status;
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.fc_status = self.engine.fc_status.clone();
-            renderer.ui_state.pc_status = self.engine.pc_status.clone();
-            renderer.ui_state.optional_viewing_layers =
+            renderer.ui.ui_state.fc_status = self.engine.fc_status.clone();
+            renderer.ui.ui_state.pc_status = self.engine.pc_status.clone();
+            renderer.ui.ui_state.optional_viewing_layers =
                 ferrite_s101::optional_viewing_layers(&self.engine.pc);
-            renderer.ui_state.notice = None;
+            renderer.ui.ui_state.notice = None;
         }
         self.install_portrayal_change(prepared);
         self.refresh_dataset_tree();
@@ -2581,7 +2584,7 @@ impl ChartApp {
             &catalogue_registry,
             owned,
             preflight_resources,
-            ferrite_wgpu::compute_area_triangulation,
+            ferrite_gpu::compute_area_triangulation,
         )?;
         let base_instruction_count = next.instruction_count();
         for mut instruction in self.plugin_system.get_render_instructions() {
@@ -2609,8 +2612,8 @@ impl ChartApp {
         prepare_flat_coverage(
             Some(coverage.as_ref()),
             &mut next,
-            renderer.window().inner_size(),
-            renderer.window().scale_factor(),
+            renderer.ui.window().inner_size(),
+            renderer.ui.window().scale_factor(),
         )?;
         let raster_staging = if matches!(raster_preparation, RasterPreparation::Rebuild) {
             // An ordinary S101-only installation must not depend on an S102 PC.
@@ -2691,7 +2694,7 @@ impl ChartApp {
                         }
                         for window in numeric.numeric_geometry().windows(edge, edge)? {
                             let layer = if active_ic.is_none() {
-                                ferrite_wgpu::S102RasterMaterial::Bound(
+                                ferrite_gpu::S102RasterMaterial::Bound(
                                     portrayal
                                         .as_ref()
                                         .context("Missing staged S102 portrayal")?
@@ -2707,7 +2710,7 @@ impl ChartApp {
                                         )?,
                                 )
                             } else {
-                                ferrite_wgpu::S102RasterMaterial::LegacyIc(
+                                ferrite_gpu::S102RasterMaterial::LegacyIc(
                                     interoperability::compose_raster(
                                         portrayal
                                             .as_ref()
@@ -2888,7 +2891,7 @@ impl ChartApp {
     fn audit_portrayal_change_recovery(&mut self, output: &Path, profile: &str) -> Result<()> {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -2920,7 +2923,7 @@ impl ChartApp {
         let old_scaler = format!("{:?}", self.engine.render_context.scaler);
         let old_selection = format!(
             "{:?}",
-            self.renderer.as_ref().unwrap().ui_state.selected_feature
+            self.renderer.as_ref().unwrap().ui.ui_state.selected_feature
         );
         self.audit_portrayal(&output.join("before"))?;
         anyhow::ensure!(
@@ -2983,7 +2986,7 @@ impl ChartApp {
                 && format!("{:?}", self.engine.render_context.scaler) == old_scaler
                 && format!(
                     "{:?}",
-                    self.renderer.as_ref().unwrap().ui_state.selected_feature
+                    self.renderer.as_ref().unwrap().ui.ui_state.selected_feature
                 ) == old_selection,
             "Committed target profile/settings changed camera or selection"
         );
@@ -3202,7 +3205,7 @@ impl ChartApp {
         fs::write(
             output,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "app_ic_activated":self.active_ic().is_some(),"ui_ic_activated":renderer.ui_state.interoperability_active,"catalogue_name":ic.catalogue.name,"catalogue_version":ic.catalogue.version,
+                "app_ic_activated":self.active_ic().is_some(),"ui_ic_activated":renderer.ui.ui_state.interoperability_active,"catalogue_name":ic.catalogue.name,"catalogue_version":ic.catalogue.version,
                 "authenticated_metadata":ic.authorization.metadata,"source_sha384":ic.authorization.resource.sha384,
                 "trust_anchor_sha256":ic.authorization.trust_anchor_sha256,"revocation_checked":ic.authorization.revocation_checked,
                 "assigned_vectors":self.engine.ic_assigned_vectors,"vector_planes":vector_planes,"raster_layers":raster,
@@ -3276,7 +3279,7 @@ impl ChartApp {
         fs::create_dir_all(directory)?;
         let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
         let instructions = bincode::serialize(self.engine.render_context.raw_instructions())?;
-        if ferrite_wgpu::audit_digest_only_enabled() {
+        if ferrite_gpu::audit_digest_only_enabled() {
             fs::write(
                 directory.join("instructions.sha256.json"),
                 serde_json::to_vec_pretty(&serde_json::json!({
@@ -3296,8 +3299,8 @@ impl ChartApp {
                 "settings": format!("{:?}",self.engine.render_context.settings),
                 "applied_settings": format!("{:?}",self.applied_settings),
                 "optional_layer_policy": optional_layer_policy,
-                "digital_signature_verification_enabled": renderer.ui_state.verify_dataset_signatures,
-                "digital_signature_status": renderer.ui_state.security_status,
+                "digital_signature_verification_enabled": renderer.ui.ui_state.verify_dataset_signatures,
+                "digital_signature_status": renderer.ui.ui_state.security_status,
                 "verified_dataset_count": self.engine.verified_count,
                 "unsigned_evaluation_dataset_count": self.engine.unsigned_count,
                 "profile": self.engine.current_profile_name,
@@ -3314,11 +3317,11 @@ impl ChartApp {
                 "flat_source_northing_cache": self.engine.coverage_inventory.as_ref().map(|i|i.flat_northing_cache_statistics()),
                 "source_cells": self.engine.cells.iter().map(|c| &c.file_path).collect::<Vec<_>>(),
                 "native_physical_input_verified": false,
-                "debug_statistics": {"cpu_percent": renderer.ui_state.debug_cpu_usage,
-                    "resident_mib": renderer.ui_state.debug_memory_mb,
+                "debug_statistics": {"cpu_percent": renderer.ui.ui_state.debug_cpu_usage,
+                    "resident_mib": renderer.ui.ui_state.debug_memory_mb,
                     "logical_cpus": self.process_stats.logical_cpus(),
                     "updates": self.process_stats.updates()},
-                "background_test": ferrite_wgpu::background_test::enabled(),
+                "background_test": ferrite_ui::background_test::enabled(),
                 "native_window_visible": self.window.as_ref().and_then(|w|w.is_visible()),
                 "native_window_has_focus": self.window.as_ref().is_some_and(|w|w.has_focus()),
             }))?,
@@ -3489,7 +3492,7 @@ impl ChartApp {
     }
 
     fn refresh_dataset_tree(&mut self) {
-        use ferrite_wgpu::{
+        use ferrite_ui::{
             DatasetCatalogueLayer, DatasetLayerEntry, DatasetLayerId, DatasetProductLayer,
         };
         let mut files = Vec::with_capacity(self.engine.cells.len());
@@ -3507,7 +3510,7 @@ impl ChartApp {
                 .unwrap_or_default();
             if let Some(owner) = self.engine.catalogue_owner_for_cell(index) {
                 if let Ok(cell_index) = u32::try_from(index) {
-                    catalogue_bindings.push(ferrite_wgpu::DatasetCatalogueBinding {
+                    catalogue_bindings.push(ferrite_ui::DatasetCatalogueBinding {
                         cell_index: Some(cell_index),
                         id: DatasetLayerId::S101 {
                             product: product.clone(),
@@ -3566,7 +3569,7 @@ impl ChartApp {
         let native_catalogue = self.native_s421.catalogue_layer();
         let (overlay_layers, overlay_catalogues) = self.overlay_tree();
         for row in &native_files {
-            catalogue_bindings.push(ferrite_wgpu::DatasetCatalogueBinding {
+            catalogue_bindings.push(ferrite_ui::DatasetCatalogueBinding {
                 cell_index: None,
                 id: row.id.clone(),
                 source: row.source.clone(),
@@ -3575,8 +3578,8 @@ impl ChartApp {
             });
         }
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.dataset_catalogue_bindings = catalogue_bindings;
-            renderer.ui_state.catalogue_layers = vec![
+            renderer.ui.ui_state.dataset_catalogue_bindings = catalogue_bindings;
+            renderer.ui.ui_state.catalogue_layers = vec![
                 DatasetCatalogueLayer {
                     product: "S-101".into(),
                     fc: self.engine.fc_status.clone(),
@@ -3588,7 +3591,7 @@ impl ChartApp {
                     pc: self.engine.s102_pc_status.clone(),
                 },
             ];
-            renderer.ui_state.dataset_layers = vec![
+            renderer.ui.ui_state.dataset_layers = vec![
                 DatasetProductLayer {
                     product: "S-101".into(),
                     fc: format!(
@@ -3614,48 +3617,59 @@ impl ChartApp {
                 },
             ];
             if !trial_files.is_empty() {
-                renderer.ui_state.dataset_layers.push(DatasetProductLayer {
-                    product: "S-102 2.1 Trial (Inspection Only)".into(),
-                    fc: "No feature catalogue binding".into(),
-                    pc: "Not portrayed".into(),
-                    files: trial_files,
-                });
+                renderer
+                    .ui
+                    .ui_state
+                    .dataset_layers
+                    .push(DatasetProductLayer {
+                        product: "S-102 2.1 Trial (Inspection Only)".into(),
+                        fc: "No feature catalogue binding".into(),
+                        pc: "Not portrayed".into(),
+                        files: trial_files,
+                    });
             }
             renderer
+                .ui
                 .ui_state
                 .catalogue_layers
                 .push(native_catalogue.clone());
-            renderer.ui_state.dataset_layers.push(DatasetProductLayer {
-                product: "S-421".into(),
-                fc: format!(
-                    "FC {} · {}",
-                    native_catalogue.fc.version, native_catalogue.fc.path
-                ),
-                pc: format!(
-                    "PC {} · {} · host illustration",
-                    native_catalogue.pc.version, native_catalogue.pc.path
-                ),
-                files: native_files,
-            });
-            renderer.ui_state.dataset_layers.extend(overlay_layers);
             renderer
+                .ui
+                .ui_state
+                .dataset_layers
+                .push(DatasetProductLayer {
+                    product: "S-421".into(),
+                    fc: format!(
+                        "FC {} · {}",
+                        native_catalogue.fc.version, native_catalogue.fc.path
+                    ),
+                    pc: format!(
+                        "PC {} · {} · host illustration",
+                        native_catalogue.pc.version, native_catalogue.pc.path
+                    ),
+                    files: native_files,
+                });
+            renderer.ui.ui_state.dataset_layers.extend(overlay_layers);
+            renderer
+                .ui
                 .ui_state
                 .catalogue_layers
                 .extend(overlay_catalogues);
             if !renderer
+                .ui
                 .ui_state
                 .dataset_layers
                 .iter()
                 .flat_map(|p| &p.files)
-                .any(|f| renderer.ui_state.selected_dataset.as_ref() == Some(&f.id))
+                .any(|f| renderer.ui.ui_state.selected_dataset.as_ref() == Some(&f.id))
             {
-                renderer.ui_state.selected_dataset = None;
+                renderer.ui.ui_state.selected_dataset = None;
             }
         }
         self.service_mcp_ui();
     }
 
-    fn unload_dataset(&mut self, id: ferrite_wgpu::DatasetLayerId) -> Result<()> {
+    fn unload_dataset(&mut self, id: ferrite_ui::DatasetLayerId) -> Result<()> {
         self.engine.hydrate_all_cells()?;
         anyhow::ensure!(
             self.loading_state.is_none()
@@ -3671,13 +3685,13 @@ impl ChartApp {
                 && self.pending_portrayal_change.is_none(),
             "Finish navigation or portrayal changes before unloading"
         );
-        if let ferrite_wgpu::DatasetLayerId::Overlay { id, .. } = &id {
+        if let ferrite_ui::DatasetLayerId::Overlay { id, .. } = &id {
             self.ensure_navigation_scene()?;
             anyhow::ensure!(self.gml_overlays.remove(*id), "Dataset is no longer loaded");
             if self
                 .renderer
                 .as_ref()
-                .and_then(|r| r.ui_state.selected_feature.as_ref())
+                .and_then(|r| r.ui.ui_state.selected_feature.as_ref())
                 .is_some_and(|f| {
                     f.cell_index.is_none()
                         && gml_overlay::decode_key(f.feature_id).is_some_and(|(d, _)| d == *id)
@@ -3686,20 +3700,20 @@ impl ChartApp {
                 self.select_feature(None);
             }
             if let Some(renderer) = &mut self.renderer {
-                renderer.ui_state.selected_dataset = None;
-                renderer.ui_state.notice = Some("Dataset unloaded".into());
+                renderer.ui.ui_state.selected_dataset = None;
+                renderer.ui.ui_state.notice = Some("Dataset unloaded".into());
             }
             self.overlays_changed(false);
             self.refresh_visible_selection();
             return Ok(());
         }
-        if let ferrite_wgpu::DatasetLayerId::S421 { route_id } = &id {
+        if let ferrite_ui::DatasetLayerId::S421 { route_id } = &id {
             self.ensure_navigation_scene()?;
             self.native_s421.unload_route(*route_id)?;
             self.native_s421_ui_revision = 0;
             if let Some(renderer) = &mut self.renderer {
                 renderer.invalidate_native_route_gpu();
-                renderer.ui_state.selected_dataset = None;
+                renderer.ui.ui_state.selected_dataset = None;
             }
             self.refresh_dataset_tree();
             return Ok(());
@@ -3711,7 +3725,7 @@ impl ChartApp {
             settings: self.applied_settings.clone(),
         };
         match id {
-            ferrite_wgpu::DatasetLayerId::S101 { product, name } => {
+            ferrite_ui::DatasetLayerId::S101 { product, name } => {
                 let key = (product, name);
                 let index = self
                     .engine
@@ -3740,11 +3754,11 @@ impl ChartApp {
                 }
                 self.engine.loaded_discovery.remove(&key);
             }
-            ferrite_wgpu::DatasetLayerId::S421 { .. }
-            | ferrite_wgpu::DatasetLayerId::Overlay { .. } => {
+            ferrite_ui::DatasetLayerId::S421 { .. }
+            | ferrite_ui::DatasetLayerId::Overlay { .. } => {
                 anyhow::bail!("Native route dispatch state changed")
             }
-            ferrite_wgpu::DatasetLayerId::S102Trial(path) => {
+            ferrite_ui::DatasetLayerId::S102Trial(path) => {
                 // Same pre-commit failure hook as published datasets: an
                 // injected failure leaves the inspection list untouched.
                 anyhow::ensure!(
@@ -3758,7 +3772,7 @@ impl ChartApp {
                     "Dataset is no longer loaded"
                 );
             }
-            ferrite_wgpu::DatasetLayerId::S102(path) => {
+            ferrite_ui::DatasetLayerId::S102(path) => {
                 anyhow::ensure!(
                     self.engine
                         .bathymetry
@@ -3803,24 +3817,25 @@ impl ChartApp {
         self.pending_hit_test = None;
         self.chart_loaded = !self.engine.cells.is_empty() || !self.engine.bathymetry.is_empty();
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.selection_candidates.clear();
-            renderer.ui_state.selection_requested = None;
-            renderer.ui_state.chart_count = self.engine.cells.len() + self.engine.bathymetry.len();
-            renderer.ui_state.bathymetry_count = self.engine.bathymetry.len();
-            renderer.ui_state.security_status = "Retained datasets keep their original verification results; dataset manually unloaded".into();
-            renderer.ui_state.feature_count = self
+            renderer.ui.ui_state.selection_candidates.clear();
+            renderer.ui.ui_state.selection_requested = None;
+            renderer.ui.ui_state.chart_count =
+                self.engine.cells.len() + self.engine.bathymetry.len();
+            renderer.ui.ui_state.bathymetry_count = self.engine.bathymetry.len();
+            renderer.ui.ui_state.security_status = "Retained datasets keep their original verification results; dataset manually unloaded".into();
+            renderer.ui.ui_state.feature_count = self
                 .engine
                 .cells
                 .iter()
                 .map(|cell| cell.features.len())
                 .sum();
-            renderer.ui_state.loaded_chart = self
+            renderer.ui.ui_state.loaded_chart = self
                 .engine
                 .cells
                 .first()
                 .map(|cell| cell.dsid.dataset_name.clone());
-            renderer.ui_state.selected_dataset = None;
-            renderer.ui_state.notice = Some("Dataset unloaded".into());
+            renderer.ui.ui_state.selected_dataset = None;
+            renderer.ui.ui_state.notice = Some("Dataset unloaded".into());
         }
         self.refresh_dataset_tree();
         self.refresh_visible_selection();
@@ -3854,7 +3869,7 @@ impl ChartApp {
             })?;
         self.dataset_open_discovery = Some(receiver);
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.notice = Some("Discovering datasets…".into());
+            renderer.ui.ui_state.notice = Some("Discovering datasets…".into());
         }
         Ok(())
     }
@@ -3897,7 +3912,7 @@ impl ChartApp {
                         let message = format!("Could not open datasets: {error:#}");
                         error!("{message}");
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.ui_state.notice = Some(message);
+                            renderer.ui.ui_state.notice = Some(message);
                         }
                     }
                 }
@@ -4008,7 +4023,7 @@ impl ChartApp {
         } else {
             session.summary(self.engine.cells.len())
         };
-        if ferrite_wgpu::background_test::enabled() {
+        if ferrite_ui::background_test::enabled() {
             if let Some(path) = std::env::var_os("FERRITE_OPEN_FOLDER_AUDIT_OUTPUT") {
                 std::env::remove_var("FERRITE_OPEN_FOLDER_AUDIT_OUTPUT");
                 let result = (|| -> Result<()> {
@@ -4037,10 +4052,10 @@ impl ChartApp {
         }
         info!("{summary}");
         if let Some(renderer) = &mut self.renderer {
-            if let Ok(mut log) = renderer.ui_state.diagnostics.try_lock() {
+            if let Ok(mut log) = renderer.ui.ui_state.diagnostics.try_lock() {
                 log.push_notice(&summary);
             }
-            renderer.ui_state.notice = Some(summary);
+            renderer.ui.ui_state.notice = Some(summary);
         }
     }
 
@@ -4436,7 +4451,7 @@ impl ChartApp {
 
         // Update UI to show loading
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.loading_progress = Some((total_files, 0));
+            renderer.ui.ui_state.loading_progress = Some((total_files, 0));
         }
 
         Ok(())
@@ -4467,7 +4482,7 @@ impl ChartApp {
                             let message = format!("S-101 load failed: {error:#}");
                             error!("{message}");
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.ui_state.notice = Some(message.clone());
+                                renderer.ui.ui_state.notice = Some(message.clone());
                             }
                             if let Some(session) = &mut self.dataset_open_session {
                                 session.chart_failed = true;
@@ -4498,7 +4513,7 @@ impl ChartApp {
                         );
                         error!("{message}");
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.ui_state.notice = Some(message.clone());
+                            renderer.ui.ui_state.notice = Some(message.clone());
                         }
                         if let Some(session) = &mut self.dataset_open_session {
                             session.chart_failed = true;
@@ -4517,7 +4532,8 @@ impl ChartApp {
         // Update UI progress
         if let Some(renderer) = &mut self.renderer {
             if let Some(state) = &self.loading_state {
-                renderer.ui_state.loading_progress = Some((state.total_files, state.loaded_count));
+                renderer.ui.ui_state.loading_progress =
+                    Some((state.total_files, state.loaded_count));
             }
         }
 
@@ -4528,11 +4544,11 @@ impl ChartApp {
             if std::env::var("FERRITE_ROOT_FORCE_FIRST_LOAD_LAYOUT_RACE").as_deref() == Ok("1") {
                 std::env::remove_var("FERRITE_ROOT_FORCE_FIRST_LOAD_LAYOUT_RACE");
                 assert!(
-                    ferrite_wgpu::background_test::enabled(),
+                    ferrite_ui::background_test::enabled(),
                     "Hidden race audit required"
                 );
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.ui_state.chart_area = (0., 0., 0., 0.);
+                    renderer.ui.ui_state.chart_area = (0., 0., 0., 0.);
                 }
             }
             let publishable = self.loading_state.as_ref().is_some_and(|state| {
@@ -4544,7 +4560,7 @@ impl ChartApp {
                     .as_ref()
                     .is_some_and(|r| chart_viewport_ready(r.chart_viewport_pixels()))
             {
-                if ferrite_wgpu::background_test::enabled() {
+                if ferrite_ui::background_test::enabled() {
                     if let Some(path) = std::env::var_os("FERRITE_ROOT_LOAD_LAYOUT_DEFER_RECEIPT") {
                         std::env::remove_var("FERRITE_ROOT_LOAD_LAYOUT_DEFER_RECEIPT");
                         let pending = self.loading_state.as_ref().unwrap().pending.len();
@@ -4576,7 +4592,7 @@ impl ChartApp {
                 // still installs only completely materialized logical datasets.
                 self.restore_load_checkpoint(state.checkpoint);
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.ui_state.loading_progress = None;
+                    renderer.ui.ui_state.loading_progress = None;
                 }
             } else if state.checkpoint.signature_mode != self.signature_verification_enabled()
                 || state.checkpoint.catalogue_identity != self.bound_catalogue_identity()
@@ -4612,8 +4628,8 @@ impl ChartApp {
             unsigned_count: self.engine.unsigned_count,
             security_ui: self.renderer.as_ref().map(|r| {
                 (
-                    r.ui_state.security_status.clone(),
-                    r.ui_state.security_details.clone(),
+                    r.ui.ui_state.security_status.clone(),
+                    r.ui.ui_state.security_details.clone(),
                 )
             }),
             frames_since_loaded: self.frames_since_loaded,
@@ -4653,7 +4669,7 @@ impl ChartApp {
         if let (Some(renderer), Some((status, details))) =
             (&mut self.renderer, checkpoint.security_ui)
         {
-            renderer.ui_state.security_status = if current_mode == checkpoint.signature_mode {
+            renderer.ui.ui_state.security_status = if current_mode == checkpoint.signature_mode {
                 status
             } else {
                 format!(
@@ -4663,7 +4679,7 @@ impl ChartApp {
                     self.engine.unsigned_count
                 )
             };
-            renderer.ui_state.security_details = details;
+            renderer.ui.ui_state.security_details = details;
         }
     }
     fn load_error(&mut self, error: anyhow::Error) {
@@ -4674,8 +4690,8 @@ impl ChartApp {
             session.chart_partial = false;
         }
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.loading_progress = None;
-            renderer.ui_state.notice = Some(message.clone());
+            renderer.ui.ui_state.loading_progress = None;
+            renderer.ui.ui_state.notice = Some(message.clone());
         }
         if self.auto_screenshot.is_some() {
             self.startup_error = Some(message);
@@ -4793,8 +4809,8 @@ impl ChartApp {
             // chart's authentication results or status.
             self.restore_load_checkpoint(checkpoint);
             if let Some(renderer) = &mut self.renderer {
-                renderer.ui_state.loading_progress = None;
-                renderer.ui_state.notice = Some(format!(
+                renderer.ui.ui_state.loading_progress = None;
+                renderer.ui.ui_state.notice = Some(format!(
                     "Recorded {cancelled_count} S-101 cancellation announcement(s); no stored content matched"
                 ));
             }
@@ -4875,13 +4891,11 @@ impl ChartApp {
         // Every recoverable portrayal error precedes durable and visible commits.
         // The OS lock keeps history/name reuse checks current across instances.
         let persist_result = if self.catalogue_test_fail_history {
-            Err(anyhow::anyhow!(
-                if ferrite_wgpu::background_test::enabled() {
-                    "Injected catalogue history failure after complete material staging"
-                } else {
-                    "History fault requires hidden test"
-                }
-            ))
+            Err(anyhow::anyhow!(if ferrite_ui::background_test::enabled() {
+                "Injected catalogue history failure after complete material staging"
+            } else {
+                "History fault requires hidden test"
+            }))
         } else {
             history.persist(transaction.cancellations())
         };
@@ -4910,7 +4924,7 @@ impl ChartApp {
             self.zoom_rebuild_phase = 0;
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_zoom_level(1.0);
-                renderer.ui_state.zoom_level = 1.0;
+                renderer.ui.ui_state.zoom_level = 1.0;
             }
         }
         match prepared {
@@ -4922,11 +4936,11 @@ impl ChartApp {
                 self.engine.fc_status = owner.fc_status;
                 self.engine.pc_status = owner.pc_status;
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.ui_state.fc_status = self.engine.fc_status.clone();
-                    renderer.ui_state.pc_status = self.engine.pc_status.clone();
-                    renderer.ui_state.optional_viewing_layers =
+                    renderer.ui.ui_state.fc_status = self.engine.fc_status.clone();
+                    renderer.ui.ui_state.pc_status = self.engine.pc_status.clone();
+                    renderer.ui.ui_state.optional_viewing_layers =
                         ferrite_s101::optional_viewing_layers(&self.engine.pc);
-                    renderer.ui_state.notice = Some(owner.notice);
+                    renderer.ui.ui_state.notice = Some(owner.notice);
                 }
                 self.install_portrayal_change(*change);
             }
@@ -4936,17 +4950,17 @@ impl ChartApp {
         self.chart_loaded = !self.engine.cells.is_empty() || !self.engine.bathymetry.is_empty();
 
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.selected_feature = None;
-            renderer.ui_state.selected_symbol_preview = None;
-            renderer.ui_state.selection_candidates.clear();
-            renderer.ui_state.selection_requested = None;
+            renderer.ui.ui_state.selected_feature = None;
+            renderer.ui.ui_state.selected_symbol_preview = None;
+            renderer.ui.ui_state.selection_candidates.clear();
+            renderer.ui.ui_state.selection_requested = None;
             renderer.update_selection(&self.engine.render_context.scaler);
             renderer.precompute_triangulations(&self.engine.render_context);
         }
 
         // Update UI state
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.loading_progress = None;
+            renderer.ui.ui_state.loading_progress = None;
 
             if self.chart_loaded {
                 let chart_info = if self.engine.cells.len() == 1 {
@@ -4962,7 +4976,7 @@ impl ChartApp {
                 } else {
                     format!("{} charts loaded", self.engine.cells.len())
                 };
-                renderer.ui_state.loaded_chart = Some(chart_info);
+                renderer.ui.ui_state.loaded_chart = Some(chart_info);
 
                 let total_count: usize = self
                     .engine
@@ -4970,8 +4984,8 @@ impl ChartApp {
                     .iter()
                     .map(|c| c.statistics().features)
                     .sum();
-                renderer.ui_state.feature_count = total_count;
-                renderer.ui_state.chart_count =
+                renderer.ui.ui_state.feature_count = total_count;
+                renderer.ui.ui_state.chart_count =
                     self.engine.cells.len() + self.engine.bathymetry.len();
 
                 // The reference comes from producer DataCoverage attributes.
@@ -5041,15 +5055,15 @@ impl ChartApp {
                 }
                 renderer.set_world_map_chart_boxes(chart_boxes);
             } else {
-                renderer.ui_state.loaded_chart = None;
-                renderer.ui_state.feature_count = 0;
-                renderer.ui_state.chart_count = 0;
-                renderer.ui_state.coverage_info = None;
+                renderer.ui.ui_state.loaded_chart = None;
+                renderer.ui.ui_state.feature_count = 0;
+                renderer.ui.ui_state.chart_count = 0;
+                renderer.ui.ui_state.coverage_info = None;
                 renderer.set_world_map_chart_boxes(Vec::new());
                 renderer.set_compilation_scale(0);
             }
             if cancelled_count > 0 {
-                renderer.ui_state.notice = Some(format!(
+                renderer.ui.ui_state.notice = Some(format!(
                     "Cancelled {cancelled_count} S-101 dataset(s); cancellation history retained"
                 ));
             }
@@ -5231,7 +5245,7 @@ impl ChartApp {
 
         // Clear render context and base instruction count
         if let Some(renderer) = &self.renderer {
-            let size = renderer.window().inner_size();
+            let size = renderer.ui.window().inner_size();
             let display_settings = self.engine.render_context.settings.clone();
             self.engine.render_context =
                 RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
@@ -5253,17 +5267,17 @@ impl ChartApp {
         // Update UI state
         if let Some(renderer) = &mut self.renderer {
             renderer.clear_raster_layers();
-            renderer.ui_state.bathymetry_count = 0;
-            renderer.ui_state.coverage_info = None;
-            renderer.ui_state.security_status.clear();
-            renderer.ui_state.security_details.clear();
-            renderer.ui_state.loaded_chart = None;
-            renderer.ui_state.feature_count = 0;
-            renderer.ui_state.chart_count = 0;
-            renderer.ui_state.selected_feature = None;
-            renderer.ui_state.selected_symbol_preview = None;
-            renderer.ui_state.selection_candidates.clear();
-            renderer.ui_state.selection_requested = None;
+            renderer.ui.ui_state.bathymetry_count = 0;
+            renderer.ui.ui_state.coverage_info = None;
+            renderer.ui.ui_state.security_status.clear();
+            renderer.ui.ui_state.security_details.clear();
+            renderer.ui.ui_state.loaded_chart = None;
+            renderer.ui.ui_state.feature_count = 0;
+            renderer.ui.ui_state.chart_count = 0;
+            renderer.ui.ui_state.selected_feature = None;
+            renderer.ui.ui_state.selected_symbol_preview = None;
+            renderer.ui.ui_state.selection_candidates.clear();
+            renderer.ui.ui_state.selection_requested = None;
             renderer.update_selection(&self.engine.render_context.scaler);
 
             // Clear renderer frame
@@ -5328,13 +5342,13 @@ impl ChartApp {
             current_settings.as_ref(),
             viewport,
             active_ic,
-            ferrite_wgpu::compute_area_triangulation,
+            ferrite_gpu::compute_area_triangulation,
         )?;
         // S-124/S-129 overlays: cell-less, coverage-exempt host instructions.
         let profile = self.engine.current_profile_name.clone();
         self.append_overlay_instructions(&mut next, &profile);
         if let Some(renderer) = &self.renderer {
-            let size = renderer.window().inner_size();
+            let size = renderer.ui.window().inner_size();
             next.set_viewport(size.width as f32, size.height as f32);
             if preserve_view {
                 next.scaler = self.engine.render_context.scaler.clone();
@@ -5345,12 +5359,12 @@ impl ChartApp {
                 Some(coverage_inventory.as_ref()),
                 &mut next,
                 size,
-                renderer.window().scale_factor(),
+                renderer.ui.window().scale_factor(),
             )?;
         }
         if self.publication_test_fail_before_commit {
             anyhow::ensure!(
-                ferrite_wgpu::background_test::enabled(),
+                ferrite_ui::background_test::enabled(),
                 "Publication failure injection requires hidden background test"
             );
             anyhow::bail!(
@@ -5379,7 +5393,7 @@ impl ChartApp {
         &self,
         registry: &s101_catalogue_selection::DatasetCatalogueRegistry,
         request: &PortrayalChangeRequest,
-    ) -> Result<ferrite_wgpu::CellPortrayalResources> {
+    ) -> Result<ferrite_gpu::CellPortrayalResources> {
         let bindings = self
             .engine
             .cells
@@ -5390,7 +5404,7 @@ impl ChartApp {
                     .owner_for(&EngineState::catalogue_dataset_key(&cell.dsid)?)
                     .context("Missing cell PC resource owner")?;
                 validated_lua_context(owner.pc(), Some(&request.settings))?;
-                Ok(ferrite_wgpu::CellPortrayalResourceBinding {
+                Ok(ferrite_gpu::CellPortrayalResourceBinding {
                     cell_index,
                     catalogue: Arc::clone(owner.pc()),
                     shallow_pattern: ferrite_s101::shallow_pattern_contract(owner.pc()),
@@ -5398,7 +5412,7 @@ impl ChartApp {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut resources =
-            ferrite_wgpu::CellPortrayalResources::prepare(&bindings, &request.profile, 4096)?;
+            ferrite_gpu::CellPortrayalResources::prepare(&bindings, &request.profile, 4096)?;
         let preset = match request.settings.display_mode {
             DisplayMode::Base => ferrite_s101::DisplayPreset::Base,
             DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
@@ -5457,7 +5471,7 @@ impl ChartApp {
     fn install_prepared_portrayal(
         &mut self,
         prepared: PreparedPortrayal,
-    ) -> Option<ferrite_wgpu::PreparedRasterScenePublication> {
+    ) -> Option<ferrite_gpu::PreparedRasterScenePublication> {
         self.poll_scene_build(true);
         let PreparedPortrayal {
             context: mut next,
@@ -5495,7 +5509,7 @@ impl ChartApp {
     /// Draw the installed portrayal synchronously (the original publication).
     fn emit_published_scene(
         &mut self,
-        raster_scene: Option<ferrite_wgpu::PreparedRasterScenePublication>,
+        raster_scene: Option<ferrite_gpu::PreparedRasterScenePublication>,
     ) {
         let color_profile = self
             .engine
@@ -5549,8 +5563,8 @@ impl ChartApp {
                 let message = format!("Chart portrayal preparation failed: {error}");
                 tracing::error!("{message}");
                 renderer.begin_frame();
-                renderer.ui_state.notice = Some(message.clone());
-                renderer.ui_state.clear_selection();
+                renderer.ui.ui_state.notice = Some(message.clone());
+                renderer.ui.ui_state.clear_selection();
                 renderer.set_selection_geometry(Vec::new(), &self.engine.render_context.scaler);
                 self.rendered_symbols.clear();
                 self.pending_hit_test = None;
@@ -5599,7 +5613,7 @@ impl ChartApp {
             }
         };
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.notice = Some(notice);
+            renderer.ui.ui_state.notice = Some(notice);
         }
     }
 
@@ -5608,9 +5622,9 @@ impl ChartApp {
     /// areas behind panels are drawn too. Then restore the normal view.
     fn export_chart_without_ui(&mut self, path: &Path) -> Result<()> {
         let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
-        let size = renderer.window().inner_size();
+        let size = renderer.ui.window().inner_size();
         let points = renderer.ui_pixels_per_point();
-        let saved_area = renderer.ui_state.chart_area;
+        let saved_area = renderer.ui.ui_state.chart_area;
         // The window's corners under the current camera bound the export, so
         // fitting them to the window keeps the scale and the centre.
         let scaler = &self.engine.render_context.scaler;
@@ -5629,7 +5643,7 @@ impl ChartApp {
             "Current view has no exportable extent"
         );
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.chart_area = (
+            renderer.ui.ui_state.chart_area = (
                 0.,
                 0.,
                 size.width as f32 / points,
@@ -5647,7 +5661,7 @@ impl ChartApp {
         };
         self.view_bounds_override = None;
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.chart_area = saved_area;
+            renderer.ui.ui_state.chart_area = saved_area;
         }
         self.update_view();
         result
@@ -5913,7 +5927,7 @@ impl ChartApp {
     /// removal. Original user history and all original input files stay untouched.
     fn audit_native_dataset_open(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden native dataset audit required"
         );
         let window = self.window.as_ref().context("No window")?;
@@ -5970,7 +5984,7 @@ impl ChartApp {
             "Unexpected native route count: {} vs {expected}",
             ids.len()
         );
-        let opening_notice = self.renderer.as_ref().unwrap().ui_state.notice.clone();
+        let opening_notice = self.renderer.as_ref().unwrap().ui.ui_state.notice.clone();
         if self.engine.require_signatures {
             anyhow::ensure!(
                 loaded["routes"] == initial_routes && ids.is_empty(),
@@ -5992,10 +6006,10 @@ impl ChartApp {
         }
         self.sync_native_s421_overlay();
         self.renderer.as_mut().unwrap().render()?;
-        let layers=self.renderer.as_ref().unwrap().ui_state.dataset_layers.iter().map(|product| serde_json::json!({
+        let layers=self.renderer.as_ref().unwrap().ui.ui_state.dataset_layers.iter().map(|product| serde_json::json!({
             "product":product.product,"files":product.files.iter().map(|file|serde_json::json!({"id":format!("{:?}",file.id),"name":file.name,"source":file.source,"detail":file.detail})).collect::<Vec<_>>()
         })).collect::<Vec<_>>();
-        let catalogue_bindings = self.renderer.as_ref().unwrap().ui_state.dataset_catalogue_bindings.iter().map(|binding| serde_json::json!({
+        let catalogue_bindings = self.renderer.as_ref().unwrap().ui.ui_state.dataset_catalogue_bindings.iter().map(|binding| serde_json::json!({
             "id": format!("{:?}", binding.id), "cell_index":binding.cell_index,"source":binding.source,
             "fc":{"loaded":binding.fc.loaded,"version":binding.fc.version,"path":binding.fc.path},
             "pc":{"loaded":binding.pc.loaded,"version":binding.pc.version,"path":binding.pc.path}
@@ -6052,7 +6066,7 @@ impl ChartApp {
     /// removal paths. No official input or cancellation history is rewritten.
     fn audit_dataset_ui(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -6103,6 +6117,7 @@ impl ChartApp {
             .renderer
             .as_ref()
             .unwrap()
+            .ui
             .ui_state
             .dataset_layers
             .iter()
@@ -6112,9 +6127,9 @@ impl ChartApp {
             tree_count == expected && expected > 0,
             "Expected {expected} tree files, got {tree_count}"
         );
-        let opening_notice = self.renderer.as_ref().unwrap().ui_state.notice.clone();
+        let opening_notice = self.renderer.as_ref().unwrap().ui.ui_state.notice.clone();
         // Qualify the actual recursive-open layout with all files and summary present.
-        self.renderer.as_mut().unwrap().ui_state.debug_mode = false;
+        self.renderer.as_mut().unwrap().ui.ui_state.debug_mode = false;
         for _ in 0..12 {
             self.update_own_ship_indication();
             self.update_raster_suppression();
@@ -6129,7 +6144,7 @@ impl ChartApp {
             .as_mut()
             .unwrap()
             .save_screenshot_with_ui(output.join("loaded/ui.png"))?;
-        self.renderer.as_mut().unwrap().ui_state.show_logs = true;
+        self.renderer.as_mut().unwrap().ui.ui_state.show_logs = true;
         for _ in 0..12 {
             self.renderer.as_mut().unwrap().render()?;
             std::thread::sleep(std::time::Duration::from_millis(30));
@@ -6138,12 +6153,13 @@ impl ChartApp {
             .as_mut()
             .unwrap()
             .save_screenshot_with_ui(output.join("loaded/logs.png"))?;
-        self.renderer.as_mut().unwrap().ui_state.show_logs = false;
+        self.renderer.as_mut().unwrap().ui.ui_state.show_logs = false;
         let before = self.capture_catalogue_audit(&output.join("loaded"))?;
         let id = self
             .renderer
             .as_ref()
             .unwrap()
+            .ui
             .ui_state
             .dataset_layers
             .iter()
@@ -6154,7 +6170,7 @@ impl ChartApp {
             .clone();
         let old_tree = format!(
             "{:?}",
-            self.renderer.as_ref().unwrap().ui_state.dataset_layers
+            self.renderer.as_ref().unwrap().ui.ui_state.dataset_layers
         );
         self.publication_test_fail_before_commit = true;
         let failure = self
@@ -6169,7 +6185,7 @@ impl ChartApp {
         anyhow::ensure!(
             format!(
                 "{:?}",
-                self.renderer.as_ref().unwrap().ui_state.dataset_layers
+                self.renderer.as_ref().unwrap().ui.ui_state.dataset_layers
             ) == old_tree,
             "Failed unload changed tree"
         );
@@ -6178,6 +6194,7 @@ impl ChartApp {
             self.renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .selected_feature
                 .is_none()
@@ -6185,6 +6202,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .selection_candidates
                     .is_empty(),
@@ -6197,6 +6215,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .dataset_layers
                     .iter()
@@ -6259,8 +6278,8 @@ impl ChartApp {
                     "fc_version":owner.fc().version,"pc_version":owner.pc().version}))
             }).collect::<Result<Vec<_>>>()?,
             "symbol_cache_revision":self.symbol_cache.resource_revision(),"symbol_cache_len":self.symbol_cache.len(),
-            "fc_ui":format!("{:?}",r.ui_state.fc_status),"pc_ui":format!("{:?}",r.ui_state.pc_status),
-            "optional_layers":format!("{:?}",r.ui_state.optional_viewing_layers),
+            "fc_ui":format!("{:?}",r.ui.ui_state.fc_status),"pc_ui":format!("{:?}",r.ui.ui_state.pc_status),
+            "optional_layers":format!("{:?}",r.ui.ui_state.optional_viewing_layers),
             "profile":self.engine.current_profile_name,"history_sha256":history}))
     }
     fn capture_catalogue_audit(&mut self, output: &Path) -> Result<serde_json::Value> {
@@ -6290,7 +6309,7 @@ impl ChartApp {
     fn audit_catalogue_publication(&mut self, output: &Path) -> Result<()> {
         self.poll_scene_build(true);
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden audit required"
         );
         let w = self.window.as_ref().context("Window required")?;
@@ -6446,7 +6465,7 @@ impl ChartApp {
                 anyhow::ensure!(
                     self.zoom_level == 1.
                         && self.zoom_target == 1.
-                        && renderer.ui_state.zoom_level == 1.,
+                        && renderer.ui.ui_state.zoom_level == 1.,
                     "Fit load retained stale displayed zoom"
                 );
                 anyhow::ensure!(
@@ -6628,7 +6647,7 @@ impl ChartApp {
     fn audit_ready_vector_activation(&mut self, output: &Path) -> Result<()> {
         self.poll_scene_build(true);
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden activation audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -6696,7 +6715,7 @@ impl ChartApp {
                     .context("Invalid expected text draw count")
             })
             .transpose()?;
-        let symbol_snapshot = |renderer: &ferrite_wgpu::WgpuRenderer| -> Result<Vec<u8>> {
+        let symbol_snapshot = |renderer: &ferrite_ui::WgpuRenderer| -> Result<Vec<u8>> {
             let rows = renderer.displayed_symbols_with_sources();
             anyhow::ensure!(
                 rows.len() <= 500_000,
@@ -6730,7 +6749,7 @@ impl ChartApp {
             );
             anyhow::ensure!(
                 renderer.settings() == &self.applied_settings
-                    && renderer.ui_state.color_profile == self.engine.current_profile_name,
+                    && renderer.ui.ui_state.color_profile == self.engine.current_profile_name,
                 "Applied policy/palette mismatch"
             );
             let settings = renderer.vector_emission_settings();
@@ -6741,7 +6760,7 @@ impl ChartApp {
                 profile: self.engine.current_profile_name.clone(),
                 settings: self.applied_settings.clone(),
             };
-            let prepare = || -> Result<ferrite_wgpu::ReadyVectorGpuFrame> {
+            let prepare = || -> Result<ferrite_gpu::ReadyVectorGpuFrame> {
                 let mut next = self.engine.render_context.empty_for_rebuild();
                 next.set_instructions_from_cache(
                     self.engine.render_context.raw_instructions().to_vec(),
@@ -6874,7 +6893,8 @@ impl ChartApp {
         for _ in 0..5 {
             let renderer = self.renderer.as_mut().unwrap();
             anyhow::ensure!(
-                renderer.window().is_visible() == Some(false) && !renderer.window().has_focus(),
+                renderer.ui.window().is_visible() == Some(false)
+                    && !renderer.ui.window().has_focus(),
                 "Normal activation audit frame visible/focused"
             );
             renderer.render()?; // Actual overlay/layout/private atlas path; no update_view/repair.
@@ -7017,7 +7037,7 @@ impl ChartApp {
     fn prepare_joint_audit_vector(
         &self,
         profile: &str,
-    ) -> Result<ferrite_wgpu::ReadyVectorGpuFrame> {
+    ) -> Result<ferrite_gpu::ReadyVectorGpuFrame> {
         let renderer = self.renderer.as_ref().context("Renderer required")?;
         let window = self.window.as_ref().context("Window required")?;
         let mut next = self.engine.render_context.empty_for_rebuild();
@@ -7055,11 +7075,11 @@ impl ChartApp {
     fn prepare_joint_audit_raster(
         &mut self,
         wrong_camera: bool,
-    ) -> Result<ferrite_wgpu::PreparedRasterScenePublication> {
+    ) -> Result<ferrite_gpu::PreparedRasterScenePublication> {
         let (_, _, groups) = self.bathymetry_portrayal_with_status()?;
         let renderer = self.renderer.as_mut().context("Renderer required")?;
         // Reuse the ACTUAL displayed immutable regular materials; never invent a replacement texture.
-        let batch = renderer.stage_raster_material_batch::<ferrite_wgpu::WgpuError>(
+        let batch = renderer.stage_raster_material_batch::<ferrite_gpu::WgpuError>(
             &self.engine.render_context.scaler,
             |_| Ok(()),
         )?;
@@ -7080,7 +7100,7 @@ impl ChartApp {
         self.poll_scene_build(true);
         let window = self.window.as_ref().context("Window required")?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled()
+            ferrite_ui::background_test::enabled()
                 && window.is_visible() == Some(false)
                 && !window.has_focus(),
             "Hidden unfocused joint audit required"
@@ -7121,7 +7141,7 @@ impl ChartApp {
                 && pivot == (0., 0.)
                 && renderer.geometry_matches_view(&self.engine.render_context.scaler)
                 && renderer.settings() == &self.applied_settings
-                && renderer.ui_state.color_profile == self.engine.current_profile_name,
+                && renderer.ui.ui_state.color_profile == self.engine.current_profile_name,
             "Joint audit stale affine or policy"
         );
         let before = self.bathymetry_publication_model()?;
@@ -7190,7 +7210,7 @@ impl ChartApp {
             raster_visible_count > 0,
             "No visible original raster material"
         );
-        let direct_exact = |renderer: &ferrite_wgpu::WgpuRenderer| -> Result<()> {
+        let direct_exact = |renderer: &ferrite_ui::WgpuRenderer| -> Result<()> {
             let actual = renderer.audit_displayed_regular_mixed_frame(true)?;
             anyhow::ensure!(
                 actual.rgba8 == direct_reference.rgba8
@@ -7413,7 +7433,7 @@ impl ChartApp {
     /// Same-original single-PC private preparation only; not an App/raster publication.
     fn audit_private_single_pc_vector_gpu(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -7458,7 +7478,7 @@ impl ChartApp {
         let groups = self.get_visible_viewing_groups();
         let boxes = renderer.vector_world_map_chart_boxes();
         anyhow::ensure!(boxes.len() <= 4096, "World-map copy admission exceeded");
-        let prepare = |settings| -> Result<ferrite_wgpu::PreparedSinglePcVectorEmission> {
+        let prepare = |settings| -> Result<ferrite_gpu::PreparedSinglePcVectorEmission> {
             let origin = renderer.capture_publication_origin();
             let mut next = self.engine.render_context.empty_for_rebuild();
             next.set_instructions_from_cache(original.to_vec());
@@ -7481,7 +7501,7 @@ impl ChartApp {
                 self.engine.pc.sources(),
                 ferrite_s101::shallow_pattern_contract(&self.engine.pc),
             );
-            let resources = ferrite_wgpu::SinglePcVectorResources::new(
+            let resources = ferrite_gpu::SinglePcVectorResources::new(
                 cache,
                 Arc::clone(&self.engine.pc),
                 &self.engine.current_profile_name,
@@ -7544,7 +7564,7 @@ impl ChartApp {
         let early_origin = renderer.capture_publication_origin();
         let mut early_context = self.engine.render_context.empty_for_rebuild();
         early_context.set_instructions_from_cache(original.to_vec());
-        let early_resources = ferrite_wgpu::SinglePcVectorResources::new(
+        let early_resources = ferrite_gpu::SinglePcVectorResources::new(
             SymbolCache::new_with_pattern_contract(
                 self.engine.pc.root_path.join("Symbols"),
                 self.engine.pc.sources(),
@@ -7557,7 +7577,7 @@ impl ChartApp {
         let early_boxes = boxes.to_vec();
         let renderer = self.renderer.as_mut().context("Renderer required")?;
         let early_old_profile = std::mem::replace(
-            &mut renderer.ui_state.color_profile,
+            &mut renderer.ui.ui_state.color_profile,
             "audit-early-policy-drift".to_owned(),
         );
         let early_result = renderer.prepare_private_single_pc_vector_emission_from_origin(
@@ -7568,7 +7588,7 @@ impl ChartApp {
             360. * self.engine.render_context.scaler.scale_x() as f32,
             early_boxes,
         );
-        renderer.ui_state.color_profile = early_old_profile;
+        renderer.ui.ui_state.color_profile = early_old_profile;
         let early_rejection = match early_result {
             Err(error) => error.to_string(),
             Ok(_) => anyhow::bail!("Early SinglePc policy drift admitted"),
@@ -7582,11 +7602,11 @@ impl ChartApp {
             "Early SinglePc refusal changed original GPU scene"
         );
         let old_profile = std::mem::replace(
-            &mut renderer.ui_state.color_profile,
+            &mut renderer.ui.ui_state.color_profile,
             "audit-policy-drift".to_owned(),
         );
         let stale_result = renderer.prepare_private_single_pc_vector_gpu(stale_emission);
-        renderer.ui_state.color_profile = old_profile; // restore before any audit Result
+        renderer.ui.ui_state.color_profile = old_profile; // restore before any audit Result
         let stale_rejection = match stale_result {
             Err(error) => error.to_string(),
             Ok(_) => anyhow::bail!("CPU/GPU policy drift admitted by private preparation"),
@@ -7737,7 +7757,7 @@ impl ChartApp {
                     .is_some_and(|o| Arc::ptr_eq(o.pc(), &self.engine.pc))),
                 "SinglePc TARGET fixture must have actual identical PC owners"
             );
-            let resources = ferrite_wgpu::SinglePcVectorResources::new(
+            let resources = ferrite_gpu::SinglePcVectorResources::new(
                 symbols,
                 self.engine.pc.clone(),
                 &request.profile,
@@ -7851,7 +7871,7 @@ impl ChartApp {
     fn audit_target_vector_raster_preparation(&mut self, output: &Path) -> Result<()> {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden TARGET audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -7898,7 +7918,7 @@ impl ChartApp {
         let renderer = self.renderer.as_ref().context("Renderer required")?;
         anyhow::ensure!(
             renderer.settings() == &self.applied_settings
-                && renderer.ui_state.color_profile == self.engine.current_profile_name
+                && renderer.ui.ui_state.color_profile == self.engine.current_profile_name
                 && renderer.geometry_matches_view(&self.engine.render_context.scaler),
             "OLD policy/view mismatch"
         );
@@ -7956,7 +7976,7 @@ impl ChartApp {
                 .validate_publication_origin(&old_origin)?;
             check_old_pixels_and_model(app)
         };
-        let mut target_pixels: Option<ferrite_wgpu::PrivateVectorReadback> = None;
+        let mut target_pixels: Option<ferrite_gpu::PrivateVectorReadback> = None;
         let mut target_metadata = serde_json::Value::Null;
         for _ in 0..2 {
             let (capsule, metadata) = self.prepare_target_audit_capsule(single, None, false)?;
@@ -8013,7 +8033,7 @@ impl ChartApp {
         let (capsule, _) = self.prepare_target_audit_capsule(single, None, false)?;
         let renderer = self.renderer.as_mut().context("Renderer required")?;
         let old_profile = std::mem::replace(
-            &mut renderer.ui_state.color_profile,
+            &mut renderer.ui.ui_state.color_profile,
             "audit-late-target-old-drift".to_owned(),
         );
         let drift_result = match &capsule {
@@ -8024,7 +8044,7 @@ impl ChartApp {
                 renderer.validate_target_single_pc_vector_raster_publication(c)
             }
         };
-        renderer.ui_state.color_profile = old_profile;
+        renderer.ui.ui_state.color_profile = old_profile;
         let drift_error = match drift_result {
             Err(error) => error.to_string(),
             Ok(_) => anyhow::bail!("Late OLD drift admitted"),
@@ -8056,7 +8076,7 @@ impl ChartApp {
         let target_pixels = target_pixels.context("Missing actual TARGET readback")?;
         let activation_requested =
             std::env::var("FERRITE_TARGET_ACTIVATION_AUDIT").as_deref() == Ok("1");
-        let emission_bits = |v: ferrite_wgpu::VectorEmissionSettings| {
+        let emission_bits = |v: ferrite_gpu::VectorEmissionSettings| {
             let c = v.background_color.to_array();
             [
                 v.symbol_scale.to_bits(),
@@ -8109,8 +8129,8 @@ impl ChartApp {
             let renderer = self.renderer.as_ref().context("Renderer required")?;
             anyhow::ensure!(
                 renderer.settings() == &target_settings
-                    && renderer.ui_state.color_profile == "Dusk"
-                    && renderer.ui_state.zoom_level.to_bits() == self.zoom_level.to_bits()
+                    && renderer.ui.ui_state.color_profile == "Dusk"
+                    && renderer.ui.ui_state.zoom_level.to_bits() == self.zoom_level.to_bits()
                     && emission_bits(renderer.vector_emission_settings())
                         == emission_bits(target_emission),
                 "Activated renderer policy differs from staged target"
@@ -8143,7 +8163,7 @@ impl ChartApp {
             anyhow::ensure!(
                 renderer.audit_displayed_vector_frame()?.rgba8 == target_pixels.rgba8
                     && renderer.settings() == &target_settings
-                    && renderer.ui_state.color_profile == "Dusk"
+                    && renderer.ui.ui_state.color_profile == "Dusk"
                     && emission_bits(renderer.vector_emission_settings())
                         == emission_bits(target_emission),
                 "Stale activation rejection changed TARGET"
@@ -8204,7 +8224,7 @@ impl ChartApp {
             return self.audit_private_single_pc_vector_gpu(output);
         }
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden private vector audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -8264,7 +8284,7 @@ impl ChartApp {
             "Applied/displayed settings mismatch"
         );
         anyhow::ensure!(
-            renderer.ui_state.color_profile == self.engine.current_profile_name,
+            renderer.ui.ui_state.color_profile == self.engine.current_profile_name,
             "Displayed palette mismatch"
         );
         let groups = self.get_visible_viewing_groups();
@@ -8383,7 +8403,7 @@ impl ChartApp {
         let early_boxes = boxes.to_vec();
         let renderer = self.renderer.as_mut().context("Renderer required")?;
         let old_profile = std::mem::replace(
-            &mut renderer.ui_state.color_profile,
+            &mut renderer.ui.ui_state.color_profile,
             "audit-early-policy-drift".to_owned(),
         );
         let early_result = renderer.prepare_private_vector_emission_from_origin(
@@ -8395,7 +8415,7 @@ impl ChartApp {
             wrap,
             early_boxes,
         );
-        renderer.ui_state.color_profile = old_profile;
+        renderer.ui.ui_state.color_profile = old_profile;
         let early_rejection = match early_result {
             Err(error) => error.to_string(),
             Ok(_) => anyhow::bail!("Early OwnedCells policy drift admitted"),
@@ -8440,16 +8460,16 @@ impl ChartApp {
             "chart_loaded":self.chart_loaded,"frames_since_loaded":self.frames_since_loaded,"base_instruction_count":self.engine.base_instruction_count,
             "instructions_sha256":format!("{:x}",Sha256::digest(bincode::serialize(self.engine.render_context.raw_instructions())?)),
             "verified":self.engine.verified_count,"unsigned":self.engine.unsigned_count,
-            "security_status":renderer.ui_state.security_status,"security_details":renderer.ui_state.security_details,
-            "selection":format!("{:?}",renderer.ui_state.selected_feature),
-            "selection_candidates":format!("{:?}",renderer.ui_state.selection_candidates),
+            "security_status":renderer.ui.ui_state.security_status,"security_details":renderer.ui.ui_state.security_details,
+            "selection":format!("{:?}",renderer.ui.ui_state.selected_feature),
+            "selection_candidates":format!("{:?}",renderer.ui.ui_state.selection_candidates),
             "rendered_symbols":format!("{:?}",self.rendered_symbols),
             "scaler":format!("{:?}",self.engine.render_context.scaler),"applied_settings":format!("{:?}",self.applied_settings)}),
         )
     }
     fn audit_decoded_chart_reopen(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden audit required"
         );
         let w = self.window.as_ref().context("Window required")?;
@@ -8478,7 +8498,7 @@ impl ChartApp {
         for label in ["cold", "warm"] {
             self.ensure_navigation_scene()?;
             let (product, name) = s101_update_plan::dataset_key(&self.engine.cells[0].dsid)?;
-            self.unload_dataset(ferrite_wgpu::DatasetLayerId::S101 { product, name })?;
+            self.unload_dataset(ferrite_ui::DatasetLayerId::S101 { product, name })?;
             anyhow::ensure!(self.engine.cells.is_empty(), "Unload did not remove cell");
             let before = self.engine.decoded_chart_cache.lock().unwrap().statistics();
             let started = std::time::Instant::now();
@@ -8542,7 +8562,7 @@ impl ChartApp {
     fn audit_root_cancellation(&mut self, output: &Path) -> Result<()> {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden test required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -8599,6 +8619,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .selected_feature
                     .is_none()
@@ -8667,8 +8688,8 @@ impl ChartApp {
         );
         let renderer = self.renderer.as_ref().unwrap();
         anyhow::ensure!(
-            renderer.ui_state.selected_feature.is_none()
-                && renderer.ui_state.selection_candidates.is_empty(),
+            renderer.ui.ui_state.selected_feature.is_none()
+                && renderer.ui.ui_state.selection_candidates.is_empty(),
             "Cancelled selection survived"
         );
         anyhow::ensure!(
@@ -8728,7 +8749,7 @@ impl ChartApp {
     fn capture_coverage_lifecycle(&mut self, output: &Path) -> Result<()> {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden lifecycle audit required"
         );
         fs::create_dir_all(output)?;
@@ -8736,6 +8757,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .context("Renderer missing")?
+            .ui
             .ui_state
             .selection_candidates
             .clear();
@@ -8751,7 +8773,7 @@ impl ChartApp {
         r.render()?;
         r.wait_hidden_key_frame()?;
         anyhow::ensure!(
-            r.window().is_visible() == Some(false) && !r.window().has_focus(),
+            r.ui.window().is_visible() == Some(false) && !r.ui.window().has_focus(),
             "Visible/focused lifecycle forbidden"
         );
         let viewport = r.chart_viewport_pixels();
@@ -8772,7 +8794,7 @@ impl ChartApp {
                     viewport.1 as f64 + viewport.3 as f64 * y as f64 / 3.,
                 );
                 self.chart_click(point);
-                let selected=self.renderer.as_ref().unwrap().ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
+                let selected=self.renderer.as_ref().unwrap().ui.ui_state.selected_feature.as_ref().map(|f|serde_json::json!({"feature_id":f.feature_id,"cell_index":f.cell_index,"source":f.source,"full_attributes":f.attributes,"foid":f.foid,"definition":f.definition,"primitive_type":f.primitive_type,"symbol_name":f.symbol_name,"world_position_bits":[f.world_pos.0.to_bits(),f.world_pos.1.to_bits()],"longitude_shift_bits":f.longitude_shift.to_bits()}));
                 picks.push(serde_json::json!({"pixel":point,"selected":selected}));
             }
         }
@@ -8780,6 +8802,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .unwrap()
+            .ui
             .ui_state
             .selection_candidates
             .clear();
@@ -8815,7 +8838,7 @@ impl ChartApp {
 
     /// The window's physical size and scale factor, once it exists.
     fn viewport_pixels(&self) -> Option<ferrite_engine::ViewportPixels> {
-        let window = self.renderer.as_ref()?.window();
+        let window = self.renderer.as_ref()?.ui.window();
         let size = window.inner_size();
         Some(ferrite_engine::ViewportPixels {
             width: size.width,
@@ -8947,6 +8970,7 @@ impl ChartApp {
             self.renderer
                 .as_mut()
                 .unwrap()
+                .ui
                 .ui_state
                 .settings
                 .isolated_dangers = enabled;
@@ -8956,6 +8980,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .unwrap()
+            .ui
             .ui_state
             .settings
             .isolated_dangers = old_danger;
@@ -8999,7 +9024,7 @@ impl ChartApp {
         bounds.sort();
         let sources=self.engine.bathymetry.iter().map(|(path,c,snapshot)|serde_json::json!({"path":path,"instance":c.instance_name,"geometry":format!("{:?}",c.numeric_geometry()),"datum":c.vertical_datum,"snapshot":snapshot.as_ref().map(|s|s.path())})).collect::<Vec<_>>();
         Ok(
-            serde_json::json!({"vectors":self.publication_model()?,"sources":sources,"policies":policies,"private_inputs":inputs,"bounds":bounds,"pan_bits":[self.pan_offset.0.to_bits(),self.pan_offset.1.to_bits()],"zoom_bits":self.zoom_level.to_bits(),"zoom_target_bits":self.zoom_target.to_bits(),"raster_composition":renderer.raster_composition_metadata().map(|(p,o,g,v)|(format!("{p:?}"),o,g.to_vec(),v)).collect::<Vec<_>>(),"ui_bathymetry_count":renderer.ui_state.bathymetry_count,"ui_chart_count":renderer.ui_state.chart_count}),
+            serde_json::json!({"vectors":self.publication_model()?,"sources":sources,"policies":policies,"private_inputs":inputs,"bounds":bounds,"pan_bits":[self.pan_offset.0.to_bits(),self.pan_offset.1.to_bits()],"zoom_bits":self.zoom_level.to_bits(),"zoom_target_bits":self.zoom_target.to_bits(),"raster_composition":renderer.raster_composition_metadata().map(|(p,o,g,v)|(format!("{p:?}"),o,g.to_vec(),v)).collect::<Vec<_>>(),"ui_bathymetry_count":renderer.ui.ui_state.bathymetry_count,"ui_chart_count":renderer.ui.ui_state.chart_count}),
         )
     }
     /// A genuine application transaction regression using private immutable
@@ -9008,7 +9033,7 @@ impl ChartApp {
         self.ensure_navigation_scene()?;
         let window = self.window.as_ref().context("Window required")?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled()
+            ferrite_ui::background_test::enabled()
                 && window.is_visible() == Some(false)
                 && !window.has_focus(),
             "Hidden audit required"
@@ -9052,7 +9077,7 @@ impl ChartApp {
         self.ensure_navigation_scene()?;
         let window = self.window.as_ref().context("Window required")?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled()
+            ferrite_ui::background_test::enabled()
                 && window.is_visible() == Some(false)
                 && !window.has_focus(),
             "Hidden audit required"
@@ -9146,7 +9171,7 @@ impl ChartApp {
         self.ensure_navigation_scene()?;
         let window = self.window.as_ref().context("Window required")?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled()
+            ferrite_ui::background_test::enabled()
                 && window.is_visible() == Some(false)
                 && !window.has_focus(),
             "Hidden audit required"
@@ -9175,6 +9200,7 @@ impl ChartApp {
             self.renderer
                 .as_mut()
                 .unwrap()
+                .ui
                 .ui_state
                 .verify_dataset_signatures = false;
             let unchecked = self
@@ -9187,6 +9213,7 @@ impl ChartApp {
             self.renderer
                 .as_mut()
                 .unwrap()
+                .ui
                 .ui_state
                 .verify_dataset_signatures = true;
             let cancelled = self
@@ -9246,6 +9273,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .unwrap()
+            .ui
             .ui_state
             .verify_dataset_signatures = true;
         self.load_bathymetry(&paths[..1])?;
@@ -9365,7 +9393,7 @@ impl ChartApp {
             .path()
             .to_path_buf();
         let weak = Arc::downgrade(&self.engine.s102_original_inputs[&middle].snapshot);
-        self.unload_dataset(ferrite_wgpu::DatasetLayerId::S102(middle.clone()))?;
+        self.unload_dataset(ferrite_ui::DatasetLayerId::S102(middle.clone()))?;
         anyhow::ensure!(
             !self.engine.s102_original_inputs.contains_key(&middle)
                 && weak.upgrade().is_none()
@@ -9406,7 +9434,7 @@ impl ChartApp {
     fn audit_geographic_annulus(&self, output: &Path) -> Result<()> {
         use ferrite_kernel::geodesy::{direct, inverse, GeographicPosition};
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -9473,7 +9501,7 @@ impl ChartApp {
         );
         let prepare = |sweep: Option<f64>,
                        feature_id: i64|
-         -> Result<ferrite_wgpu::ReadyVectorGpuFrame> {
+         -> Result<ferrite_gpu::ReadyVectorGpuFrame> {
             let mut next = self.engine.render_context.empty_for_rebuild();
             if let Some(sweep) = sweep {
                 let script=format!("DrawingPriority:7;Annulus:{},{},{},{},35,{sweep};AugmentedPath:GeographicCRS,GeographicCRS,GeographicCRS;LineStyle:L,,0.64,CHBLK;LineInstructionUnsuppressed:L",origin.x,origin.y,radius,radius*0.5);
@@ -9633,7 +9661,7 @@ impl ChartApp {
 
     fn audit_s102_append_reuse(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden audit required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -9773,7 +9801,7 @@ impl ChartApp {
     fn audit_root_bathymetry_publication(&mut self, output: &Path) -> Result<()> {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden background test required"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -9862,7 +9890,7 @@ impl ChartApp {
             "Successful publication did not publish all file metadata"
         );
         anyhow::ensure!(
-            self.renderer.as_ref().unwrap().ui_state.bathymetry_count
+            self.renderer.as_ref().unwrap().ui.ui_state.bathymetry_count
                 == self.engine.bathymetry.len(),
             "UI count out of sync"
         );
@@ -9919,6 +9947,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .selected_feature
                     .is_none()
@@ -9955,6 +9984,7 @@ impl ChartApp {
                         .renderer
                         .as_ref()
                         .unwrap()
+                        .ui
                         .ui_state
                         .notice
                         .as_deref()
@@ -10012,7 +10042,7 @@ impl ChartApp {
     fn audit_root_publication(&mut self, output: &Path) -> Result<()> {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden background test required"
         );
         anyhow::ensure!(
@@ -10065,6 +10095,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .selected_feature
                     .is_none()
@@ -10122,6 +10153,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .unwrap()
+            .ui
             .ui_state
             .verify_dataset_signatures = true;
         self.wait_publication_test_load()?;
@@ -10155,6 +10187,7 @@ impl ChartApp {
             self.renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .verify_dataset_signatures,
             "Rollback changed the user's new policy"
@@ -10163,10 +10196,10 @@ impl ChartApp {
         self.audit_portrayal(&output.join("after-policy-rejection"))?;
         // Restore the diagnostic's initial policy, without reopening an input.
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.verify_dataset_signatures = false;
-            renderer.ui_state.security_status =
+            renderer.ui.ui_state.verify_dataset_signatures = false;
+            renderer.ui.ui_state.security_status =
                 original["security_status"].as_str().unwrap().into();
-            renderer.ui_state.security_details =
+            renderer.ui.ui_state.security_details =
                 original["security_details"].as_str().unwrap().into();
         }
 
@@ -10209,7 +10242,7 @@ impl ChartApp {
         fs::remove_file(bad_path)?;
         // Successful retry publishes the same official updated chain once.
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.notice = None;
+            renderer.ui.ui_state.notice = None;
         }
         self.load_charts(&[selected])?;
         self.wait_publication_test_load()?;
@@ -10234,6 +10267,7 @@ impl ChartApp {
             self.renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .selected_feature
                 .is_none(),
@@ -10319,14 +10353,14 @@ impl ChartApp {
 
     fn audit_object_selection_mode(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Hidden test required"
         );
         self.ensure_navigation_scene()?;
         self.build_rendered_symbols();
         let renderer = self.renderer.as_ref().context("No renderer")?;
         anyhow::ensure!(
-            !renderer.ui_state.object_selection_mode,
+            !renderer.ui.ui_state.object_selection_mode,
             "Selection must default OFF"
         );
         anyhow::ensure!(
@@ -10347,7 +10381,7 @@ impl ChartApp {
             })
             .map(|symbol| (f64::from(symbol.screen_x), f64::from(symbol.screen_y)))
             .context("No visible source object for actual click audit")?;
-        let before = format!("{:?}", renderer.ui_state.selected_feature);
+        let before = format!("{:?}", renderer.ui.ui_state.selected_feature);
         let camera = (
             self.zoom_level.to_bits(),
             format!("{:?}", self.engine.render_context.scaler),
@@ -10356,7 +10390,7 @@ impl ChartApp {
         anyhow::ensure!(
             format!(
                 "{:?}",
-                self.renderer.as_ref().unwrap().ui_state.selected_feature
+                self.renderer.as_ref().unwrap().ui.ui_state.selected_feature
             ) == before,
             "OFF changed selection"
         );
@@ -10370,17 +10404,19 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .unwrap()
+            .ui
             .ui_state
             .object_selection_mode = true;
         self.chart_click(point);
         let renderer = self.renderer.as_ref().unwrap();
         let feature = renderer
+            .ui
             .ui_state
             .selected_feature
             .as_ref()
             .context("ON failed to select visible object")?;
         anyhow::ensure!(
-            !renderer.ui_state.object_details_hidden,
+            !renderer.ui.ui_state.object_details_hidden,
             "ON did not reveal detail panel"
         );
         let cell = feature
@@ -10396,6 +10432,7 @@ impl ChartApp {
             .catalogue_owner_for_cell(cell)
             .context("Selected catalogue owner missing")?;
         let preview = renderer
+            .ui
             .ui_state
             .selected_symbol_preview
             .as_ref()
@@ -10413,6 +10450,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .unwrap()
+            .ui
             .ui_state
             .set_object_selection_mode(false);
         self.clear_selection();
@@ -10421,6 +10459,7 @@ impl ChartApp {
             self.renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .selected_feature
                 .is_none()
@@ -10428,6 +10467,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .selected_symbol_preview
                     .is_none()
@@ -10435,6 +10475,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .selection_candidates
                     .is_empty()
@@ -10442,6 +10483,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .coverage_info
                     .is_none(),
@@ -10450,6 +10492,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .unwrap()
+            .ui
             .ui_state
             .set_object_selection_mode(true);
         self.chart_click(point);
@@ -10457,6 +10500,7 @@ impl ChartApp {
             self.renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .selected_feature
                 .is_some(),
@@ -10467,6 +10511,7 @@ impl ChartApp {
             self.renderer
                 .as_ref()
                 .unwrap()
+                .ui
                 .ui_state
                 .selected_feature
                 .is_none()
@@ -10474,6 +10519,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .selection_candidates
                     .is_empty()
@@ -10481,6 +10527,7 @@ impl ChartApp {
                     .renderer
                     .as_ref()
                     .unwrap()
+                    .ui
                     .ui_state
                     .object_selection_mode,
             "Escape failed or disabled selection mode"
@@ -10494,20 +10541,20 @@ impl ChartApp {
             renderer.render()?;
         }
         renderer.save_screenshot_with_ui(output.join("selected.png"))?;
-        renderer.ui_state.show_logs = true;
-        renderer.ui_state.show_load_status = true;
+        renderer.ui.ui_state.show_logs = true;
+        renderer.ui.ui_state.show_load_status = true;
         for _ in 0..3 {
             renderer.render()?;
         }
         renderer.save_screenshot_with_ui(output.join("separate-windows.png"))?;
-        renderer.ui_state.show_logs = false;
+        renderer.ui.ui_state.show_logs = false;
         anyhow::ensure!(
-            renderer.ui_state.show_load_status,
+            renderer.ui.ui_state.show_load_status,
             "Closing Logs closed Load status"
         );
         renderer.render()?;
         renderer.save_screenshot_with_ui(output.join("status-only.png"))?;
-        renderer.ui_state.show_load_status = false;
+        renderer.ui.ui_state.show_load_status = false;
         let day = self.engine.current_profile_name.clone();
         for profile in ["Night", day.as_str()] {
             let prepared = self.prepare_portrayal_change(PortrayalChangeRequest {
@@ -10517,12 +10564,14 @@ impl ChartApp {
             self.commit_portrayal_change(prepared)?;
             let renderer = self.renderer.as_mut().unwrap();
             let feature = renderer
+                .ui
                 .ui_state
                 .selected_feature
                 .as_ref()
                 .context("Palette change lost selection")?;
             anyhow::ensure!(
                 renderer
+                    .ui
                     .ui_state
                     .selected_symbol_preview
                     .as_ref()
@@ -10870,7 +10919,7 @@ impl ChartApp {
         let selected = self
             .renderer
             .as_ref()
-            .and_then(|r| r.ui_state.selected_feature.clone());
+            .and_then(|r| r.ui.ui_state.selected_feature.clone());
         if selected
             .as_ref()
             .is_some_and(|s| !visible.contains(&(s.cell_index, s.feature_id)))
@@ -10881,6 +10930,7 @@ impl ChartApp {
         }
         if let Some(renderer) = &mut self.renderer {
             renderer
+                .ui
                 .ui_state
                 .selection_candidates
                 .retain(|s| visible.contains(&(s.cell_index, s.feature_id)));
@@ -10891,7 +10941,7 @@ impl ChartApp {
     fn prepare_selected_symbol_preview(
         &mut self,
         feature: &SelectedFeature,
-    ) -> Result<Option<ferrite_wgpu::SelectedSymbolPreview>> {
+    ) -> Result<Option<ferrite_ui::SelectedSymbolPreview>> {
         self.poll_scene_build(true);
         if feature.symbol_name.is_none() {
             return Ok(None);
@@ -10906,8 +10956,7 @@ impl ChartApp {
                 .profiles
                 .get(&self.engine.current_profile_name)
                 .context("Active colour profile unavailable")?;
-            return ferrite_wgpu::prepare_overlay_symbol_preview(feature, active)
-                .map_err(Into::into);
+            return ferrite_ui::prepare_overlay_symbol_preview(feature, active).map_err(Into::into);
         }
         let index = feature
             .cell_index
@@ -10927,28 +10976,28 @@ impl ChartApp {
                 .context("Selected symbol exact retained source/PC binding unavailable")?,
         );
         if let Some(resources) = &mut self.cell_resources {
-            return ferrite_wgpu::prepare_selected_symbol_preview(feature, resources)
+            return ferrite_ui::prepare_selected_symbol_preview(feature, resources)
                 .map_err(Into::into);
         }
         // Single-owner rendering may not own a per-cell registry. Prepare ONE exact
         // retained cell PC here, never the application's unverified global name cache.
-        let binding = ferrite_wgpu::CellPortrayalResourceBinding {
+        let binding = ferrite_gpu::CellPortrayalResourceBinding {
             cell_index: index,
             catalogue: Arc::clone(owner.pc()),
             shallow_pattern: None,
         };
-        let mut resources = ferrite_wgpu::CellPortrayalResources::prepare(
+        let mut resources = ferrite_gpu::CellPortrayalResources::prepare(
             &[binding],
             &self.engine.current_profile_name,
             1,
         )?;
-        ferrite_wgpu::prepare_selected_symbol_preview(feature, &mut resources).map_err(Into::into)
+        ferrite_ui::prepare_selected_symbol_preview(feature, &mut resources).map_err(Into::into)
     }
     fn refresh_selected_symbol_preview(&mut self) {
         let selected = self
             .renderer
             .as_ref()
-            .and_then(|r| r.ui_state.selected_feature.clone());
+            .and_then(|r| r.ui.ui_state.selected_feature.clone());
         if let Some(index) = selected.as_ref().and_then(|f| f.cell_index) {
             // A selection kept across a residency change may name a released cell.
             if let Err(error) = self.engine.hydrate_cells(&[index as usize]) {
@@ -10970,7 +11019,7 @@ impl ChartApp {
                 && owner.is_some_and(|owner| {
                     self.renderer
                         .as_ref()
-                        .and_then(|r| r.ui_state.selected_symbol_preview.as_ref())
+                        .and_then(|r| r.ui.ui_state.selected_symbol_preview.as_ref())
                         .is_some_and(|p| {
                             p.matches_bound(
                                 feature,
@@ -10993,15 +11042,15 @@ impl ChartApp {
             }
         });
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.selected_symbol_preview = preview;
+            renderer.ui.ui_state.selected_symbol_preview = preview;
         }
     }
 
     /// Deselection is infallible and never flushes/retries a portrayal rebuild.
     fn clear_selection(&mut self) {
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui_state.clear_selection();
-            renderer.ui_state.clear_selection_requested = false;
+            renderer.ui.ui_state.clear_selection();
+            renderer.ui.ui_state.clear_selection_requested = false;
             renderer.set_selection_geometry(Vec::new(), &self.engine.render_context.scaler);
         }
         if let Some(window) = &self.window {
@@ -11064,9 +11113,9 @@ impl ChartApp {
         }
         if let Some(renderer) = &mut self.renderer {
             if selected.is_some() {
-                renderer.ui_state.object_details_hidden = false;
+                renderer.ui.ui_state.object_details_hidden = false;
             }
-            renderer.ui_state.selected_feature = selected;
+            renderer.ui.ui_state.selected_feature = selected;
             renderer.set_selection_geometry(geometry, &self.engine.render_context.scaler);
         }
         self.refresh_selected_symbol_preview();
@@ -11122,7 +11171,7 @@ impl ChartApp {
                 }
                 _ => unreachable!(),
             }
-            renderer.ui_state.object_selection_mode = false;
+            renderer.ui.ui_state.object_selection_mode = false;
             self.clear_selection();
             self.is_dragging = false;
             self.pan_velocity = (0., 0.);
@@ -11137,7 +11186,7 @@ impl ChartApp {
         let select_objects = self
             .renderer
             .as_ref()
-            .is_some_and(|r| r.ui_state.object_selection_mode);
+            .is_some_and(|r| r.ui.ui_state.object_selection_mode);
         if !self.native_s421.editing()
             && !select_objects
             && !self.plugin_system.has_loaded_plugins()
@@ -11175,7 +11224,8 @@ impl ChartApp {
             });
             if let Err(error) = result {
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.ui_state.notice = Some(format!("S-421 waypoint rejected: {error:#}"));
+                    renderer.ui.ui_state.notice =
+                        Some(format!("S-421 waypoint rejected: {error:#}"));
                 }
             } else {
                 self.refresh_dataset_tree();
@@ -11228,12 +11278,12 @@ impl ChartApp {
             };
             // Update selected feature in UI
             if let Some(renderer) = &mut self.renderer {
-                renderer.ui_state.selection_candidates = candidates;
-                renderer.ui_state.selection_requested = None;
+                renderer.ui.ui_state.selection_candidates = candidates;
+                renderer.ui.ui_state.selection_requested = None;
                 if coverage_info.is_some() {
-                    renderer.ui_state.object_details_hidden = false;
+                    renderer.ui.ui_state.object_details_hidden = false;
                 }
-                renderer.ui_state.coverage_info = coverage_info;
+                renderer.ui.ui_state.coverage_info = coverage_info;
             }
 
             self.select_feature(selected);
@@ -11289,7 +11339,7 @@ impl ChartApp {
                     self.update_view();
                 }
             } else if let Some(renderer) = &mut self.renderer {
-                renderer.ui_state.zoom_level = zoom;
+                renderer.ui.ui_state.zoom_level = zoom;
             }
         }
         self.zoom_last_scroll = std::time::Instant::now();
@@ -11332,11 +11382,11 @@ impl ChartApp {
         // Per-cell owners, or the single-catalogue cache and palette that the
         // UI-thread rebuild would use; the worker returns them on install.
         let resources = match self.cell_resources.take() {
-            Some(resources) => ferrite_wgpu::SceneResources::Owners(resources),
+            Some(resources) => ferrite_gpu::SceneResources::Owners(resources),
             None => {
                 let stand_in = self.symbol_cache.fork_empty();
                 self.symbol_cache_lent = Some(stand_in.resource_revision());
-                ferrite_wgpu::SceneResources::Single {
+                ferrite_gpu::SceneResources::Single {
                     symbol_cache: Box::new(std::mem::replace(&mut self.symbol_cache, stand_in)),
                     color_profile: self
                         .engine
@@ -11395,10 +11445,10 @@ impl ChartApp {
         };
         let installed = renderer.install_built_scene(built, &self.engine.render_context);
         match installed.resources {
-            ferrite_wgpu::SceneResources::Owners(resources) => {
+            ferrite_gpu::SceneResources::Owners(resources) => {
                 self.cell_resources = Some(resources);
             }
-            ferrite_wgpu::SceneResources::Single { symbol_cache, .. } => {
+            ferrite_gpu::SceneResources::Single { symbol_cache, .. } => {
                 // A portrayal change replaced the stand-in: keep the newer cache.
                 if self.symbol_cache_lent.take() == Some(self.symbol_cache.resource_revision()) {
                     self.symbol_cache = *symbol_cache;
@@ -11534,7 +11584,7 @@ impl ChartApp {
     /// - `preserve_declutter`: if true, preserve symbol declutter grids to avoid flickering
     fn start_flat_eventloop_diagnostics(&mut self, path: PathBuf) -> anyhow::Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Eventloop diagnostic requires BG=1"
         );
         anyhow::ensure!(
@@ -11550,7 +11600,7 @@ impl ChartApp {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No renderer"))?;
         anyhow::ensure!(
-            !r.window().is_visible().unwrap_or(true) && !r.window().has_focus(),
+            !r.ui.window().is_visible().unwrap_or(true) && !r.ui.window().has_focus(),
             "Eventloop diagnostic cannot activate a window"
         );
         // Explicit timestamp qualification uses identical legacy-profiler OFF
@@ -11561,7 +11611,7 @@ impl ChartApp {
         {
             self.debug_mode = false;
             let renderer = self.renderer.as_mut().unwrap();
-            renderer.ui_state.debug_mode = false;
+            renderer.ui.ui_state.debug_mode = false;
             renderer.set_profiling_enabled(false);
         }
         // Qualify the real palette transaction before timing any callbacks.
@@ -11652,9 +11702,9 @@ impl ChartApp {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("No replay renderer"))?;
             anyhow::ensure!(
-                ferrite_wgpu::background_test::enabled()
-                    && r.window().is_visible() == Some(false)
-                    && !r.window().has_focus(),
+                ferrite_ui::background_test::enabled()
+                    && r.ui.window().is_visible() == Some(false)
+                    && !r.ui.window().has_focus(),
                 "Replay window visible/focused"
             );
         }
@@ -11799,7 +11849,7 @@ impl ChartApp {
         {
             let r = self.renderer.as_ref().unwrap();
             anyhow::ensure!(
-                r.window().is_visible() == Some(false) && !r.window().has_focus(),
+                r.ui.window().is_visible() == Some(false) && !r.ui.window().has_focus(),
                 "Replay rendered window visible/focused"
             );
             let bits = self.navigation_camera_bits();
@@ -11820,7 +11870,7 @@ impl ChartApp {
                 std::fs::create_dir_all(&folder)?;
                 let r = self.renderer.as_ref().unwrap();
                 anyhow::ensure!(
-                    r.window().is_visible() == Some(false) && !r.window().has_focus(),
+                    r.ui.window().is_visible() == Some(false) && !r.ui.window().has_focus(),
                     "Selected pose visible/focused"
                 );
                 self.audit_portrayal(&folder)?;
@@ -11830,7 +11880,7 @@ impl ChartApp {
                     .save_screenshot(folder.join("frame.png"))?;
                 let r = self.renderer.as_ref().unwrap();
                 anyhow::ensure!(
-                    r.window().is_visible() == Some(false) && !r.window().has_focus(),
+                    r.ui.window().is_visible() == Some(false) && !r.ui.window().has_focus(),
                     "Readback window visible/focused"
                 );
                 self.navigation_burst_audit
@@ -11956,7 +12006,7 @@ impl ChartApp {
     fn audit_flat_service(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Flat service requires background mode"
         );
         let mut ledger = ferrite_render::flat_reuse_diagnostics::FlatFrameLedger::<512>::default();
@@ -12198,7 +12248,7 @@ impl ChartApp {
             renderer.reset_pan_offset();
         }
         self.zoom_rebuilt_level = self.zoom_level;
-        let profiling = ferrite_wgpu::profiler::is_profiling_enabled();
+        let profiling = ferrite_gpu::profiler::is_profiling_enabled();
         let update_view_start = if profiling {
             Some(std::time::Instant::now())
         } else {
@@ -12269,8 +12319,8 @@ impl ChartApp {
             if let Err(error) = prepare_flat_coverage(
                 self.engine.coverage_inventory.as_deref(),
                 &mut self.engine.render_context,
-                renderer.window().inner_size(),
-                renderer.window().scale_factor(),
+                renderer.ui.window().inner_size(),
+                renderer.ui.window().scale_factor(),
             ) {
                 let message = format!("Coverage preparation failed: {error}");
                 tracing::error!("{message}");
@@ -12279,7 +12329,7 @@ impl ChartApp {
                 }
                 if let Some(renderer) = &mut self.renderer {
                     renderer.begin_frame();
-                    renderer.ui_state.notice = Some(message);
+                    renderer.ui.ui_state.notice = Some(message);
                 }
                 return false;
             }
@@ -12294,8 +12344,8 @@ impl ChartApp {
         if let Some(renderer) = &mut self.renderer {
             // Update zoom level for symbol decluttering and UI
             renderer.set_zoom_level(self.zoom_level);
-            renderer.ui_state.zoom_level = self.zoom_level;
-            renderer.ui_state.signature_counts =
+            renderer.ui.ui_state.zoom_level = self.zoom_level;
+            renderer.ui.ui_state.signature_counts =
                 Some((self.engine.verified_count, self.engine.unsigned_count));
             // During animation, preserve declutter state to avoid flickering
             renderer.begin_frame_ex(preserve_declutter);
@@ -12327,8 +12377,8 @@ impl ChartApp {
                 let message = format!("Chart portrayal preparation failed: {error}");
                 tracing::error!("{message}");
                 renderer.begin_frame();
-                renderer.ui_state.notice = Some(message.clone());
-                renderer.ui_state.clear_selection();
+                renderer.ui.ui_state.notice = Some(message.clone());
+                renderer.ui.ui_state.clear_selection();
                 renderer.set_selection_geometry(Vec::new(), &self.engine.render_context.scaler);
                 self.rendered_symbols.clear();
                 self.pending_hit_test = None;
@@ -12470,7 +12520,7 @@ impl ChartApp {
     /// consumer checks. Explicit hidden diagnostics are excluded from frame timing.
     fn audit_native_s421_editor(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Editor audit requires hidden mode"
         );
         anyhow::ensure!(
@@ -12497,6 +12547,7 @@ impl ChartApp {
         self.renderer
             .as_mut()
             .context("No renderer")?
+            .ui
             .ui_state
             .object_selection_mode = false;
         // Actual App command route; no direct controller-only shortcut.
@@ -12690,7 +12741,7 @@ impl ChartApp {
 
     fn audit_native_s421_lifecycle(&mut self, output: &Path) -> Result<()> {
         anyhow::ensure!(
-            ferrite_wgpu::background_test::enabled(),
+            ferrite_ui::background_test::enabled(),
             "Native lifecycle audit requires background mode"
         );
         std::fs::create_dir_all(output)?;
@@ -12835,8 +12886,8 @@ impl ApplicationHandler for ChartApp {
                 window_attrs = window_attrs.with_window_icon(Some(icon));
             }
 
-            window_attrs = ferrite_wgpu::background_test::window_attributes(window_attrs);
-            if ferrite_wgpu::background_test::enabled() {
+            window_attrs = ferrite_ui::background_test::window_attributes(window_attrs);
+            if ferrite_ui::background_test::enabled() {
                 window_attrs =
                     window_attrs.with_inner_size(winit::dpi::PhysicalSize::new(1920, 1018));
             }
@@ -12846,7 +12897,7 @@ impl ApplicationHandler for ChartApp {
                     self.window = Some(window.clone());
 
                     // Create renderer asynchronously
-                    match pollster::block_on(WgpuRenderer::new(window.clone())) {
+                    match pollster::block_on(ferrite_ui::create_renderer(window.clone())) {
                         Ok(mut renderer) => {
                             // Update render context viewport
                             let size = window.inner_size();
@@ -12855,36 +12906,37 @@ impl ApplicationHandler for ChartApp {
                                 .set_viewport(size.width as f32, size.height as f32);
 
                             // Startup and worker-thread warning/error events share this bounded owner.
-                            renderer.ui_state.diagnostics = diagnostics_tracing::shared();
-                            renderer.ui_state.diagnostic_sink_dropped =
+                            renderer.ui.ui_state.diagnostics = diagnostics_tracing::shared();
+                            renderer.ui.ui_state.diagnostic_sink_dropped =
                                 diagnostics_tracing::shared_dropped();
                             // Initialize UI state
-                            renderer.ui_state.verify_dataset_signatures =
+                            renderer.ui.ui_state.verify_dataset_signatures =
                                 self.engine.require_signatures || self.engine.operational_mode;
-                            renderer.ui_state.signature_verification_locked =
+                            renderer.ui.ui_state.signature_verification_locked =
                                 self.engine.operational_mode;
-                            renderer.ui_state.settings.viewing_layers =
+                            renderer.ui.ui_state.settings.viewing_layers =
                                 self.applied_settings.viewing_layers.clone();
-                            renderer.ui_state.settings.viewing_layer_owner =
+                            renderer.ui.ui_state.settings.viewing_layer_owner =
                                 self.applied_settings.viewing_layer_owner;
-                            renderer.ui_state.optional_viewing_layers =
+                            renderer.ui.ui_state.optional_viewing_layers =
                                 ferrite_s101::optional_viewing_layers(&self.engine.pc);
-                            renderer.ui_state.settings.display_mode =
+                            renderer.ui.ui_state.settings.display_mode =
                                 self.applied_settings.display_mode;
-                            renderer.ui_state.version = VERSION.to_string();
-                            renderer.ui_state.zoom_level = self.zoom_level;
-                            renderer.ui_state.signature_counts =
+                            renderer.ui.ui_state.version = VERSION.to_string();
+                            renderer.ui.ui_state.zoom_level = self.zoom_level;
+                            renderer.ui.ui_state.signature_counts =
                                 Some((self.engine.verified_count, self.engine.unsigned_count));
-                            renderer.ui_state.fc_status = self.engine.fc_status.clone();
-                            renderer.ui_state.pc_status = self.engine.pc_status.clone();
-                            renderer.ui_state.debug_mode = self.debug_mode;
-                            renderer.ui_state.settings.interoperability_enabled =
+                            renderer.ui.ui_state.fc_status = self.engine.fc_status.clone();
+                            renderer.ui.ui_state.pc_status = self.engine.pc_status.clone();
+                            renderer.ui.ui_state.debug_mode = self.debug_mode;
+                            renderer.ui.ui_state.settings.interoperability_enabled =
                                 self.initial_interoperability_enabled;
-                            renderer.ui_state.interoperability_available = self.engine.ic.is_some();
-                            renderer.ui_state.interoperability_active =
+                            renderer.ui.ui_state.interoperability_available =
+                                self.engine.ic.is_some();
+                            renderer.ui.ui_state.interoperability_active =
                                 self.engine.ic.is_some() && self.initial_interoperability_enabled;
                             if let Some(ic) = &self.engine.ic {
-                                renderer.ui_state.interoperability_status = format!(
+                                renderer.ui.ui_state.interoperability_status = format!(
                                     "Interoperability {}: {} {} (signature verified)",
                                     if self.initial_interoperability_enabled {
                                         "on"
@@ -12895,7 +12947,7 @@ impl ApplicationHandler for ChartApp {
                                     ic.catalogue.version
                                 );
                             }
-                            renderer.ui_state.temporal_view =
+                            renderer.ui.ui_state.temporal_view =
                                 ferrite_render::TemporalView::from_settings(
                                     &self.engine.render_context.settings,
                                 );
@@ -12924,8 +12976,8 @@ impl ApplicationHandler for ChartApp {
                                 if let Err(error) = prepare_flat_coverage(
                                     self.engine.coverage_inventory.as_deref(),
                                     &mut self.engine.render_context,
-                                    renderer.window().inner_size(),
-                                    renderer.window().scale_factor(),
+                                    renderer.ui.window().inner_size(),
+                                    renderer.ui.window().scale_factor(),
                                 ) {
                                     self.startup_error =
                                         Some(format!("Coverage preparation failed: {error}"));
@@ -12955,8 +13007,8 @@ impl ApplicationHandler for ChartApp {
                                         format!("Chart portrayal preparation failed: {error}");
                                     tracing::error!("{message}");
                                     renderer.begin_frame();
-                                    renderer.ui_state.notice = Some(message.clone());
-                                    renderer.ui_state.clear_selection();
+                                    renderer.ui.ui_state.notice = Some(message.clone());
+                                    renderer.ui.ui_state.clear_selection();
                                     renderer.set_selection_geometry(
                                         Vec::new(),
                                         &self.engine.render_context.scaler,
@@ -13041,7 +13093,7 @@ impl ApplicationHandler for ChartApp {
                             }
                             self.refresh_dataset_tree();
 
-                            if ferrite_wgpu::background_test::enabled() {
+                            if ferrite_ui::background_test::enabled() {
                                 if let Some(path) = std::env::var_os("FERRITE_NATIVE_DATASET_AUDIT")
                                 {
                                     std::env::remove_var("FERRITE_NATIVE_DATASET_AUDIT");
@@ -13183,13 +13235,13 @@ impl ApplicationHandler for ChartApp {
             self.thread_stats.reset();
             self.frame_times.clear();
             if let Some(renderer) = &mut self.renderer {
-                renderer.ui_state.debug_mode = self.debug_mode;
+                renderer.ui.ui_state.debug_mode = self.debug_mode;
                 renderer.set_profiling_enabled(self.debug_mode);
-                renderer.ui_state.debug_cpu_usage = None;
-                renderer.ui_state.debug_main_thread_cpu = None;
-                renderer.ui_state.debug_memory_mb = None;
-                renderer.ui_state.debug_gpu.utilization_percent = None;
-                renderer.ui_state.debug_history = Default::default();
+                renderer.ui.ui_state.debug_cpu_usage = None;
+                renderer.ui.ui_state.debug_main_thread_cpu = None;
+                renderer.ui.ui_state.debug_memory_mb = None;
+                renderer.ui.ui_state.debug_gpu.utilization_percent = None;
+                renderer.ui.ui_state.debug_history = Default::default();
             }
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -13215,7 +13267,7 @@ impl ApplicationHandler for ChartApp {
 
         // Forward events to egui first
         let egui_consumed = if let Some(renderer) = &mut self.renderer {
-            renderer.handle_egui_event(&event)
+            renderer.ui.handle_egui_event(&event)
         } else {
             false
         };
@@ -13338,7 +13390,10 @@ impl ApplicationHandler for ChartApp {
                 }
 
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.resize(physical_size);
+                    renderer.resize(ferrite_gpu::PhysicalSize::new(
+                        physical_size.width,
+                        physical_size.height,
+                    ));
                     // Reset renderer's screen pan offset (will be recalculated by update_view)
                     renderer.reset_pan_offset();
 
@@ -13401,7 +13456,7 @@ impl ApplicationHandler for ChartApp {
                 self.last_frame_time = now;
 
                 // Frame profiling: begin frame
-                let profiling_enabled = ferrite_wgpu::profiler::is_profiling_enabled();
+                let profiling_enabled = ferrite_gpu::profiler::is_profiling_enabled();
                 if profiling_enabled {
                     if let Some(renderer) = &mut self.renderer {
                         renderer.cpu_profiler.begin_navigation_frame(
@@ -13502,8 +13557,8 @@ impl ApplicationHandler for ChartApp {
                                 // be obtained by scaling old screen anchors.
                                 self.update_view_ex(false, true);
                             } else if let Some(renderer) = &mut self.renderer {
-                                renderer.ui_state.zoom_level = self.zoom_level;
-                                renderer.ui_state.signature_counts =
+                                renderer.ui.ui_state.zoom_level = self.zoom_level;
+                                renderer.ui.ui_state.signature_counts =
                                     Some((self.engine.verified_count, self.engine.unsigned_count));
                             }
                         }
@@ -13577,7 +13632,7 @@ impl ApplicationHandler for ChartApp {
 
                 // Hidden diagnostics exercise the same asynchronous folder queue
                 // as the menu, rather than bypassing it with --s102 startup loads.
-                if ferrite_wgpu::background_test::enabled() {
+                if ferrite_ui::background_test::enabled() {
                     if let Some(path) = std::env::var_os("FERRITE_OPEN_FOLDER_AUDIT_INPUT") {
                         std::env::remove_var("FERRITE_OPEN_FOLDER_AUDIT_INPUT");
                         if let Err(error) = self.begin_dataset_open(PathBuf::from(path), true) {
@@ -13596,22 +13651,22 @@ impl ApplicationHandler for ChartApp {
                     .renderer
                     .as_mut()
                     .map(|renderer| {
-                        renderer.ui_state.dataset_loading = dataset_busy;
+                        renderer.ui.ui_state.dataset_loading = dataset_busy;
                         (
-                            renderer.ui_state.dataset_selection_requested.take(),
-                            renderer.ui_state.dataset_unload_requested.take(),
+                            renderer.ui.ui_state.dataset_selection_requested.take(),
+                            renderer.ui.ui_state.dataset_unload_requested.take(),
                         )
                     })
                     .unwrap_or((None, None));
                 if let Some(id) = select_dataset {
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.ui_state.selected_dataset = Some(id);
+                        renderer.ui.ui_state.selected_dataset = Some(id);
                     }
                 }
                 if let Some(id) = unload_dataset {
                     if let Err(error) = self.unload_dataset(id) {
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.ui_state.notice = Some(format!(
+                            renderer.ui.ui_state.notice = Some(format!(
                                 "Could not unload dataset; previous display retained: {error:#}"
                             ));
                         }
@@ -13620,17 +13675,23 @@ impl ApplicationHandler for ChartApp {
                 self.process_pending_portrayal_change();
 
                 if self.renderer.as_mut().is_some_and(|renderer| {
-                    std::mem::take(&mut renderer.ui_state.clear_selection_requested)
+                    std::mem::take(&mut renderer.ui.ui_state.clear_selection_requested)
                 }) {
                     self.clear_selection();
                 }
                 let candidate = self.renderer.as_mut().and_then(|renderer| {
                     renderer
+                        .ui
                         .ui_state
                         .selection_requested
                         .take()
                         .and_then(|index| {
-                            renderer.ui_state.selection_candidates.get(index).cloned()
+                            renderer
+                                .ui
+                                .ui_state
+                                .selection_candidates
+                                .get(index)
+                                .cloned()
                         })
                 });
                 if let Some(candidate) = candidate {
@@ -13644,14 +13705,14 @@ impl ApplicationHandler for ChartApp {
                     self.pan_velocity = (0., 0.);
                     self.select_feature(None);
                     if let Some(r) = &mut self.renderer {
-                        r.ui_state.selection_candidates.clear();
-                        r.ui_state.selection_requested = None;
+                        r.ui.ui_state.selection_candidates.clear();
+                        r.ui.ui_state.selection_requested = None;
                     }
                     self.update_view();
                 }
                 let temporal_request = self.renderer.as_mut().and_then(|renderer| {
-                    if std::mem::take(&mut renderer.ui_state.temporal_changed) {
-                        Some(renderer.ui_state.temporal_view.clone())
+                    if std::mem::take(&mut renderer.ui.ui_state.temporal_changed) {
+                        Some(renderer.ui.ui_state.temporal_view.clone())
                     } else {
                         None
                     }
@@ -13665,7 +13726,7 @@ impl ApplicationHandler for ChartApp {
                         Err(error) => {
                             tracing::warn!("Viewing-time change rejected: {error}");
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.ui_state.temporal_view =
+                                renderer.ui.ui_state.temporal_view =
                                     ferrite_render::TemporalView::from_settings(
                                         &self.engine.render_context.settings,
                                     );
@@ -13678,8 +13739,8 @@ impl ApplicationHandler for ChartApp {
                     .as_mut()
                     .map(|r| {
                         (
-                            std::mem::take(&mut r.ui_state.open_exchange_requested),
-                            std::mem::take(&mut r.ui_state.close_requested),
+                            std::mem::take(&mut r.ui.ui_state.open_exchange_requested),
+                            std::mem::take(&mut r.ui.ui_state.close_requested),
                         )
                     })
                     .unwrap_or((false, false));
@@ -13693,7 +13754,7 @@ impl ApplicationHandler for ChartApp {
                 if open_exchange {
                     if let Err(error) = self.ensure_navigation_scene() {
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.ui_state.notice =
+                            renderer.ui.ui_state.notice =
                                 Some(format!("Could not open dataset folder: {error:#}"));
                         }
                     } else if let Some(folder) = rfd::FileDialog::new()
@@ -13702,16 +13763,15 @@ impl ApplicationHandler for ChartApp {
                     {
                         if let Err(error) = self.begin_dataset_open(folder, true) {
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.ui_state.notice =
+                                renderer.ui.ui_state.notice =
                                     Some(format!("Could not open dataset folder: {error:#}"));
                             }
                         }
                     }
                 }
-                let open_catalogue_set = self
-                    .renderer
-                    .as_mut()
-                    .is_some_and(|r| std::mem::take(&mut r.ui_state.open_catalogue_set_requested));
+                let open_catalogue_set = self.renderer.as_mut().is_some_and(|r| {
+                    std::mem::take(&mut r.ui.ui_state.open_catalogue_set_requested)
+                });
                 if open_catalogue_set {
                     if let Some(folder) = rfd::FileDialog::new()
                         .set_title("Open catalogue version folder containing FC and PC")
@@ -13760,7 +13820,7 @@ impl ApplicationHandler for ChartApp {
                                     self.change_catalogue_pair_manually(Arc::new(fc), Arc::new(pc))
                                 {
                                     if let Some(r) = &mut self.renderer {
-                                        r.ui_state.notice = Some(format!(
+                                        r.ui.ui_state.notice = Some(format!(
                                             "Catalogue set portrayal failed: {error:#}"
                                         ));
                                     }
@@ -13768,7 +13828,7 @@ impl ApplicationHandler for ChartApp {
                             }
                             Err(error) => {
                                 if let Some(r) = &mut self.renderer {
-                                    r.ui_state.notice =
+                                    r.ui.ui_state.notice =
                                         Some(format!("Could not open catalogue set: {error:#}"));
                                 }
                             }
@@ -13777,17 +13837,17 @@ impl ApplicationHandler for ChartApp {
                 }
                 // The toolbar edits the same mode used by F12 and --debug.
                 if let Some(renderer) = &mut self.renderer {
-                    if self.debug_mode != renderer.ui_state.debug_mode {
-                        self.debug_mode = renderer.ui_state.debug_mode;
+                    if self.debug_mode != renderer.ui.ui_state.debug_mode {
+                        self.debug_mode = renderer.ui.ui_state.debug_mode;
                         self.process_stats.reset();
                         self.thread_stats.reset();
                         self.frame_times.clear();
                         renderer.set_profiling_enabled(self.debug_mode);
-                        renderer.ui_state.debug_cpu_usage = None;
-                        renderer.ui_state.debug_main_thread_cpu = None;
-                        renderer.ui_state.debug_memory_mb = None;
-                        renderer.ui_state.debug_gpu.utilization_percent = None;
-                        renderer.ui_state.debug_history = Default::default();
+                        renderer.ui.ui_state.debug_cpu_usage = None;
+                        renderer.ui.ui_state.debug_main_thread_cpu = None;
+                        renderer.ui.ui_state.debug_memory_mb = None;
+                        renderer.ui.ui_state.debug_gpu.utilization_percent = None;
+                        renderer.ui.ui_state.debug_history = Default::default();
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
@@ -13809,17 +13869,17 @@ impl ApplicationHandler for ChartApp {
                 ) = {
                     if let Some(renderer) = &mut self.renderer {
                         (
-                            renderer.take_open_file_request(),
-                            renderer.take_open_fc_request(),
-                            renderer.take_open_pc_request(),
-                            renderer.take_screenshot_request(),
-                            renderer.take_zoom_in_request(),
-                            renderer.take_zoom_out_request(),
-                            renderer.take_reset_view_request(),
-                            renderer.take_clear_charts_request(),
-                            renderer.take_color_profile_change(),
-                            renderer.take_settings_change(),
-                            renderer.take_plugin_toggle_request(),
+                            renderer.ui.take_open_file_request(),
+                            renderer.ui.take_open_fc_request(),
+                            renderer.ui.take_open_pc_request(),
+                            renderer.ui.take_screenshot_request(),
+                            renderer.ui.take_zoom_in_request(),
+                            renderer.ui.take_zoom_out_request(),
+                            renderer.ui.take_reset_view_request(),
+                            renderer.ui.take_clear_charts_request(),
+                            renderer.ui.take_color_profile_change(),
+                            renderer.ui.take_settings_change(),
+                            renderer.ui.take_plugin_toggle_request(),
                         )
                     } else {
                         (
@@ -13833,7 +13893,7 @@ impl ApplicationHandler for ChartApp {
                 if open_file {
                     if let Err(error) = self.ensure_navigation_scene() {
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.ui_state.notice =
+                            renderer.ui.ui_state.notice =
                                 Some(format!("Could not open dataset: {error:#}"));
                         }
                     } else if let Some(path) = rfd::FileDialog::new()
@@ -13851,7 +13911,7 @@ impl ApplicationHandler for ChartApp {
                     {
                         if let Err(error) = self.begin_dataset_open(path, false) {
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.ui_state.notice =
+                                renderer.ui.ui_state.notice =
                                     Some(format!("Could not open dataset: {error:#}"));
                             }
                         }
@@ -13889,7 +13949,7 @@ impl ApplicationHandler for ChartApp {
                                     self.engine.pc.clone(),
                                 ) {
                                     if let Some(r) = &mut self.renderer {
-                                        r.ui_state.notice = Some(format!(
+                                        r.ui.ui_state.notice = Some(format!(
                                             "Feature catalogue portrayal failed: {error:#}"
                                         ));
                                     }
@@ -13898,7 +13958,7 @@ impl ApplicationHandler for ChartApp {
                             Err(e) => {
                                 error!("Failed to load Feature Catalogue: {}", e);
                                 if let Some(r) = &mut self.renderer {
-                                    r.ui_state.notice =
+                                    r.ui.ui_state.notice =
                                         Some(format!("Could not open feature catalogue: {e:#}"));
                                 }
                             }
@@ -13940,7 +14000,7 @@ impl ApplicationHandler for ChartApp {
                                     Arc::new(new_pc),
                                 ) {
                                     if let Some(r) = &mut self.renderer {
-                                        r.ui_state.notice = Some(format!(
+                                        r.ui.ui_state.notice = Some(format!(
                                             "Portrayal catalogue rebuild failed: {error:#}"
                                         ));
                                     }
@@ -13949,7 +14009,7 @@ impl ApplicationHandler for ChartApp {
                             Err(e) => {
                                 error!("Failed to load Portrayal Catalogue: {}", e);
                                 if let Some(r) = &mut self.renderer {
-                                    r.ui_state.notice =
+                                    r.ui.ui_state.notice =
                                         Some(format!("Could not open portrayal catalogue: {e:#}"));
                                 }
                             }
@@ -13960,7 +14020,7 @@ impl ApplicationHandler for ChartApp {
                 if screenshot {
                     if let Err(error) = self.ensure_navigation_scene() {
                         if let Some(r) = self.renderer.as_mut() {
-                            r.ui_state.notice = Some(format!("Screenshot rejected: {error:#}"));
+                            r.ui.ui_state.notice = Some(format!("Screenshot rejected: {error:#}"));
                         }
                         if self.auto_screenshot.is_some() || self.flat_eventloop_audit.is_some() {
                             self.startup_error =
@@ -13986,7 +14046,7 @@ impl ApplicationHandler for ChartApp {
                 if self
                     .renderer
                     .as_mut()
-                    .is_some_and(|r| r.take_chart_image_request())
+                    .is_some_and(|r| r.ui.take_chart_image_request())
                 {
                     self.save_chart_image();
                 }
@@ -14072,7 +14132,7 @@ impl ApplicationHandler for ChartApp {
                         Err(error) => {
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.set_settings(self.applied_settings.clone());
-                                renderer.ui_state.notice = Some(format!("Primary PC layer selection rejected; previous display retained: {error:#}"));
+                                renderer.ui.ui_state.notice = Some(format!("Primary PC layer selection rejected; previous display retained: {error:#}"));
                             }
                         }
                     }
@@ -14088,7 +14148,7 @@ impl ApplicationHandler for ChartApp {
                     } else if self.chart_loaded {
                         if let Err(error) = self.ensure_navigation_scene() {
                             if let Some(r) = self.renderer.as_mut() {
-                                r.ui_state.notice =
+                                r.ui.ui_state.notice =
                                     Some(format!("Plugin change rejected: {error:#}"));
                             }
                             if self.auto_screenshot.is_some() || self.flat_eventloop_audit.is_some()
@@ -14110,7 +14170,7 @@ impl ApplicationHandler for ChartApp {
                 // post-render sync_chart_layout path fits the same camera bounds
                 // to the measured chart viewport without accumulating world pan.
                 if let Some(renderer) = &mut self.renderer {
-                    let _ = renderer.take_pan_adjust_pixels();
+                    let _ = renderer.ui.take_pan_adjust_pixels();
                 }
 
                 // Plain redraws must not re-arm failed deferred work. Inspect
@@ -14118,7 +14178,7 @@ impl ApplicationHandler for ChartApp {
                 let queued_plugin_ui = self
                     .renderer
                     .as_ref()
-                    .is_some_and(|r| !r.ui_state.plugin_ui_events.is_empty());
+                    .is_some_and(|r| !r.ui.ui_state.plugin_ui_events.is_empty());
                 let loaded_plugins = self.plugin_system.has_loaded_plugins();
                 if !flat_event_coalescing::plugin_ui_runtime(self, loaded_plugins, queued_plugin_ui)
                 {
@@ -14127,7 +14187,7 @@ impl ApplicationHandler for ChartApp {
                     );
                     {
                         if let Some(r) = self.renderer.as_mut() {
-                            r.ui_state.notice = Some(format!("Plugin UI rejected: {error:#}"));
+                            r.ui.ui_state.notice = Some(format!("Plugin UI rejected: {error:#}"));
                         }
                         if self.auto_screenshot.is_some() || self.flat_eventloop_audit.is_some() {
                             self.startup_error =
@@ -14141,7 +14201,7 @@ impl ApplicationHandler for ChartApp {
                     && self
                         .renderer
                         .as_ref()
-                        .is_some_and(|renderer| renderer.ui_state.object_selection_mode)
+                        .is_some_and(|renderer| renderer.ui.ui_state.object_selection_mode)
                 {
                     self.native_s421.stop_local_edit();
                 }
@@ -14152,20 +14212,20 @@ impl ApplicationHandler for ChartApp {
                         .get_toolbar_buttons()
                         .into_iter()
                         .filter(|btn| btn.plugin_id != native_s421::PROVIDER_ID)
-                        .map(|btn| ferrite_wgpu::PluginButton {
+                        .map(|btn| ferrite_ui::PluginButton {
                             plugin_id: btn.plugin_id,
                             label: btn.label,
                             tooltip: btn.tooltip,
                             active: btn.active,
                         })
                         .collect();
-                    buttons.push(ferrite_wgpu::PluginButton {
+                    buttons.push(ferrite_ui::PluginButton {
                         plugin_id: native_s421::PROVIDER_ID.into(),
                         label: "S-421 Routes".into(),
                         tooltip: Some("Import/export and inspect route data".into()),
                         active: self.native_s421.panel_visible(),
                     });
-                    renderer.set_plugin_buttons(buttons);
+                    renderer.ui.set_plugin_buttons(buttons);
 
                     // Cached native UI is rebuilt only after route/panel mutations;
                     // its presence does not disable ordinary navigation coalescing.
@@ -14177,21 +14237,21 @@ impl ApplicationHandler for ChartApp {
                             native_s421::PROVIDER_ID.into(),
                             self.native_s421.ui_json().into(),
                         ));
-                        renderer.set_plugin_ui_data(ui_data);
+                        renderer.ui.set_plugin_ui_data(ui_data);
                         self.native_s421_ui_revision = self.native_s421.revision();
                     }
                 }
                 let native_plugin_events = self
                     .renderer
                     .as_mut()
-                    .map(|renderer| renderer.take_plugin_ui_events())
+                    .map(|renderer| renderer.ui.take_plugin_ui_events())
                     .unwrap_or_default();
                 // Process plugin UI events
                 for (plugin_id, event_json) in native_plugin_events {
                     if plugin_id == native_s421::PROVIDER_ID {
                         if let Err(error) = self.handle_native_s421_ui(&event_json) {
                             if let Some(r) = self.renderer.as_mut() {
-                                r.ui_state.notice = Some(format!("S-421: {error:#}"));
+                                r.ui.ui_state.notice = Some(format!("S-421: {error:#}"));
                             }
                         }
                         if let Some(window) = &self.window {
@@ -14229,27 +14289,27 @@ impl ApplicationHandler for ChartApp {
                             if self.frame_times.len() >= 2 {
                                 let oldest = self.frame_times.front().unwrap();
                                 let elapsed = now.duration_since(*oldest).as_secs_f32();
-                                renderer.ui_state.debug_fps =
+                                renderer.ui.ui_state.debug_fps =
                                     (self.frame_times.len() - 1) as f32 / elapsed;
                             }
 
                             let sample = self.process_stats.sample();
-                            renderer.ui_state.debug_cpu_usage = sample.cpu_percent;
-                            renderer.ui_state.debug_main_thread_cpu = self.thread_stats.sample();
-                            renderer.ui_state.debug_memory_mb = sample.resident_mib;
-                            renderer.ui_state.debug_gpu.utilization_percent =
-                                gpu_usage::sample(&renderer.ui_state.debug_gpu.adapter);
-                            renderer.ui_state.debug_history.record(
-                                renderer.ui_state.debug_fps,
+                            renderer.ui.ui_state.debug_cpu_usage = sample.cpu_percent;
+                            renderer.ui.ui_state.debug_main_thread_cpu = self.thread_stats.sample();
+                            renderer.ui.ui_state.debug_memory_mb = sample.resident_mib;
+                            renderer.ui.ui_state.debug_gpu.utilization_percent =
+                                gpu_usage::sample(&renderer.ui.ui_state.debug_gpu.adapter);
+                            renderer.ui.ui_state.debug_history.record(
+                                renderer.ui.ui_state.debug_fps,
                                 sample.cpu_percent,
                                 sample.resident_mib,
                             );
                             if let Some(path) = &self.debug_stats_audit {
                                 self.debug_stats_samples.push(serde_json::json!({
                                     "cpu_percent": sample.cpu_percent,
-                                    "main_thread_cpu_percent": renderer.ui_state.debug_main_thread_cpu,
+                                    "main_thread_cpu_percent": renderer.ui.ui_state.debug_main_thread_cpu,
                                     "resident_mib": sample.resident_mib,
-                                    "gpu_device_percent": renderer.ui_state.debug_gpu.utilization_percent,
+                                    "gpu_device_percent": renderer.ui.ui_state.debug_gpu.utilization_percent,
                                     "logical_cpus": self.process_stats.logical_cpus(),
                                     "updates": self.process_stats.updates(),
                                     "elapsed_since_previous_ms": stats_elapsed.as_millis(),
@@ -14271,9 +14331,9 @@ impl ApplicationHandler for ChartApp {
                             }
 
                             // Instruction and symbol counts
-                            renderer.ui_state.debug_instruction_count =
+                            renderer.ui.ui_state.debug_instruction_count =
                                 self.engine.render_context.instruction_count();
-                            renderer.ui_state.debug_symbol_count = self.rendered_symbols.len();
+                            renderer.ui.ui_state.debug_symbol_count = self.rendered_symbols.len();
                         }
                     }
                 }
@@ -14287,7 +14347,7 @@ impl ApplicationHandler for ChartApp {
                             self.mouse_pos.1 as f32,
                         ),
                     );
-                    renderer.set_cursor_world(p.x, p.y);
+                    renderer.ui.set_cursor_world(p.x, p.y);
                 }
                 if !self.flush_navigation_scene() {
                     if self.auto_screenshot.is_some() || self.flat_eventloop_audit.is_some() {
@@ -14320,8 +14380,8 @@ impl ApplicationHandler for ChartApp {
                 self.sync_native_s421_overlay();
                 // Render
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.ui_state.coordinate_ruler_scaler = (self.chart_loaded
-                        && renderer.ui_state.coordinate_rulers)
+                    renderer.ui.ui_state.coordinate_ruler_scaler = (self.chart_loaded
+                        && renderer.ui.ui_state.coordinate_rulers)
                         .then(|| self.engine.render_context.scaler.clone());
                     if let Err(e) = renderer.render() {
                         error!("Render error: {}", e);
@@ -14380,7 +14440,7 @@ impl ApplicationHandler for ChartApp {
                             return;
                         }
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.ui_state.notice = Some(message);
+                            renderer.ui.ui_state.notice = Some(message);
                         }
                     }
                     if let Some(window) = &self.window {
@@ -14628,7 +14688,7 @@ impl ApplicationHandler for ChartApp {
                         }
                         if let Some(path) = std::env::var_os("FERRITE_ROOT_UI_PRESENTATION_AUDIT") {
                             std::env::remove_var("FERRITE_ROOT_UI_PRESENTATION_AUDIT");
-                            if ferrite_wgpu::background_test::enabled() {
+                            if ferrite_ui::background_test::enabled() {
                                 self.build_rendered_symbols();
                                 let selected = self
                                     .rendered_symbols
@@ -14637,8 +14697,8 @@ impl ApplicationHandler for ChartApp {
                                     .map(|symbol| self.describe_hit(&symbol));
                                 self.select_feature(selected);
                                 if let Some(renderer) = &mut self.renderer {
-                                    renderer.ui_state.show_logs = true;
-                                    renderer.ui_state.debug_mode = false;
+                                    renderer.ui.ui_state.show_logs = true;
+                                    renderer.ui.ui_state.debug_mode = false;
                                     // Allow UI layout and its opening transition to settle before visual QA.
                                     for _ in 0..12 {
                                         if let Err(error) = renderer.render() {
@@ -14659,7 +14719,7 @@ impl ApplicationHandler for ChartApp {
                                         event_loop.exit();
                                         return;
                                     }
-                                    renderer.ui_state.show_logs = false;
+                                    renderer.ui.ui_state.show_logs = false;
                                     if let Err(error) = renderer.render().and_then(|_| {
                                         renderer.save_screenshot_with_ui(
                                             PathBuf::from(&path).with_extension("object.png"),
@@ -14674,7 +14734,7 @@ impl ApplicationHandler for ChartApp {
                                 }
                             }
                         }
-                        if ferrite_wgpu::background_test::enabled() {
+                        if ferrite_ui::background_test::enabled() {
                             if let Some(path) = std::env::var_os("FERRITE_POINT_RETENTION_AUDIT") {
                                 std::env::remove_var("FERRITE_POINT_RETENTION_AUDIT");
                                 if let Err(error) = self.audit_point_retention(&PathBuf::from(path))
@@ -14725,7 +14785,7 @@ impl ApplicationHandler for ChartApp {
                                 return;
                             }
                         }
-                        if ferrite_wgpu::background_test::enabled() {
+                        if ferrite_ui::background_test::enabled() {
                             if let Some(path) = std::env::var_os("FERRITE_NATIVE_S421_EDITOR_AUDIT")
                             {
                                 std::env::remove_var("FERRITE_NATIVE_S421_EDITOR_AUDIT");
@@ -14739,7 +14799,7 @@ impl ApplicationHandler for ChartApp {
                                 }
                             }
                         }
-                        if ferrite_wgpu::background_test::enabled() {
+                        if ferrite_ui::background_test::enabled() {
                             if let Some(path) =
                                 std::env::var_os("FERRITE_NATIVE_S421_LIFECYCLE_AUDIT")
                             {
@@ -14755,7 +14815,7 @@ impl ApplicationHandler for ChartApp {
                                 }
                             }
                         }
-                        if ferrite_wgpu::background_test::enabled() {
+                        if ferrite_ui::background_test::enabled() {
                             if let Some(path) = std::env::var_os("FERRITE_NATIVE_S421_AUDIT") {
                                 std::env::remove_var("FERRITE_NATIVE_S421_AUDIT");
                                 if let Some(renderer) = &self.renderer {
@@ -14832,7 +14892,7 @@ impl ApplicationHandler for ChartApp {
                     let egui_needs = self
                         .renderer
                         .as_ref()
-                        .is_some_and(|r| r.egui_needs_repaint());
+                        .is_some_and(|r| r.ui.egui_needs_repaint());
                     let has_pan_rebuild = self.pan_rebuild_phase > 0;
                     self.flat_eventloop_audit.is_some()
                         || self.is_dragging
@@ -14885,8 +14945,10 @@ impl ApplicationHandler for ChartApp {
                     let screen_pt =
                         ferrite_render::ScreenPoint::new(new_pos.0 as f32, new_pos.1 as f32);
                     let world = self.engine.render_context.scaler.screen_to_world(screen_pt);
-                    renderer.set_cursor_world(world.x, world.y);
-                    renderer.set_cursor_screen(new_pos.0 as f32, new_pos.1 as f32);
+                    renderer.ui.set_cursor_world(world.x, world.y);
+                    renderer
+                        .ui
+                        .set_cursor_screen(new_pos.0 as f32, new_pos.1 as f32);
                 }
 
                 self.mouse_pos = new_pos;
@@ -14975,7 +15037,7 @@ impl ApplicationHandler for ChartApp {
                     && !self
                         .renderer
                         .as_ref()
-                        .is_some_and(|r| r.egui_wants_pointer());
+                        .is_some_and(|r| r.ui.egui_wants_pointer());
                 match state {
                     ElementState::Pressed if chart_pointer => {
                         // If inertia was active, stop it and rebuild view immediately
@@ -15061,7 +15123,7 @@ impl ApplicationHandler for ChartApp {
                             let egui_wants = self
                                 .renderer
                                 .as_ref()
-                                .is_some_and(|r| r.egui_wants_pointer());
+                                .is_some_and(|r| r.ui.egui_wants_pointer());
 
                             // Skip chart/plugin handling if click was on UI or no chart loaded
                             if !egui_wants && self.chart_loaded {
@@ -15086,7 +15148,7 @@ impl ApplicationHandler for ChartApp {
                     && !self
                         .renderer
                         .as_ref()
-                        .is_some_and(|r| r.egui_wants_pointer())
+                        .is_some_and(|r| r.ui.egui_wants_pointer())
                 {
                     self.native_s421.stop_local_edit();
                     if let Some(window) = &self.window {
@@ -15096,7 +15158,7 @@ impl ApplicationHandler for ChartApp {
                 }
                 if let Err(error) = self.ensure_navigation_scene() {
                     if let Some(r) = self.renderer.as_mut() {
-                        r.ui_state.notice = Some(format!("Plugin click rejected: {error:#}"));
+                        r.ui.ui_state.notice = Some(format!("Plugin click rejected: {error:#}"));
                     }
                     if self.auto_screenshot.is_some() || self.flat_eventloop_audit.is_some() {
                         self.startup_error =
@@ -15109,7 +15171,7 @@ impl ApplicationHandler for ChartApp {
                 let egui_wants = self
                     .renderer
                     .as_ref()
-                    .is_some_and(|r| r.egui_wants_pointer());
+                    .is_some_and(|r| r.ui.egui_wants_pointer());
 
                 // Skip if click was on UI
                 if !egui_wants {
@@ -15443,7 +15505,7 @@ fn run_app() -> Result<()> {
             Ok((fc, pc))
         });
         let mut event_loop_builder = EventLoop::builder();
-        ferrite_wgpu::background_test::configure_event_loop(&mut event_loop_builder);
+        ferrite_ui::background_test::configure_event_loop(&mut event_loop_builder);
         #[cfg(windows)]
         {
             use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -15795,7 +15857,7 @@ fn init_logging(log_path: &Path, debug_mode: bool) -> Result<()> {
     // doesn't drown out the log on every adapter probe.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "info,ferrite_s100=debug,ferrite_engine=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug,ferrite_wgpu=debug,wgpu_hal::vulkan::conv=error",
+            "info,ferrite_s100=debug,ferrite_engine=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug,ferrite_gpu=debug,ferrite_ui=debug,wgpu_hal::vulkan::conv=error",
         )
     });
 
