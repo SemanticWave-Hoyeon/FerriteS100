@@ -164,7 +164,9 @@ mod tests {
         let path = folder.path().join("legacy21.h5");
         std::fs::write(&path, b"original legacy product bytes").unwrap();
         let path = path.canonicalize().unwrap();
-        let report = crate::dataset_signature_policy::unchecked_datasets(&[path.clone()]).unwrap();
+        let report =
+            crate::dataset_signature_policy::unchecked_datasets(std::slice::from_ref(&path))
+                .unwrap();
         let mut budget = 1024;
         let captured =
             crate::s102_input_capture::CapturedInput::capture(&report, &path, false, &mut budget)

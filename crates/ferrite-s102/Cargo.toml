@@ -5,16 +5,24 @@ edition.workspace = true
 description = "S-102 bathymetric surface product adapter"
 
 [features]
-default = ["lua54", "crypto-openssl"]
+default = ["lua54", "crypto-openssl", "hdf5"]
+# Native reader: the HDF5 C library (hdf5-metno), used for local paths.
+# The pure-Rust reader (`h5::pure`) is always built; it reads in-memory
+# sources and every source when this feature is off (WebAssembly).
+hdf5 = ["dep:hdf5", "dep:hdf5_sys"]
 # Signature backend of ferrite-security (dependents select one).
 crypto-openssl = ["ferrite-security/crypto-openssl"]
 crypto-rust = ["ferrite-security/crypto-rust"]
-lua54 = ["ferrite-lua/lua54"]
-lua55 = ["ferrite-lua/lua55"]
+# Evaluates the PC rule (BathymetryCoverage.lua) with mlua. Off: portrayal is
+# built from the rule's recorded Part 9a instruction string.
+lua-native = ["ferrite-lua/native"]
+lua54 = ["lua-native", "ferrite-lua/lua54"]
+lua55 = ["lua-native", "ferrite-lua/lua55"]
 
 [dependencies]
-hdf5 = { package = "hdf5-metno", version = "=0.14.1", features = ["static", "zlib"] }
-hdf5_sys = { package = "hdf5-metno-sys", version = "=0.12.4" }
+hdf5 = { package = "hdf5-metno", version = "=0.14.1", features = ["static", "zlib"], optional = true }
+hdf5_sys = { package = "hdf5-metno-sys", version = "=0.12.4", optional = true }
+flate2 = "=1.1.8"
 anyhow.workspace = true
 serde.workspace = true
 sha2.workspace = true
@@ -30,6 +38,12 @@ chrono.workspace = true
 roxmltree = "=0.20.0"
 
 [dev-dependencies]
+# Fixture writing in the reader parity tests (the version hdf5-metno uses).
+ndarray = "=0.17.2"
 base64 = "=0.22.1"
 openssl = { version = "0.10", features = ["vendored"] }
 tempfile = "3"
+
+[[example]]
+name = "resolved_color_lookup_bench"
+required-features = ["lua-native"]

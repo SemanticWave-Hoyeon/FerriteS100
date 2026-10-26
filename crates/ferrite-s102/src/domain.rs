@@ -1,29 +1,13 @@
 //! S102 native-coordinate domain metadata. Raw HDF samples remain unchanged.
 #![allow(non_local_definitions)]
+use crate::h5::{FloatSize, TypeDescriptor};
 use anyhow::{ensure, Result};
 use ferrite_kernel::{coverage_domain::SimpleRing, GridGeometry};
-use hdf5::{
-    types::{FloatSize, TypeDescriptor},
-    H5Type,
-};
 #[derive(Debug, Clone)]
 pub enum InstanceDomain {
     FullGrid,
     Rectangle([f64; 4]),
     Polygon(SimpleRing),
-}
-#[derive(H5Type, Clone, Copy)]
-#[repr(C)]
-struct LonLat {
-    longitude: f64,
-    latitude: f64,
-}
-#[derive(H5Type, Clone, Copy)]
-#[repr(C)]
-#[allow(non_snake_case)]
-struct XY {
-    X: f64,
-    Y: f64,
 }
 const NAMES: [&str; 4] = [
     "westBoundLongitude",
@@ -62,7 +46,7 @@ impl DomainWork {
         Ok(())
     }
 }
-pub(crate) fn preflight_work(file: &hdf5::File) -> Result<()> {
+pub(crate) fn preflight_work(file: &crate::h5::Group) -> Result<()> {
     let mut work = DomainWork::default();
     for name in ["BathymetryCoverage", "QualityOfBathymetryCoverage"] {
         if !file.link_exists(name) {
@@ -123,7 +107,7 @@ pub(crate) fn matches_encoded(bound: crate::GridBoundary, value: f32) -> Result<
     )
 }
 impl InstanceDomain {
-    pub fn read(g: &hdf5::Group, geometry: &GridGeometry) -> Result<Self> {
+    pub fn read(g: &crate::h5::Group, geometry: &GridGeometry) -> Result<Self> {
         let attrs = g.attr_names()?;
         let count = NAMES
             .iter()
@@ -153,16 +137,19 @@ impl InstanceDomain {
                 "Domain polygon requires two float coordinates"
             );
             let has = |name: &str| c.fields.iter().any(|f| f.name == name);
+            let pair = |x: &str, y: &str| -> Result<Vec<[f64; 2]>> {
+                let xs = d.read_field::<f64>(x)?;
+                let ys = d.read_field::<f64>(y)?;
+                ensure!(
+                    xs.len() == ys.len(),
+                    "Domain polygon member length mismatch"
+                );
+                Ok(xs.into_iter().zip(ys).map(|(x, y)| [x, y]).collect())
+            };
             let points = if geometry.horizontal_crs == 4326 && has("longitude") && has("latitude") {
-                d.read_raw::<LonLat>()?
-                    .into_iter()
-                    .map(|p| [p.longitude, p.latitude])
-                    .collect()
+                pair("longitude", "latitude")?
             } else if geometry.horizontal_crs != 4326 && has("X") && has("Y") {
-                d.read_raw::<XY>()?
-                    .into_iter()
-                    .map(|p| [p.X, p.Y])
-                    .collect()
+                pair("X", "Y")?
             } else {
                 anyhow::bail!("Domain polygon coordinate fields disagree with CRS");
             };
@@ -222,9 +209,25 @@ impl InstanceDomain {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
+    use hdf5::H5Type;
+    #[derive(H5Type, Clone, Copy)]
+    #[repr(C)]
+    struct LonLat {
+        longitude: f64,
+        latitude: f64,
+    }
+    #[derive(H5Type, Clone, Copy)]
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct XY {
+        X: f64,
+        Y: f64,
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SERIAL: AtomicUsize = AtomicUsize::new(0);
     struct Fixture(std::path::PathBuf, hdf5::File, hdf5::Group);
@@ -302,11 +305,11 @@ mod tests {
             .unwrap()
             .write_raw(&points)
             .unwrap();
-        let d = InstanceDomain::read(&f.2, &geometry(4326)).unwrap();
+        let d = InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).unwrap();
         assert!(d.contains(1., 1.));
         assert!(d.contains(2., 2.));
         assert!(!d.contains(3., 2.));
-        assert!(InstanceDomain::read(&f.2, &geometry(32631)).is_err());
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(32631)).is_err());
         let f = fixture();
         let points = [
             XY { X: 0., Y: 0. },
@@ -320,10 +323,10 @@ mod tests {
             .unwrap()
             .write_raw(&points)
             .unwrap();
-        assert!(InstanceDomain::read(&f.2, &geometry(32631))
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(32631))
             .unwrap()
             .contains(1., 1.));
-        assert!(InstanceDomain::read(&f.2, &geometry(4326)).is_err());
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).is_err());
     }
     #[test]
     fn malformed_names_and_two_dimensional_coordinates_are_rejected() {
@@ -335,7 +338,7 @@ mod tests {
             .unwrap()
             .write_raw(&points)
             .unwrap();
-        assert!(InstanceDomain::read(&f.2, &geometry(4326)).is_err());
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).is_err());
         let f = fixture();
         f.2.new_dataset::<LonLat>()
             .shape([2, 2])
@@ -348,19 +351,19 @@ mod tests {
                 }; 4],
             )
             .unwrap();
-        assert!(InstanceDomain::read(&f.2, &geometry(4326)).is_err());
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).is_err());
     }
     #[test]
     fn clipping_bbox_is_closed_and_full_grid_is_distinguished() {
         let f = fixture();
         bbox(&f.2, [0.5, 3.5, 1.5, 3.5]);
         assert!(matches!(
-            InstanceDomain::read(&f.2, &geometry(4326)).unwrap(),
+            InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).unwrap(),
             InstanceDomain::FullGrid
         ));
         let f = fixture();
         bbox(&f.2, [0.75, 2.75, 1.75, 3.]);
-        let d = InstanceDomain::read(&f.2, &geometry(4326)).unwrap();
+        let d = InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).unwrap();
         assert!(d.requires_mask());
         assert!(d.contains(0.75, 1.75));
         assert!(d.contains(2.75, 3.));
@@ -413,7 +416,7 @@ mod tests {
             .unwrap()
             .write_scalar(&0.)
             .unwrap();
-        assert!(InstanceDomain::read(&f.2, &geometry(4326)).is_err());
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).is_err());
         let f = fixture();
         for name in NAMES {
             f.2.new_attr::<f64>()
@@ -422,10 +425,10 @@ mod tests {
                 .write_scalar(&1.)
                 .unwrap();
         }
-        assert!(InstanceDomain::read(&f.2, &geometry(4326)).is_err());
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).is_err());
         let f = fixture();
         bbox(&f.2, [f32::NAN, 3., 1., 3.]);
-        assert!(InstanceDomain::read(&f.2, &geometry(4326)).is_err());
+        assert!(InstanceDomain::read(&crate::w(&f.2), &geometry(4326)).is_err());
     }
     #[test]
     fn aggregate_quadratic_work_is_charged_before_geometry() {
@@ -447,7 +450,7 @@ mod tests {
                 .create("domainExtent.polygon")
                 .unwrap();
         }
-        assert!(preflight_work(&f.1)
+        assert!(preflight_work(&crate::w(&f.1))
             .unwrap_err()
             .to_string()
             .contains("budget"));

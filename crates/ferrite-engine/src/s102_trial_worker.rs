@@ -164,6 +164,25 @@ pub fn inspect(path: &Path) -> Result<TrialInspection> {
     TrialInspection::decode(file, request)
 }
 
+/// Metadata-only inspection of S-102 2.1 trial bytes held by a data source,
+/// decoded in this process with the pure-Rust HDF5 reader (no child-process
+/// isolation; hosts without processes, such as the web, use this path).
+pub fn inspect_bytes(bytes: std::sync::Arc<[u8]>) -> Result<TrialInspection> {
+    let length = bytes.len() as u64;
+    ensure!(
+        length > 0 && length <= MAX_SOURCE_BYTES,
+        "S-102 trial input size outside the 512MiB receiver limit"
+    );
+    let request = TrialInspectionRequest {
+        source: TrialSourceIdentity {
+            byte_length: length,
+            sha256: Sha256::digest(&bytes).into(),
+        },
+        window: None,
+    };
+    let grid = ferrite_s102::legacy_trial::LegacyTrialGrid::open_bytes(bytes)?;
+    TrialInspection::from_grid(&grid, request)
+}
 /// One-line description for the data tree.
 pub fn summary(inspection: &TrialInspection) -> String {
     use ferrite_s102::legacy_trial::TrialVerticalDatum;

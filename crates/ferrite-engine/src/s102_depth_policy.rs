@@ -38,23 +38,53 @@ fn datum(value: u32) -> Result<()> {
 }
 impl DepthPolicy {
     pub fn load(config: Option<&Path>, data: &Path, datums: &[u32]) -> Result<Self> {
-        let default = *datums.first().context("No S102 instances")?;
+        datums.first().context("No S102 instances")?;
         let Some(config) = config else {
-            return Ok(Self {
-                target: default,
-                corrections: Vec::new(),
-            });
+            return Self::from_bytes(None, || unreachable!(), datums);
         };
         let mut bytes = Vec::new();
         std::fs::File::open(config)
             .context("Read S102 depth adjustment configuration")?
             .take(1024 * 1024 + 1)
             .read_to_end(&mut bytes)?;
+        Self::from_bytes(
+            Some(&bytes),
+            || {
+                let mut file = std::fs::File::open(data)?;
+                let mut hash = Sha256::new();
+                let mut block = [0u8; 65536];
+                loop {
+                    let n = file.read(&mut block)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&block[..n]);
+                }
+                Ok(hash.finalize().into())
+            },
+            datums,
+        )
+    }
+    /// [`Self::load`] from configuration bytes and the dataset's SHA-256
+    /// (computed only when a configuration is present), e.g. bytes held by a
+    /// data source or user store.
+    pub fn from_bytes(
+        config: Option<&[u8]>,
+        data_sha256: impl FnOnce() -> Result<[u8; 32]>,
+        datums: &[u32],
+    ) -> Result<Self> {
+        let default = *datums.first().context("No S102 instances")?;
+        let Some(bytes) = config else {
+            return Ok(Self {
+                target: default,
+                corrections: Vec::new(),
+            });
+        };
         ensure!(
             bytes.len() <= 1024 * 1024,
             "S102 adjustment configuration exceeds 1MiB"
         );
-        let configuration: Configuration = serde_json::from_slice(&bytes)?;
+        let configuration: Configuration = serde_json::from_slice(bytes)?;
         let mut digests = std::collections::HashSet::new();
         for d in &configuration.datasets {
             ensure!(
@@ -66,17 +96,7 @@ impl DepthPolicy {
                 "Duplicate dataset adjustment SHA256"
             );
         }
-        let mut file = std::fs::File::open(data)?;
-        let mut hash = Sha256::new();
-        let mut block = [0u8; 65536];
-        loop {
-            let n = file.read(&mut block)?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&block[..n]);
-        }
-        let digest = format!("{:x}", hash.finalize());
+        let digest: String = data_sha256()?.iter().map(|b| format!("{b:02x}")).collect();
         let Some(d) = configuration
             .datasets
             .into_iter()
@@ -195,5 +215,23 @@ mod tests {
             assert!(DepthPolicy::load(Some(&cfg), &data, &[10, 23]).is_err());
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn bytes_policy_equals_file_policy() {
+        let sha: [u8; 32] = Sha256::digest(b"fixture").into();
+        let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+        let document = serde_json::json!({"datasets":[{"sha256":hex,"target_datum":10,"corrections":[{"datum":23,"correction_metres":-4.,"source":"Synthetic unit fixture"}]}]});
+        let config = serde_json::to_vec(&document).unwrap();
+        let p = DepthPolicy::from_bytes(Some(&config), || Ok(sha), &[10, 23]).unwrap();
+        assert_eq!(p.target, 10);
+        assert!(!p.identity(10));
+        let other = DepthPolicy::from_bytes(Some(&config), || Ok([0; 32]), &[23]).unwrap();
+        assert!(other.identity(23));
+        // No configuration never hashes the dataset.
+        let none = DepthPolicy::from_bytes(None, || panic!("hashed"), &[7]).unwrap();
+        assert_eq!(none.target, 7);
+        assert!(
+            DepthPolicy::from_bytes(Some(&vec![b' '; 1024 * 1024 + 1]), || Ok(sha), &[10]).is_err()
+        );
     }
 }

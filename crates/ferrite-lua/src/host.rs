@@ -2205,7 +2205,7 @@ mod result_transfer_benchmark {
                     .write()
                     .unwrap()
                     .sort_by_key(|r| std::cmp::Reverse(r.feature_id.parse::<i64>().unwrap()));
-                let started = std::time::Instant::now();
+                let started = ferrite_kernel::time::Instant::now();
                 let results = if mode == 0 {
                     host.get_results()
                 } else {
@@ -2313,7 +2313,7 @@ mod catalogue_setup_benchmark {
         let mut samples = [Vec::new(), Vec::new()];
         for round in 0..8 {
             for mode in [0, 1, 1, 0] {
-                let start = std::time::Instant::now();
+                let start = ferrite_kernel::time::Instant::now();
                 for _ in 0..100 {
                     if mode == 0 {
                         host.set_type_catalogue((*catalogue).clone());

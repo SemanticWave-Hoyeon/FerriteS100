@@ -9,13 +9,20 @@ to --out, outside the repository; cargo output goes to --target-dir.
 
     cargo install wasm-bindgen-cli --version 0.2.108 --locked --root DIR
     python3 -I tools/build_wasm.py --out OUT --wasm-bindgen DIR/bin/wasm-bindgen \\
-        [--target-dir DIR] [--profile release] \\
+        [--target-dir DIR] [--profile release] [--no-lua] \\
         [--sample FILE_OR_DIR ...] [--precomputed DIR]
     python3 -m http.server -d OUT 8000      # open http://localhost:8000/
 
+The build portrays S-101 with the catalogue's Lua rules in the browser
+(feature lua-wasm: Lua 5.4 compiled to wasm32 with clang; set FERRITE_WASM_CC
+and FERRITE_WASM_AR when clang/llvm-ar with the WebAssembly target are not
+found, see crates/ferrite-lua-runtime/build.rs). --no-lua builds without it:
+S-101 cells then draw only from precomputed payloads.
+
 --sample copies datasets to OUT/samples (listed in samples.json, loaded by
 the page's "Load samples" button); --precomputed copies the .ferrite_pre_*
-payloads written by `ferrite precompute` so S-101 cells can be drawn.
+payloads written by `ferrite precompute` (without Lua they are required for
+S-101 cells; with Lua they replace the portrayal of the cells they cover).
 """
 from __future__ import annotations
 
@@ -64,6 +71,8 @@ def main() -> int:
     parser.add_argument("--sample", action="append", type=Path, default=[])
     parser.add_argument("--precomputed", type=Path)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--no-lua", action="store_true",
+                        help="build without Lua portrayal (precomputed S-101 payloads only)")
     args = parser.parse_args()
 
     out = args.out.resolve()
@@ -81,7 +90,7 @@ def main() -> int:
     if not args.skip_build:
         subprocess.run(
             ["cargo", "build", "-p", "ferrite-wasm", "--target", "wasm32-unknown-unknown",
-             "--profile", args.profile],
+             "--profile", args.profile, *([] if args.no_lua else ["--features", "lua-wasm"])],
             cwd=REPO, env=env, check=True,
         )
     profile_dir = "debug" if args.profile == "dev" else args.profile

@@ -21,8 +21,9 @@
 //! default): `parallel` (threads and rayon; off: sequential executor and
 //! iteration with identical results), `lua-native` (mlua portrayal, selected
 //! by `lua54`/`lua55`; off: S-101 cells come from precomputed payloads,
-//! [`PortrayalSource::Precomputed`]) and `s102-hdf5` (off: S-102 inputs are
-//! reported as unsupported).
+//! [`PortrayalSource::Precomputed`]) and `s102-hdf5` (S-102 with the HDF5 C
+//! library for local paths). `s102-pure` serves S-102 with the pure-Rust HDF5
+//! reader alone (wasm); with neither, S-102 inputs are reported as unsupported.
 
 pub mod catalogue;
 pub mod cell_source_identity;
@@ -50,10 +51,11 @@ pub mod s101_xc_coverage;
 pub mod s101_xc_region;
 pub mod s102_depth_policy;
 pub mod s102_input_capture;
-#[cfg(feature = "s102-hdf5")]
+#[cfg(feature = "s102-pure")]
 pub mod s102_journal_admission;
 pub mod s102_original_inputs;
-#[cfg(feature = "s102-hdf5")]
+pub mod s102_scene;
+#[cfg(feature = "s102-pure")]
 pub mod s102_trial_worker;
 pub mod s421_dataset_input;
 pub mod scene;

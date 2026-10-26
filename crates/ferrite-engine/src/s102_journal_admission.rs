@@ -183,11 +183,18 @@ fn verify_snapshot(record: &OwnedOriginalInput) -> Result<()> {
         expected <= CAP,
         "Original snapshot exceeds existing App capture budget"
     );
-    let mut file = File::open(record.snapshot.path())?;
-    ensure!(
-        file.metadata()?.is_file(),
-        "Captured original is not a regular file"
-    );
+    // A data-source (in-memory) snapshot is hashed from its owned bytes.
+    let mut file: Box<dyn Read> = match record.snapshot.bytes() {
+        Some(bytes) => Box::new(bytes),
+        None => {
+            let file = File::open(record.snapshot.path())?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "Captured original is not a regular file"
+            );
+            Box::new(file)
+        }
+    };
     let mut hash = Sha384::new();
     let mut bytes = 0u64;
     let mut buffer = [0u8; 64 * 1024];

@@ -655,15 +655,27 @@ pub trait UserRecord: Send + Sync {
     fn set_aside(&self, suffix: &str);
     /// Where the record lives, for messages.
     fn describe(&self) -> String;
+    /// Hold the record exclusively across a read, validate and write
+    /// transaction; dropping the guard releases it. None: the record needs no
+    /// lock (its single owner serializes access, e.g. memory records).
+    fn lock(&self) -> io::Result<Option<RecordLock>> {
+        Ok(None)
+    }
 }
+
+/// Guard of [`UserRecord::lock`] (an OS file lock for native records).
+pub type RecordLock = Box<dyn std::any::Any + Send>;
 
 /// Per-user persistent state of the engine.
 pub trait UserStore: Send + Sync {
     /// The S-124 user state record of an OS user (None: not persisted).
     fn navwarn_state(&self, user: &str) -> Option<Box<dyn UserRecord>>;
-    /// The transactional S-101 cancellation history file. Native only: the
-    /// history store is file based (stage 5); None means cancellations are
+    /// The transactional S-101 cancellation history record
+    /// ([`crate::chart_publication::HistoryStore`]). None: cancellations are
     /// not supported by this host.
+    fn cancellation_history(&self) -> Option<Box<dyn UserRecord>>;
+    /// Native location of the cancellation history file, for hosts that
+    /// address it directly (the viewer); None for stores without files.
     fn cancellation_history_path(&self) -> Option<PathBuf>;
 }
 
@@ -777,6 +789,11 @@ impl UserStore for NativeUserStore {
             }) as Box<dyn UserRecord>
         })
     }
+    fn cancellation_history(&self) -> Option<Box<dyn UserRecord>> {
+        Some(Box::new(crate::chart_publication::HistoryFile::new(
+            self.history_path.clone(),
+        )))
+    }
     fn cancellation_history_path(&self) -> Option<PathBuf> {
         Some(self.history_path.clone())
     }
@@ -821,8 +838,12 @@ pub fn user_file_name(user: &str) -> String {
 pub struct MemoryUserStore {
     records: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
+/// Key of the S-101 cancellation history in a [`MemoryUserStore`].
+pub const MEMORY_HISTORY_KEY: &str = "s101-cancellations";
+
 impl MemoryUserStore {
-    /// The stored bytes of a record (`navwarn/<user>`), for inspection.
+    /// The stored bytes of a record (`navwarn/<user>`,
+    /// [`MEMORY_HISTORY_KEY`]), for inspection.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.records.lock().ok()?.get(key).cloned()
     }
@@ -866,6 +887,12 @@ impl UserStore for MemoryUserStore {
     fn navwarn_state(&self, user: &str) -> Option<Box<dyn UserRecord>> {
         Some(Box::new(MemoryRecord {
             key: format!("navwarn/{}", user_file_name(user)),
+            records: Arc::clone(&self.records),
+        }))
+    }
+    fn cancellation_history(&self) -> Option<Box<dyn UserRecord>> {
+        Some(Box::new(MemoryRecord {
+            key: MEMORY_HISTORY_KEY.into(),
             records: Arc::clone(&self.records),
         }))
     }

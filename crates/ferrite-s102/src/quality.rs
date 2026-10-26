@@ -1,13 +1,8 @@
 //! S-102 3.0 feature-oriented quality grid and source survey attributes.
+use crate::h5::{FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
 use crate::string_attr;
 use anyhow::{ensure, Context, Result};
 use ferrite_kernel::{validate_s100_date, GridGeometry, GridWindow};
-use hdf5::{
-    types::{
-        CompoundField, CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode,
-    },
-    H5Type,
-};
 use std::{collections::HashMap, sync::Arc};
 const FIELDS: [&str; 15] = [
     "id",
@@ -26,92 +21,57 @@ const FIELDS: [&str; 15] = [
     "surveyAuthority",
     "typeOfBathymetricEstimationUncertainty",
 ];
-/// Named one-field projection. repr(C) places the only field at byte zero.
-#[repr(C)]
-struct Column<T, const N: usize> {
-    value: T,
-}
-// SAFETY: descriptor names the sole field at offset zero with its exact H5Type,
-// and reports the actual repr(C) object size, including alignment padding.
-unsafe impl<T: H5Type, const N: usize> H5Type for Column<T, N> {
-    fn type_descriptor() -> TypeDescriptor {
-        TypeDescriptor::Compound(CompoundType {
-            fields: vec![CompoundField {
-                name: FIELDS[N].into(),
-                ty: T::type_descriptor(),
-                offset: 0,
-                index: 0,
-            }],
-            size: std::mem::size_of::<Self>(),
-        })
-    }
-}
-fn column<T: H5Type, const N: usize>(d: &hdf5::Dataset) -> Result<Vec<T>> {
-    Ok(d.read_raw::<Column<T, N>>()?
-        .into_iter()
-        .map(|v| v.value)
-        .collect())
+fn column<T: crate::h5::H5Read>(d: &crate::h5::Dataset, n: usize) -> Result<Vec<T>> {
+    d.read_field::<T>(FIELDS[n])
 }
 // Receiver resource limits, not S-102 encoding requirements. The terminating
 // NUL is included in the HDF5 allocation forecast.
 const QUALITY_STRING_LIMIT: u64 = 16_384;
 const QUALITY_STRING_PAYLOAD_BUDGET: u64 = 64 * 1024 * 1024;
 
-fn forecast_string_column<T: H5Type, const N: usize>(
-    table: &hdf5::Dataset,
+fn forecast_string_column(
+    table: &crate::h5::Dataset,
+    n: usize,
+    unicode: bool,
     remaining: u64,
 ) -> Result<u64> {
-    let ty = hdf5::Datatype::from_type::<Column<T, N>>()?;
-    let space = table.space()?;
-    let mut size = 0;
     // HDF5 may allocate internal temporary buffers even during this query.
     // This bounds accepted output payload, NOT peak RSS or HDF5 internals.
     // The application therefore keeps decoding in its isolated worker.
-    let status = hdf5::sync::sync(|| unsafe {
-        hdf5_sys::h5d::H5Dvlen_get_buf_size(table.id(), ty.id(), space.id(), &mut size)
-    });
-    ensure!(
-        status >= 0,
-        "Cannot forecast quality string column {}",
-        FIELDS[N]
-    );
+    let size = table
+        .field_vlen_buf_size(FIELDS[n], unicode)
+        .with_context(|| format!("Cannot forecast quality string column {}", FIELDS[n]))?;
     let row_budget = (table.size() as u64)
         .checked_mul(QUALITY_STRING_LIMIT + 1)
         .context("Quality string row budget overflow")?;
     ensure!(
         size <= row_budget.min(remaining),
         "Quality string payload exceeds supported budget before column decode: {}",
-        FIELDS[N]
+        FIELDS[n]
     );
     Ok(size)
 }
 
 fn forecast_quality_strings(
-    table: &hdf5::Dataset,
+    table: &crate::h5::Dataset,
     fields: &HashMap<String, TypeDescriptor>,
     budget: u64,
 ) -> Result<u64> {
     let mut used = 0;
-    macro_rules! forecast {
-        ($n:literal) => {
-            if let Some(ty) = fields.get(FIELDS[$n]) {
-                let size = match ty {
-                    TypeDescriptor::VarLenAscii => {
-                        forecast_string_column::<VarLenAscii, $n>(table, budget - used)?
-                    }
-                    TypeDescriptor::VarLenUnicode => {
-                        forecast_string_column::<VarLenUnicode, $n>(table, budget - used)?
-                    }
-                    _ => anyhow::bail!("Unsupported quality string type {}", FIELDS[$n]),
-                };
-                used += size; // Each projection has already checked the remaining budget.
-            }
-        };
+    for (n, name) in FIELDS.iter().enumerate().take(14).skip(10) {
+        if let Some(ty) = fields.get(*name) {
+            let size = match ty {
+                TypeDescriptor::VarLenAscii => {
+                    forecast_string_column(table, n, false, budget - used)?
+                }
+                TypeDescriptor::VarLenUnicode => {
+                    forecast_string_column(table, n, true, budget - used)?
+                }
+                _ => anyhow::bail!("Unsupported quality string type {name}"),
+            };
+            used += size; // Each projection has already checked the remaining budget.
+        }
     }
-    forecast!(10);
-    forecast!(11);
-    forecast!(12);
-    forecast!(13);
     Ok(used)
 }
 
@@ -326,20 +286,20 @@ pub struct QualityCoverage {
     pub domain: crate::InstanceDomain,
     outside_domain: std::sync::atomic::AtomicBool,
     geometry: GridGeometry,
-    values: hdf5::Dataset,
+    values: crate::h5::Dataset,
     records: HashMap<u32, QualityRecord>,
 }
 impl QualityCoverage {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "hdf5"))]
     pub(crate) fn open_optional(
-        file: &hdf5::File,
+        file: &crate::h5::Group,
         grids: &[GridGeometry],
     ) -> Result<Option<Arc<Self>>> {
         Self::open_optional_with_records(file, grids, None)
     }
 
     pub(crate) fn open_optional_with_records(
-        file: &hdf5::File,
+        file: &crate::h5::Group,
         grids: &[GridGeometry],
         worker_records: Option<Option<Vec<QualityRecord>>>,
     ) -> Result<Option<Arc<Self>>> {
@@ -498,7 +458,7 @@ impl QualityCoverage {
         } else {
             // Forecast every consumed string column before materializing any rows.
             forecast_quality_strings(&table, &fields, QUALITY_STRING_PAYLOAD_BUDGET)?;
-            let mut rows: Vec<_> = column::<u32, 0>(&table)?
+            let mut rows: Vec<_> = column::<u32>(&table, 0)?
                 .into_iter()
                 .map(|id| QualityRecord {
                     id,
@@ -509,7 +469,7 @@ impl QualityCoverage {
                 ($n:literal,$ty:ty,$field:ident,$desc:expr) => {
                     if let Some(t) = fields.get(FIELDS[$n]) {
                         ensure!(*t == $desc, "Invalid quality column {} type", FIELDS[$n]);
-                        for (row, value) in rows.iter_mut().zip(column::<$ty, $n>(&table)?) {
+                        for (row, value) in rows.iter_mut().zip(column::<$ty>(&table, $n)?) {
                             row.$field = Some(value);
                         }
                     }
@@ -522,7 +482,7 @@ impl QualityCoverage {
                             *t == TypeDescriptor::Unsigned(IntSize::U1),
                             "Invalid quality boolean type"
                         );
-                        for (row, value) in rows.iter_mut().zip(column::<u8, $n>(&table)?) {
+                        for (row, value) in rows.iter_mut().zip(column::<u8>(&table, $n)?) {
                             ensure!(value <= 1, "Invalid quality boolean {}", FIELDS[$n]);
                             row.$field = Some(value == 1);
                         }
@@ -569,11 +529,11 @@ impl QualityCoverage {
                         // Validate bytes before invoking any HDF5 string as_str/Display.
                         // Delivered files can contradict their UTF-8/ASCII declarations.
                         let values: Vec<Vec<u8>> = match t {
-                            TypeDescriptor::VarLenAscii => column::<VarLenAscii, $n>(&table)?
+                            TypeDescriptor::VarLenAscii => column::<VarLenAscii>(&table, $n)?
                                 .into_iter()
                                 .map(|v| v.as_bytes().to_vec())
                                 .collect(),
-                            TypeDescriptor::VarLenUnicode => column::<VarLenUnicode, $n>(&table)?
+                            TypeDescriptor::VarLenUnicode => column::<VarLenUnicode>(&table, $n)?
                                 .into_iter()
                                 .map(|v| v.as_bytes().to_vec())
                                 .collect(),
@@ -603,7 +563,7 @@ impl QualityCoverage {
                         || *t == TypeDescriptor::Unsigned(IntSize::U1),
                     "Invalid uncertainty type column"
                 );
-                for (row, value) in rows.iter_mut().zip(column::<u8, 14>(&table)?) {
+                for (row, value) in rows.iter_mut().zip(column::<u8>(&table, 14)?) {
                     ensure!(value <= 4, "Unknown bathymetric uncertainty code {value}");
                     row.uncertainty_type = Some(value);
                 }
@@ -684,10 +644,10 @@ impl QualityCoverage {
         window.validate(&self.geometry)?;
         let ids: Vec<_> = self
             .values
-            .read_slice_2d::<u32, _>((
+            .read_slice_2d::<u32>(
                 window.row..window.row + window.height,
                 window.column..window.column + window.width,
-            ))?
+            )?
             .into_iter()
             .collect();
         ensure!(
@@ -731,9 +691,12 @@ impl QualityCoverage {
         Ok((id != 0).then(|| self.records.get(&id)).flatten())
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
+    use hdf5::H5Type;
     #[allow(non_snake_case)]
     #[derive(H5Type, Clone)]
     #[repr(C)]
@@ -854,7 +817,7 @@ mod tests {
         )
     }
     use std::str::FromStr;
-    fn table_fields(table: &hdf5::Dataset) -> HashMap<String, TypeDescriptor> {
+    fn table_fields(table: &crate::h5::Dataset) -> HashMap<String, TypeDescriptor> {
         let TypeDescriptor::Compound(desc) = table.dtype().unwrap().to_descriptor().unwrap() else {
             panic!("Expected compound table");
         };
@@ -872,7 +835,7 @@ mod tests {
         rows[0].sourceSurveyID = VarLenAscii::from_ascii(&"x".repeat(1024 * 1024)).unwrap();
         table.write_raw(&rows).unwrap();
         drop(rows);
-        let error = QualityCoverage::open_optional(&file, &[geometry])
+        let error = QualityCoverage::open_optional(&crate::w(&file), &[geometry])
             .unwrap_err()
             .to_string();
         assert!(
@@ -896,6 +859,7 @@ mod tests {
             row.surveyAuthority = VarLenUnicode::from_str(&"b".repeat(512)).unwrap();
         }
         table.write_raw(&rows).unwrap();
+        let table = crate::w(&group).dataset("featureAttributeTable").unwrap();
         let fields = table_fields(&table);
         let used = forecast_quality_strings(&table, &fields, 4096).unwrap();
         assert_eq!(used, 2 * 2 * 513);
@@ -904,7 +868,11 @@ mod tests {
             .to_string()
             .contains("before column decode: surveyAuthority"));
         let empty = group.new_dataset::<Row>().shape(0).create("empty").unwrap();
-        assert_eq!(forecast_quality_strings(&empty, &fields, 0).unwrap(), 0);
+        let empty_view = crate::w(&group).dataset("empty").unwrap();
+        assert_eq!(
+            forecast_quality_strings(&empty_view, &fields, 0).unwrap(),
+            0
+        );
         drop(empty);
         drop(table);
         drop(group);
@@ -916,13 +884,13 @@ mod tests {
     fn worker_records_match_quality_table_and_do_not_decode_it_again() {
         let (path, geometry) = fixture(vec![1; 6], false, false);
         let file = hdf5::File::open_rw(&path).unwrap();
-        let original = QualityCoverage::open_optional(&file, &[geometry])
+        let original = QualityCoverage::open_optional(&crate::w(&file), &[geometry])
             .unwrap()
             .unwrap();
         let rows = original.records().cloned().collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         let injected = QualityCoverage::open_optional_with_records(
-            &file,
+            &crate::w(&file),
             &[geometry],
             Some(Some(rows.clone())),
         )
@@ -930,7 +898,7 @@ mod tests {
         .unwrap();
         assert_eq!(injected.record_count(), 1);
         assert!(QualityCoverage::open_optional_with_records(
-            &file,
+            &crate::w(&file),
             &[geometry],
             Some(Some(Vec::new()))
         )
@@ -938,7 +906,7 @@ mod tests {
         let mut duplicate = rows.clone();
         duplicate.push(rows[0].clone());
         assert!(QualityCoverage::open_optional_with_records(
-            &file,
+            &crate::w(&file),
             &[geometry],
             Some(Some(duplicate))
         )
@@ -989,7 +957,7 @@ mod tests {
             }
             {
                 let f = hdf5::File::open(&p).unwrap();
-                let error = QualityCoverage::open_optional(&f, &[geometry])
+                let error = QualityCoverage::open_optional(&crate::w(&f), &[geometry])
                     .unwrap_err()
                     .to_string();
                 assert!(
@@ -1016,7 +984,7 @@ mod tests {
         }
         {
             let f = hdf5::File::open(&p).unwrap();
-            assert!(QualityCoverage::open_optional(&f, &[g])
+            assert!(QualityCoverage::open_optional(&crate::w(&f), &[g])
                 .unwrap_err()
                 .to_string()
                 .contains("must match"));
@@ -1042,7 +1010,10 @@ mod tests {
             }
             {
                 let f = hdf5::File::open(&p).unwrap();
-                assert!(QualityCoverage::open_optional(&f, &[g]).is_err(), "{field}");
+                assert!(
+                    QualityCoverage::open_optional(&crate::w(&f), &[g]).is_err(),
+                    "{field}"
+                );
             }
             std::fs::remove_file(p).unwrap();
         }
@@ -1058,7 +1029,7 @@ mod tests {
         }
         {
             let f = hdf5::File::open(&p).unwrap();
-            assert!(QualityCoverage::open_optional(&f, &[g]).is_err());
+            assert!(QualityCoverage::open_optional(&crate::w(&f), &[g]).is_err());
         }
         {
             let f = hdf5::File::open_rw(&p).unwrap();
@@ -1077,7 +1048,7 @@ mod tests {
         }
         {
             let f = hdf5::File::open(&p).unwrap();
-            let q = QualityCoverage::open_optional(&f, &[g, g])
+            let q = QualityCoverage::open_optional(&crate::w(&f), &[g, g])
                 .unwrap()
                 .unwrap();
             assert_eq!(q.horizontal_position_uncertainty, 0.5);
@@ -1089,7 +1060,9 @@ mod tests {
     fn quality_projection_enum_unicode_false_and_missing_are_distinct() {
         let (path, g) = fixture(vec![0, 1, 1, 1, 0, 1], false, false);
         let f = hdf5::File::open(&path).unwrap();
-        let q = QualityCoverage::open_optional(&f, &[g]).unwrap().unwrap();
+        let q = QualityCoverage::open_optional(&crate::w(&f), &[g])
+            .unwrap()
+            .unwrap();
         assert_eq!(
             q.read_window_ids(GridWindow {
                 column: 1,
@@ -1169,7 +1142,7 @@ mod tests {
             container.unlink("Saved").unwrap();
         }
         let f = hdf5::File::open(&path).unwrap();
-        let q = QualityCoverage::open_optional(&f, &[geometry])
+        let q = QualityCoverage::open_optional(&crate::w(&f), &[geometry])
             .unwrap()
             .unwrap();
         assert!(!q.observed_id_centroids_outside_domain());
@@ -1210,7 +1183,7 @@ mod tests {
         for (duplicate, bad_bool) in [(true, false), (false, true)] {
             let (path, g) = fixture(vec![1; 6], duplicate, bad_bool);
             let f = hdf5::File::open(&path).unwrap();
-            assert!(QualityCoverage::open_optional(&f, &[g]).is_err());
+            assert!(QualityCoverage::open_optional(&crate::w(&f), &[g]).is_err());
             drop(f);
             std::fs::remove_file(path).unwrap();
         }
@@ -1226,14 +1199,14 @@ mod tests {
                 .unwrap()
                 .write_scalar(&count)
                 .unwrap();
-            assert!(QualityCoverage::open_optional(&f, &[g]).is_err());
+            assert!(QualityCoverage::open_optional(&crate::w(&f), &[g]).is_err());
         }
         group
             .attr("numInstances")
             .unwrap()
             .write_scalar(&1u8)
             .unwrap();
-        assert!(QualityCoverage::open_optional(&f, &[g]).is_ok());
+        assert!(QualityCoverage::open_optional(&crate::w(&f), &[g]).is_ok());
         drop(group);
         drop(f);
         std::fs::remove_file(path).unwrap();
@@ -1243,7 +1216,9 @@ mod tests {
     fn orphan_ids_and_misaligned_geometry_are_rejected() {
         let (path, g) = fixture(vec![0, 1, 9, 1, 0, 1], false, false);
         let f = hdf5::File::open(&path).unwrap();
-        let q = QualityCoverage::open_optional(&f, &[g]).unwrap().unwrap();
+        let q = QualityCoverage::open_optional(&crate::w(&f), &[g])
+            .unwrap()
+            .unwrap();
         assert!(q
             .read_window_ids(GridWindow {
                 column: 2,
@@ -1256,7 +1231,7 @@ mod tests {
             origin_x: 1.0001,
             ..g
         };
-        assert!(QualityCoverage::open_optional(&f, &[shifted]).is_err());
+        assert!(QualityCoverage::open_optional(&crate::w(&f), &[shifted]).is_err());
         drop(q);
         drop(f);
         std::fs::remove_file(path).unwrap();
@@ -1279,9 +1254,11 @@ mod encoding_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod semantic_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
     #[test]
     fn rejects_contradictory_coverage_but_preserves_absent_flags() {
         for (full, observed, valid) in [

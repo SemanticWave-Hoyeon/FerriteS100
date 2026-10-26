@@ -83,6 +83,14 @@ fn dataset_snapshot_key(
 }
 
 pub fn unchecked_datasets(paths: &[PathBuf]) -> Result<AuthorizedDatasets> {
+    unchecked_datasets_in(&crate::platform::NativeDataSource, paths)
+}
+
+/// [`unchecked_datasets`] keyed by the data source's canonical paths.
+pub fn unchecked_datasets_in(
+    data: &dyn DataSource,
+    paths: &[PathBuf],
+) -> Result<AuthorizedDatasets> {
     let mut report = AuthorizedDatasets {
         dataset_discovery: Default::default(),
         snapshots: Default::default(),
@@ -93,7 +101,7 @@ pub fn unchecked_datasets(paths: &[PathBuf]) -> Result<AuthorizedDatasets> {
     for path in paths {
         // Match the canonical keys used by authenticated dataset loading.
         // None means no authenticated snapshot; it does not assert unsignedness.
-        let canonical = path.canonicalize()?;
+        let canonical = data.canonicalize(path)?;
         report.dataset_discovery.insert(
             canonical.clone(),
             DatasetDiscoveryAuthorization::SignatureVerificationDisabled,

@@ -8,12 +8,26 @@ description = "Web (wasm32-unknown-unknown) bindings of the S-100 ChartEngine: i
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# S-101 portrayal with the catalogue's Lua rules in the browser: the vendored
+# Lua 5.4 compiled to wasm32 by ferrite-lua-runtime (needs a clang with the
+# WebAssembly target, e.g. Homebrew LLVM, and llvm-ar; see its build script).
+# Off: S-101 cells draw only from precomputed payloads.
+lua-wasm = ["ferrite-engine/lua54", "ferrite-cli/lua54", "dep:ferrite-lua", "ferrite-lua/lua54"]
+
+[[example]]
+name = "part9a_dump"
+required-features = ["lua-wasm"]
+
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
 ferrite-cli = { path = "../ferrite-cli", default-features = false, features = ["crypto-rust"] }
 ferrite-engine = { workspace = true, features = ["crypto-rust"] }
 ferrite-gpu.workspace = true
+ferrite-lua = { workspace = true, optional = true }
+ferrite-render.workspace = true
+tracing.workspace = true
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = "=0.2.108"

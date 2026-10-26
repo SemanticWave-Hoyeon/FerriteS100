@@ -10,7 +10,7 @@ use crate::portrayal::{
     CellCaches, CellPortrayalSelection, PortrayalChangeRequest, PortrayalRun, PortrayalSource,
     PrecomputedCells,
 };
-#[cfg(feature = "s102-hdf5")]
+#[cfg(feature = "s102-pure")]
 use crate::s102_journal_admission;
 use crate::{
     cell_source_identity, decoded_chart_cache, interoperability, primary_viewing_layers,
@@ -26,9 +26,9 @@ use ferrite_render::DrawingInstruction;
 use ferrite_render::{GeoBounds, RenderContext};
 use ferrite_s100_core::S101Cell;
 use ferrite_s101::coverage_projection::GeographicCoverageInventory;
-#[cfg(feature = "s102-hdf5")]
+#[cfg(feature = "s102-pure")]
 use ferrite_s102::BathymetryCoverage;
-#[cfg(feature = "s102-hdf5")]
+#[cfg(feature = "s102-pure")]
 use ferrite_security::AuthenticatedSnapshot;
 use ferrite_security::UnauthenticatedSnapshot;
 use std::collections::{BTreeMap, HashMap};
@@ -123,19 +123,21 @@ pub struct EngineState {
     pub ic_combination: Option<String>,
     pub ic_assigned_vectors: usize,
     /// S-102 2.1 trial files opened for inspection only (never depth).
-    #[cfg(feature = "s102-hdf5")]
+    #[cfg(feature = "s102-pure")]
     pub s102_trials: Vec<(PathBuf, ferrite_s102::trial_inspection::TrialInspection)>,
-    #[cfg(feature = "s102-hdf5")]
+    #[cfg(feature = "s102-pure")]
     pub bathymetry: Vec<(
         PathBuf,
         BathymetryCoverage,
         Option<Arc<AuthenticatedSnapshot>>,
     )>,
     pub bathymetry_bounds: HashMap<PathBuf, GeoBounds>,
+    /// Signature provenance of each S-102 file opened by `ChartEngine`.
+    pub s102_provenance: HashMap<PathBuf, String>,
     pub depth_policies: HashMap<PathBuf, DepthPolicy>,
     pub depth_inputs: HashMap<PathBuf, Arc<UnauthenticatedSnapshot>>,
     pub s102_original_inputs: s102_original_inputs::Registry,
-    #[cfg(feature = "s102-hdf5")]
+    #[cfg(feature = "s102-pure")]
     pub s102_journal_gate: Option<s102_journal_admission::Gate>,
     pub require_signatures: bool,
     pub operational_mode: bool,
@@ -199,15 +201,16 @@ impl EngineState {
             ic: None,
             ic_combination: None,
             ic_assigned_vectors: 0,
-            #[cfg(feature = "s102-hdf5")]
+            #[cfg(feature = "s102-pure")]
             s102_trials: Vec::new(),
-            #[cfg(feature = "s102-hdf5")]
+            #[cfg(feature = "s102-pure")]
             bathymetry: Vec::new(),
             bathymetry_bounds: Default::default(),
+            s102_provenance: Default::default(),
             depth_policies: HashMap::new(),
             depth_inputs: HashMap::new(),
             s102_original_inputs: Default::default(),
-            #[cfg(feature = "s102-hdf5")]
+            #[cfg(feature = "s102-pure")]
             s102_journal_gate: None,
             require_signatures: false,
             operational_mode: false,
@@ -313,7 +316,12 @@ impl EngineState {
         } else {
             DatasetCatalogueRegistry::default()
         };
-        let mut next = base.stage(&requests, fallback, &self.catalogue_inventory)?;
+        let mut next = base.stage_in(
+            self.platform.data.as_ref(),
+            &requests,
+            fallback,
+            &self.catalogue_inventory,
+        )?;
         next.retain_keys(&requests.iter().map(|r| r.dataset_key.clone()).collect());
         for request in &requests {
             let binding = next
@@ -361,7 +369,12 @@ impl EngineState {
             Arc::clone(fc),
             Arc::clone(pc),
         )?);
-        let mut next = registry.stage(&requests, fallback, &self.catalogue_inventory)?;
+        let mut next = registry.stage_in(
+            self.platform.data.as_ref(),
+            &requests,
+            fallback,
+            &self.catalogue_inventory,
+        )?;
         next.retain_keys(&requests.iter().map(|r| r.dataset_key.clone()).collect());
         for request in &requests {
             anyhow::ensure!(
@@ -743,13 +756,13 @@ impl EngineState {
         if !self.cells.is_empty() {
             displayed.push("S-101");
         }
-        #[cfg(feature = "s102-hdf5")]
+        #[cfg(feature = "s102-pure")]
         let bathymetry: Vec<&dyn ferrite_kernel::NumericCoverageSource> = self
             .bathymetry
             .iter()
             .map(|(_, c, _)| c as &dyn ferrite_kernel::NumericCoverageSource)
             .collect();
-        #[cfg(not(feature = "s102-hdf5"))]
+        #[cfg(not(feature = "s102-pure"))]
         let bathymetry: Vec<&dyn ferrite_kernel::NumericCoverageSource> = Vec::new();
         if !bathymetry.is_empty() {
             displayed.push("S-102");

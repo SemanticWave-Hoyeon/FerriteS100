@@ -1,23 +1,32 @@
 //! S-102 HDF5 adapter with bounded window reads; no application or GPU dependency.
 #![allow(non_local_definitions)]
+pub mod h5;
 pub mod legacy_trial;
 mod scalar;
 pub mod singleton;
 pub mod trial_inspection;
 use anyhow::{ensure, Context, Result};
 use ferrite_kernel::{CoverageSample, CoverageSource, CoverageTile, GridGeometry, GridWindow};
+use h5::{VarLenAscii, VarLenUnicode};
+#[cfg(feature = "hdf5")]
 pub use hdf5;
-use hdf5::{
-    types::{VarLenAscii, VarLenUnicode},
-    H5Type,
-};
+#[cfg(all(test, feature = "hdf5"))]
+use hdf5::H5Type;
 use std::path::Path;
+/// Test view of a native group through the backend-neutral API.
+#[cfg(all(test, feature = "hdf5"))]
+pub(crate) fn w(g: &hdf5::Group) -> h5::Group {
+    h5::Group::from(g)
+}
+/// Test fixture element types (the adapter reads members by name).
+#[cfg(all(test, feature = "hdf5"))]
 #[derive(H5Type, Clone, Copy)]
 #[repr(C)]
 struct DepthValue {
     depth: f32,
     uncertainty: f32,
 }
+#[cfg(all(test, feature = "hdf5"))]
 #[derive(H5Type, Clone, Copy)]
 #[repr(C)]
 struct DepthOnly {
@@ -28,25 +37,25 @@ pub enum UncertaintyEncoding {
     PerCell,
     GroupConstant,
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 #[allow(non_snake_case)]
 #[derive(H5Type, Clone)]
 #[repr(C)]
 struct Definition {
-    code: VarLenAscii,
-    name: VarLenAscii,
+    code: hdf5::types::VarLenAscii,
+    name: hdf5::types::VarLenAscii,
     #[hdf5(rename = "uom.name")]
-    unit: VarLenAscii,
-    fillValue: VarLenAscii,
-    datatype: VarLenAscii,
-    lower: VarLenAscii,
-    upper: VarLenAscii,
-    closure: VarLenAscii,
+    unit: hdf5::types::VarLenAscii,
+    fillValue: hdf5::types::VarLenAscii,
+    datatype: hdf5::types::VarLenAscii,
+    lower: hdf5::types::VarLenAscii,
+    upper: hdf5::types::VarLenAscii,
+    closure: hdf5::types::VarLenAscii,
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 impl Definition {
     fn for_code(code: &str) -> Self {
-        let text = |v: &str| VarLenAscii::from_ascii(v).unwrap();
+        let text = |v: &str| hdf5::types::VarLenAscii::from_ascii(v).unwrap();
         let (name, unit, fill, datatype, lower, upper, closure) = match code {
             "uncertainty" => (
                 code,
@@ -80,15 +89,15 @@ impl Definition {
         }
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 fn write_test_feature_declarations(g: &hdf5::Group) {
-    g.new_dataset::<VarLenAscii>()
+    g.new_dataset::<hdf5::types::VarLenAscii>()
         .shape(2)
         .create("featureCode")
         .unwrap()
         .write_raw(
             &["BathymetryCoverage", "QualityOfBathymetryCoverage"]
-                .map(|s| VarLenAscii::from_ascii(s).unwrap()),
+                .map(|s| hdf5::types::VarLenAscii::from_ascii(s).unwrap()),
         )
         .unwrap();
     g.new_dataset::<Definition>()
@@ -108,7 +117,7 @@ pub struct BathymetryCoverage {
     pub quality: Option<std::sync::Arc<QualityCoverage>>,
     geometry: GridGeometry,
     pub domain: InstanceDomain,
-    values: hdf5::Dataset,
+    values: h5::Dataset,
     range_violations: std::sync::atomic::AtomicU8,
     /// Container coordinate uncertainty (metres); -1 means unknown/inapplicable.
     /// Kept separately from the depth values group's cell/constant uncertainty.
@@ -151,8 +160,8 @@ fn checked_metadata_text(bytes: &[u8], ascii: bool, name: &str) -> Result<String
         .with_context(|| format!("Invalid S102 {name} UTF8"))?
         .to_owned())
 }
-fn string_attr(g: &hdf5::Group, name: &str) -> Result<String> {
-    use hdf5::types::{FixedAscii, FixedUnicode, TypeDescriptor};
+fn string_attr(g: &h5::Group, name: &str) -> Result<String> {
+    use h5::{FixedAscii, FixedUnicode, TypeDescriptor};
     let a = g.attr(name)?;
     ensure!(
         crate::singleton::admitted(&a),
@@ -186,6 +195,53 @@ fn string_attr(g: &hdf5::Group, name: &str) -> Result<String> {
         _ => anyhow::bail!("S102 {name} must be a string attribute"),
     }
 }
+/// The root `productSpecification` text of an HDF5 product, with the
+/// receiver discovery contract (scalar or one-element, same-charset string,
+/// at most 255 bytes, no NUL). Used to dispatch editions before decoding.
+pub fn product_specification(file: &h5::Group) -> Result<String> {
+    use h5::{FixedAscii, FixedUnicode, TypeDescriptor};
+    let attr = file
+        .attr("productSpecification")
+        .context("HDF has no productSpecification attribute")?;
+    ensure!(
+        singleton::admitted(&attr),
+        "HDF productSpecification must be scalar or a single element"
+    );
+    let checked = |raw: &[u8]| -> Result<String> {
+        ensure!(
+            raw.len() <= 255 && !raw.contains(&0),
+            "HDF productSpecification exceeds255 bytes or contains NUL"
+        );
+        Ok(std::str::from_utf8(raw)?.to_owned())
+    };
+    match attr.dtype()?.to_descriptor()? {
+        TypeDescriptor::FixedAscii(n) => {
+            ensure!(
+                n <= 256,
+                "HDF productSpecification exceeds256 encoded bytes"
+            );
+            checked(singleton::read::<FixedAscii<256>>(&attr)?.as_bytes())
+        }
+        TypeDescriptor::FixedUnicode(n) => {
+            ensure!(
+                n <= 256,
+                "HDF productSpecification exceeds256 encoded bytes"
+            );
+            checked(singleton::read::<FixedUnicode<256>>(&attr)?.as_bytes())
+        }
+        TypeDescriptor::VarLenAscii => checked(singleton::read::<VarLenAscii>(&attr)?.as_bytes()),
+        TypeDescriptor::VarLenUnicode => {
+            checked(singleton::read::<VarLenUnicode>(&attr)?.as_bytes())
+        }
+        _ => anyhow::bail!("HDF productSpecification must be text"),
+    }
+}
+/// Exact S-102 edition this reader decodes as bathymetric coverage.
+pub const SUPPORTED_PRODUCT: &str = "INT.IHO.S-102.3.0.0";
+/// S-102 2.1 trial editions (inspection only, never depth coverage).
+pub fn is_trial_product(spec: &str) -> bool {
+    matches!(spec, "INT.IHO.S-102.2.1" | "INT.IHO.S-102.2.1.0")
+}
 // S-1023.0 Table10-4 and Table10-6: these are encoded metadata contracts,
 // independent of GPU sampling or any application portrayal settings.
 // Product storage contract; kernel GridGeometry remains orientation-neutral.
@@ -205,7 +261,7 @@ fn validate_storage_geometry(g: &GridGeometry) -> Result<()> {
     );
     Ok(())
 }
-fn validate_container(container: &hdf5::Group) -> Result<u8> {
+fn validate_container(container: &h5::Group) -> Result<u8> {
     for (name, expected) in [
         ("dimension", 2u8),
         ("commonPointRule", 2),
@@ -227,8 +283,8 @@ fn validate_container(container: &hdf5::Group) -> Result<u8> {
 // S1023.0 Table10-4 rows4/5: mandatory scalar float32 container metadata.
 // S100 Part10c describes -1 as unknown/inapplicable, or a measured uncertainty
 // in metres. Zero is retained; the example wording is not a strict-positive gate.
-fn position_uncertainties(container: &hdf5::Group) -> Result<[f32; 2]> {
-    use hdf5::types::{FloatSize, TypeDescriptor};
+fn position_uncertainties(container: &h5::Group) -> Result<[f32; 2]> {
+    use h5::{FloatSize, TypeDescriptor};
     let mut values = [0.; 2];
     for (i, name) in ["horizontalPositionUncertainty", "verticalUncertainty"]
         .into_iter()
@@ -267,7 +323,7 @@ pub fn vertical_cs_6499_as_depth_enabled() -> bool {
     std::env::var_os(VERTICAL_CS_6499_AS_DEPTH_ENV).is_some_and(|v| v == "1")
 }
 /// Ok(true) when a 6499 declaration was admitted as depth-down by opt-in.
-fn validate_vertical_root(file: &hdf5::Group, admit_6499_as_depth: bool) -> Result<bool> {
+fn validate_vertical_root(file: &h5::Group, admit_6499_as_depth: bool) -> Result<bool> {
     let vertical_cs = crate::scalar::u32(file, "verticalCS")?;
     let reinterpreted = match vertical_cs {
         6498 => false,
@@ -406,7 +462,7 @@ fn validate_instance_domains(items: &[(u32, GridGeometry)]) -> Result<()> {
     }
     Ok(())
 }
-fn instance_vertical_datum(group: &hdf5::Group, root_datum: u32) -> Result<u32> {
+fn instance_vertical_datum(group: &h5::Group, root_datum: u32) -> Result<u32> {
     let attributes = group.attr_names()?;
     let datum = if attributes.iter().any(|n| n == "verticalDatum") {
         let datum = crate::scalar::unsigned_or_enum_u32(group, "verticalDatum")?;
@@ -612,8 +668,19 @@ impl BathymetryCoverage {
         })
     }
     /// Read only structure and metadata. Values stay in HDF5 until a window is requested.
+    /// Local paths use the default reader ([`h5::Backend::default_for_paths`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Vec<Self>> {
-        Self::open_impl(path, None)
+        Self::open_file(h5::File::open(path)?, None)
+    }
+
+    /// Open a local file with an explicit reader (parity checks, diagnostics).
+    pub fn open_with_backend(path: impl AsRef<Path>, backend: h5::Backend) -> Result<Vec<Self>> {
+        Self::open_file(h5::File::open_with(path, backend)?, None)
+    }
+
+    /// Open an in-memory S-102 file image with the pure-Rust reader.
+    pub fn open_bytes(bytes: impl Into<std::sync::Arc<[u8]>>) -> Result<Vec<Self>> {
+        Self::open_file(h5::File::open_bytes(bytes)?, None)
     }
 
     /// Open a captured S-102 input with quality attributes decoded in an isolated worker.
@@ -622,14 +689,15 @@ impl BathymetryCoverage {
         path: impl AsRef<Path>,
         quality_records: Option<Vec<quality::QualityRecord>>,
     ) -> Result<Vec<Self>> {
-        Self::open_impl(path, Some(quality_records))
+        Self::open_file(h5::File::open(path)?, Some(quality_records))
     }
 
-    fn open_impl(
-        path: impl AsRef<Path>,
+    /// Open an already opened HDF5 file (either reader). `quality_records`:
+    /// `None` decodes quality attributes here; `Some` supplies a worker's result.
+    pub fn open_file(
+        file: h5::File,
         quality_records: Option<Option<Vec<quality::QualityRecord>>>,
     ) -> Result<Vec<Self>> {
-        let file = hdf5::File::open(path)?;
         // Dispatch edition before applying any edition-specific metadata contracts.
         let spec = string_attr(&file, "productSpecification")?;
         ensure!(
@@ -718,7 +786,7 @@ impl BathymetryCoverage {
             validate_time_point(&time_point)?;
             let values = g.dataset("Group_001/values")?;
             let desc = values.dtype()?.to_descriptor()?;
-            let hdf5::types::TypeDescriptor::Compound(fields) = desc else {
+            let h5::TypeDescriptor::Compound(fields) = desc else {
                 anyhow::bail!("S102 values must be compound");
             };
             ensure!(
@@ -729,10 +797,10 @@ impl BathymetryCoverage {
                 "S102 values require only depth and optional uncertainty members"
             );
             let is_f32 = |name: &str| {
-                fields.fields.iter().any(|p| {
-                    p.name == name
-                        && p.ty == hdf5::types::TypeDescriptor::Float(hdf5::types::FloatSize::U4)
-                })
+                fields
+                    .fields
+                    .iter()
+                    .any(|p| p.name == name && p.ty == h5::TypeDescriptor::Float(h5::FloatSize::U4))
             };
             ensure!(is_f32("depth"), "S102 depth compound field must be float32");
             let has_uncertainty = fields.fields.iter().any(|p| p.name == "uncertainty");
@@ -834,15 +902,17 @@ impl CoverageSource for BathymetryCoverage {
         let samples: Vec<CoverageSample> = match self.uncertainty_encoding {
             UncertaintyEncoding::PerCell => self
                 .values
-                .read_slice_2d::<DepthValue, _>(bounds)?
-                .into_iter()
-                .map(|v| self.validated_sample(v.depth, v.uncertainty, &mut issues))
+                .read_f32_fields_2d(&["depth", "uncertainty"], bounds.0, bounds.1)?
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| self.validated_sample(v[0], v[1], &mut issues))
                 .collect::<Result<Vec<_>>>()?,
             UncertaintyEncoding::GroupConstant => self
                 .values
-                .read_slice_2d::<DepthOnly, _>(bounds)?
+                .read_f32_fields_2d(&["depth"], bounds.0, bounds.1)?
                 .into_iter()
-                .map(|v| self.validated_sample(v.depth, self.declared_min_uncertainty, &mut issues))
+                .map(|v| self.validated_sample(v, self.declared_min_uncertainty, &mut issues))
                 .collect::<Result<Vec<_>>>()?,
         };
         if self.domain.requires_mask()
@@ -883,9 +953,11 @@ pub mod continuous;
 mod portrayal;
 pub use portrayal::*;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
     fn attr<T: H5Type>(g: &hdf5::Group, name: &str, value: T) {
         g.new_attr::<T>()
             .create(name)
@@ -1189,9 +1261,11 @@ impl BathymetryCoverage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod metadata_contract_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
     fn attr<T: H5Type>(g: &hdf5::Group, n: &str, v: T) {
         g.new_attr::<T>()
             .create(n)
@@ -1209,12 +1283,12 @@ mod metadata_contract_tests {
             attr(&g, "dimension", 2u8);
             attr(&g, "commonPointRule", 2u8);
             attr(&g, "numInstances", 2u8);
-            assert!(validate_container(&g)
+            assert!(validate_container(&crate::w(&g))
                 .unwrap_err()
                 .to_string()
                 .contains("interpolationType"));
             attr(&g, "interpolationType", 1u8);
-            assert_eq!(validate_container(&g).unwrap(), 2);
+            assert_eq!(validate_container(&crate::w(&g)).unwrap(), 2);
             for (name, bad) in [
                 ("interpolationType", 2u8),
                 ("commonPointRule", 1),
@@ -1224,7 +1298,7 @@ mod metadata_contract_tests {
                 let a = g.attr(name).unwrap();
                 let old = a.read_scalar::<u8>().unwrap();
                 a.write_scalar(&bad).unwrap();
-                assert!(validate_container(&g).is_err());
+                assert!(validate_container(&crate::w(&g)).is_err());
                 a.write_scalar(&old).unwrap();
             }
         }
@@ -1239,16 +1313,16 @@ mod metadata_contract_tests {
         {
             let file = hdf5::File::create(&path).unwrap();
             let g = file.create_group("BathymetryCoverage.01").unwrap();
-            assert_eq!(instance_vertical_datum(&g, 10).unwrap(), 10);
+            assert_eq!(instance_vertical_datum(&crate::w(&g), 10).unwrap(), 10);
             attr(&g, "verticalDatum", 23u16);
-            assert_eq!(instance_vertical_datum(&g, 10).unwrap(), 23);
+            assert_eq!(instance_vertical_datum(&crate::w(&g), 10).unwrap(), 23);
             attr(&g, "verticalDatumReference", 1u8);
-            assert_eq!(instance_vertical_datum(&g, 10).unwrap(), 23);
+            assert_eq!(instance_vertical_datum(&crate::w(&g), 10).unwrap(), 23);
             g.attr("verticalDatumReference")
                 .unwrap()
                 .write_scalar(&2u8)
                 .unwrap();
-            assert!(instance_vertical_datum(&g, 10).is_err());
+            assert!(instance_vertical_datum(&crate::w(&g), 10).is_err());
             g.attr("verticalDatumReference")
                 .unwrap()
                 .write_scalar(&1u8)
@@ -1257,23 +1331,25 @@ mod metadata_contract_tests {
                 .unwrap()
                 .write_scalar(&10u16)
                 .unwrap();
-            assert!(instance_vertical_datum(&g, 10).is_err());
+            assert!(instance_vertical_datum(&crate::w(&g), 10).is_err());
             g.attr("verticalDatum")
                 .unwrap()
                 .write_scalar(&31u16)
                 .unwrap();
-            assert!(instance_vertical_datum(&g, 10).is_err());
+            assert!(instance_vertical_datum(&crate::w(&g), 10).is_err());
             let h = file.create_group("BathymetryCoverage.02").unwrap();
             attr(&h, "verticalDatumReference", 1u8);
-            assert!(instance_vertical_datum(&h, 10).is_err());
+            assert!(instance_vertical_datum(&crate::w(&h), 10).is_err());
         }
         std::fs::remove_file(path).unwrap();
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod vertical_contract_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
     #[test]
     fn required_vertical_axis_is_depth_metres_down_and_datum_based() {
         let path =
@@ -1285,27 +1361,27 @@ mod vertical_contract_tests {
                 .unwrap()
                 .write_scalar(&6498u32)
                 .unwrap();
-            assert!(validate_vertical_root(&file, false).is_err());
+            assert!(validate_vertical_root(&crate::w(&file), false).is_err());
             file.new_attr::<u8>()
                 .create("verticalCoordinateBase")
                 .unwrap()
                 .write_scalar(&2u8)
                 .unwrap();
-            assert!(!validate_vertical_root(&file, false).unwrap());
-            assert!(!validate_vertical_root(&file, true).unwrap());
+            assert!(!validate_vertical_root(&crate::w(&file), false).unwrap());
+            assert!(!validate_vertical_root(&crate::w(&file), true).unwrap());
             file.attr("verticalCS")
                 .unwrap()
                 .write_scalar(&6499u32)
                 .unwrap();
-            let refused = validate_vertical_root(&file, false).unwrap_err();
+            let refused = validate_vertical_root(&crate::w(&file), false).unwrap_err();
             assert!(refused.to_string().contains(VERTICAL_CS_6499_AS_DEPTH_ENV));
             // Opt-in admits only 6499, and reports the reinterpretation.
-            assert!(validate_vertical_root(&file, true).unwrap());
+            assert!(validate_vertical_root(&crate::w(&file), true).unwrap());
             file.attr("verticalCS")
                 .unwrap()
                 .write_scalar(&5714u32)
                 .unwrap();
-            assert!(validate_vertical_root(&file, true).is_err());
+            assert!(validate_vertical_root(&crate::w(&file), true).is_err());
             file.attr("verticalCS")
                 .unwrap()
                 .write_scalar(&6498u32)
@@ -1314,7 +1390,7 @@ mod vertical_contract_tests {
                 .unwrap()
                 .write_scalar(&1u8)
                 .unwrap();
-            assert!(validate_vertical_root(&file, true).is_err());
+            assert!(validate_vertical_root(&crate::w(&file), true).is_err());
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -1385,10 +1461,12 @@ mod vertical_contract_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod values_contract_tests {
     use super::*;
     use ferrite_kernel::NumericCoverageSource;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SERIAL: AtomicUsize = AtomicUsize::new(0);
     struct Fixture(std::path::PathBuf);
@@ -2772,17 +2850,17 @@ mod boundary_stack_tests {
 
 mod metadata;
 pub use metadata::{AxisMetadata, AxisNamesOrder, IssueMetadata};
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 fn write_test_axes(g: &hdf5::Group, crs: u32) {
     let names = canonical_axes(crs).unwrap();
     let a = [
-        VarLenAscii::from_ascii(names[1]).unwrap(),
-        VarLenAscii::from_ascii(names[0]).unwrap(),
+        hdf5::types::VarLenAscii::from_ascii(names[1]).unwrap(),
+        hdf5::types::VarLenAscii::from_ascii(names[0]).unwrap(),
     ];
     if g.link_exists("axisNames") {
         g.dataset("axisNames").unwrap().write_raw(&a).unwrap();
     } else {
-        g.new_dataset::<VarLenAscii>()
+        g.new_dataset::<hdf5::types::VarLenAscii>()
             .shape(2)
             .create("axisNames")
             .unwrap()

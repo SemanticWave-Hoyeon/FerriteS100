@@ -1,6 +1,7 @@
 //! Version-specific S-101 catalogue selection. Does not confer authentication.
 //! S98 20.1/20.2 and Appendix B: absence/incompatibility is an error, not a
 //! warning permission to process Edition 1 with Edition 2 catalogues.
+use crate::platform::{DataSource, EntryKind, NativeDataSource};
 use anyhow::{ensure, Context, Result};
 use ferrite_feature_catalog::{BoundFeatureCatalogue, FeatureCatalogue};
 use ferrite_kernel::SpecificationVersion;
@@ -78,7 +79,15 @@ fn resolve_pair_for_loading(
     current_pc: &PortrayalCatalogue,
     inventory: &Path,
 ) -> Result<Selection> {
-    resolve_pair_with_policy(incoming, loaded, current_fc, current_pc, inventory, false)
+    resolve_pair_with_policy(
+        &NativeDataSource,
+        incoming,
+        loaded,
+        current_fc,
+        current_pc,
+        inventory,
+        false,
+    )
 }
 /// New owner admission only. Retained compatible owners are not automatically rebound.
 /// Prefer exact Edition+Revision captured FC/PC; S-101 same-Edition later Revision
@@ -90,7 +99,27 @@ pub fn resolve_pair_exact_first(
     current_pc: &PortrayalCatalogue,
     inventory: &Path,
 ) -> Result<Selection> {
-    resolve_pair_with_policy(incoming, loaded, current_fc, current_pc, inventory, true)
+    resolve_pair_exact_first_in(
+        &NativeDataSource,
+        incoming,
+        loaded,
+        current_fc,
+        current_pc,
+        inventory,
+    )
+}
+/// [`resolve_pair_exact_first`] reading the inventory through a data source.
+pub fn resolve_pair_exact_first_in(
+    data: &dyn DataSource,
+    incoming: &[DatasetIdentification],
+    loaded: &[DatasetIdentification],
+    current_fc: &FeatureCatalogue,
+    current_pc: &PortrayalCatalogue,
+    inventory: &Path,
+) -> Result<Selection> {
+    resolve_pair_with_policy(
+        data, incoming, loaded, current_fc, current_pc, inventory, true,
+    )
 }
 fn exact_revision_pair(
     target: SpecificationVersion,
@@ -107,6 +136,7 @@ fn exact_revision_pair(
         && exact(&pc.version)?)
 }
 fn resolve_pair_with_policy(
+    data: &dyn DataSource,
     incoming: &[DatasetIdentification],
     loaded: &[DatasetIdentification],
     current_fc: &FeatureCatalogue,
@@ -141,30 +171,30 @@ fn resolve_pair_with_policy(
     let Some(target) = required_version(incoming, loaded)? else {
         return Ok(Selection::KeepCurrent);
     };
-    if exact_first && current_compatible && !inventory.is_dir() {
+    if exact_first && current_compatible && !data.is_dir(inventory) {
         return Ok(Selection::KeepCurrent);
     }
     ensure!(
-        inventory.is_dir(),
+        data.is_dir(inventory),
         "SSE131: No installed compatible S-101 FC/PC inventory at {}",
         inventory.display()
     );
     let mut folders = Vec::new();
-    for (n, e) in std::fs::read_dir(inventory)?.enumerate() {
+    for (n, e) in data.read_dir(inventory)?.into_iter().enumerate() {
         ensure!(n < 256, "Installed catalogue inventory exceeds256 entries");
-        let e = e?;
-        if !e.file_type()?.is_dir() {
+        if e.kind != EntryKind::Dir {
             continue;
         }
         let Some(hint) = e
+            .path
             .file_name()
-            .to_str()
+            .and_then(|name| name.to_str())
             .and_then(|s| s.parse::<SpecificationVersion>().ok())
         else {
             continue;
         };
         if hint.edition == target.edition {
-            folders.push((hint, e.path()));
+            folders.push((hint, e.path));
         }
     }
     folders.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -172,20 +202,22 @@ fn resolve_pair_with_policy(
     for (_, folder) in folders {
         let fc_dir = folder.join("FC");
         let pc_dir = folder.join("PC");
-        if !fc_dir.is_dir() || !pc_dir.is_dir() {
+        if !data.is_dir(&fc_dir) || !data.is_dir(&pc_dir) {
             continue;
         }
         let mut files: Vec<PathBuf> = Vec::new();
-        for (n, e) in std::fs::read_dir(&fc_dir)?.enumerate() {
+        for (n, e) in data.read_dir(&fc_dir)?.into_iter().enumerate() {
             ensure!(n < 256, "Installed FC inventory exceeds256 entries");
-            let e = e?;
-            if e.file_type()?.is_file()
-                && e.path()
+            if e.kind == EntryKind::File
+                && e.path
                     .extension()
                     .is_some_and(|x| x.eq_ignore_ascii_case("xml"))
-                && !e.file_name().as_encoded_bytes().starts_with(b"._")
+                && !e
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().starts_with(b"._"))
             {
-                files.push(e.path());
+                files.push(e.path);
             }
         }
         ensure!(
@@ -193,10 +225,24 @@ fn resolve_pair_with_policy(
             "SSE131: {} needs exactly one explicit FC XML",
             fc_dir.display()
         );
-        let fc = FeatureCatalogue::load_bound(&files[0])
-            .with_context(|| format!("Installed FC could not be read: {}", files[0].display()))?;
-        let pc = PortrayalCatalogue::load_bound(&pc_dir)
-            .with_context(|| format!("Installed PC could not be read: {}", pc_dir.display()))?;
+        let (fc, pc) = if data.local_paths() {
+            (
+                FeatureCatalogue::load_bound(&files[0]),
+                PortrayalCatalogue::load_bound(&pc_dir),
+            )
+        } else {
+            (
+                data.read_limited(&files[0], FeatureCatalogue::MAX_XML_SIZE)
+                    .map_err(ferrite_feature_catalog::FCError::from)
+                    .and_then(|bytes| FeatureCatalogue::bound_from_bytes(&files[0], &bytes)),
+                data.portrayal_sources(&pc_dir)
+                    .and_then(|sources| PortrayalCatalogue::bound_from_sources(&pc_dir, sources)),
+            )
+        };
+        let fc =
+            fc.with_context(|| format!("Installed FC could not be read: {}", files[0].display()))?;
+        let pc =
+            pc.with_context(|| format!("Installed PC could not be read: {}", pc_dir.display()))?;
         if !pair_matches(
             target,
             &fc.product_id,
@@ -337,6 +383,17 @@ impl DatasetCatalogueRegistry {
         fallback: std::sync::Arc<DatasetCatalogueOwner>,
         inventory: &Path,
     ) -> Result<Self> {
+        self.stage_in(&NativeDataSource, requests, fallback, inventory)
+    }
+    /// [`DatasetCatalogueRegistry::stage`] reading the installed inventory
+    /// through a data source.
+    pub fn stage_in(
+        &self,
+        data: &dyn DataSource,
+        requests: &[DatasetCatalogueRequest],
+        fallback: std::sync::Arc<DatasetCatalogueOwner>,
+        inventory: &Path,
+    ) -> Result<Self> {
         ensure!(
             requests.len() <= 4096 && self.bindings.len() <= 4096,
             "Dataset catalogue registry limit exceeded"
@@ -406,7 +463,14 @@ impl DatasetCatalogueRegistry {
                     .iter()
                     .map(|r| r.identification.clone())
                     .collect();
-                match resolve_pair_exact_first(&ids, &[], &fallback.fc, &fallback.pc, inventory)? {
+                match resolve_pair_exact_first_in(
+                    data,
+                    &ids,
+                    &[],
+                    &fallback.fc,
+                    &fallback.pc,
+                    inventory,
+                )? {
                     Selection::KeepCurrent => std::sync::Arc::clone(&fallback),
                     Selection::UseInstalled { fc, pc, .. } => {
                         std::sync::Arc::new(DatasetCatalogueOwner::new(
@@ -662,6 +726,65 @@ mod tests {
         };
         assert_eq!(fc.version, "2.0.1");
         assert_eq!(pc.version, "2.0.1");
+    }
+    #[test]
+    fn inventory_in_a_memory_source_selects_like_the_folder() {
+        let f = Fixture::new();
+        let (fc, pc) = f.pair("current", "1.0.2", "1.0.2");
+        f.pair("inventory/2.2.0", "2.2.0", "2.2.0");
+        f.pair("inventory/2.0.1", "2.0.1", "2.0.1");
+        let mut memory = crate::platform::MemoryDataSource::new();
+        memory
+            .copy_tree(
+                &NativeDataSource,
+                &f.root.join("inventory"),
+                Path::new("/mem/inventory"),
+            )
+            .unwrap();
+        // The folder is gone: only the memory copy can be selected from.
+        drop(f);
+        let Selection::UseInstalled {
+            fc: installed_fc,
+            pc: installed_pc,
+            ..
+        } = resolve_pair_exact_first_in(
+            &memory,
+            &[d("2.0.9")],
+            &[],
+            &fc,
+            &pc,
+            Path::new("/mem/inventory"),
+        )
+        .unwrap()
+        else {
+            panic!("expected new owner")
+        };
+        assert_eq!(installed_fc.version, "2.0.1");
+        assert_eq!(installed_pc.version, "2.0.1");
+        assert_eq!(
+            installed_fc.source_path,
+            Path::new("/mem/inventory/2.0.1/FC/FC.xml")
+        );
+        let fallback = std::sync::Arc::new(
+            DatasetCatalogueOwner::new(std::sync::Arc::new(fc), std::sync::Arc::new(pc)).unwrap(),
+        );
+        let staged = DatasetCatalogueRegistry::default()
+            .stage_in(
+                &memory,
+                &[request("SHOM", "2.0", 2)],
+                fallback.clone(),
+                Path::new("/mem/inventory"),
+            )
+            .unwrap();
+        assert_eq!(staged.owner_for("SHOM").unwrap().fc().version, "2.0.1");
+        assert!(DatasetCatalogueRegistry::default()
+            .stage_in(
+                &memory,
+                &[request("SHOM", "2.0", 2)],
+                fallback,
+                Path::new("/mem/absent"),
+            )
+            .is_err());
     }
     #[test]
     fn checkpoint_rejects_source_change_removal_and_fresh_equal_digest_owner() {

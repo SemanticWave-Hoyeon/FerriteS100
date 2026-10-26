@@ -690,6 +690,54 @@ impl PortrayalEngine {
         self.process_cell_with_loader(context, |session| session.set_owned_cell_data(cell_data))
     }
 
+    /// [`Self::process_owned_cell`] that also records the raw Part 9a strings
+    /// the rules hand to `HostPortrayalEmit` (feature reference, drawing
+    /// instructions, observed context parameters) in emission order, to
+    /// compare interpreter builds (native and WebAssembly) byte for byte.
+    pub fn process_owned_cell_recording(
+        &mut self,
+        cell_data: CellData,
+        context: ContextParameters,
+    ) -> Result<(Vec<PortrayalResult>, Vec<[String; 3]>)> {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&emitted);
+        let results = self.process_cell_with_loader(context, move |session| {
+            session.set_owned_cell_data(cell_data)?;
+            let lua = session.lua();
+            let globals = lua.globals();
+            let emit: mlua::Function = globals.raw_get("HostPortrayalEmit")?;
+            let record = lua.create_function(
+                move |_,
+                      (feature, instructions, observed): (
+                    mlua::String,
+                    mlua::String,
+                    mlua::String,
+                )| {
+                    let text =
+                        |s: &mlua::String| String::from_utf8_lossy(&s.as_bytes()).into_owned();
+                    sink.lock()
+                        .map_err(|_| mlua::Error::external("Part 9a record lock poisoned"))?
+                        .push([text(&feature), text(&instructions), text(&observed)]);
+                    Ok(())
+                },
+            )?;
+            let wrapper = lua
+                .load(
+                    "local emit, record = ...\n\
+                     return function(f, i, o) record(f, i, o) return emit(f, i, o) end",
+                )
+                .call::<mlua::Function>((emit, record))?;
+            globals.raw_set("HostPortrayalEmit", wrapper)?;
+            Ok(())
+        })?;
+        let emitted = std::mem::take(
+            &mut *emitted
+                .lock()
+                .map_err(|_| LuaError::Portrayal("Part 9a record lock poisoned".into()))?,
+        );
+        Ok((results, emitted))
+    }
+
     fn process_cell_with_loader(
         &mut self,
         context: ContextParameters,

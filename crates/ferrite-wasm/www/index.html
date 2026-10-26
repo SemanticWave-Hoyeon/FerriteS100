@@ -39,7 +39,7 @@
   <h1>Ferrite S-100 Web</h1>
   <div style="color:var(--muted)">ChartEngine in WebAssembly, drawn by ferrite-gpu.</div>
   <h2>Data</h2>
-  <div id="drop">Drop S-124 / S-129 GML, S-101 cells and<br><code>.ferrite_pre_*</code> payloads here
+  <div id="drop">Drop S-101 cells, S-124 / S-129 GML and<br>optional <code>.ferrite_pre_*</code> payloads here
     <div class="row" style="justify-content:center">
       <label><input id="files" type="file" multiple hidden><button id="pick-files" type="button">Choose files</button></label>
       <button id="samples" type="button">Load samples</button>
@@ -48,6 +48,11 @@
   <div class="row">
     <label>Palette <select id="palette"></select></label>
     <button id="fit" type="button">Fit</button>
+  </div>
+  <div class="row">
+    <label>S-101 <select id="portrayal">
+      <option value="auto">Auto</option><option value="lua">Lua (in browser)</option><option value="precomputed">Precomputed</option>
+    </select></label>
   </div>
   <div class="row">
     <label>Backend <select id="backend">

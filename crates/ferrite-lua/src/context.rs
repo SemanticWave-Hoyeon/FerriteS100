@@ -1044,7 +1044,7 @@ mod curve_conversion_benchmark {
         let mut samples = [Vec::new(), Vec::new()];
         for round in 0..8 {
             for mode in [0, 1, 1, 0] {
-                let start = std::time::Instant::now();
+                let start = ferrite_kernel::time::Instant::now();
                 let result = collect(mode);
                 let elapsed = start.elapsed().as_secs_f64() * 1000.;
                 let bits: Vec<Vec<_>> = result

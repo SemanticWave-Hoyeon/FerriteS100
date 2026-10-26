@@ -1,9 +1,6 @@
 //! Encoded axis and publication metadata; never a request to transpose raw values.
+use crate::h5::{FixedAscii, FixedUnicode, Group, TypeDescriptor, VarLenAscii, VarLenUnicode};
 use anyhow::{ensure, Context, Result};
-use hdf5::{
-    types::{FixedAscii, FixedUnicode, TypeDescriptor, VarLenAscii, VarLenUnicode},
-    Group,
-};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisNamesOrder {
     ArrayMajorFirst,
@@ -30,8 +27,7 @@ impl AxisMetadata {
             d.shape() == [2],
             "S102 axisNames must be one-dimensional with two entries"
         );
-        let ty = d.dtype()?;
-        let desc = ty.to_descriptor()?;
+        let desc = d.dtype()?.to_descriptor()?;
         let variable = matches!(
             desc,
             TypeDescriptor::VarLenAscii | TypeDescriptor::VarLenUnicode
@@ -41,16 +37,9 @@ impl AxisMetadata {
             TypeDescriptor::VarLenAscii | TypeDescriptor::FixedAscii(_)
         );
         if variable {
-            let space = d.space()?;
-            let mut bytes = 0;
-            // IDs remain owned/live, and the same HDF5 recursive lock covers this FFI.
-            let result = hdf5::sync::sync(|| unsafe {
-                hdf5_sys::h5d::H5Dvlen_get_buf_size(d.id(), ty.id(), space.id(), &mut bytes)
-            });
-            ensure!(
-                result >= 0,
-                "Cannot forecast axisNames variable string size"
-            );
+            let bytes = d
+                .vlen_buf_size()
+                .context("Cannot forecast axisNames variable string size")?;
             ensure!(
                 bytes <= 130,
                 "axisNames variable payload exceeds supported130 bytes"
@@ -187,9 +176,13 @@ fn validate_basic_time(value: &str) -> Result<()> {
     );
     Ok(())
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{FixedAscii, FixedUnicode, VarLenAscii, VarLenUnicode};
+    #[allow(unused_imports)]
+    use hdf5::Group;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     struct File(std::path::PathBuf, hdf5::File);
@@ -228,7 +221,7 @@ mod tests {
             let f = file();
             text(&f.1, "issueDate", d);
             assert_eq!(
-                IssueMetadata::read(&f.1).unwrap(),
+                IssueMetadata::read(&crate::w(&f.1)).unwrap(),
                 IssueMetadata {
                     date: d.into(),
                     time: None
@@ -249,7 +242,7 @@ mod tests {
             let f = file();
             text(&f.1, "issueDate", "20240229");
             text(&f.1, "issueTime", t);
-            let a = IssueMetadata::read(&f.1).unwrap();
+            let a = IssueMetadata::read(&crate::w(&f.1)).unwrap();
             assert_eq!(a.date, "20240229");
             assert_eq!(a.time.as_deref(), Some(t));
         }
@@ -257,7 +250,7 @@ mod tests {
     #[test]
     fn missing_non_scalar_incomplete_and_invalid_publication_metadata_rejected() {
         let f = file();
-        assert!(IssueMetadata::read(&f.1).is_err());
+        assert!(IssueMetadata::read(&crate::w(&f.1)).is_err());
         for d in [
             "20230229",
             "20240230",
@@ -269,7 +262,7 @@ mod tests {
         ] {
             let f = file();
             text(&f.1, "issueDate", d);
-            assert!(IssueMetadata::read(&f.1).is_err(), "{d}");
+            assert!(IssueMetadata::read(&crate::w(&f.1)).is_err(), "{d}");
         }
         for t in [
             "25",
@@ -285,7 +278,7 @@ mod tests {
             let f = file();
             text(&f.1, "issueDate", "20240229");
             text(&f.1, "issueTime", t);
-            assert!(IssueMetadata::read(&f.1).is_err(), "{t}");
+            assert!(IssueMetadata::read(&crate::w(&f.1)).is_err(), "{t}");
         }
         // A single-element array (UKHO 2026) is admitted as the scalar value;
         // any other shape remains rejected.
@@ -296,7 +289,10 @@ mod tests {
             .unwrap()
             .write_raw(&[VarLenAscii::from_ascii("20240229").unwrap()])
             .unwrap();
-        assert_eq!(IssueMetadata::read(&f.1).unwrap().date, "20240229");
+        assert_eq!(
+            IssueMetadata::read(&crate::w(&f.1)).unwrap().date,
+            "20240229"
+        );
         let f = file();
         f.1.new_attr::<VarLenAscii>()
             .shape(2)
@@ -307,7 +303,7 @@ mod tests {
                 VarLenAscii::from_ascii("20240301").unwrap(),
             ])
             .unwrap();
-        assert!(IssueMetadata::read(&f.1).is_err());
+        assert!(IssueMetadata::read(&crate::w(&f.1)).is_err());
     }
     #[test]
     fn geographic_and_projected_axis_order_is_preserved_and_diagnosed() {
@@ -320,13 +316,13 @@ mod tests {
         ] {
             let f = file();
             axes(&f.1, names);
-            let a = AxisMetadata::read(&f.1, crs).unwrap();
+            let a = AxisMetadata::read(&crate::w(&f.1), crs).unwrap();
             assert_eq!(a.names, names);
             assert_eq!(a.order, AxisNamesOrder::ScanFastFirst);
             assert!(!a.matches_generic_array_major_order());
             let f = file();
             axes(&f.1, [names[1], names[0]]);
-            assert!(AxisMetadata::read(&f.1, crs)
+            assert!(AxisMetadata::read(&crate::w(&f.1), crs)
                 .unwrap()
                 .matches_generic_array_major_order());
         }
@@ -340,7 +336,11 @@ mod tests {
             .unwrap()
             .write_raw(&["Latitude", "Longitude"].map(|v| v.parse::<VarLenUnicode>().unwrap()))
             .unwrap();
-        assert!(AxisMetadata::read(&f.1, 4326).unwrap().variable_length);
+        assert!(
+            AxisMetadata::read(&crate::w(&f.1), 4326)
+                .unwrap()
+                .variable_length
+        );
         let f = file();
         f.1.new_dataset::<FixedAscii<12>>()
             .shape(2)
@@ -348,7 +348,11 @@ mod tests {
             .unwrap()
             .write_raw(&["Latitude", "Longitude"].map(|v| FixedAscii::<12>::from_ascii(v).unwrap()))
             .unwrap();
-        assert!(!AxisMetadata::read(&f.1, 4326).unwrap().variable_length);
+        assert!(
+            !AxisMetadata::read(&crate::w(&f.1), 4326)
+                .unwrap()
+                .variable_length
+        );
         for names in [
             ["latitude", "longitude"],
             ["X", "Y"],
@@ -358,37 +362,41 @@ mod tests {
         ] {
             let f = file();
             axes(&f.1, names);
-            assert!(AxisMetadata::read(&f.1, 4326).is_err());
+            assert!(AxisMetadata::read(&crate::w(&f.1), 4326).is_err());
         }
     }
     #[test]
     fn dataset_admission_checks_shape_type_and_variable_payload_before_decode() {
         let f = file();
-        assert!(AxisMetadata::read(&f.1, 4326).is_err());
+        assert!(AxisMetadata::read(&crate::w(&f.1), 4326).is_err());
         let f = file();
         f.1.new_dataset::<u32>()
             .shape(2)
             .create("axisNames")
             .unwrap();
-        assert!(AxisMetadata::read(&f.1, 4326).is_err());
+        assert!(AxisMetadata::read(&crate::w(&f.1), 4326).is_err());
         let f = file();
         f.1.new_dataset::<VarLenAscii>()
             .shape([1, 2])
             .create("axisNames")
             .unwrap();
-        assert!(AxisMetadata::read(&f.1, 4326).is_err());
+        assert!(AxisMetadata::read(&crate::w(&f.1), 4326).is_err());
         let f = file();
         axes(&f.1, [&"a".repeat(1000), "Latitude"]);
-        assert!(AxisMetadata::read(&f.1, 4326)
+        assert!(AxisMetadata::read(&crate::w(&f.1), 4326)
             .unwrap_err()
             .to_string()
             .contains("variable payload"));
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod invalid_encoding_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{FixedAscii, FixedUnicode, VarLenAscii, VarLenUnicode};
+    #[allow(unused_imports)]
+    use hdf5::Group;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     struct File(std::path::PathBuf, hdf5::File);
@@ -425,7 +433,7 @@ mod invalid_encoding_tests {
             .unwrap()
             .write_scalar(&VarLenAscii::from_ascii(&huge).unwrap())
             .unwrap();
-        assert!(crate::string_attr(&f.1, "issueDate")
+        assert!(crate::string_attr(&crate::w(&f.1), "issueDate")
             .unwrap_err()
             .to_string()
             .contains("string exceeds"));
@@ -442,7 +450,7 @@ mod invalid_encoding_tests {
             hdf5_sys::h5a::H5Awrite(a.id(), ty.id(), (&ptr as *const *const u8).cast())
         });
         assert!(status >= 0);
-        assert!(crate::string_attr(&f.1, "issueDate")
+        assert!(crate::string_attr(&crate::w(&f.1), "issueDate")
             .unwrap_err()
             .to_string()
             .contains("UTF8"));
@@ -470,7 +478,7 @@ mod invalid_encoding_tests {
             )
         });
         assert!(status >= 0);
-        assert!(AxisMetadata::read(&f.1, 4326)
+        assert!(AxisMetadata::read(&crate::w(&f.1), 4326)
             .unwrap_err()
             .to_string()
             .contains("UTF8"));

@@ -14,12 +14,17 @@ parallel = ["ferrite-kernel/parallel", "ferrite-render/parallel", "ferrite-s101/
 # mlua S-101 portrayal (needs lua54 or lua55, which select the interpreter).
 # Off: S-101 cells are portrayed from precomputed per-cell instruction
 # payloads in the cache store (`PortrayalSource::Precomputed`).
-lua-native = ["ferrite-lua/native"]
+lua-native = ["ferrite-lua/native", "ferrite-s102?/lua-native"]
 lua54 = ["lua-native", "ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102?/lua54"]
 lua55 = ["lua-native", "ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102?/lua55"]
-# S-102 bathymetry (HDF5, C library; its portrayal needs lua-native). Off:
-# S-102 inputs are reported as unsupported.
-s102-hdf5 = ["dep:ferrite-s102", "lua-native"]
+# S-102 bathymetry with the pure-Rust HDF5 reader only (no C library;
+# builds for wasm32). Without lua-native the PC rule's instructions come
+# from the cache store (precomputed). Off (with s102-hdf5): S-102 inputs
+# are reported as unsupported.
+s102-pure = ["dep:ferrite-s102"]
+# S-102 with the HDF5 C library as the reader for local paths (the viewer's
+# native reader) and Lua rule evaluation; implies s102-pure.
+s102-hdf5 = ["s102-pure", "ferrite-s102/hdf5", "lua-native"]
 # Signature backends of ferrite-security; at least one is required.
 # OpenSSL (C, vendored) is the default; crypto-rust alone builds without
 # OpenSSL, with both OpenSSL stays the default (`CryptoBackend::Rust` selectable).

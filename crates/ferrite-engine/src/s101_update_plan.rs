@@ -1,10 +1,19 @@
 //! Application exchange-set planning. The core owns transactional materialization;
 //! this module only selects a complete edition/reissue chain from authorized inputs.
+//!
+//! Inputs are read through a [`DataSource`]: the path-based functions use the
+//! local file system ([`NativeDataSource`], private snapshot files exactly as
+//! before) and the `_in` variants any source. Sources without local files
+//! retain owned bytes instead of snapshot files; paths stay the identity of
+//! inputs (authorization keys, lifecycle metadata, cell source paths).
+use crate::platform::{DataSource, EntryKind, NativeDataSource};
+use crate::s101_lifecycle_metadata::RetainedInput;
 use anyhow::{ensure, Context, Result};
 use ferrite_s100_core::{DatasetIdentification, S101Cell};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 const MAX_INPUTS: usize = 4096;
@@ -36,6 +45,15 @@ fn stem(path: &Path) -> Result<String> {
 /// A selected update also needs its base and predecessors. Loaded bases are
 /// candidates, never substitutes for newly authenticated/parsed input bytes.
 pub fn expand_candidates(selected: &[PathBuf], loaded: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    expand_candidates_in(&NativeDataSource, selected, loaded)
+}
+
+/// [`expand_candidates`] over any data source (its canonical paths).
+pub fn expand_candidates_in(
+    data: &dyn DataSource,
+    selected: &[PathBuf],
+    loaded: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let names: BTreeSet<_> = selected.iter().map(|p| stem(p)).collect::<Result<_>>()?;
     let mut roots = selected.to_vec();
     roots.extend(
@@ -49,8 +67,12 @@ pub fn expand_candidates(selected: &[PathBuf], loaded: &[PathBuf]) -> Result<Vec
     for path in roots {
         let name = stem(&path)?;
         // Canonicalize the selected input for authorization keys and deduplication.
-        ensure!(path.is_file(), "Missing chart input: {}", path.display());
-        inputs.insert(path.canonicalize()?);
+        ensure!(
+            data.is_file(&path),
+            "Missing chart input: {}",
+            path.display()
+        );
+        inputs.insert(data.canonicalize(&path)?);
         folders
             .entry(path.parent().unwrap_or(Path::new(".")).to_path_buf())
             .or_default()
@@ -58,17 +80,18 @@ pub fn expand_candidates(selected: &[PathBuf], loaded: &[PathBuf]) -> Result<Vec
     }
     let mut count = 0usize;
     for (folder, names) in folders {
-        for entry in std::fs::read_dir(folder)? {
-            let entry = entry?;
+        for entry in data.read_dir(&folder)? {
             count += 1;
             ensure!(
                 count <= MAX_ENTRIES,
                 "S-101 sibling discovery exceeds entry limit"
             );
-            let path = entry.path();
-            if entry.file_type()?.is_file() && is_chart_file(&path) && names.contains(&stem(&path)?)
+            let path = entry.path;
+            if entry.kind == EntryKind::File
+                && is_chart_file(&path)
+                && names.contains(&stem(&path)?)
             {
-                inputs.insert(path.canonicalize()?);
+                inputs.insert(data.canonicalize(&path)?);
                 ensure!(inputs.len() <= MAX_INPUTS, "Too many S-101 chain inputs");
             }
         }
@@ -79,10 +102,14 @@ pub fn expand_candidates(selected: &[PathBuf], loaded: &[PathBuf]) -> Result<Vec
 
 pub struct Input {
     pub original: PathBuf,
+    /// Private snapshot file of a local source (empty when the input is
+    /// retained as bytes).
     pub data: PathBuf,
     pub id: DatasetIdentification,
     pub metadata: Option<crate::s101_lifecycle_metadata::MetadataEvidence>,
     _snapshot: Option<std::sync::Arc<ferrite_security::UnauthenticatedSnapshot>>,
+    /// Owned private copy of an input from a source without local files.
+    memory: Option<Arc<[u8]>>,
     data_length: u64,
     data_sha256: [u8; 32],
 }
@@ -109,7 +136,23 @@ pub fn authorized_plans(
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
 ) -> Result<Vec<Plan>> {
-    let (inputs, cancellations) = authorized_inputs(candidates, authorization, require_signature)?;
+    authorized_plans_in(
+        &NativeDataSource,
+        candidates,
+        authorization,
+        require_signature,
+    )
+}
+/// [`authorized_plans`] over any data source.
+#[cfg(any(test, feature = "test-support"))]
+pub fn authorized_plans_in(
+    data: &dyn DataSource,
+    candidates: Vec<PathBuf>,
+    authorization: &ferrite_security::AuthorizedDatasets,
+    require_signature: bool,
+) -> Result<Vec<Plan>> {
+    let (inputs, cancellations) =
+        authorized_inputs(data, candidates, authorization, require_signature)?;
     ensure!(
         cancellations.is_empty(),
         "Cancellation datasets require the explicit App removal operation"
@@ -124,9 +167,13 @@ pub struct CancellationPlan {
     previous_issue_date: Option<chrono::NaiveDate>,
 }
 impl CancellationPlan {
+    /// The selected cancellation input (its canonical path).
+    pub fn original(&self) -> &Path {
+        &self.input.original
+    }
     pub fn load(self) -> Result<crate::chart_publication::ValidatedRemoval> {
         self.input.verify_captured()?;
-        let bytes = read_cancellation_bytes(&self.input.data)?;
+        let bytes = self.input.cancellation_bytes()?;
         let cancellation =
             parse_captured_cancellation(&bytes, self.input.data_length, self.input.data_sha256)?;
         let metadata = self
@@ -187,26 +234,50 @@ fn parse_captured_cancellation(
 }
 /// Cancellation is considered only when explicitly selected, never triggered
 /// by discovering an old cancellation sibling while opening a different base.
+/// Loaded logical datasets a batch is planned against: identification,
+/// captured source identity and retained ending lifecycle metadata.
+pub type LoadedDatasets = BTreeMap<
+    (String, String),
+    (
+        DatasetIdentification,
+        ferrite_s100_core::CellSourceIdentity,
+        Option<crate::s101_lifecycle_metadata::MetadataEvidence>,
+    ),
+>;
 pub fn authorized_batch(
     candidates: Vec<PathBuf>,
     selected: &[PathBuf],
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
-    loaded: &BTreeMap<
-        (String, String),
-        (
-            DatasetIdentification,
-            ferrite_s100_core::CellSourceIdentity,
-            Option<crate::s101_lifecycle_metadata::MetadataEvidence>,
-        ),
-    >,
+    loaded: &LoadedDatasets,
+    history: &crate::chart_publication::CancellationHistory,
+) -> Result<(Vec<Plan>, Vec<CancellationPlan>)> {
+    authorized_batch_in(
+        &NativeDataSource,
+        candidates,
+        selected,
+        authorization,
+        require_signature,
+        loaded,
+        history,
+    )
+}
+/// [`authorized_batch`] over any data source.
+pub fn authorized_batch_in(
+    data: &dyn DataSource,
+    candidates: Vec<PathBuf>,
+    selected: &[PathBuf],
+    authorization: &ferrite_security::AuthorizedDatasets,
+    require_signature: bool,
+    loaded: &LoadedDatasets,
     history: &crate::chart_publication::CancellationHistory,
 ) -> Result<(Vec<Plan>, Vec<CancellationPlan>)> {
     let selected = selected
         .iter()
-        .map(|p| p.canonicalize())
+        .map(|p| data.canonicalize(p))
         .collect::<std::io::Result<BTreeSet<_>>>()?;
-    let (mut ordinary, physical) = authorized_inputs(candidates, authorization, require_signature)?;
+    let (mut ordinary, physical) =
+        authorized_inputs(data, candidates, authorization, require_signature)?;
     let mut cancellations = Vec::new();
     let mut cancelled = BTreeSet::new();
     for input in physical
@@ -225,60 +296,13 @@ pub fn authorized_batch(
                     && dataset_key(&ordinary.id).is_ok_and(|k| k == key)),
             "Apply the complete base/update chain before selecting its cancellation"
         );
-        if !loaded.contains_key(&key) {
-            let metadata = input
-                .metadata
-                .as_ref()
-                .context("Cancellation needs captured catalogue metadata")?;
-            ensure!(
-                !require_signature || metadata.is_authenticated(),
-                "Cancellation metadata is not authenticated"
-            );
-            let physical = parse_captured_cancellation(
-                &read_cancellation_bytes(&input.data)?,
-                input.data_length,
-                input.data_sha256,
-            )?;
-            let product = ferrite_s101::cancellation::CancellationMetadata::new(
-                metadata.edition,
-                metadata.update,
-                &metadata.issue_date.format("%Y-%m-%d").to_string(),
-            )?;
-            let announcement = crate::chart_publication::ValidatedRemoval::announcement(
-                &physical,
-                &product,
-                metadata.purpose,
-            )?;
-            history.validate_cancellation(announcement.record())?;
-            cancellations.push(CancellationPlan {
-                input,
-                target: None,
-                target_identity: None,
-                previous_issue_date: None,
-            });
-            continue;
-        }
-        let (target, identity, previous) = loaded.get(&key).expect("Checked above");
-        let previous = previous.as_ref().context(
-            "Loaded target has no retained producer issueDate; reopen a valid exchange set",
-        )?;
-        let metadata = input
-            .metadata
-            .as_ref()
-            .context("Cancellation needs catalogue edition, purpose, update and issueDate")?;
-        ensure!(!require_signature || (previous.is_authenticated() && metadata.is_authenticated()),
-            "Signature ON cannot use previously unchecked issueDate evidence; reopen the target with verification ON");
-        ensure!(
-            previous.edition == u32::from(target.edition_number)
-                && previous.update == Some(u32::from(target.update_number)),
-            "Retained ending metadata does not match cancellation target edition/update"
-        );
-        cancellations.push(CancellationPlan {
+        cancellations.push(cancellation_plan(
             input,
-            target: Some(target.clone()),
-            target_identity: Some(*identity),
-            previous_issue_date: Some(previous.issue_date),
-        });
+            key,
+            require_signature,
+            loaded,
+            history,
+        )?);
     }
     ordinary.retain(|input| !dataset_key(&input.id).is_ok_and(|key| cancelled.contains(&key)));
     let plans = plans(ordinary)?;
@@ -296,14 +320,180 @@ pub fn authorized_batch(
     }
     Ok((plans, cancellations))
 }
+/// Validate one explicitly selected physical cancellation against the loaded
+/// target (or as an announcement when nothing of it is loaded) and history.
+fn cancellation_plan(
+    input: Input,
+    key: (String, String),
+    require_signature: bool,
+    loaded: &LoadedDatasets,
+    history: &crate::chart_publication::CancellationHistory,
+) -> Result<CancellationPlan> {
+    if !loaded.contains_key(&key) {
+        let metadata = input
+            .metadata
+            .as_ref()
+            .context("Cancellation needs captured catalogue metadata")?;
+        ensure!(
+            !require_signature || metadata.is_authenticated(),
+            "Cancellation metadata is not authenticated"
+        );
+        let physical = parse_captured_cancellation(
+            &input.cancellation_bytes()?,
+            input.data_length,
+            input.data_sha256,
+        )?;
+        let product = ferrite_s101::cancellation::CancellationMetadata::new(
+            metadata.edition,
+            metadata.update,
+            &metadata.issue_date.format("%Y-%m-%d").to_string(),
+        )?;
+        let announcement = crate::chart_publication::ValidatedRemoval::announcement(
+            &physical,
+            &product,
+            metadata.purpose,
+        )?;
+        history.validate_cancellation(announcement.record())?;
+        return Ok(CancellationPlan {
+            input,
+            target: None,
+            target_identity: None,
+            previous_issue_date: None,
+        });
+    }
+    let (target, identity, previous) = loaded.get(&key).expect("Checked above");
+    let previous = previous
+        .as_ref()
+        .context("Loaded target has no retained producer issueDate; reopen a valid exchange set")?;
+    let metadata = input
+        .metadata
+        .as_ref()
+        .context("Cancellation needs catalogue edition, purpose, update and issueDate")?;
+    ensure!(!require_signature || (previous.is_authenticated() && metadata.is_authenticated()),
+        "Signature ON cannot use previously unchecked issueDate evidence; reopen the target with verification ON");
+    ensure!(
+        previous.edition == u32::from(target.edition_number)
+            && previous.update == Some(u32::from(target.update_number)),
+        "Retained ending metadata does not match cancellation target edition/update"
+    );
+    Ok(CancellationPlan {
+        input,
+        target: Some(target.clone()),
+        target_identity: Some(*identity),
+        previous_issue_date: Some(previous.issue_date),
+    })
+}
 /// Folder discovery is not an explicit cancellation operation. Capture each
 /// authorized original once, then isolate failures by logical dataset; successful
 /// groups still use the existing edition/reissue/duplicate/chain planner.
 pub fn authorized_folder_plans(
-    mut candidates: Vec<PathBuf>,
+    candidates: Vec<PathBuf>,
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
 ) -> Result<(Vec<Plan>, Vec<String>)> {
+    authorized_folder_plans_in(
+        &NativeDataSource,
+        candidates,
+        authorization,
+        require_signature,
+    )
+}
+/// [`authorized_folder_plans`] over any data source.
+pub fn authorized_folder_plans_in(
+    data: &dyn DataSource,
+    candidates: Vec<PathBuf>,
+    authorization: &ferrite_security::AuthorizedDatasets,
+    require_signature: bool,
+) -> Result<(Vec<Plan>, Vec<String>)> {
+    let (plans, _, notices) =
+        folder_inputs(data, candidates, authorization, require_signature, false)?;
+    Ok((plans, notices))
+}
+/// Plans of an explicit selection with folder isolation: the candidates
+/// (the selection expanded by [`expand_candidates_in`]) are planned as
+/// [`authorized_folder_plans_in`] does (failures become notices, per logical
+/// dataset). Physical cancellations among the `selected` inputs are validated
+/// against `loaded` and `history` as [`authorized_batch_in`] does, and the
+/// other inputs of their dataset are not planned; a rejected cancellation, or
+/// one whose dataset also has a selected ordinary input, is skipped with a
+/// notice. Plans of names in the cancellation history need a newer issueDate.
+#[allow(clippy::too_many_arguments)]
+pub fn authorized_selection_plans_in(
+    data: &dyn DataSource,
+    candidates: Vec<PathBuf>,
+    selected: &[PathBuf],
+    authorization: &ferrite_security::AuthorizedDatasets,
+    require_signature: bool,
+    loaded: &LoadedDatasets,
+    history: &crate::chart_publication::CancellationHistory,
+) -> Result<(Vec<Plan>, Vec<CancellationPlan>, Vec<String>)> {
+    let selected = selected
+        .iter()
+        .map(|p| data.canonicalize(p))
+        .collect::<std::io::Result<BTreeSet<_>>>()?;
+    let (mut plans, physical, mut notices) =
+        folder_inputs(data, candidates, authorization, require_signature, true)?;
+    let mut cancellations = Vec::new();
+    let mut cancelled = BTreeSet::new();
+    for input in physical {
+        let original = input.original.clone();
+        if !selected.contains(&original) {
+            notices.push(format!(
+                "Skipped discovered cancellation (explicit selection required): {}",
+                original.display()
+            ));
+            continue;
+        }
+        let planned = (|| -> Result<CancellationPlan> {
+            let key = dataset_key(&input.id)?;
+            ensure!(
+                !cancelled.contains(&key),
+                "Duplicate cancellation of one logical dataset"
+            );
+            ensure!(
+                !plans.iter().any(|plan| {
+                    dataset_key(&plan.base.id).is_ok_and(|k| k == key)
+                        && plan.input_paths().iter().any(|p| selected.contains(p))
+                }),
+                "Apply the complete base/update chain before selecting its cancellation"
+            );
+            cancelled.insert(key.clone());
+            cancellation_plan(input, key, require_signature, loaded, history)
+        })();
+        match planned {
+            Ok(plan) => cancellations.push(plan),
+            Err(error) => notices.push(format!(
+                "Skipped S-101 cancellation {}: {error:#}",
+                original.display()
+            )),
+        }
+    }
+    plans.retain(|plan| !dataset_key(&plan.base.id).is_ok_and(|key| cancelled.contains(&key)));
+    let mut ready = Vec::new();
+    for plan in plans {
+        match history.validate_reuse(
+            &plan.base.id,
+            plan.base.metadata.as_ref().map(|m| m.issue_date),
+        ) {
+            Ok(()) => ready.push(plan),
+            Err(error) => notices.push(format!(
+                "Skipped S-101 dataset {}: {error:#}",
+                plan.base.original.display()
+            )),
+        }
+    }
+    Ok((ready, cancellations, notices))
+}
+/// Capture each folder candidate once with the shared budget: planned
+/// ordinary groups, the physical cancellations (`selected`; otherwise each is
+/// a skip notice) and notices of skipped inputs and groups.
+fn folder_inputs(
+    data: &dyn DataSource,
+    mut candidates: Vec<PathBuf>,
+    authorization: &ferrite_security::AuthorizedDatasets,
+    require_signature: bool,
+    selected: bool,
+) -> Result<(Vec<Plan>, Vec<Input>, Vec<String>)> {
     ensure!(
         candidates.len() <= MAX_INPUTS,
         "Too many S-101 folder inputs"
@@ -312,9 +502,11 @@ pub fn authorized_folder_plans(
     candidates.dedup();
     let mut remaining = 512u64 * 1024 * 1024;
     let mut captured = Vec::new();
+    let mut physical = Vec::new();
     let mut notices = Vec::new();
     for candidate in candidates {
         match authorized_inputs_with_budget(
+            data,
             vec![candidate.clone()],
             authorization,
             require_signature,
@@ -333,10 +525,14 @@ pub fn authorized_folder_plans(
                     remaining = remaining
                         .checked_sub(input.data_length)
                         .context("Folder snapshot budget accounting mismatch")?;
-                    notices.push(format!(
-                        "Skipped discovered cancellation (explicit selection required): {}",
-                        input.original.display()
-                    ));
+                    if selected {
+                        physical.push(input);
+                    } else {
+                        notices.push(format!(
+                            "Skipped discovered cancellation (explicit selection required): {}",
+                            input.original.display()
+                        ));
+                    }
                 }
             }
             Err(error) => notices.push(format!(
@@ -347,7 +543,7 @@ pub fn authorized_folder_plans(
     }
     let (ready, group_notices) = folder_group_plans(captured)?;
     notices.extend(group_notices);
-    Ok((ready, notices))
+    Ok((ready, physical, notices))
 }
 fn folder_group_plans(inputs: Vec<Input>) -> Result<(Vec<Plan>, Vec<String>)> {
     ensure!(
@@ -376,9 +572,19 @@ fn folder_group_plans(inputs: Vec<Input>) -> Result<(Vec<Plan>, Vec<String>)> {
     }
     Ok((ready, notices))
 }
-fn input_fingerprint(path: &Path, limit: u64) -> Result<(u64, [u8; 32])> {
+fn input_fingerprint(retained: RetainedInput<'_>, limit: u64) -> Result<(u64, [u8; 32])> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
+    let path = match retained {
+        RetainedInput::File(path) => path,
+        RetainedInput::Bytes(bytes) => {
+            ensure!(
+                bytes.len() as u64 <= limit,
+                "S-101 aggregate snapshot budget exceeded"
+            );
+            return Ok((bytes.len() as u64, Sha256::digest(bytes).into()));
+        }
+    };
     let mut file = std::fs::File::open(path)?;
     let mut total = 0u64;
     let mut hash = Sha256::new();
@@ -397,24 +603,67 @@ fn input_fingerprint(path: &Path, limit: u64) -> Result<(u64, [u8; 32])> {
     Ok((total, hash.finalize().into()))
 }
 impl Input {
+    /// The retained private copy: snapshot file or owned bytes.
+    fn retained(&self) -> RetainedInput<'_> {
+        match &self.memory {
+            Some(bytes) => RetainedInput::Bytes(bytes),
+            None => RetainedInput::File(&self.data),
+        }
+    }
     fn verify_captured(&self) -> Result<()> {
         ensure!(
-            input_fingerprint(&self.data, self.data_length)?
+            input_fingerprint(self.retained(), self.data_length)?
                 == (self.data_length, self.data_sha256),
             "Retained S-101 input changed after planning"
         );
         if let Some(metadata) = &self.metadata {
-            metadata.verify_resource(&self.original, &self.data)?;
+            metadata.verify_retained(&self.original, self.retained())?;
         }
         Ok(())
     }
+    fn cancellation_bytes(&self) -> Result<Vec<u8>> {
+        match self.retained() {
+            RetainedInput::File(path) => read_cancellation_bytes(path),
+            RetainedInput::Bytes(bytes) => {
+                ensure!(
+                    bytes.len() <= ferrite_s101::cancellation::MAX_CANCELLATION_BYTES,
+                    "Cancellation input exceeds the receiver size limit"
+                );
+                Ok(bytes.to_vec())
+            }
+        }
+    }
+    /// The retained bytes (a snapshot file is read whole).
+    fn retained_bytes(&self) -> Result<Vec<u8>> {
+        Ok(match self.retained() {
+            RetainedInput::File(path) => std::fs::read(path)?,
+            RetainedInput::Bytes(bytes) => bytes.to_vec(),
+        })
+    }
+}
+/// Bounded owned copy of an unauthenticated input from a source without
+/// local files (the counterpart of `UnauthenticatedSnapshot::copy_bounded`).
+fn copy_bounded_in(data: &dyn DataSource, path: &Path, max_bytes: u64) -> Result<Arc<[u8]>> {
+    ensure!(data.is_file(path), "Snapshot source is not a regular file");
+    ensure!(
+        data.len(path)? <= max_bytes,
+        "Snapshot source exceeds receiver byte budget"
+    );
+    let bytes = data.read_limited(path, max_bytes)?;
+    ensure!(
+        bytes.len() as u64 <= max_bytes,
+        "Snapshot grew beyond receiver byte budget"
+    );
+    Ok(bytes.into())
 }
 fn authorized_inputs(
+    data: &dyn DataSource,
     candidates: Vec<PathBuf>,
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
 ) -> Result<(Vec<Input>, Vec<Input>)> {
     authorized_inputs_with_budget(
+        data,
         candidates,
         authorization,
         require_signature,
@@ -424,6 +673,7 @@ fn authorized_inputs(
 // Same original capture/parse path with the caller's remaining aggregate budget.
 // The legacy wrapper passes its original512MiB; folder calls never reset it.
 fn authorized_inputs_with_budget(
+    source: &dyn DataSource,
     candidates: Vec<PathBuf>,
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
@@ -437,28 +687,51 @@ fn authorized_inputs_with_budget(
     let mut cancellations = Vec::new();
     let mut capture_cache = crate::s101_lifecycle_metadata::CaptureCache::default();
     for path in candidates {
-        let authenticated = crate::dataset_signature_policy::dataset_snapshot(
+        let authenticated = crate::dataset_signature_policy::dataset_snapshot_in(
+            source,
             authorization,
             &path,
             require_signature,
         )?;
-        let unchecked = if authenticated.is_none() {
-            Some(std::sync::Arc::new(
+        let mut memory: Option<Arc<[u8]>> = None;
+        let unchecked = match &authenticated {
+            Some(snapshot) => {
+                memory = snapshot.bytes().map(Arc::from);
+                None
+            }
+            None if source.local_paths() => Some(std::sync::Arc::new(
                 ferrite_security::UnauthenticatedSnapshot::copy_bounded(&path, remaining)?,
-            ))
-        } else {
-            None
+            )),
+            None => {
+                memory = Some(copy_bounded_in(source, &path, remaining)?);
+                None
+            }
         };
-        let data = authenticated
-            .as_ref()
-            .map(|s| s.path().to_path_buf())
-            .or_else(|| unchecked.as_ref().map(|s| s.path().to_path_buf()))
-            .expect("Retained snapshot in every mode");
-        let (data_length, data_sha256) = input_fingerprint(&data, remaining)?;
+        let data = if memory.is_some() {
+            PathBuf::new()
+        } else {
+            authenticated
+                .as_ref()
+                .map(|s| s.path().to_path_buf())
+                .or_else(|| unchecked.as_ref().map(|s| s.path().to_path_buf()))
+                .expect("Retained snapshot in every mode")
+        };
+        let retained = match &memory {
+            Some(bytes) => RetainedInput::Bytes(bytes),
+            None => RetainedInput::File(&data),
+        };
+        let (data_length, data_sha256) = input_fingerprint(retained, remaining)?;
         remaining -= data_length;
         let cancellation =
             if data_length <= ferrite_s101::cancellation::MAX_CANCELLATION_BYTES as u64 {
-                ferrite_s101::cancellation::Cancellation::parse(&std::fs::read(&data)?).ok()
+                match retained {
+                    RetainedInput::File(file) => {
+                        ferrite_s101::cancellation::Cancellation::parse(&std::fs::read(file)?).ok()
+                    }
+                    RetainedInput::Bytes(bytes) => {
+                        ferrite_s101::cancellation::Cancellation::parse(bytes).ok()
+                    }
+                }
             } else {
                 None
             };
@@ -477,12 +750,20 @@ fn authorized_inputs_with_budget(
                 ..Default::default()
             }
         } else {
-            ferrite_s100_core::inspect_dataset_identification(&data)
-                .with_context(|| format!("Cannot inspect S-101 input {}", path.display()))?
+            match retained {
+                RetainedInput::File(file) => {
+                    ferrite_s100_core::inspect_dataset_identification(file)
+                }
+                RetainedInput::Bytes(bytes) => {
+                    ferrite_s100_core::inspect_dataset_identification_bytes(bytes)
+                }
+            }
+            .with_context(|| format!("Cannot inspect S-101 input {}", path.display()))?
         };
-        let metadata = match crate::s101_lifecycle_metadata::capture_cached(
+        let metadata = match crate::s101_lifecycle_metadata::capture_cached_in(
+            source,
             &path,
-            &data,
+            retained,
             Some((data_length, data_sha256)),
             authorization,
             &mut capture_cache,
@@ -521,6 +802,7 @@ fn authorized_inputs_with_budget(
             id,
             metadata,
             _snapshot: unchecked,
+            memory,
             data_length,
             data_sha256,
         };
@@ -737,12 +1019,26 @@ impl Plan {
             input.verify_captured()?;
         }
         let expected = self.captured_source_identity_sha();
-        let updates: Vec<_> = self.updates.iter().map(|i| i.data.clone()).collect();
-        let result = S101Cell::load_update_chain_from_with_identity(
-            &self.base.original,
-            &self.base.data,
-            &updates,
-        )?;
+        let result = if chain.iter().all(|input| input.memory.is_none()) {
+            let updates: Vec<_> = self.updates.iter().map(|i| i.data.clone()).collect();
+            S101Cell::load_update_chain_from_with_identity(
+                &self.base.original,
+                &self.base.data,
+                &updates,
+            )?
+        } else {
+            // Owned private copies: the same limits, validation and identity.
+            let updates = self
+                .updates
+                .iter()
+                .map(Input::retained_bytes)
+                .collect::<Result<Vec<_>>>()?;
+            S101Cell::load_update_chain_bytes_with_identity(
+                &self.base.original,
+                self.base.retained_bytes()?,
+                updates,
+            )?
+        };
         ensure!(
             *result.1.sha256() == expected,
             "Materialized S-101 chain differs from captured raw inputs"
@@ -832,6 +1128,7 @@ mod tests {
             data: format!("private/{edition}/{name}").into(),
             metadata: None,
             _snapshot: None,
+            memory: None,
             data_length: 0,
             data_sha256: [0; 32],
             id: DatasetIdentification {
@@ -1045,7 +1342,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("Conflicting duplicate S-101 operation"));
-        let (inputs, _) = authorized_inputs(all, &authorization, false).unwrap();
+        let (inputs, _) = authorized_inputs(&NativeDataSource, all, &authorization, false).unwrap();
         let equivalent: Vec<_> = inputs
             .into_iter()
             .filter(|i| i.id.dataset_name.starts_with("101FR00571300.") && i.id.edition_number == 1)
@@ -1066,7 +1363,8 @@ mod tests {
         let candidates = expand_candidates(&selected, &[]).unwrap();
         let authorization =
             crate::dataset_signature_policy::unchecked_datasets(&candidates).unwrap();
-        let (inputs, _) = authorized_inputs(candidates, &authorization, false).unwrap();
+        let (inputs, _) =
+            authorized_inputs(&NativeDataSource, candidates, &authorization, false).unwrap();
         let mixed: Vec<_> = inputs
             .into_iter()
             .filter(|i| i.id.dataset_name.starts_with("101FR00571300.") && i.id.edition_number == 1)
@@ -1371,6 +1669,95 @@ mod tests {
         std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
+    fn memory_source_plans_unchecked_chains_and_cancellations_like_files() {
+        use crate::platform::MemoryDataSource;
+        let fixture = crate::chart_publication::tests::physical_cancellation_fixture;
+        let xml = r#"<S100_ExchangeCatalogue xmlns="http://www.iho.int/s100/xc/5.2"><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.002</fileName><purpose>4</purpose><editionNumber>4</editionNumber><updateNumber>2</updateNumber><issueDate>2024-10-16</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.003</fileName><purpose>5</purpose><editionNumber>4</editionNumber><updateNumber>3</updateNumber><issueDate>2024-10-17</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata></S100_ExchangeCatalogue>"#;
+        let base_bytes = fixture("1", "4.002", "101AA00TEST.002");
+        let memory = MemoryDataSource::new()
+            .with("/mem/xs/101AA00TEST.002", base_bytes.clone())
+            .with(
+                "/mem/xs/101AA00TEST.003",
+                fixture("2", "0", "101AA00TEST.003"),
+            )
+            .with("/mem/xs/OTHER.000", Vec::new())
+            .with("/mem/xs/CATALOG.XML", xml.as_bytes().to_vec());
+        let base = PathBuf::from("/mem/xs/101AA00TEST.002");
+        let cancel = PathBuf::from("/mem/xs/101AA00TEST.003");
+        // Sibling discovery through the source.
+        assert_eq!(
+            expand_candidates_in(&memory, std::slice::from_ref(&cancel), &[]).unwrap(),
+            [base.clone(), cancel.clone()]
+        );
+        let auth = crate::dataset_signature_policy::unchecked_datasets_in(
+            &memory,
+            &[base.clone(), cancel.clone()],
+        )
+        .unwrap();
+        // Unverified catalogue metadata of the base, read from memory.
+        let (cell, identity) = S101Cell::load_bytes_with_identity(&base, base_bytes).unwrap();
+        let previous = crate::s101_lifecycle_metadata::capture_cached_in(
+            &memory,
+            &base,
+            RetainedInput::Bytes(&memory.read(&base).unwrap()),
+            None,
+            &auth,
+            &mut Default::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!previous.is_authenticated());
+        assert_eq!(previous.issue_date.to_string(), "2024-10-16");
+        let mut loaded = BTreeMap::new();
+        loaded.insert(
+            dataset_key(&cell.dsid).unwrap(),
+            (cell.dsid.clone(), identity, Some(previous)),
+        );
+        let history = crate::chart_publication::CancellationHistory::default();
+        let (loads, cancels) = authorized_batch_in(
+            &memory,
+            vec![base.clone(), cancel.clone()],
+            std::slice::from_ref(&cancel),
+            &auth,
+            false,
+            &loaded,
+            &history,
+        )
+        .unwrap();
+        assert!(loads.is_empty());
+        let removal = cancels.into_iter().next().unwrap().load().unwrap();
+        assert!(removal.removes_content());
+        assert_eq!(removal.record().cancellation_update, 3);
+        // Folder discovery never applies it; the explicit selection does.
+        let (plans, notices) =
+            authorized_folder_plans_in(&memory, vec![cancel.clone()], &auth, false).unwrap();
+        assert!(plans.is_empty());
+        assert!(notices[0].contains("explicit selection required"));
+        let (plans, cancels, notices) = authorized_selection_plans_in(
+            &memory,
+            vec![base.clone(), cancel.clone()],
+            std::slice::from_ref(&cancel),
+            &auth,
+            false,
+            &loaded,
+            &history,
+        )
+        .unwrap();
+        assert!(plans.is_empty(), "{notices:?}");
+        assert_eq!(cancels.len(), 1);
+        // The retained copy is owned bytes with the parsed identity.
+        let plan = authorized_plans_in(&memory, vec![base.clone()], &auth, false).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].base.data.as_os_str().is_empty());
+        assert_eq!(plan[0].captured_source_identity_sha(), *identity.sha256());
+        plan[0].base.verify_captured().unwrap();
+        // Budgets apply to owned copies as to snapshot files.
+        let error = authorized_inputs_with_budget(&memory, vec![base], &auth, false, 1)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("budget"));
+    }
+    #[test]
     fn cancellation_reader_rejects_growth_beyond_physical_receiver_limit() {
         let path =
             std::env::temp_dir().join(format!("ferrite-cancel-limit-{}", std::process::id()));
@@ -1510,7 +1897,7 @@ mod tests {
         assert!(ready.is_empty());
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("Required authenticated dataset snapshot"));
-        let error = authorized_inputs_with_budget(vec![path], &auth, false, 1)
+        let error = authorized_inputs_with_budget(&NativeDataSource, vec![path], &auth, false, 1)
             .err()
             .unwrap();
         assert!(format!("{error:#}").contains("limit") || format!("{error:#}").contains("budget"));

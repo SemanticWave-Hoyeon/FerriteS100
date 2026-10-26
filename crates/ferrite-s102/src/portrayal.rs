@@ -4,7 +4,9 @@ use anyhow::{ensure, Context, Result};
 use ferrite_kernel::{
     CoverageSample, CoverageSource, GridWindow, IntervalClosure, NumericCoverageSource,
 };
-use ferrite_lua::{DrawingCommand, LookupEntry, LuaSession};
+#[cfg(feature = "lua-native")]
+use ferrite_lua::LuaSession;
+use ferrite_lua::{DrawingCommand, LookupEntry};
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, ColorProfile, PortrayalCatalogue};
 use ferrite_render::{GeoBounds, RasterDrawOrder, RasterGrid, RasterLayer};
 use std::{path::Path, sync::Arc};
@@ -82,6 +84,7 @@ pub struct BathymetryPortrayal {
     pub viewing_groups: Vec<u32>,
 }
 impl BathymetryPortrayal {
+    #[cfg(feature = "lua-native")]
     pub fn from_catalogue(
         pc: &PortrayalCatalogue,
         profile: &str,
@@ -94,6 +97,7 @@ impl BathymetryPortrayal {
         Self::evaluate_rule(pc, profile, settings, &script, session)
     }
     /// Parse/profile/rule execution all use the same immutable captured PC owner.
+    #[cfg(feature = "lua-native")]
     pub fn from_bound_catalogue(
         pc: Arc<BoundPortrayalCatalogue>,
         profile: &str,
@@ -137,13 +141,46 @@ impl BathymetryPortrayal {
         );
         Ok(())
     }
-    fn evaluate_rule(
-        pc: &PortrayalCatalogue,
+    /// The Part 9a instruction string the PC rule emits for `settings`
+    /// (what [`Self::from_bound_instructions`] consumes without Lua).
+    #[cfg(feature = "lua-native")]
+    pub fn rule_instructions(
+        pc: &BoundPortrayalCatalogue,
+        settings: DepthSettings,
+    ) -> Result<String> {
+        Self::validate_settings(settings)?;
+        let rule = pc
+            .sources()
+            .read_relative(Path::new("Rules/BathymetryCoverage.lua"))?;
+        Self::run_rule(settings, &rule, LuaSession::new()?)
+    }
+    /// Build the portrayal from the rule's recorded Part 9a instruction
+    /// string (no Lua). The executed-rule owner records the rule bytes of
+    /// the bound PC; the instructions must be what that rule emits for
+    /// `settings` (see [`Self::rule_instructions`]).
+    pub fn from_bound_instructions(
+        pc: Arc<BoundPortrayalCatalogue>,
         profile: &str,
         settings: DepthSettings,
-        script: &[u8],
-        session: LuaSession,
+        instructions: &str,
     ) -> Result<Self> {
+        Self::validate_settings(settings)?;
+        let rule = pc
+            .sources()
+            .read_relative(Path::new("Rules/BathymetryCoverage.lua"))?;
+        let mut result = Self::from_instructions(&pc, profile, instructions.to_owned())?;
+        result.bound_evaluation = Some(Arc::new(BoundBathymetryEvaluation {
+            draw_order: result.draw_order,
+            viewing_groups: result.viewing_groups.clone(),
+            profile_id: result.profile.id.clone(),
+            catalogue: pc,
+            rule,
+            settings,
+        }));
+        Ok(result)
+    }
+    #[cfg(feature = "lua-native")]
+    fn run_rule(settings: DepthSettings, script: &[u8], session: LuaSession) -> Result<String> {
         let lua = session.lua();
         lua.load(script)
             .set_name("@S102-BathymetryCoverage")
@@ -163,10 +200,27 @@ impl BathymetryPortrayal {
         let rule: ferrite_lua::mlua::Function = lua.globals().get("BathymetryCoverage")?;
         rule.call::<()>((lua.create_table()?, portrayal.clone(), params))?;
         let list: ferrite_lua::mlua::Table = portrayal.get("instructions")?;
-        let instructions = list
+        Ok(list
             .sequence_values::<String>()
             .collect::<std::result::Result<Vec<_>, _>>()?
-            .join(";");
+            .join(";"))
+    }
+    #[cfg(feature = "lua-native")]
+    fn evaluate_rule(
+        pc: &PortrayalCatalogue,
+        profile: &str,
+        settings: DepthSettings,
+        script: &[u8],
+        session: LuaSession,
+    ) -> Result<Self> {
+        let instructions = Self::run_rule(settings, script, session)?;
+        Self::from_instructions(pc, profile, instructions)
+    }
+    fn from_instructions(
+        pc: &PortrayalCatalogue,
+        profile: &str,
+        instructions: String,
+    ) -> Result<Self> {
         let parsed = ferrite_lua::parse_instruction_string("BathymetryCoverage", &instructions)?;
         let (entries, visibility) = parsed
             .commands
@@ -668,7 +722,7 @@ mod display_selection_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lua-native"))]
 mod bound_evaluation_tests {
     use super::*;
     struct Fixture(std::path::PathBuf);
@@ -846,7 +900,7 @@ mod bound_evaluation_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lua-native"))]
 mod resolved_lookup_tests {
     use super::*;
     use ferrite_portrayal_catalog::{ColorDefinition, SrgbColor};

@@ -42,6 +42,9 @@ function scheduleRender(delay = 0) {
 // camera would then keep. The ResizeObserver renders once the canvas grows.
 const MIN_CANVAS_CSS_PX = 64;
 
+// Per-frame timings (prepare/set_view and draw), for measurements.
+const timings = [];
+
 function render() {
   if (!engine || !gpu || opened === 0) return;
   if (canvas.clientWidth < MIN_CANVAS_CSS_PX || canvas.clientHeight < MIN_CANVAS_CSS_PX) return;
@@ -49,9 +52,11 @@ function render() {
   canvas.width = width;
   canvas.height = height;
   try {
+    // set_view re-projects the prepared scene when only the camera or size
+    // changed and the resident cells stay; otherwise it portrays again.
     const t0 = performance.now();
     const summary = JSON.parse(
-      engine.prepare(width, height, dpr, camera.lat, camera.lon, camera.zoom, false));
+      engine.set_view(width, height, dpr, camera.lat, camera.lon, camera.zoom, false));
     const t1 = performance.now();
     engine.render_to_canvas(gpu);
     const t2 = performance.now();
@@ -60,10 +65,15 @@ function render() {
     camera.lat = latOf((mercY(view.north) + mercY(view.south)) / 2);
     camera.lon = (view.east + view.west) / 2;
     canvas.style.transform = "";
-    $("hud").textContent = `${adapter} · ` +
+    timings.push({ prepare: t1 - t0, draw: t2 - t1, reprojected: summary.reprojected,
+      portrayal: summary.portrayal, instructions: summary.instructions });
+    const source = summary.portrayal == null ? "" :
+      ` · S-101 ${summary.portrayal === "lua" ? "Lua" : "precomputed"}`;
+    const resident = summary.resident_cells == null ? "" : ` · ${summary.resident_cells}/${summary.cells} cells resident`;
+    $("hud").textContent = `${adapter}${source} · ` +
       `${summary.instructions} instructions · 1:${Math.round(summary.display_scale)} · ` +
-      `zoom ${summary.zoom.toFixed(2)} · ${camera.lat.toFixed(4)}, ${camera.lon.toFixed(4)} · ` +
-      `prepare ${(t1 - t0).toFixed(0)} ms, draw ${(t2 - t1).toFixed(0)} ms`;
+      `zoom ${summary.zoom.toFixed(2)} · ${camera.lat.toFixed(4)}, ${camera.lon.toFixed(4)}${resident} · ` +
+      `${summary.reprojected ? "view" : "portray"} ${(t1 - t0).toFixed(0)} ms, draw ${(t2 - t1).toFixed(0)} ms`;
   } catch (error) {
     status(`Render failed: ${error.message ?? error}`);
   }
@@ -132,10 +142,12 @@ async function readFileList(list) {
 
 async function loadSamples() {
   status("Fetching samples…");
-  const listed = await (await fetch("samples.json")).json();
+  // Not from the HTTP cache: sample names (samples/data/NNNN) and their
+  // modification times (copied) repeat across builds with other contents.
+  const listed = await (await fetch("samples.json", { cache: "no-store" })).json();
   const files = [];
   for (const entry of listed) {
-    const bytes = new Uint8Array(await (await fetch(entry.url)).arrayBuffer());
+    const bytes = new Uint8Array(await (await fetch(entry.url, { cache: "no-store" })).arrayBuffer());
     files.push({ name: entry.name, bytes });
   }
   files.sort((a, b) => Number(!a.name.includes("ferrite_pre_")) - Number(!b.name.includes("ferrite_pre_")));
@@ -159,6 +171,9 @@ function setupInput() {
     const url = new URL(location.href);
     url.searchParams.set("backend", e.target.value);
     location.assign(url);
+  });
+  $("portrayal").addEventListener("change", (e) => {
+    try { engine.set_portrayal(e.target.value); scheduleRender(); } catch (error) { status(error.message); }
   });
   $("palette").addEventListener("change", (e) => {
     try { engine.set_palette(e.target.value); scheduleRender(); } catch (error) { status(error.message); }
@@ -238,8 +253,11 @@ function pick(e) {
 async function main() {
   await init();
   status("Loading catalogues…");
-  const bundle = new Uint8Array(await (await fetch("catalogues.bin")).arrayBuffer());
+  const bundle = new Uint8Array(await (await fetch("catalogues.bin", { cache: "no-store" })).arrayBuffer());
   engine = WebEngine.from_bundle(bundle);
+  const lua = WebEngine.lua_available();
+  $("portrayal").querySelector("option[value=lua]").disabled = !lua;
+  if (!lua) $("portrayal").value = "precomputed";
   const select = $("palette");
   for (const name of JSON.parse(engine.palettes())) select.add(new Option(name, name, name === "Day", name === "Day"));
   const { dpr, width, height } = pixelSize();
@@ -251,7 +269,10 @@ async function main() {
   $("hud").textContent = adapter;
   setupInput();
   const notes = JSON.parse(engine.catalogue_notes());
-  status(`Ready: ${adapter} [backend ${backend}]${notes.length ? `\n${notes.join("\n")}` : ""}\nDrop files or load the samples.`);
+  status(`Ready: ${adapter} [backend ${backend}], S-101 ${lua ? "Lua portrayal in the browser" : "precomputed payloads only"}` +
+    `${notes.length ? `\n${notes.join("\n")}` : ""}\nDrop files or load the samples.`);
+  // For scripted checks: the engine, the camera and the frame timings.
+  window.ferrite = { engine, camera, timings, render, setPortrayal: (v) => { engine.set_portrayal(v); $("portrayal").value = v; } };
 }
 
 main().catch((error) => status(`Start failed: ${error.message ?? error}`));

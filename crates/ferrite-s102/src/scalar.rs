@@ -1,11 +1,8 @@
 //! Decode numeric metadata without HDF5's silent float/integer coercion or narrowing.
 //! Integer widths remain receiver-compatible; this is not a full encoded-width
 //! schema certificate. Enumerations retain their explicit HDF enum representation.
+use crate::h5::{Attribute, FloatSize, Group, TypeDescriptor};
 use anyhow::{ensure, Context, Result};
-use hdf5::{
-    types::{FloatSize, TypeDescriptor},
-    Attribute, Group,
-};
 fn attribute(g: &Group, name: &str) -> Result<Attribute> {
     let a = g
         .attr(name)
@@ -91,10 +88,10 @@ pub(crate) fn f64(g: &Group, name: &str) -> Result<f64> {
     );
     crate::singleton::read::<f64>(&a)
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
-    fn attr<T: hdf5::H5Type>(g: &Group, n: &str, v: T) {
+    fn attr<T: hdf5::H5Type>(g: &hdf5::Group, n: &str, v: T) {
         g.new_attr::<T>()
             .create(n)
             .unwrap()
@@ -106,33 +103,34 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ferrite-scalar-int-{}.h5", std::process::id()));
         {
             let f = hdf5::File::create(&p).unwrap();
+            let g = crate::h5::Group::from(&*f);
             attr(&f, "float_enum", 2.5f64);
             attr(&f, "signed_count", 1i32);
             attr(&f, "wide_count", 256u16);
             attr(&f, "wide_grid", u64::from(u32::MAX) + 1);
             attr(&f, "u8max", 255u64);
             attr(&f, "u32max", u64::from(u32::MAX));
-            assert!(u8(&f, "float_enum").is_err());
-            assert!(unsigned_u32(&f, "signed_count").is_err());
-            assert_eq!(u32(&f, "signed_count").unwrap(), 1);
-            assert!(u8(&f, "wide_count").is_err());
-            assert!(u32(&f, "wide_grid").is_err());
-            assert_eq!(u8(&f, "u8max").unwrap(), 255);
-            assert_eq!(u32(&f, "u32max").unwrap(), u32::MAX);
+            assert!(u8(&g, "float_enum").is_err());
+            assert!(unsigned_u32(&g, "signed_count").is_err());
+            assert_eq!(u32(&g, "signed_count").unwrap(), 1);
+            assert!(u8(&g, "wide_count").is_err());
+            assert!(u32(&g, "wide_grid").is_err());
+            assert_eq!(u8(&g, "u8max").unwrap(), 255);
+            assert_eq!(u32(&g, "u32max").unwrap(), u32::MAX);
             f.new_attr::<u8>()
                 .shape(1)
                 .create("singleton")
                 .unwrap()
                 .write_raw(&[2])
                 .unwrap();
-            assert_eq!(u8(&f, "singleton").unwrap(), 2);
+            assert_eq!(u8(&g, "singleton").unwrap(), 2);
             f.new_attr::<u8>()
                 .shape(2)
                 .create("vector")
                 .unwrap()
                 .write_raw(&[2, 3])
                 .unwrap();
-            assert!(u8(&f, "vector").is_err());
+            assert!(u8(&g, "vector").is_err());
         }
         std::fs::remove_file(p).unwrap();
     }
@@ -144,6 +142,7 @@ mod tests {
         ));
         {
             let f = hdf5::File::create(&p).unwrap();
+            let g = crate::h5::Group::from(&*f);
             attr(&f, "unsigned", 10u32);
             attr(&f, "signed", 10i32);
             #[derive(hdf5::H5Type, Clone, Copy)]
@@ -163,11 +162,11 @@ mod tests {
                 .unwrap()
                 .write_scalar(&Datum::Negative)
                 .unwrap();
-            assert_eq!(unsigned_or_enum_u32(&f, "unsigned").unwrap(), 10);
-            assert_eq!(unsigned_or_enum_u32(&f, "enum").unwrap(), 10);
-            assert!(unsigned_or_enum_u32(&f, "signed").is_err());
-            assert!(unsigned_or_enum_u32(&f, "negative_enum").is_err());
-            assert!(unsigned_u32(&f, "enum").is_err());
+            assert_eq!(unsigned_or_enum_u32(&g, "unsigned").unwrap(), 10);
+            assert_eq!(unsigned_or_enum_u32(&g, "enum").unwrap(), 10);
+            assert!(unsigned_or_enum_u32(&g, "signed").is_err());
+            assert!(unsigned_or_enum_u32(&g, "negative_enum").is_err());
+            assert!(unsigned_u32(&g, "enum").is_err());
         }
         std::fs::remove_file(p).unwrap();
     }
@@ -177,20 +176,21 @@ mod tests {
             std::env::temp_dir().join(format!("ferrite-scalar-float-{}.h5", std::process::id()));
         {
             let f = hdf5::File::create(&p).unwrap();
+            let g = crate::h5::Group::from(&*f);
             attr(&f, "spacing", f64::from_bits(1));
             attr(&f, "range", -0.0f32);
             attr(&f, "integer", 1u32);
-            assert_eq!(f64(&f, "spacing").unwrap().to_bits(), 1);
-            assert_eq!(f32(&f, "range").unwrap().to_bits(), (-0.0f32).to_bits());
-            assert!(f32(&f, "spacing").is_err());
-            assert!(f64(&f, "range").is_err());
-            assert!(f64(&f, "integer").is_err());
+            assert_eq!(f64(&g, "spacing").unwrap().to_bits(), 1);
+            assert_eq!(f32(&g, "range").unwrap().to_bits(), (-0.0f32).to_bits());
+            assert!(f32(&g, "spacing").is_err());
+            assert!(f64(&g, "range").is_err());
+            assert!(f64(&g, "integer").is_err());
         }
         std::fs::remove_file(p).unwrap();
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod enum_tests {
     use super::*;
     #[derive(hdf5::H5Type, Clone, Copy)]
@@ -212,7 +212,7 @@ mod enum_tests {
         One = 1,
         Overflow = 4294967296,
     }
-    fn attr<T: hdf5::H5Type>(g: &Group, n: &str, v: T) {
+    fn attr<T: hdf5::H5Type>(g: &hdf5::Group, n: &str, v: T) {
         g.new_attr::<T>()
             .create(n)
             .unwrap()
@@ -224,6 +224,7 @@ mod enum_tests {
         let p = std::env::temp_dir().join(format!("ferrite-scalar-enum-{}.h5", std::process::id()));
         {
             let f = hdf5::File::create(&p).unwrap();
+            let g = crate::h5::Group::from(&*f);
             attr(&f, "unsigned_one", Unsigned::One);
             attr(&f, "unsigned_max", Unsigned::Max);
             attr(&f, "signed_one", Signed::One);
@@ -231,14 +232,14 @@ mod enum_tests {
             attr(&f, "signed_large", Signed::Large);
             attr(&f, "wide_one", Wide::One);
             attr(&f, "wide_overflow", Wide::Overflow);
-            assert_eq!(u8(&f, "unsigned_one").unwrap(), 1);
-            assert_eq!(u8(&f, "unsigned_max").unwrap(), 255);
-            assert_eq!(u8(&f, "signed_one").unwrap(), 1);
-            assert_eq!(u32(&f, "signed_large").unwrap(), 256);
-            assert!(u8(&f, "signed_large").is_err());
-            assert!(u8(&f, "signed_negative").is_err());
-            assert_eq!(u32(&f, "wide_one").unwrap(), 1);
-            assert!(u32(&f, "wide_overflow").is_err());
+            assert_eq!(u8(&g, "unsigned_one").unwrap(), 1);
+            assert_eq!(u8(&g, "unsigned_max").unwrap(), 255);
+            assert_eq!(u8(&g, "signed_one").unwrap(), 1);
+            assert_eq!(u32(&g, "signed_large").unwrap(), 256);
+            assert!(u8(&g, "signed_large").is_err());
+            assert!(u8(&g, "signed_negative").is_err());
+            assert_eq!(u32(&g, "wide_one").unwrap(), 1);
+            assert!(u32(&g, "wide_overflow").is_err());
         }
         std::fs::remove_file(p).unwrap();
     }

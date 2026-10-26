@@ -1,11 +1,8 @@
 //! Complete encoded Group_F metadata, independent of application and portrayal.
 //! Receiver diagnostics do not rewrite the producer's feature list or sample values.
+use crate::h5::{TypeDescriptor, VarLenAscii, VarLenUnicode};
 use anyhow::{ensure, Context, Result};
 use ferrite_kernel::ExactDecimal;
-use hdf5::{
-    types::{CompoundField, CompoundType, TypeDescriptor, VarLenAscii, VarLenUnicode},
-    H5Type,
-};
 use std::cmp::Ordering;
 const FIELDS: [&str; 8] = [
     "code",
@@ -19,24 +16,6 @@ const FIELDS: [&str; 8] = [
 ];
 const FEATURES: [&str; 2] = ["BathymetryCoverage", "QualityOfBathymetryCoverage"];
 const STRING_LIMIT: usize = 4096;
-#[repr(C)]
-struct Column<T, const N: usize> {
-    value: T,
-}
-// SAFETY: sole repr(C) field has offset0, actual T descriptor and object size.
-unsafe impl<T: H5Type, const N: usize> H5Type for Column<T, N> {
-    fn type_descriptor() -> TypeDescriptor {
-        TypeDescriptor::Compound(CompoundType {
-            fields: vec![CompoundField {
-                name: FIELDS[N].into(),
-                ty: T::type_descriptor(),
-                offset: 0,
-                index: 0,
-            }],
-            size: std::mem::size_of::<Self>(),
-        })
-    }
-}
 fn text(bytes: &[u8], ascii: bool) -> Result<String> {
     ensure!(
         bytes.len() <= STRING_LIMIT,
@@ -50,30 +29,23 @@ fn text(bytes: &[u8], ascii: bool) -> Result<String> {
         .context("Invalid Group_F UTF8")?
         .to_owned())
 }
-fn forecast(d: &hdf5::Dataset, cap: u64) -> Result<()> {
-    let ty = d.dtype()?;
-    let space = d.space()?;
-    let mut size = 0;
-    let status = hdf5::sync::sync(|| unsafe {
-        hdf5_sys::h5d::H5Dvlen_get_buf_size(d.id(), ty.id(), space.id(), &mut size)
-    });
-    ensure!(status >= 0, "Cannot forecast Group_F variable payload");
+fn forecast(size: u64, cap: u64) -> Result<()> {
     ensure!(
         size <= cap,
         "Group_F variable payload exceeds supported budget"
     );
     Ok(())
 }
-fn column<const N: usize>(d: &hdf5::Dataset, ascii: bool) -> Result<Vec<String>> {
+fn column(d: &crate::h5::Dataset, n: usize, ascii: bool) -> Result<Vec<String>> {
     if ascii {
-        d.read_raw::<Column<VarLenAscii, N>>()?
+        d.read_field::<VarLenAscii>(FIELDS[n])?
             .into_iter()
-            .map(|v| text(v.value.as_bytes(), true))
+            .map(|v| text(v.as_bytes(), true))
             .collect()
     } else {
-        d.read_raw::<Column<VarLenUnicode, N>>()?
+        d.read_field::<VarLenUnicode>(FIELDS[n])?
             .into_iter()
-            .map(|v| text(v.value.as_bytes(), false))
+            .map(|v| text(v.as_bytes(), false))
             .collect()
     }
 }
@@ -211,7 +183,7 @@ impl FeatureDefinition {
     }
 }
 pub(crate) fn definitions(
-    g: &hdf5::Group,
+    g: &crate::h5::Group,
     name: &str,
     max_rows: usize,
 ) -> Result<Vec<FeatureDefinition>> {
@@ -240,16 +212,21 @@ pub(crate) fn definitions(
             _ => anyhow::bail!("Group_F {n} must use variable-length strings"),
         };
     }
-    forecast(&d, (max_rows * 8 * (STRING_LIMIT + 1)) as u64)?;
-    let cols = [
-        column::<0>(&d, ascii[0])?,
-        column::<1>(&d, ascii[1])?,
-        column::<2>(&d, ascii[2])?,
-        column::<3>(&d, ascii[3])?,
-        column::<4>(&d, ascii[4])?,
-        column::<5>(&d, ascii[5])?,
-        column::<6>(&d, ascii[6])?,
-        column::<7>(&d, ascii[7])?,
+    // HDF5 forecast of the whole compound's variable payload, member by member.
+    let mut payload = 0u64;
+    for (i, n) in FIELDS.iter().enumerate() {
+        payload = payload.saturating_add(d.field_vlen_buf_size(n, !ascii[i])?);
+    }
+    forecast(payload, (max_rows * 8 * (STRING_LIMIT + 1)) as u64)?;
+    let cols: [Vec<String>; 8] = [
+        column(&d, 0, ascii[0])?,
+        column(&d, 1, ascii[1])?,
+        column(&d, 2, ascii[2])?,
+        column(&d, 3, ascii[3])?,
+        column(&d, 4, ascii[4])?,
+        column(&d, 5, ascii[5])?,
+        column(&d, 6, ascii[6])?,
+        column(&d, 7, ascii[7])?,
     ];
     ensure!(
         cols.iter().all(|c| c.len() == shape[0]),
@@ -277,7 +254,7 @@ pub struct FeatureMetadata {
     pub diagnostics: Vec<FeatureMetadataDiagnostic>,
 }
 impl FeatureMetadata {
-    pub(crate) fn read(file: &hdf5::File) -> Result<Self> {
+    pub(crate) fn read(file: &crate::h5::Group) -> Result<Self> {
         let g = file.group("Group_F").context("Missing Group_F")?;
         ensure!(
             g.attr_names()?.is_empty(),
@@ -297,7 +274,7 @@ impl FeatureMetadata {
             TypeDescriptor::VarLenUnicode => false,
             _ => anyhow::bail!("Group_F featureCode requires variable-length strings"),
         };
-        forecast(&d, 2 * (STRING_LIMIT + 1) as u64)?;
+        forecast(d.vlen_buf_size()?, 2 * (STRING_LIMIT + 1) as u64)?;
         let declared_features: Vec<String> = if ascii {
             d.read_raw::<VarLenAscii>()?
                 .into_iter()
@@ -392,10 +369,32 @@ impl FeatureMetadata {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
+    /// One named member, for malformed-table fixtures.
+    #[repr(C)]
+    struct Column<T, const N: usize> {
+        value: T,
+    }
+    // SAFETY: sole repr(C) field has offset0, actual T descriptor and object size.
+    unsafe impl<T: H5Type, const N: usize> H5Type for Column<T, N> {
+        fn type_descriptor() -> hdf5::types::TypeDescriptor {
+            hdf5::types::TypeDescriptor::Compound(hdf5::types::CompoundType {
+                fields: vec![hdf5::types::CompoundField {
+                    name: FIELDS[N].into(),
+                    ty: T::type_descriptor(),
+                    offset: 0,
+                    index: 0,
+                }],
+                size: std::mem::size_of::<Self>(),
+            })
+        }
+    }
     use crate::Definition;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
+    use hdf5::H5Type;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     struct File(std::path::PathBuf, hdf5::File);
@@ -457,7 +456,7 @@ mod tests {
     #[test]
     fn full_definition_preserves_order_lexical_fields_and_infinite_endpoint() {
         let f = fixture(&[FEATURES[1], FEATURES[0]]);
-        let m = FeatureMetadata::read(&f.1).unwrap();
+        let m = FeatureMetadata::read(&crate::w(&f.1)).unwrap();
         assert_eq!(m.declared_features, [FEATURES[1], FEATURES[0]]);
         m.validate_declaration().unwrap();
         assert_eq!(m.bathymetry[0].code, "uncertainty");
@@ -471,12 +470,15 @@ mod tests {
         assert_eq!(m.quality[0].name, "ID");
         assert_eq!(m.fills(), (1e6, Some(1e6)));
         replace(&f, &[Definition::for_code("depth")]);
-        assert_eq!(FeatureMetadata::read(&f.1).unwrap().fills(), (1e6, None));
+        assert_eq!(
+            FeatureMetadata::read(&crate::w(&f.1)).unwrap().fills(),
+            (1e6, None)
+        );
     }
     #[test]
     fn incomplete_producer_list_diagnosed_without_inventing_or_discarding_source() {
         let f = fixture(&[FEATURES[0]]);
-        let m = FeatureMetadata::read(&f.1).unwrap();
+        let m = FeatureMetadata::read(&crate::w(&f.1)).unwrap();
         assert_eq!(m.declared_features, [FEATURES[0]]);
         assert_eq!(
             m.diagnostics,
@@ -491,17 +493,17 @@ mod tests {
     fn quality_is_optional_only_when_list_table_and_coverage_are_all_absent() {
         let f = fixture(&[FEATURES[0]]);
         f.1.group("Group_F").unwrap().unlink(FEATURES[1]).unwrap();
-        let m = FeatureMetadata::read(&f.1).unwrap();
+        let m = FeatureMetadata::read(&crate::w(&f.1)).unwrap();
         assert!(m.quality.is_empty());
         assert!(m.diagnostics.is_empty());
         // Declared but without a table, or a coverage group without a table: refused.
         let f = fixture(&FEATURES);
         f.1.group("Group_F").unwrap().unlink(FEATURES[1]).unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
         let f = fixture(&[FEATURES[0]]);
         f.1.group("Group_F").unwrap().unlink(FEATURES[1]).unwrap();
         f.1.create_group(FEATURES[1]).unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
     }
     #[test]
     fn feature_codes_admit_only_known_unique_variable_1d_strings() {
@@ -511,28 +513,28 @@ mod tests {
             vec!["Unknown"],
         ] {
             let f = fixture(&codes);
-            assert!(FeatureMetadata::read(&f.1).is_err());
+            assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
         }
         let f = fixture(&FEATURES);
         let g = f.1.group("Group_F").unwrap();
         g.unlink("featureCode").unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
         g.new_dataset::<VarLenAscii>()
             .shape([1, 2])
             .create("featureCode")
             .unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
         g.unlink("featureCode").unwrap();
         g.new_dataset::<VarLenAscii>()
             .create("featureCode")
             .unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
         g.unlink("featureCode").unwrap();
         g.new_dataset::<hdf5::types::FixedAscii<32>>()
             .shape(2)
             .create("featureCode")
             .unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
     }
     #[test]
     fn missing_compound_members_wrong_units_type_fill_and_code_rejected() {
@@ -543,7 +545,7 @@ mod tests {
             .shape(1)
             .create(FEATURES[0])
             .unwrap();
-        assert!(FeatureMetadata::read(&f.1)
+        assert!(FeatureMetadata::read(&crate::w(&f.1))
             .unwrap_err()
             .to_string()
             .contains("eight"));
@@ -561,18 +563,18 @@ mod tests {
                 _ => r.upper = v("-15"),
             };
             replace(&f, &[r]);
-            assert!(FeatureMetadata::read(&f.1).is_err());
+            assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
         }
         let f = fixture(&FEATURES);
         replace(
             &f,
             &[Definition::for_code("depth"), Definition::for_code("depth")],
         );
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
         let f = fixture(&FEATURES);
         let g = f.1.group("Group_F").unwrap();
         g.unlink(FEATURES[1]).unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
     }
     #[test]
     fn all_eight_interval_types_use_exact_endpoint_ownership_and_missing_bound_rules() {
@@ -626,7 +628,7 @@ mod tests {
         let mut row = Definition::for_code("depth");
         row.fillValue = VarLenAscii::from_ascii("1000000.0000000000001").unwrap();
         replace(&f, &[row]);
-        assert!(FeatureMetadata::read(&f.1).is_err());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_err());
     }
     #[test]
     fn informative_long_names_are_preserved_without_unverified_catalogue_guess() {
@@ -644,7 +646,7 @@ mod tests {
             .unwrap()
             .write_raw(&[q])
             .unwrap();
-        let m = FeatureMetadata::read(&f.1).unwrap();
+        let m = FeatureMetadata::read(&crate::w(&f.1)).unwrap();
         assert_eq!(m.bathymetry[0].name, "Sounding depth");
         assert_eq!(m.quality[0].name, "Survey quality identifier");
     }
@@ -654,7 +656,7 @@ mod tests {
         let mut r = Definition::for_code("depth");
         r.name = VarLenAscii::from_ascii(&vec![b'a'; 1024 * 1024]).unwrap();
         replace(&f, &[r]);
-        assert!(FeatureMetadata::read(&f.1)
+        assert!(FeatureMetadata::read(&crate::w(&f.1))
             .unwrap_err()
             .to_string()
             .contains("payload"));
@@ -698,7 +700,7 @@ mod tests {
             closure: t("closedInterval"),
         }])
         .unwrap();
-        assert!(FeatureMetadata::read(&f.1).is_ok());
+        assert!(FeatureMetadata::read(&crate::w(&f.1)).is_ok());
         // Write invalid bytes through a full eight-pointer C record; never build invalid Rust str.
         let ty = d.dtype().unwrap();
         let bad = [0xffu8, 0];
@@ -723,7 +725,7 @@ mod tests {
             )
         });
         assert!(status >= 0);
-        assert!(FeatureMetadata::read(&f.1)
+        assert!(FeatureMetadata::read(&crate::w(&f.1))
             .unwrap_err()
             .to_string()
             .contains("UTF8"));

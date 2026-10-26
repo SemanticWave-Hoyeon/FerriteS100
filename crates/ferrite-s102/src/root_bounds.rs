@@ -1,8 +1,8 @@
 //! Geographic root metadata is separate from native instance validity.
+use crate::h5::{FloatSize, TypeDescriptor};
 use crate::{GridBoundary, InstanceDomain};
 use anyhow::{ensure, Result};
 use ferrite_kernel::GridGeometry;
-use hdf5::types::{FloatSize, TypeDescriptor};
 const NAMES: [&str; 4] = [
     "westBoundLongitude",
     "eastBoundLongitude",
@@ -112,7 +112,7 @@ fn assess_geographic(bounds: [f32; 4], extent: [GridBoundary; 4]) -> Result<Encl
     }
 }
 impl RootBounds {
-    pub fn read(file: &hdf5::File) -> Result<Self> {
+    pub fn read(file: &crate::h5::Group) -> Result<Self> {
         let mut encoded = [0.; 4];
         for (i, n) in NAMES.iter().enumerate() {
             let a = file.attr(n)?;
@@ -143,7 +143,7 @@ impl RootBounds {
         self,
         g: &GridGeometry,
         domain: &InstanceDomain,
-        instance: &hdf5::Group,
+        instance: &crate::h5::Group,
     ) -> Result<RootEnclosure> {
         if g.horizontal_crs != 4326 {
             return Ok(RootEnclosure {
@@ -175,9 +175,11 @@ impl RootBounds {
         })
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
     fn exact(b: [f64; 4]) -> [GridBoundary; 4] {
         b.map(|v| crate::boundary(v, 1., 0.).unwrap())
     }
@@ -273,7 +275,7 @@ mod tests {
                         .unwrap();
                 }
             }
-            assert_eq!(RootBounds::read(&f).is_ok(), case == 0);
+            assert_eq!(RootBounds::read(&crate::w(&f)).is_ok(), case == 0);
             drop(f);
             std::fs::remove_file(path).unwrap();
         }

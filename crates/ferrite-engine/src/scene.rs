@@ -21,6 +21,8 @@ pub struct PreparedScene {
     pub catalogue_registry: DatasetCatalogueRegistry,
     /// Vector instructions changed by interoperability composition.
     pub ic_changed: usize,
+    /// S-102 bathymetry rasters (empty without S-102).
+    pub bathymetry: crate::s102_scene::BathymetryScene,
 }
 
 impl PreparedScene {

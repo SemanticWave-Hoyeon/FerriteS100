@@ -9,6 +9,9 @@ compile_error!("Choose one Lua backend: lua54 or lua55");
 pub use mlua;
 mod chunk_cache;
 mod identity;
+// The C library half for the browser build's Lua (tested on the host).
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod wasm_libc;
 pub use chunk_cache::{ChunkCache, ChunkCacheStats};
 pub use identity::{runtime_identity, RuntimeIdentity};
 

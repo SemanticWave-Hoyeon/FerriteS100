@@ -1,8 +1,9 @@
 //! Receiver resource policy, not an S-100 limit or hard OS isolation boundary.
 use crate::mlua::{HookTriggers, Lua, VmState};
 use crate::{LuaError, Result};
+use ferrite_kernel::time::Instant;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 const TICK: u32 = 1000;
 #[derive(Clone, Copy, Debug)]
 pub struct LuaResourceLimits {

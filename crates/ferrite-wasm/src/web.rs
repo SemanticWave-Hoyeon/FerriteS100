@@ -138,6 +138,59 @@ impl WebEngine {
             .map_err(js_error)
     }
 
+    /// Move to a view (arguments as [`WebEngine::prepare`]): re-projects the
+    /// current scene when only the camera or size changed and the resident
+    /// cells stay the same, otherwise portrays again. The summary's
+    /// `reprojected` says which.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_view(
+        &mut self,
+        width: u32,
+        height: u32,
+        density: f64,
+        center_lat: f64,
+        center_lon: f64,
+        scale_or_zoom: f64,
+        is_scale: bool,
+    ) -> Result<String, JsError> {
+        self.core
+            .set_view(
+                width,
+                height,
+                density,
+                center_lat,
+                center_lon,
+                scale_or_zoom,
+                is_scale,
+            )
+            .map_err(js_error)
+    }
+
+    /// S-101 portrayal: `"auto"` (default: Lua when built and no payloads
+    /// were loaded, else precomputed payloads with Lua for missing ones),
+    /// `"lua"` or `"precomputed"`.
+    pub fn set_portrayal(&mut self, choice: &str) -> Result<(), JsError> {
+        self.core.set_portrayal(choice).map_err(js_error)
+    }
+
+    /// `{choice, lua_available, payloads, used}` (JSON); `used` is the
+    /// source of the current scene's S-101 instructions.
+    pub fn portrayal(&self) -> String {
+        self.core.portrayal_json()
+    }
+
+    /// Whether this build portrays S-101 with Lua (feature `lua-wasm`).
+    pub fn lua_available() -> bool {
+        crate::core::LUA_AVAILABLE
+    }
+
+    /// Raw Part 9a output of the Lua rules for every opened S-101 cell
+    /// (see `WebEngineCore::part9a_dump`; parity with native builds).
+    #[cfg(feature = "lua-wasm")]
+    pub fn part9a_dump(&self) -> Result<String, JsError> {
+        self.core.part9a_dump().map_err(js_error)
+    }
+
     /// Features at physical pixel (`x`, `y`) within `radius` (JSON array).
     pub fn pick_json(&mut self, x: f64, y: f64, radius: f32) -> Result<String, JsError> {
         self.core.pick_json(x, y, radius).map_err(js_error)

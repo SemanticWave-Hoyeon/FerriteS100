@@ -22,16 +22,24 @@
 //! opens folders on disk exactly as the viewer does (signature verification,
 //! the S-101 update planner, decoded-chart memo, portrayal cell cache); an
 //! in-memory platform opens the same products from bytes with no file
-//! system. Opening runs as a background job on the platform executor; its
-//! result is installed on the owner thread, like the viewer's publication.
+//! system, including signature verification and S-101 update planning of
+//! exchange sets. Explicitly selected S-101 cancellations remove their
+//! loaded target (or are recorded as announcements) and persist in the
+//! platform user store's cancellation history. Opening runs as a background
+//! job on the platform executor; its result is installed on the owner
+//! thread, like the viewer's publication.
 use crate::catalogue::{
     load_feature_catalogue_from, load_portrayal_catalogue_from, validate_fc, validate_pc,
 };
 use crate::chart_cells::chart_data_bounds;
+use crate::chart_publication::{
+    CancellationHistory, CancellationRecord, HistoryStore, ValidatedRemoval,
+};
 use crate::gml_overlay::{self, GmlOverlays, Provenance, SymbolRegistrar};
 use crate::pick::{find_features_at, FeatureReport, GeometryPicker, PickCandidate, PickSurface};
 use crate::platform::{parallel_map, EntryKind, Platform};
 use crate::portrayal::{AreaTriangulator, PortrayalChangeRequest, PortrayalSource};
+use crate::s421_dataset_input::CapturedRouteInput;
 use crate::scene::{prepare_flat_coverage, PreparedScene};
 use crate::state::{EngineState, ViewportPixels};
 use crate::{dataset_signature_policy, s101_update_plan, CellHydrationSource, ChartLoadResult};
@@ -52,9 +60,9 @@ pub enum SignaturePolicy {
     /// Open without verification (datasets are marked unverified).
     Off,
     /// Reject unsigned or invalid datasets (S-100 Part 15). Exchange sets are
-    /// verified through the platform data source (files or bytes); S-101
-    /// cells still need a source of local files (the update planner and its
-    /// lifecycle metadata are path-based).
+    /// verified through the platform data source (files or bytes) and S-101
+    /// chains are planned from the authenticated snapshots, as the viewer
+    /// does for local folders.
     Required,
 }
 
@@ -111,11 +119,12 @@ pub enum DatasetSource {
     Files(Vec<PathBuf>),
     /// Datasets held by the host, named by paths that are only their
     /// identity (exchange-set file names, update chains and product sniffing
-    /// use them). Under [`SignaturePolicy::Off`] they are opened unverified.
-    /// Under [`SignaturePolicy::Required`] S-124/S-129 datasets are verified
-    /// from the bytes (include their signature files and exchange catalogue
-    /// among the inputs); S-101 datasets from bytes are rejected until the
-    /// S-101 update planner reads non-local sources.
+    /// use them). Under [`SignaturePolicy::Off`] they are opened unverified
+    /// (S-101 chains are planned from the dataset identifications). Under
+    /// [`SignaturePolicy::Required`] they are verified from the bytes and
+    /// S-101 chains planned by the S-101 update planner (include the
+    /// signature files and exchange catalogue among the inputs; paths must
+    /// be absolute, they are the authorization keys).
     Bytes(Vec<(PathBuf, Arc<[u8]>)>),
 }
 
@@ -253,23 +262,40 @@ pub struct OpenReport {
     pub issues: Vec<ValidationIssue>,
     /// Inputs not opened and other information.
     pub notices: Vec<String>,
+    /// S-101 cancellations applied and recorded in the cancellation history
+    /// by this job (removals of loaded datasets and announcements).
+    pub cancellations: Vec<CancellationRecord>,
+    /// S-102 files newly opened by this job.
+    pub bathymetry: Vec<crate::s102_scene::BathymetrySummary>,
 }
 
 /// Datasets loaded by an [`OpenJob`], not yet installed.
 pub struct OpenedDatasets {
     cells: Vec<(ChartLoadResult, String)>,
     overlays: Vec<(PathBuf, Vec<u8>, Provenance)>,
+    removals: Vec<(PathBuf, ValidatedRemoval)>,
+    routes: Vec<CapturedRouteInput>,
     issues: Vec<ValidationIssue>,
     notices: Vec<String>,
     catalogues: ([u8; 32], [u8; 32]),
+    /// Decoded S-102 inputs.
+    s102: crate::s102_scene::OpenedS102,
 }
 
 impl OpenedDatasets {
+    /// Decoded S-102 files (coverage and trial inspections).
+    pub fn bathymetry_count(&self) -> usize {
+        self.s102.len()
+    }
     pub fn cell_count(&self) -> usize {
         self.cells.len()
     }
     pub fn overlay_count(&self) -> usize {
         self.overlays.len()
+    }
+    /// Validated S-101 cancellations (removals and announcements).
+    pub fn cancellation_count(&self) -> usize {
+        self.removals.len()
     }
 }
 
@@ -282,7 +308,7 @@ pub enum JobStatus {
 
 enum JobSlot {
     Running,
-    Done(Result<OpenedDatasets>),
+    Done(Box<Result<OpenedDatasets>>),
     Taken,
 }
 
@@ -317,7 +343,7 @@ impl OpenJob {
                 *slot = JobSlot::Running;
                 None
             }
-            JobSlot::Done(result) => Some(result),
+            JobSlot::Done(result) => Some(*result),
             JobSlot::Taken => Some(Err(anyhow::anyhow!("Open result already taken"))),
         }
     }
@@ -336,7 +362,7 @@ impl OpenJob {
                 .map_err(|_| anyhow::anyhow!("Open job poisoned"))?;
         }
         match std::mem::replace(&mut *slot, JobSlot::Taken) {
-            JobSlot::Done(result) => result,
+            JobSlot::Done(result) => *result,
             _ => bail!("Open result already taken"),
         }
     }
@@ -368,6 +394,9 @@ pub struct ChartEngine {
     triangulate: AreaTriangulator,
     display: DisplayOptions,
     provenance: Vec<String>,
+    routes: Vec<CapturedRouteInput>,
+    /// S-102 host options (depth adjustments, raster tile edge).
+    s102: crate::s102_scene::S102Options,
 }
 
 impl ChartEngine {
@@ -392,7 +421,7 @@ impl ChartEngine {
             &config.catalogues,
             config.register_overlay_symbols,
         );
-        let state = EngineState::new(
+        let mut state = EngineState::new(
             config.platform,
             Arc::new(fc),
             Arc::new(pc),
@@ -401,6 +430,9 @@ impl ChartEngine {
             config.profile.clone(),
             config.inventory.unwrap_or_default(),
         );
+        // S-102 catalogues are optional, like the overlay catalogues.
+        let data = Arc::clone(&state.platform.data);
+        crate::s102_scene::load_catalogues(&mut state, data.as_ref(), &config.catalogues);
         Ok(Self {
             state,
             overlays,
@@ -412,7 +444,22 @@ impl ChartEngine {
                 ..DisplayOptions::default()
             },
             provenance: Vec::new(),
+            routes: Vec::new(),
+            s102: Default::default(),
         })
+    }
+
+    /// Opened S-102 files ([`crate::s102_scene::SUPPORT`] says what is served).
+    pub fn bathymetry(&self) -> Vec<crate::s102_scene::BathymetrySummary> {
+        crate::s102_scene::summaries(&self.state)
+    }
+    pub fn s102_options(&self) -> &crate::s102_scene::S102Options {
+        &self.s102
+    }
+    /// Depth adjustments and raster tile edge for S-102 opened and prepared
+    /// from now on.
+    pub fn set_s102_options(&mut self, options: crate::s102_scene::S102Options) {
+        self.s102 = options;
     }
 
     /// The chart state (cells, catalogues, coverage).
@@ -429,6 +476,19 @@ impl ChartEngine {
     /// Catalogue errors of the optional overlay products.
     pub fn catalogue_errors(&self) -> &[String] {
         &self.overlays.catalogue_errors
+    }
+    /// S-421 routes captured by the opened inputs (not portrayed by the
+    /// engine; under [`SignaturePolicy::Required`] none are admitted).
+    pub fn routes(&self) -> &[CapturedRouteInput] {
+        &self.routes
+    }
+    /// The S-101 cancellation history of the platform user store (empty when
+    /// the host keeps none).
+    pub fn cancellation_history(&self) -> Result<CancellationHistory> {
+        match self.state.platform.user.cancellation_history() {
+            Some(record) => CancellationHistory::read_record(record.as_ref()),
+            None => Ok(CancellationHistory::default()),
+        }
     }
 
     /// Where S-101 cell instructions come from (default: Lua when the
@@ -516,6 +576,15 @@ impl ChartEngine {
             decoded: Arc::clone(&self.state.decoded_chart_cache),
             overlay_products: self.overlays.s124.is_some() || self.overlays.s129.is_some(),
             inventory: self.state.catalogue_inventory.clone(),
+            loaded: self.loaded_datasets(),
+            loaded_inputs: self
+                .state
+                .loaded_chain_paths
+                .iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            s102_options: self.s102.clone(),
         };
         let worker = Arc::clone(&shared);
         self.state.platform.executor.spawn(Box::new(move || {
@@ -523,11 +592,126 @@ impl ChartEngine {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.run(&worker.cancel)))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("Open job panicked")));
             if let Ok(mut slot) = worker.slot.lock() {
-                *slot = JobSlot::Done(result);
+                *slot = JobSlot::Done(Box::new(result));
             }
             worker.done.notify_all();
         }));
         OpenJob { shared }
+    }
+
+    /// The loaded logical datasets explicit cancellations are planned against.
+    fn loaded_datasets(&self) -> s101_update_plan::LoadedDatasets {
+        let mut loaded = BTreeMap::new();
+        for (index, cell) in self.state.cells.iter().enumerate() {
+            let (Ok(key), Some(identity)) = (
+                s101_update_plan::dataset_key(&cell.dsid),
+                self.state.loaded_source_identities.get(index),
+            ) else {
+                continue;
+            };
+            let metadata = self.state.loaded_discovery.get(&key).cloned().flatten();
+            loaded.insert(key, (cell.dsid.clone(), identity, metadata));
+        }
+        loaded
+    }
+
+    /// Validate the job's cancellations against the current cells and a
+    /// fresh, locked cancellation history, persist them, then remove the
+    /// cancelled cells. Nothing changes when any check or the write fails.
+    fn apply_cancellations(
+        &mut self,
+        removals: Vec<(PathBuf, ValidatedRemoval)>,
+        incoming: &[(ChartLoadResult, String)],
+        report: &mut OpenReport,
+    ) -> Result<()> {
+        let record = self.state.platform.user.cancellation_history();
+        if removals.is_empty() {
+            // Reused cancelled names need a newer issueDate (fresh history).
+            if !incoming.is_empty() {
+                if let Some(record) = record {
+                    let history = CancellationHistory::read_record(record.as_ref())?;
+                    for (result, _) in incoming {
+                        history.validate_reuse(
+                            &result.cell.dsid,
+                            result.base_metadata.as_ref().map(|m| m.issue_date),
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let record = record.context("This host keeps no S-101 cancellation history")?;
+        let mut store = HistoryStore::begin_record(record)?;
+        let incoming_keys = incoming
+            .iter()
+            .map(|(result, _)| s101_update_plan::dataset_key(&result.cell.dsid))
+            .collect::<Result<HashSet<_>>>()?;
+        let mut targets = Vec::new();
+        for (path, removal) in &removals {
+            store.history.validate_cancellation(removal.record())?;
+            ensure!(
+                !incoming_keys.contains(removal.key()),
+                "Same dataset cannot be loaded and cancelled in one batch: {}",
+                path.display()
+            );
+            let index = self.state.cells.iter().position(|cell| {
+                s101_update_plan::dataset_key(&cell.dsid).is_ok_and(|key| &key == removal.key())
+            });
+            if removal.removes_content() {
+                let index = index.with_context(|| {
+                    format!("Cancellation target is not loaded: {}", path.display())
+                })?;
+                ensure!(
+                    removal.targets(
+                        &self.state.cells[index].dsid,
+                        self.state.loaded_source_identities.get(index)
+                    ),
+                    "Cancellation target changed after validation: {}",
+                    path.display()
+                );
+                ensure!(!targets.contains(&index), "Duplicate cancellation target");
+                targets.push(index);
+            } else {
+                ensure!(
+                    index.is_none(),
+                    "Cancellation absence changed after announcement validation: {}",
+                    path.display()
+                );
+            }
+        }
+        for (result, _) in incoming {
+            store.history.validate_reuse(
+                &result.cell.dsid,
+                result.base_metadata.as_ref().map(|m| m.issue_date),
+            )?;
+        }
+        let records: Vec<CancellationRecord> =
+            removals.iter().map(|(_, r)| r.record().clone()).collect();
+        store.persist(records.clone())?;
+        targets.sort_unstable();
+        for index in targets.into_iter().rev() {
+            let cell = self.state.cells.remove(index);
+            self.state.loaded_source_identities.remove(index);
+            self.state.loaded_chain_paths.remove(index);
+            self.provenance.remove(index);
+            if let Ok(key) = s101_update_plan::dataset_key(&cell.dsid) {
+                self.state.loaded_discovery.remove(&key);
+            }
+            report.notices.push(format!(
+                "Cancelled S-101 dataset {} (edition {}, update {})",
+                cell.dsid.dataset_name, cell.dsid.edition_number, cell.dsid.update_number
+            ));
+        }
+        for (path, removal) in &removals {
+            if !removal.removes_content() {
+                report.notices.push(format!(
+                    "Recorded S-101 cancellation announcement {} (no loaded content)",
+                    path.display()
+                ));
+            }
+        }
+        report.cancellations = records;
+        Ok(())
     }
 
     /// Open and install in one call.
@@ -550,7 +734,23 @@ impl ChartEngine {
             datasets: Vec::new(),
             issues: opened.issues,
             notices: opened.notices,
+            cancellations: Vec::new(),
+            bathymetry: Vec::new(),
         };
+        self.apply_cancellations(opened.removals, &opened.cells, &mut report)?;
+        for route in opened.routes {
+            if self.routes.iter().any(|r| r.sha256() == route.sha256()) {
+                report
+                    .notices
+                    .push(format!("Already open: {}", route.path().display()));
+                continue;
+            }
+            report.notices.push(format!(
+                "S-421 route captured (not portrayed by ChartEngine): {}",
+                route.path().display()
+            ));
+            self.routes.push(route);
+        }
         let mut added = 0usize;
         let mut loaded: HashSet<[u8; 32]> = (0..self.state.cells.len())
             .filter_map(|i| self.state.cell_identity_sha(i))
@@ -621,6 +821,8 @@ impl ChartEngine {
             self.state.catalogue_registry =
                 self.state
                     .prepare_catalogue_registry(&self.state.fc, &self.state.pc, true)?;
+        } else {
+            self.state.catalogue_registry = Default::default();
         }
         let first_new = self.state.cells.len() - added;
         for (index, cell) in self.state.cells.iter().enumerate().skip(first_new) {
@@ -650,14 +852,19 @@ impl ChartEngine {
                 }),
             }
         }
+        crate::s102_scene::install(&mut self.state, opened.s102, &mut report);
         self.state.bounds = self.data_bounds();
         Ok(report)
     }
 
     fn data_bounds(&self) -> GeoBounds {
-        if !self.state.cells.is_empty() {
-            // The viewer's all-data view: the data extent with a margin.
-            let mut bounds = chart_data_bounds(&self.state.cells, std::iter::empty());
+        if !self.state.cells.is_empty() || !self.state.bathymetry_bounds.is_empty() {
+            // The viewer's all-data view: the data extent (S-101 cells and
+            // S-102 rasters) with a margin.
+            let mut bounds = chart_data_bounds(
+                &self.state.cells,
+                self.state.bathymetry_bounds.values().copied(),
+            );
             bounds.expand_by_percent(0.1);
             return bounds;
         }
@@ -894,6 +1101,13 @@ impl ChartEngine {
             [width, height],
             scale_factor,
         )?;
+        // S-102: the viewer's raster portrayal of the loaded bathymetry.
+        let bathymetry = crate::s102_scene::prepare_scene(
+            &self.state,
+            &self.display.profile,
+            &settings,
+            &self.s102,
+        )?;
         self.state.catalogue_registry = registry.clone();
         self.state.coverage_inventory = Some(Arc::clone(&coverage));
         self.state.ic_assigned_vectors = ic_changed;
@@ -902,7 +1116,55 @@ impl ChartEngine {
             coverage,
             catalogue_registry: registry,
             ic_changed,
+            bathymetry,
         }))
+    }
+
+    /// Move `scene` to `view` without portraying again, as the viewer's
+    /// pan/zoom path does (cell instructions do not depend on the view):
+    /// the camera, viewport and pixel ratio of [`Self::prepare`] and the flat
+    /// coverage of the new view. `scene` must be the scene this engine
+    /// prepared last, with the datasets and display unchanged since. Returns
+    /// false (`scene` unchanged) when the view needs other cells resident
+    /// (large chart sets, `EngineState::residency_for_view`); then
+    /// [`Self::prepare`] portrays the new resident set. Otherwise the result
+    /// equals what [`Self::prepare`] would build for `view`.
+    pub fn reproject(&mut self, scene: &mut PreparedScene, view: &View) -> Result<bool> {
+        let ViewportPixels {
+            width,
+            height,
+            scale_factor,
+        } = view.viewport;
+        ensure!(
+            width > 0 && height > 0 && scale_factor.is_finite() && scale_factor > 0.,
+            "Empty view"
+        );
+        let fit = match view.camera {
+            Some(camera) => self.camera_view(camera, view.viewport)?.0,
+            None => view.fit.unwrap_or(self.state.bounds),
+        };
+        let context = &mut self.state.render_context;
+        context.set_bounds(self.state.bounds);
+        context.set_viewport(width as f32, height as f32);
+        context.zoom_to_fit(fit);
+        context.scaler.set_pixel_ratio(scale_factor);
+        if !self.state.cells.is_empty()
+            && self
+                .state
+                .residency_for_view(&scene.coverage, true, Some(view.viewport))
+                != self.state.resident_cells
+        {
+            return Ok(false);
+        }
+        scene.context.set_viewport(width as f32, height as f32);
+        scene.context.scaler = self.state.render_context.scaler.clone();
+        prepare_flat_coverage(
+            Some(scene.coverage.as_ref()),
+            &mut scene.context,
+            [width, height],
+            scale_factor,
+        )?;
+        Ok(true)
     }
 
     /// Features under screen point `point` of `scene` within `radius`
@@ -1013,6 +1275,11 @@ struct OpenTask {
     overlay_products: bool,
     /// Installed S-101 catalogue inventory (empty: none).
     inventory: PathBuf,
+    /// Loaded logical datasets when the job started (cancellation targets).
+    loaded: s101_update_plan::LoadedDatasets,
+    /// Inputs of the loaded chains (predecessors of selected updates).
+    loaded_inputs: Vec<PathBuf>,
+    s102_options: crate::s102_scene::S102Options,
 }
 
 /// One S-101 chain read into memory.
@@ -1072,25 +1339,17 @@ impl OpenTask {
         );
         let mut charts = Vec::new();
         let mut overlays = Vec::new();
+        let mut routes = Vec::new();
+        let mut s102_inputs = Vec::new();
         for path in inputs {
             if s101_update_plan::is_chart_file(&path) {
                 charts.push(path);
             } else if gml_overlay::sniff_product_in(data, &path).is_some() {
                 overlays.push(path);
-            } else if crate::dataset_discovery::is_dataset_file(&path, "h5")
-                || crate::dataset_discovery::is_dataset_file(&path, "hdf5")
-            {
-                notices.push(if cfg!(feature = "s102-hdf5") {
-                    format!(
-                        "Not opened (S-102 is not yet served by ChartEngine): {}",
-                        path.display()
-                    )
-                } else {
-                    format!(
-                        "Not opened (S-102 support is not built: feature s102-hdf5): {}",
-                        path.display()
-                    )
-                });
+            } else if let Some(route) = self.capture_route(&path, &mut notices) {
+                routes.push(route);
+            } else if crate::s102_scene::is_hdf5_input(&path) {
+                s102_inputs.push(path);
             } else if explicit {
                 notices.push(format!("Not a supported dataset: {}", path.display()));
             }
@@ -1107,16 +1366,15 @@ impl OpenTask {
             overlays.clear();
         }
         let require = self.signatures == SignaturePolicy::Required;
-        ensure!(
-            !require || data.local_paths() || charts.is_empty(),
-            "S-101 signature verification needs a source of local files (the S-101 update planner is path-based)"
-        );
-        let cells = if charts.is_empty() {
-            Vec::new()
-        } else if data.local_paths() {
-            self.load_local_charts(charts, cancel, &mut notices, &mut issues)?
+        let (cells, removals) = if charts.is_empty() {
+            (Vec::new(), Vec::new())
+        } else if data.local_paths() || require {
+            self.load_planned_charts(charts, explicit, cancel, &mut notices, &mut issues)?
         } else {
-            self.load_byte_charts(charts, cancel, &mut notices, &mut issues)?
+            (
+                self.load_byte_charts(charts, cancel, &mut notices, &mut issues)?,
+                Vec::new(),
+            )
         };
         let mut loaded_overlays = Vec::new();
         for path in overlays {
@@ -1131,12 +1389,25 @@ impl OpenTask {
                 }),
             }
         }
+        let s102 = crate::s102_scene::open_inputs(
+            s102_inputs,
+            data,
+            &|paths| self.authorize(paths),
+            require,
+            &self.s102_options,
+            cancel,
+            &mut notices,
+            &mut issues,
+        )?;
         Ok(OpenedDatasets {
             cells,
             overlays: loaded_overlays,
+            removals,
+            routes,
             issues,
             notices,
             catalogues: (*self.fc.source_digest(), *self.pc.source_digest()),
+            s102,
         })
     }
 
@@ -1152,7 +1423,9 @@ impl OpenTask {
     /// the same verification reading exchange sets through the data source.
     fn authorize(&self, paths: &[PathBuf]) -> Result<ferrite_security::AuthorizedDatasets> {
         match self.signatures {
-            SignaturePolicy::Off => dataset_signature_policy::unchecked_datasets(paths),
+            SignaturePolicy::Off => {
+                dataset_signature_policy::unchecked_datasets_in(self.platform.data.as_ref(), paths)
+            }
             SignaturePolicy::Required if self.platform.data.local_paths() => {
                 ferrite_security::authorize_datasets(
                     paths,
@@ -1249,24 +1522,134 @@ impl OpenTask {
         Ok(())
     }
 
-    /// Local files: the viewer's authorized planner and loader.
-    fn load_local_charts(
+    /// An S-421 route among the inputs (XML/GML whose head names S-421),
+    /// captured once; capture failures and routes refused by the signature
+    /// policy are notices.
+    fn capture_route(&self, path: &Path, notices: &mut Vec<String>) -> Option<CapturedRouteInput> {
+        let data = self.platform.data.as_ref();
+        let xml = crate::dataset_discovery::is_dataset_file(path, "gml")
+            || crate::dataset_discovery::is_dataset_file(path, "xml");
+        if !xml
+            || path
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("CATALOG.XML"))
+        {
+            return None;
+        }
+        let head = data.read_limited(path, 64 * 1024 - 1).ok()?;
+        let head = String::from_utf8_lossy(&head);
+        if !head.contains("S421") && !head.contains("S-421") {
+            return None;
+        }
+        match crate::s421_dataset_input::capture_if_route_in(data, path) {
+            Ok(Some(route)) => {
+                match route.allowed_xml(self.signatures == SignaturePolicy::Required) {
+                    Ok(_) => Some(route),
+                    Err(error) => {
+                        notices.push(format!("Not opened: {}: {error}", path.display()));
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(error) => {
+                notices.push(format!("Not opened: {}: {error}", path.display()));
+                None
+            }
+        }
+    }
+
+    /// The viewer's authorized planner and loader, over any data source:
+    /// local files (private snapshot files) or bytes (owned copies). An
+    /// explicit selection also plans its physical cancellations.
+    #[allow(clippy::type_complexity)]
+    fn load_planned_charts(
         &self,
         charts: Vec<PathBuf>,
+        explicit: bool,
         cancel: &AtomicBool,
         notices: &mut Vec<String>,
         issues: &mut Vec<ValidationIssue>,
-    ) -> Result<Vec<(ChartLoadResult, String)>> {
+    ) -> Result<(
+        Vec<(ChartLoadResult, String)>,
+        Vec<(PathBuf, ValidatedRemoval)>,
+    )> {
+        let data = self.platform.data.as_ref();
         let require = self.signatures == SignaturePolicy::Required;
+        // An explicit selection also opens the base and predecessors of a
+        // selected update (as the viewer does).
+        let selected = charts.clone();
+        // Planned inputs are canonical paths, the keys of their authorization
+        // and lifecycle metadata.
+        let charts = if explicit {
+            s101_update_plan::expand_candidates_in(data, &charts, &self.loaded_inputs)?
+        } else {
+            let mut canonical = Vec::with_capacity(charts.len());
+            for path in charts {
+                match data.canonicalize(&path) {
+                    Ok(path) => canonical.push(path),
+                    Err(error) => {
+                        notices.push(format!("Skipped S-101 input {}: {error}", path.display()))
+                    }
+                }
+            }
+            canonical
+        };
         let authorization = self.authorize(&charts)?;
         let provenance = if require {
             "signature verified"
         } else {
             "signature not verified"
         };
-        let (plans, plan_notices) =
-            s101_update_plan::authorized_folder_plans(charts, &authorization, require)?;
+        let (plans, cancellations, plan_notices) = if explicit {
+            let record = self.platform.user.cancellation_history();
+            let history = match &record {
+                Some(record) => CancellationHistory::read_record(record.as_ref())?,
+                None => CancellationHistory::default(),
+            };
+            let (plans, mut cancellations, mut plan_notices) =
+                s101_update_plan::authorized_selection_plans_in(
+                    data,
+                    charts,
+                    &selected,
+                    &authorization,
+                    require,
+                    &self.loaded,
+                    &history,
+                )?;
+            if record.is_none() {
+                for plan in cancellations.drain(..) {
+                    plan_notices.push(format!(
+                        "Skipped S-101 cancellation {}: this host keeps no cancellation history",
+                        plan.original().display()
+                    ));
+                }
+            }
+            (plans, cancellations, plan_notices)
+        } else {
+            let (plans, plan_notices) = s101_update_plan::authorized_folder_plans_in(
+                data,
+                charts,
+                &authorization,
+                require,
+            )?;
+            (plans, Vec::new(), plan_notices)
+        };
         notices.extend(plan_notices);
+        let mut removals = Vec::new();
+        for plan in cancellations {
+            ensure!(!cancel.load(Ordering::Relaxed), "Open cancelled");
+            let path = plan.original().to_path_buf();
+            match plan.load() {
+                Ok(removal) => removals.push((path, removal)),
+                Err(error) => issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    subject: path.display().to_string(),
+                    check: "S-101 cancellation".into(),
+                    message: format!("{error:#}"),
+                }),
+            }
+        }
         let codes = Arc::new(self.fc.feature_type_codes());
         let owners = self.inventory_owners(&plans, notices);
         let plans: Vec<_> = plans.into_iter().map(Arc::new).collect();
@@ -1316,7 +1699,7 @@ impl OpenTask {
                 }
             }
         }
-        Ok(cells)
+        Ok((cells, removals))
     }
 
     /// Catalogue owners from the installed inventory for planned datasets
@@ -1364,7 +1747,12 @@ impl OpenTask {
                 Arc::clone(&self.fc),
                 Arc::clone(&self.pc),
             )?);
-            DatasetCatalogueRegistry::default().stage(&requests, fallback, &self.inventory)
+            DatasetCatalogueRegistry::default().stage_in(
+                self.platform.data.as_ref(),
+                &requests,
+                fallback,
+                &self.inventory,
+            )
         })();
         let registry = match staged {
             Ok(registry) => registry,
@@ -1574,7 +1962,7 @@ mod tests {
         assert!(job.try_take().is_none());
         job.cancel();
         assert!(shared.cancel.load(Ordering::Relaxed));
-        *shared.slot.lock().unwrap() = JobSlot::Done(Err(anyhow::anyhow!("x")));
+        *shared.slot.lock().unwrap() = JobSlot::Done(Box::new(Err(anyhow::anyhow!("x"))));
         assert_eq!(job.poll(), JobStatus::Finished);
         assert!(job.try_take().unwrap().is_err());
         assert!(job.try_take().unwrap().is_err());

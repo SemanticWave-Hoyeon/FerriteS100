@@ -1,5 +1,6 @@
 //! Owned metadata evidence for S-101 lifecycle decisions. OFF reads producer
 //! metadata without any authenticity claim; it never constructs signed wrappers.
+use crate::platform::DataSource;
 use crate::s101_xc_coverage::{self, XcDataCoverage};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::NaiveDate;
@@ -16,6 +17,14 @@ use std::{
 const XC: &str = "http://www.iho.int/s100/xc/5.2";
 const MAX_XML: u64 = 8 * 1024 * 1024;
 const MAX_RESOURCE: u64 = 512 * 1024 * 1024;
+
+/// A retained private input: a snapshot file (sources of local files) or
+/// owned bytes (other sources).
+#[derive(Clone, Copy, Debug)]
+pub enum RetainedInput<'a> {
+    File(&'a Path),
+    Bytes(&'a [u8]),
+}
 
 #[derive(Clone)]
 enum Provenance {
@@ -91,6 +100,10 @@ impl MetadataEvidence {
     /// `original` is the retained canonical authorization key, not a live path
     /// to reopen. A deleted/changed original or catalogue cannot change evidence.
     pub fn verify_resource(&self, original: &Path, retained_data: &Path) -> Result<()> {
+        self.verify_retained(original, RetainedInput::File(retained_data))
+    }
+    /// [`MetadataEvidence::verify_resource`] of a retained file or bytes.
+    pub fn verify_retained(&self, original: &Path, retained_data: RetainedInput<'_>) -> Result<()> {
         ensure!(
             original == self.original_canonical_key,
             "Lifecycle metadata original canonical key mismatch"
@@ -180,7 +193,21 @@ impl MetadataEvidence {
     }
 }
 
-fn resource_digest(path: &Path) -> Result<([u8; 32], [u8; 48], u64)> {
+fn resource_digest(retained: RetainedInput<'_>) -> Result<([u8; 32], [u8; 48], u64)> {
+    let path = match retained {
+        RetainedInput::File(path) => path,
+        RetainedInput::Bytes(bytes) => {
+            ensure!(
+                bytes.len() as u64 <= MAX_RESOURCE,
+                "Lifecycle dataset exceeds regular-file receiver budget"
+            );
+            return Ok((
+                Sha256::digest(bytes).into(),
+                Sha384::digest(bytes).into(),
+                bytes.len() as u64,
+            ));
+        }
+    };
     let input = File::open(path)?;
     let metadata = input.metadata()?;
     ensure!(
@@ -261,7 +288,7 @@ fn purpose(value: &str) -> Result<DatasetPurpose> {
         _ => bail!("Unsupported lifecycle dataset purpose"),
     }
 }
-fn resource_path(root: &Path, uri: &str) -> Result<PathBuf> {
+fn resource_path(data: &dyn DataSource, root: &Path, uri: &str) -> Result<PathBuf> {
     // Decode before traversal checks, including encoded separators and dots.
     let mut decoded = Vec::with_capacity(uri.len());
     let mut input = uri.as_bytes().iter().copied();
@@ -295,12 +322,11 @@ fn resource_path(root: &Path, uri: &str) -> Result<PathBuf> {
                 && !part.contains('\0')),
         "Unsafe lifecycle exchange-relative resource path"
     );
-    let path = root
-        .join(name)
-        .canonicalize()
+    let path = data
+        .canonicalize(&root.join(name))
         .context("Missing lifecycle catalogue resource")?;
     ensure!(
-        path.starts_with(root) && path.is_file(),
+        path.starts_with(root) && data.is_file(&path),
         "Lifecycle resource escapes exchange root"
     );
     Ok(path)
@@ -371,7 +397,11 @@ struct UnverifiedEntry {
 fn message(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
-fn parse_unverified(root: &Path, xml: &str) -> std::result::Result<Vec<UnverifiedEntry>, String> {
+fn parse_unverified(
+    data: &dyn DataSource,
+    root: &Path,
+    xml: &str,
+) -> std::result::Result<Vec<UnverifiedEntry>, String> {
     let document = Document::parse_with_options(
         xml,
         ParsingOptions {
@@ -420,7 +450,7 @@ fn parse_unverified(root: &Path, xml: &str) -> std::result::Result<Vec<Unverifie
             entries.push(UnverifiedEntry {
                 path: child(entry, "fileName")
                     .and_then(text)
-                    .and_then(|name| resource_path(root, name))
+                    .and_then(|name| resource_path(data, root, name))
                     .map_err(message),
                 head: head.map_err(message),
                 rows: s101_xc_coverage::capture(entry)
@@ -461,7 +491,28 @@ pub fn capture_cached(
     authorization: &AuthorizedDatasets,
     cache: &mut CaptureCache,
 ) -> Result<Option<MetadataEvidence>> {
-    let key = original.canonicalize()?;
+    capture_cached_in(
+        &crate::platform::NativeDataSource,
+        original,
+        RetainedInput::File(retained_data),
+        retained_fingerprint,
+        authorization,
+        cache,
+    )
+}
+
+/// [`capture_cached`] reading the original's exchange catalogue through a
+/// data source (its canonical paths are the keys); `retained_data` is the
+/// private snapshot file or bytes of the original.
+pub fn capture_cached_in(
+    data: &dyn DataSource,
+    original: &Path,
+    retained_data: RetainedInput<'_>,
+    retained_fingerprint: Option<(u64, [u8; 32])>,
+    authorization: &AuthorizedDatasets,
+    cache: &mut CaptureCache,
+) -> Result<Option<MetadataEvidence>> {
+    let key = data.canonicalize(original)?;
     let authorization = authorization.checked_dataset_discovery(&key)?;
     match authorization {
         DatasetDiscoveryAuthorization::Authenticated(bound) => {
@@ -513,23 +564,32 @@ pub fn capture_cached(
                 .parent()
                 .into_iter()
                 .flat_map(Path::ancestors)
-                .find(|p| p.join("CATALOG.XML").exists())
+                .find(|p| data.exists(&p.join("CATALOG.XML")))
             else {
                 return Ok(None);
             };
-            let root = root.canonicalize()?;
-            let xml_path = root.join("CATALOG.XML").canonicalize()?;
+            let root = data.canonicalize(root)?;
+            let xml_path = data.canonicalize(&root.join("CATALOG.XML"))?;
             ensure!(
                 xml_path.starts_with(&root),
                 "Lifecycle catalogue symlink escapes exchange root"
             );
-            let file = File::open(&xml_path)?;
-            ensure!(
-                file.metadata()?.is_file() && file.metadata()?.len() <= MAX_XML,
-                "Lifecycle catalogue exceeds XML receiver budget"
-            );
-            let mut bytes = Vec::new();
-            file.take(MAX_XML + 1).read_to_end(&mut bytes)?;
+            let bytes = if data.local_paths() {
+                let file = File::open(&xml_path)?;
+                ensure!(
+                    file.metadata()?.is_file() && file.metadata()?.len() <= MAX_XML,
+                    "Lifecycle catalogue exceeds XML receiver budget"
+                );
+                let mut bytes = Vec::new();
+                file.take(MAX_XML + 1).read_to_end(&mut bytes)?;
+                bytes
+            } else {
+                ensure!(
+                    data.is_file(&xml_path) && data.len(&xml_path)? <= MAX_XML,
+                    "Lifecycle catalogue exceeds XML receiver budget"
+                );
+                data.read_limited(&xml_path, MAX_XML)?
+            };
             ensure!(
                 bytes.len() as u64 <= MAX_XML,
                 "Lifecycle catalogue grew beyond XML receiver budget"
@@ -542,7 +602,7 @@ pub fn capture_cached(
                     .entry((xml_path.clone(), digest))
                     .or_insert_with(|| {
                         Arc::new(UnverifiedCatalogue {
-                            document: parse_unverified(&root, xml),
+                            document: parse_unverified(data, &root, xml),
                             retained: std::sync::Mutex::new(None),
                         })
                     }),

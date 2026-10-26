@@ -1,4 +1,8 @@
 //! Discovery/capture only: no authentication or portrayal authority is produced here.
+//! Routes are read through a [`DataSource`]: the path-based functions read
+//! local files exactly as before; the `_in` variants any source (paths stay
+//! the identity of the captured route).
+use crate::platform::{DataSource, EntryKind, NativeDataSource};
 #[cfg(not(target_arch = "wasm32"))]
 use ferrite_s421::s421::{Profile, MAX_XML_BYTES};
 #[cfg(target_arch = "wasm32")]
@@ -98,6 +102,35 @@ pub fn capture_if_route(path: &Path) -> Result<Option<CapturedRouteInput>, Route
         .map_err(|e| RouteInputError::Io(e.to_string()))?;
     classify_owned(path.to_path_buf(), bytes)
 }
+/// [`capture_if_route`] over any data source: a regular file (not a link)
+/// within the receiver limit, captured once as owned bytes.
+pub fn capture_if_route_in(
+    data: &dyn DataSource,
+    path: &Path,
+) -> Result<Option<CapturedRouteInput>, RouteInputError> {
+    if data.local_paths() {
+        return capture_if_route(path);
+    }
+    let kind = data
+        .kind(path)
+        .map_err(|e| RouteInputError::Io(e.to_string()))?;
+    if kind != EntryKind::File {
+        return Err(RouteInputError::Io(
+            "Expected regular non-symlink file".into(),
+        ));
+    }
+    if data
+        .len(path)
+        .map_err(|e| RouteInputError::Io(e.to_string()))?
+        > MAX_XML_BYTES as u64
+    {
+        return Err(RouteInputError::TooLarge);
+    }
+    let bytes = data
+        .read_limited(path, MAX_XML_BYTES as u64)
+        .map_err(|e| RouteInputError::Io(e.to_string()))?;
+    classify_owned(path.to_path_buf(), bytes)
+}
 fn classify_owned(
     path: PathBuf,
     bytes: Vec<u8>,
@@ -184,29 +217,34 @@ fn classify_owned(
 pub fn discover_routes(
     root: &Path,
 ) -> Result<(Vec<CapturedRouteInput>, Vec<String>), RouteInputError> {
-    if !std::fs::symlink_metadata(root)
+    discover_routes_in(&NativeDataSource, root)
+}
+/// [`discover_routes`] over any data source.
+pub fn discover_routes_in(
+    data: &dyn DataSource,
+    root: &Path,
+) -> Result<(Vec<CapturedRouteInput>, Vec<String>), RouteInputError> {
+    if data
+        .kind(root)
         .map_err(|e| RouteInputError::Io(e.to_string()))?
-        .is_dir()
+        != EntryKind::Dir
     {
         return Err(RouteInputError::Io("Expected real directory".into()));
     }
     let mut paths = Vec::new();
-    for (count, entry) in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .enumerate()
-    {
+    for (count, entry) in data.walk(root).enumerate() {
         if count >= 100_000 {
             return Err(RouteInputError::TooLarge);
         }
         let entry = entry.map_err(|e| RouteInputError::Io(e.to_string()))?;
-        if entry.file_type().is_file()
-            && (crate::dataset_discovery::is_dataset_file(entry.path(), "gml")
-                || crate::dataset_discovery::is_dataset_file(entry.path(), "xml"))
+        if entry.kind == EntryKind::File
+            && (crate::dataset_discovery::is_dataset_file(&entry.path, "gml")
+                || crate::dataset_discovery::is_dataset_file(&entry.path, "xml"))
         {
             if entry
+                .path
                 .file_name()
-                .to_str()
+                .and_then(|n| n.to_str())
                 .is_some_and(|n| n.eq_ignore_ascii_case("CATALOG.XML"))
             {
                 continue;
@@ -214,7 +252,7 @@ pub fn discover_routes(
             if paths.len() >= 4096 {
                 return Err(RouteInputError::TooLarge);
             }
-            paths.push(entry.into_path());
+            paths.push(entry.path);
         }
     }
     paths.sort();
@@ -222,7 +260,7 @@ pub fn discover_routes(
     let mut notices = Vec::new();
     let mut total = 0usize;
     for path in paths {
-        match capture_if_route(&path) {
+        match capture_if_route_in(data, &path) {
             Ok(Some(input)) => {
                 let next = total
                     .checked_add(input.xml.len())

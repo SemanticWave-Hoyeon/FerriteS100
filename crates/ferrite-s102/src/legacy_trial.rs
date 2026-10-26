@@ -1,11 +1,10 @@
 //! Read-only S-102 2.1 trial-data inspection. Deliberately NOT a CoverageSource:
 //! unknown vertical references must never enter depth composition/safety queries.
 //! This bounded receiver profile is not a full S-102 2.1 conformity validator.
-use anyhow::{ensure, Context, Result};
-use hdf5::{
-    types::{FixedAscii, FixedUnicode, FloatSize, TypeDescriptor, VarLenAscii, VarLenUnicode},
-    Group,
+use crate::h5::{
+    FixedAscii, FixedUnicode, FloatSize, Group, TypeDescriptor, VarLenAscii, VarLenUnicode,
 };
+use anyhow::{ensure, Context, Result};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +47,7 @@ pub struct TrialSample {
 /// reader to an operational BathymetryCoverage or certify product conformance.
 #[derive(Debug)]
 pub struct LegacyTrialGrid {
-    values: hdf5::Dataset,
+    values: crate::h5::Dataset,
     geometry: TrialGrid,
     pub product_specification: String,
     pub issue_date_lexical: String,
@@ -63,7 +62,7 @@ pub struct LegacyTrialGrid {
 // UKHO trial attributes use a one-element rank1 dataspace rather than rank0.
 // Accept exactly these two shapes in this isolated receiver profile; the 3.0
 // scalar decoder remains unchanged and retains its stricter product contract.
-fn one_attribute(g: &Group, name: &str) -> Result<hdf5::Attribute> {
+fn one_attribute(g: &Group, name: &str) -> Result<crate::h5::Attribute> {
     let a = g.attr(name)?;
     ensure!(
         a.is_scalar() || a.shape() == [1],
@@ -71,7 +70,7 @@ fn one_attribute(g: &Group, name: &str) -> Result<hdf5::Attribute> {
     );
     Ok(a)
 }
-fn one<T: hdf5::H5Type>(a: &hdf5::Attribute) -> Result<T> {
+fn one<T: crate::h5::H5Read>(a: &crate::h5::Attribute) -> Result<T> {
     // All callers first validate the dataspace and datatype. read_raw supports
     // rank0 and [1] uniformly, with exactly one element admitted beforehand.
     let mut values = a.read_raw::<T>()?;
@@ -158,7 +157,13 @@ fn extrema(g: &Group, min: &str, max: &str) -> Result<Option<[f64; 2]>> {
 }
 impl LegacyTrialGrid {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = hdf5::File::open(path)?;
+        Self::open_file(crate::h5::File::open(path)?)
+    }
+    /// Inspect an in-memory trial file with the pure-Rust reader.
+    pub fn open_bytes(bytes: impl Into<std::sync::Arc<[u8]>>) -> Result<Self> {
+        Self::open_file(crate::h5::File::open_bytes(bytes)?)
+    }
+    pub fn open_file(file: crate::h5::File) -> Result<Self> {
         let product_specification = text(&file, "productSpecification")?;
         ensure!(
             matches!(
@@ -299,14 +304,9 @@ impl LegacyTrialGrid {
             "Trial requires only BathymetryCoverage feature declaration"
         );
         let ty = codes.dtype()?;
-        let space = codes.space()?;
-        let mut bytes = 0;
-        let status = hdf5::sync::sync(|| unsafe {
-            // Dataset, datatype and dataspace handles stay live under the HDF5 lock.
-            hdf5_sys::h5d::H5Dvlen_get_buf_size(codes.id(), ty.id(), space.id(), &mut bytes)
-        });
+        let bytes = codes.vlen_buf_size();
         ensure!(
-            status >= 0 && bytes <= 4097,
+            bytes.is_ok_and(|b| b <= 4097),
             "Trial featureCode payload exceeds receiver budget"
         );
         let code = match ty.to_descriptor()? {
@@ -409,19 +409,27 @@ impl LegacyTrialGrid {
         );
         Ok(self
             .values
-            .read_slice_2d::<crate::DepthValue, _>((row..row + height, column..column + width))?
-            .into_iter()
+            .read_f32_fields_2d(
+                &["depth", "uncertainty"],
+                row..row + height,
+                column..column + width,
+            )?
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|v| TrialSample {
-                depth: v.depth,
-                uncertainty: v.uncertainty,
+                depth: v[0],
+                uncertainty: v[1],
             })
             .collect())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use hdf5::Group;
     use hdf5::{types::VarLenAscii, H5Type};
     struct Fixture(std::path::PathBuf);
     impl Drop for Fixture {
@@ -557,31 +565,34 @@ mod tests {
             .unwrap()
             .write_raw(&[4326])
             .unwrap();
-        assert_eq!(text(&h, "singletonText").unwrap(), "2021-03-24Z");
+        assert_eq!(text(&crate::w(&h), "singletonText").unwrap(), "2021-03-24Z");
         assert_eq!(
-            number(&h, "singletonFloat").unwrap().to_bits(),
+            number(&crate::w(&h), "singletonFloat").unwrap().to_bits(),
             (-0.0f64).to_bits()
         );
-        assert_eq!(unsigned32(&h, "singletonInteger").unwrap(), 4326);
+        assert_eq!(unsigned32(&crate::w(&h), "singletonInteger").unwrap(), 4326);
         // UKHO 2026 S-102 3.0 uses the same singleton encoding (crate::singleton).
-        assert_eq!(crate::scalar::u32(&h, "singletonInteger").unwrap(), 4326);
-        assert!(unsigned32(&h, "singletonFloat").is_err());
-        assert!(number(&h, "singletonInteger").is_err());
+        assert_eq!(
+            crate::scalar::u32(&crate::w(&h), "singletonInteger").unwrap(),
+            4326
+        );
+        assert!(unsigned32(&crate::w(&h), "singletonFloat").is_err());
+        assert!(number(&crate::w(&h), "singletonInteger").is_err());
         for (name, shape) in [
             ("vector", vec![2]),
             ("matrix", vec![1, 1]),
             ("empty", vec![0]),
         ] {
             h.new_attr::<u32>().shape(shape).create(name).unwrap();
-            assert!(unsigned32(&h, name).is_err());
-            assert!(crate::scalar::u32(&h, name).is_err());
+            assert!(unsigned32(&crate::w(&h), name).is_err());
+            assert!(crate::scalar::u32(&crate::w(&h), name).is_err());
         }
         attr(&h, "negative", -1i32);
         attr(&h, "tooWide", u64::from(u32::MAX) + 1);
-        assert!(unsigned32(&h, "negative").is_err());
-        assert!(unsigned32(&h, "tooWide").is_err());
+        assert!(unsigned32(&crate::w(&h), "negative").is_err());
+        assert!(unsigned32(&crate::w(&h), "tooWide").is_err());
         attr(&h, "tooWide8", 256u16);
-        assert!(unsigned8(&h, "tooWide8").is_err());
+        assert!(unsigned8(&crate::w(&h), "tooWide8").is_err());
     }
     #[test]
     fn original_trial_bits_unknown_reference_and_node_coordinates_are_preserved() {

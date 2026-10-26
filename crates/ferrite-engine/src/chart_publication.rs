@@ -1,5 +1,6 @@
 //! App cell publication transaction. Product parsing stays in its adapter;
 //! replacement moves owned cells and retains only replaced cells for rollback.
+use crate::platform::{RecordLock, UserRecord};
 use crate::{cell_source_identity::LoadedSourceIdentities, s101_update_plan, ChartLoadResult};
 use anyhow::{ensure, Result};
 use ferrite_s100_core::{CellSourceIdentity, S101Cell};
@@ -96,6 +97,18 @@ impl ValidatedRemoval {
     pub fn key(&self) -> &(String, String) {
         &self.key
     }
+    /// Whether a loaded cell is still the validated target (edition, update
+    /// and parsed source identity), as [`CellPublication::stage_changes`] checks.
+    pub fn targets(
+        &self,
+        loaded: &ferrite_s100_core::DatasetIdentification,
+        identity: Option<CellSourceIdentity>,
+    ) -> bool {
+        self.removes_content()
+            && loaded.edition_number == self.edition
+            && Some(loaded.update_number) == self.previous_update
+            && identity == self.source_identity
+    }
 }
 
 /// A small tombstone prevents name reuse with an older issue date. It retains
@@ -158,17 +171,16 @@ struct HistoryDocument {
 const MAX_HISTORY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HISTORY_RECORDS: usize = 10_000;
 impl CancellationHistory {
+    /// The history file at `path` (absent: empty history).
     pub fn read(path: &std::path::Path) -> Result<Self> {
-        use std::io::Read;
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
-            }
-            Err(error) => return Err(error.into()),
+        Self::read_record(&HistoryFile::new(path.to_owned()))
+    }
+    /// The history in a user record ([`crate::platform::UserStore::cancellation_history`]);
+    /// a record never written is the empty history.
+    pub fn read_record(record: &dyn UserRecord) -> Result<Self> {
+        let Some(bytes) = record.read(MAX_HISTORY_BYTES)? else {
+            return Ok(Self::default());
         };
-        let mut bytes = Vec::new();
-        file.take(MAX_HISTORY_BYTES + 1).read_to_end(&mut bytes)?;
         ensure!(
             bytes.len() as u64 <= MAX_HISTORY_BYTES,
             "Cancellation history exceeds receiver budget"
@@ -211,7 +223,11 @@ impl CancellationHistory {
         }
         Ok(history)
     }
+    #[cfg(test)]
     fn write_atomic(&self, path: &std::path::Path) -> Result<()> {
+        self.write_record(&HistoryFile::new(path.to_owned()))
+    }
+    fn write_record(&self, record: &dyn UserRecord) -> Result<()> {
         ensure!(
             self.by_dataset.len() <= MAX_HISTORY_RECORDS,
             "Cancellation history record budget exceeded"
@@ -224,15 +240,79 @@ impl CancellationHistory {
             bytes.len() as u64 <= MAX_HISTORY_BYTES,
             "Cancellation history byte budget exceeded"
         );
-        let parent = path
+        record.write(&bytes)?;
+        Ok(())
+    }
+    /// Whether no cancellation was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.by_dataset.is_empty()
+    }
+    /// The recorded tombstones, by logical dataset.
+    pub fn records(&self) -> impl Iterator<Item = &CancellationRecord> {
+        self.by_dataset.values()
+    }
+}
+
+/// The native cancellation history file: replaced atomically through a
+/// private temporary file and locked by a sibling `.lock` file.
+#[derive(Clone, Debug)]
+pub struct HistoryFile {
+    pub path: PathBuf,
+}
+impl HistoryFile {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+impl UserRecord for HistoryFile {
+    fn read(&self, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+    fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let parent = self
+            .path
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("History has no parent folder"))?;
+            .ok_or_else(|| std::io::Error::other("History has no parent folder"))?;
         std::fs::create_dir_all(parent)?;
         let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
             .as_nanos();
         let temporary = parent.join(format!(".s101-history-{}-{nonce}.tmp", std::process::id()));
-        replace_history_file(path, &temporary, &bytes)
+        replace_history_file(&self.path, &temporary, bytes)
+    }
+    fn set_aside(&self, suffix: &str) {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(suffix);
+        if let Err(error) = std::fs::rename(&self.path, &name) {
+            tracing::warn!("Could not set aside {}: {error}", self.path.display());
+        }
+    }
+    fn describe(&self) -> String {
+        self.path.display().to_string()
+    }
+    fn lock(&self) -> std::io::Result<Option<RecordLock>> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("History has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.path.with_extension("lock"))?;
+        lock.lock()?;
+        Ok(Some(Box::new(lock)))
     }
 }
 
@@ -240,7 +320,7 @@ fn replace_history_file(
     path: &std::path::Path,
     temporary: &std::path::Path,
     bytes: &[u8],
-) -> Result<()> {
+) -> std::io::Result<()> {
     use std::io::Write;
     // A failed create_new gives us no ownership of this name. In particular,
     // never remove an existing file or symlink that caused a collision.
@@ -248,7 +328,7 @@ fn replace_history_file(
         .write(true)
         .create_new(true)
         .open(temporary)?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         // wasm32: the std::fs stub File has no Drop (native-only path).
@@ -262,29 +342,25 @@ fn replace_history_file(
     }
     result
 }
-/// Hold an OS file lock across fresh history validation, atomic file replacement
-/// and the synchronous visible publication. No network or chart file is deleted.
+/// Hold the history record's lock (an OS file lock natively) across fresh
+/// history validation, atomic replacement and the synchronous visible
+/// publication. No network or chart file is deleted.
 pub struct HistoryStore {
-    path: PathBuf,
-    _lock: std::fs::File,
+    record: Box<dyn UserRecord>,
+    _lock: Option<RecordLock>,
     pub history: CancellationHistory,
 }
 impl HistoryStore {
+    /// The native history file at `path`.
     pub fn begin(path: &std::path::Path) -> Result<Self> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("History has no parent"))?;
-        std::fs::create_dir_all(parent)?;
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.with_extension("lock"))?;
-        lock.lock()?;
-        let history = CancellationHistory::read(path)?;
+        Self::begin_record(Box::new(HistoryFile::new(path.to_owned())))
+    }
+    /// Any history record ([`crate::platform::UserStore::cancellation_history`]).
+    pub fn begin_record(record: Box<dyn UserRecord>) -> Result<Self> {
+        let lock = record.lock()?;
+        let history = CancellationHistory::read_record(record.as_ref())?;
         Ok(Self {
-            path: path.to_owned(),
+            record,
             _lock: lock,
             history,
         })
@@ -293,12 +369,12 @@ impl HistoryStore {
         if records.is_empty() {
             return Ok(());
         }
-        // Keep the in-memory authority aligned with the file when a known
+        // Keep the in-memory authority aligned with the record when a known
         // pre-replacement write failure rejects this candidate. This does not
         // provide crash durability or atomicity with the visible GPU scene.
         let mut next = self.history.clone();
         next.record(records);
-        next.write_atomic(&self.path)?;
+        next.write_record(self.record.as_ref())?;
         self.history = next;
         Ok(())
     }
@@ -1059,7 +1135,7 @@ pub mod tests {
         // Keep the existing committed file available for independent checking.
         let blocked = folder.join("destination-directory");
         std::fs::create_dir(&blocked).unwrap();
-        store.path = blocked;
+        store.record = Box::new(HistoryFile::new(blocked));
         assert!(store.persist(vec![candidate.clone()]).is_err());
         assert_eq!(store.history.by_dataset.get(&original.key), Some(&original));
         assert_eq!(std::fs::read(&path).unwrap(), original_file);
@@ -1068,7 +1144,7 @@ pub mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".s101-history-")));
-        store.path = path.clone();
+        store.record = Box::new(HistoryFile::new(path.clone()));
         store.persist(vec![candidate.clone()]).unwrap();
         assert_eq!(
             store.history.by_dataset.get(&candidate.key),
@@ -1082,6 +1158,45 @@ pub mod tests {
         );
         drop(reopened);
         std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn history_store_in_a_memory_user_store_round_trips_and_refuses_corruption() {
+        use crate::platform::{MemoryUserStore, UserStore, MEMORY_HISTORY_KEY};
+        let user = MemoryUserStore::default();
+        let record = CancellationRecord {
+            key: ("INT.IHO.S-101.2.0".into(), "101AA00TEST".into()),
+            cancelled_edition: 4,
+            cancellation_update: 3,
+            issue_date: chrono::NaiveDate::from_ymd_opt(2024, 10, 17).unwrap(),
+        };
+        let mut store = HistoryStore::begin_record(user.cancellation_history().unwrap()).unwrap();
+        assert!(store.history.is_empty());
+        store.persist(vec![record.clone()]).unwrap();
+        drop(store);
+        let reopened =
+            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
+                .unwrap();
+        assert_eq!(reopened.by_dataset.get(&record.key), Some(&record));
+        // Same document bytes as the native file.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("history.json");
+        HistoryStore::begin(&path)
+            .unwrap()
+            .persist(vec![record.clone()])
+            .unwrap();
+        assert_eq!(
+            user.get(MEMORY_HISTORY_KEY).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        user.cancellation_history()
+            .unwrap()
+            .write(b"truncated")
+            .unwrap();
+        assert!(
+            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
+                .is_err()
+        );
+        assert!(HistoryStore::begin_record(user.cancellation_history().unwrap()).is_err());
     }
     #[test]
     fn persistent_history_survives_reopen_and_refuses_corrupt_or_duplicate_records() {

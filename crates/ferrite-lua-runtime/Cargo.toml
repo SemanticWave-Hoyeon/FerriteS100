@@ -9,9 +9,20 @@ default = ["lua54"]
 lua54 = ["mlua/lua54"]
 lua55 = ["mlua/lua55"]
 
-[dependencies]
+# Native: mlua builds its vendored Lua (lua-src) with the host C compiler.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 mlua = { version = "=0.11.6", default-features = false, features = ["vendored", "send"] }
+
+# Browser (wasm32-unknown-unknown): the same lua-src sources are compiled by
+# this crate's build script with clang's wasm32 target, wasm exception
+# handling for setjmp/longjmp and the minimal C library in wasm-libc/
+# (mlua-sys `external`: linking is left to this crate).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+mlua = { version = "=0.11.6", default-features = false, features = ["send"] }
+mlua-sys = { version = "=0.10.0", features = ["external"] }
 
 [build-dependencies]
 sha2.workspace = true
 cc = "1"
+# Lua sources for the wasm32-unknown-unknown build (the version mlua-sys vendors).
+lua-src = "=550.0.0"

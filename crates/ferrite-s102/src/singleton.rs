@@ -4,27 +4,62 @@
 //! exactly these two shapes holding exactly one element; every datatype
 //! contract of the callers is unchanged.
 use anyhow::{ensure, Result};
-use hdf5::{Attribute, H5Type};
 
+/// An attribute handle of either reader (`h5::Attribute`, or the `hdf5`
+/// crate's own `Attribute` for native callers).
+pub trait Shaped {
+    fn is_scalar(&self) -> bool;
+    fn shape(&self) -> Vec<usize>;
+}
+/// Element reads of type `T` from an attribute handle.
+pub trait ReadAll<T>: Shaped {
+    fn read_all(&self) -> Result<Vec<T>>;
+}
+impl Shaped for crate::h5::Attribute {
+    fn is_scalar(&self) -> bool {
+        crate::h5::Attribute::is_scalar(self)
+    }
+    fn shape(&self) -> Vec<usize> {
+        crate::h5::Attribute::shape(self)
+    }
+}
+impl<T: crate::h5::H5Read> ReadAll<T> for crate::h5::Attribute {
+    fn read_all(&self) -> Result<Vec<T>> {
+        self.read_raw::<T>()
+    }
+}
+#[cfg(feature = "hdf5")]
+impl Shaped for hdf5::Attribute {
+    fn is_scalar(&self) -> bool {
+        hdf5::Container::is_scalar(self)
+    }
+    fn shape(&self) -> Vec<usize> {
+        hdf5::Container::shape(self)
+    }
+}
+#[cfg(feature = "hdf5")]
+impl<T: hdf5::H5Type> ReadAll<T> for hdf5::Attribute {
+    fn read_all(&self) -> Result<Vec<T>> {
+        Ok(self.read_raw::<T>()?)
+    }
+}
 /// Rank 0, or rank 1 with a single element.
-pub fn admitted(a: &Attribute) -> bool {
+pub fn admitted(a: &impl Shaped) -> bool {
     a.is_scalar() || a.shape() == [1]
 }
-
 /// The single value of an admitted attribute, with the same HDF5 datatype
 /// conversion as `read_scalar`.
-pub fn read<T: H5Type>(a: &Attribute) -> Result<T> {
+pub fn read<T>(a: &impl ReadAll<T>) -> Result<T> {
     ensure!(
         admitted(a),
         "S-102 attribute must be scalar or a single element, found shape {:?}",
         a.shape()
     );
-    let mut values = a.read_raw::<T>()?;
+    let mut values = a.read_all()?;
     ensure!(values.len() == 1, "S-102 attribute element count mismatch");
     Ok(values.pop().expect("one element checked"))
 }
-
-#[cfg(test)]
+#[cfg(all(test, feature = "hdf5"))]
 mod tests {
     use super::*;
     use hdf5::types::VarLenUnicode;

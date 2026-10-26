@@ -1639,7 +1639,9 @@ name = "ferrite-lua-runtime"
 version = "2.0.0"
 dependencies = [
  "cc",
+ "lua-src",
  "mlua",
+ "mlua-sys",
  "sha2",
 ]
 
@@ -1848,8 +1850,10 @@ dependencies = [
  "ferrite-portrayal-catalog",
  "ferrite-render",
  "ferrite-security",
+ "flate2",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "ndarray",
  "openssl",
  "roxmltree",
  "serde",
@@ -1937,8 +1941,11 @@ dependencies = [
  "ferrite-cli",
  "ferrite-engine",
  "ferrite-gpu",
+ "ferrite-lua",
+ "ferrite-render",
  "js-sys",
  "serde_json",
+ "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

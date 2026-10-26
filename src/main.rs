@@ -2765,6 +2765,7 @@ impl ChartApp {
                     coverage,
                     catalogue_registry,
                     ic_changed,
+                    bathymetry: Default::default(),
                 },
                 cell_resources,
                 raster_scene: scene,
@@ -5325,6 +5326,7 @@ impl ChartApp {
                 coverage: coverage_inventory,
                 catalogue_registry,
                 ic_changed,
+                bathymetry: Default::default(),
             },
             cell_resources: None,
             raster_scene: None,
@@ -5405,6 +5407,7 @@ impl ChartApp {
                     coverage,
                     catalogue_registry,
                     ic_changed,
+                    ..
                 },
             cell_resources,
             raster_scene,

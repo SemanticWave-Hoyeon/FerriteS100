@@ -122,8 +122,10 @@ fn opens_and_prepares_a_scene_entirely_from_memory() {
     );
 }
 
+/// Required signatures apply to S-101 from memory too: a cell outside any
+/// signed exchange set is rejected (exchange sets: `in_memory_exchange_sets`).
 #[test]
-fn s101_signature_verification_needs_local_files() {
+fn unsigned_s101_from_memory_is_rejected_under_required_signatures() {
     let root = repository();
     if !root.join(S101_CELL).is_file() || !root.join(S124_DATASET).is_file() {
         eprintln!("TestData not present; skipped");
@@ -140,7 +142,10 @@ fn s101_signature_verification_needs_local_files() {
         .wait()
         .err()
         .expect("rejected");
-    assert!(format!("{error:#}").contains("local files"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("Unsigned dataset rejected"),
+        "{error:#}"
+    );
 }
 
 const S124_EXCHANGE: &str = "TestData/UKHO-S100-2026/ExchangeSets/S-124_GB/S100_ROOT";
