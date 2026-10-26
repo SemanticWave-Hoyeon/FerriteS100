@@ -49,6 +49,16 @@ impl PortrayalCatalogue {
         Ok(BoundPortrayalCatalogue { catalogue, sources })
     }
 
+    /// Parse a catalogue from an already captured snapshot (e.g.
+    /// [`CatalogueSources::from_files`]); `path` must be its root.
+    pub fn bound_from_sources(
+        path: &Path,
+        sources: std::sync::Arc<CatalogueSources>,
+    ) -> Result<BoundPortrayalCatalogue> {
+        let catalogue = Self::parse_sources(path, &sources)?;
+        Ok(BoundPortrayalCatalogue { catalogue, sources })
+    }
+
     fn parse_sources(path: &Path, sources: &CatalogueSources) -> Result<Self> {
         tracing::info!("Loading Portrayal Catalogue: {}", path.display());
 

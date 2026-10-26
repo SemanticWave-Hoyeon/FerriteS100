@@ -32,49 +32,19 @@ fn configure_allocator() {
 /// Application version (from Cargo.toml)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The engine's coverage preparation for a window of `extent` physical pixels.
 fn prepare_flat_coverage(
     inventory: Option<&ferrite_s101::coverage_projection::GeographicCoverageInventory>,
     context: &mut RenderContext,
     extent: winit::dpi::PhysicalSize<u32>,
     density: f64,
 ) -> Result<()> {
-    context.scaler.set_pixel_ratio(density);
-    context.get_sorted_instructions();
-    let Some(inventory) = inventory else {
-        return Ok(());
-    };
-    if inventory.current_dataset_count() == 0 {
-        context.clear_prepared_coverage();
-        return Ok(());
-    }
-    context.require_prepared_coverage();
-    let exemptions = if context.may_have_coverage_exempt_instructions() {
-        context
-            .raw_instructions()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, command)| {
-                matches!(
-                    command.portrayal_origin(),
-                    ferrite_render::PortrayalOrigin::CoverageExempt
-                )
-                .then_some(i)
-            })
-            .collect()
-    } else {
-        std::collections::BTreeSet::new()
-    };
-    match inventory.prepare_flat(
+    ferrite_engine::scene::prepare_flat_coverage(
+        inventory,
         context,
-        &exemptions,
         [extent.width, extent.height],
-        true,
-        128 * 1024 * 1024,
-    )? {
-        Some(prepared) => context.set_prepared_coverage(prepared)?,
-        None => context.clear_prepared_coverage(),
-    }
-    Ok(())
+        density,
+    )
 }
 
 struct CoverageLifecycleResize {
@@ -125,11 +95,12 @@ use ferrite_engine::catalogue::{
 };
 use ferrite_engine::chart_cells::{chart_data_bounds, CatalogueNormalization};
 use ferrite_engine::portrayal::{validated_lua_context, PortrayalChangeRequest};
+use ferrite_engine::scene::PreparedScene;
 use ferrite_engine::{
-    chart_publication, dataset_discovery, dataset_open_plan, dataset_pick_fields,
-    dataset_signature_policy, decoded_chart_cache, interoperability, primary_viewing_layers,
-    s101_catalogue_selection, s101_update_plan, s102_depth_policy, s102_input_capture,
-    s102_journal_admission, s102_original_inputs, s102_trial_worker, s421_dataset_input,
+    chart_publication, dataset_discovery, dataset_open_plan, dataset_signature_policy,
+    interoperability, primary_viewing_layers, s101_catalogue_selection, s101_update_plan,
+    s102_depth_policy, s102_input_capture, s102_journal_admission, s102_original_inputs,
+    s102_trial_worker, s421_dataset_input,
 };
 use ferrite_engine::{
     CellHydration, CellHydrationSource, CellScene, ChangeCellScene, ChartLoadResult, EngineState,
@@ -735,13 +706,10 @@ enum ChartPublicationResult {
     Load(Box<ChartLoadResult>),
     Cancel(chart_publication::ValidatedRemoval),
 }
+/// The engine's prepared scene with the GPU resources attached to it.
 struct PreparedPortrayal {
-    context: RenderContext,
-    catalogue_registry: s101_catalogue_selection::DatasetCatalogueRegistry,
+    scene: PreparedScene,
     cell_resources: Option<ferrite_gpu::CellPortrayalResources>,
-    coverage: Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>,
-    ic_changed: usize,
-
     raster_scene: Option<ferrite_gpu::PreparedRasterScenePublication>,
 }
 
@@ -895,36 +863,35 @@ struct BackgroundLoadingState {
     receiver: Receiver<Result<ChartPublicationResult>>,
 }
 
-/// Rendered symbol info for hit testing
-/// Fields ordered by size (largest first) for optimal memory layout
-#[derive(Clone, Debug, PartialEq)]
-struct RenderedSymbol {
-    source: Option<usize>,
-    plane: ferrite_kernel::CompositionPlane,
-    /// Point = 0, line = 1, area = 2; geometry breaks ties within a display plane/priority.
-    kind: u8,
-    world_x: f64,
-    world_y: f64,
-    longitude_shift: f64,
-    feature_id: i64,
-    screen_x: f32,
-    screen_y: f32,
-    /// Drawing priority (higher = drawn on top, should be selected first)
-    priority: i32,
-    symbol_ref: String,
-    /// Cell index this symbol belongs to (for correct feature lookup in multi-cell scenarios)
-    cell_index: Option<u32>,
-}
+/// Rendered symbol info for hit testing (the engine's pick candidate).
+type RenderedSymbol = ferrite_engine::pick::PickCandidate;
 
-impl RenderedSymbol {
-    fn compare_hits(a: &(Self, f64), b: &(Self, f64)) -> std::cmp::Ordering {
-        b.0.plane
-            .cmp(&a.0.plane)
-            .then(b.0.priority.cmp(&a.0.priority))
-            .then(a.0.kind.cmp(&b.0.kind))
-            .then(a.1.total_cmp(&b.1))
-            .then(a.0.cell_index.cmp(&b.0.cell_index))
-            .then(a.0.feature_id.cmp(&b.0.feature_id))
+/// The renderer's displayed frame as the engine's picking surface.
+struct RendererPickSurface<'a>(&'a WgpuRenderer);
+impl ferrite_engine::pick::PickSurface for RendererPickSurface<'_> {
+    fn longitude_wrapping(&self) -> bool {
+        self.0.longitude_wrapping_enabled()
+    }
+    fn displayed_symbol_screen(&self, anchor: [f32; 2], pass: usize) -> Option<[f32; 2]> {
+        self.0.displayed_symbol_screen(anchor, pass)
+    }
+    fn coverage_fragment_visible(&self, index: usize, pass: usize, pixel: [f32; 2]) -> bool {
+        self.0.coverage_fragment_visible(index, pass, pixel)
+    }
+    fn selection_candidates(
+        &self,
+        context: &RenderContext,
+        query: ferrite_render::ScreenPoint,
+        radius: f64,
+    ) -> Vec<usize> {
+        self.0
+            .selection_candidates_in_context(context, query, radius)
+    }
+    fn displayed_geometry(&self) -> &[usize] {
+        self.0.displayed_geometry()
+    }
+    fn displayed_line_spans(&self, index: usize) -> Option<&[ferrite_render::LineSpan]> {
+        self.0.displayed_line_spans(index)
     }
 }
 
@@ -1153,65 +1120,35 @@ impl ChartApp {
         auto_zoom: Option<f64>,
         auto_center: Option<(f64, f64)>,
     ) -> Self {
+        // The viewer's platform: files, the private portrayal cache, its own
+        // application data paths (hidden test modes persist nothing), the
+        // system clock and threads.
+        let platform = ferrite_engine::platform::Platform::native_with_user_store(
+            ferrite_engine::platform::NativeUserStore {
+                history_path: app_data_paths::default_history_path(),
+                navwarn_path: std::sync::Arc::new(gml_overlay::default_user_state_path),
+            },
+        );
         ChartApp {
-            engine: EngineState {
-                render_context: {
-                    let mut context = RenderContext::new(Viewport::new(1920.0, 1080.0));
-                    context.set_coverage_visibility_fusion_enabled(
+            engine: {
+                let mut engine = EngineState::new(
+                    platform.clone(),
+                    fc,
+                    pc,
+                    fc_status,
+                    pc_status,
+                    initial_profile,
+                    default_catalogue_inventory(&get_app_base_dir()),
+                );
+                engine
+                    .render_context
+                    .set_coverage_visibility_fusion_enabled(
                         std::env::var("FERRITE_COVERAGE_VISIBILITY_FUSION")
                             .ok()
                             .as_deref()
                             == Some("1"),
                     );
-                    context
-                        .scaler
-                        .set_projection(ferrite_render::FlatProjection::EllipsoidalMercator);
-                    context
-                },
-                bounds: GeoBounds::new(-180.0, -90.0, 180.0, 90.0),
-                current_profile_name: initial_profile,
-                fc,
-                pc,
-                catalogue_inventory: {
-                    let base = get_app_base_dir();
-                    default_catalogue_inventory(&base)
-                },
-                catalogue_registry: Default::default(),
-                fc_status,
-                pc_status,
-                s102_pc_status: CatalogueStatus::default(),
-                s102_fc_status: CatalogueStatus::default(),
-                s102_fc: None,
-                s102_pc: None,
-                cells: Vec::new(),
-                loaded_source_identities: Default::default(),
-                loaded_chain_paths: Vec::new(),
-                loaded_discovery: Default::default(),
-                cancellation_history_path: app_data_paths::default_history_path(),
-                coverage_inventory: None,
-                coverage_memo: None,
-                cell_hydration: std::collections::HashMap::new(),
-                cell_release_pending: false,
-                ic: None,
-                ic_combination: None,
-                s102_trials: Vec::new(),
-                ic_assigned_vectors: 0,
-                bathymetry: Vec::new(),
-                bathymetry_bounds: Default::default(),
-                depth_policies: std::collections::HashMap::new(),
-                depth_inputs: std::collections::HashMap::new(),
-                s102_original_inputs: Default::default(),
-                s102_journal_gate: None,
-                require_signatures: false,
-                operational_mode: false,
-                verified_count: 0,
-                unsigned_count: 0,
-                decoded_chart_cache: Arc::new(std::sync::Mutex::new(
-                    decoded_chart_cache::DecodedChartCache::new(),
-                )),
-                base_instruction_count: 0,
-                resident_cells: None,
-                residency_camera: None,
+                engine
             },
             s100_mcp: native_mcp::Controller::default(),
             llm_chat: llm_chat::Controller::default(),
@@ -1259,11 +1196,11 @@ impl ChartApp {
             native_s421_ui_revision: 0,
             pending_auto_s421: Vec::new(),
             gml_overlays: {
-                let mut overlays = gml_overlay::load_overlays(&get_app_base_dir());
+                let mut overlays = gml_overlay::load_overlays(&platform, &get_app_base_dir());
                 // S-124 11.1.1: classifications and indications per OS user.
                 let user = gml_overlay::os_user_name();
-                if let Some(path) = gml_overlay::default_user_state_path(&user) {
-                    overlays.attach_user_store(path, user);
+                if let Some(record) = platform.user.navwarn_state(&user) {
+                    overlays.attach_user_record(record, user);
                 }
                 overlays
             },
@@ -2156,6 +2093,7 @@ impl ChartApp {
         if self.auto_screenshot.is_some() {
             if let Some((lat, lon)) = self.auto_center {
                 if let Some(pan) = prepared
+                    .scene
                     .context
                     .scaler
                     .projection()
@@ -2170,6 +2108,7 @@ impl ChartApp {
         }
         let wrapped = next_pan.0 - (next_pan.0 / 360.).round() * 360.;
         let view = prepared
+            .scene
             .context
             .scaler
             .projection()
@@ -2178,17 +2117,17 @@ impl ChartApp {
         let renderer = self.renderer.as_ref().context("Renderer not initialized")?;
         let (x, y, w, h) = renderer.chart_viewport_pixels();
         anyhow::ensure!(w > 0. && h > 0., "Invalid proposed chart viewport");
-        prepared.context.set_viewport_rect(x, y, w, h);
-        prepared.context.zoom_to_fit(view);
+        prepared.scene.context.set_viewport_rect(x, y, w, h);
+        prepared.scene.context.zoom_to_fit(view);
         prepare_flat_coverage(
-            Some(prepared.coverage.as_ref()),
-            &mut prepared.context,
+            Some(prepared.scene.coverage.as_ref()),
+            &mut prepared.scene.context,
             renderer.ui.window().inner_size(),
             renderer.ui.window().scale_factor(),
         )?;
-        renderer.reproject_raster_material_batch(&mut batch, &prepared.context.scaler)?;
+        renderer.reproject_raster_material_batch(&mut batch, &prepared.scene.context.scaler)?;
         let mut raster = renderer.prepare_raster_material_publication(batch, false, None)?;
-        renderer.reproject_raster_publication(&mut raster, &prepared.context.scaler)?;
+        renderer.reproject_raster_publication(&mut raster, &prepared.scene.context.scaler)?;
 
         let scene =
             renderer.prepare_raster_scene_publication_with_groups(raster, Some(raster_groups))?;
@@ -2821,11 +2760,13 @@ impl ChartApp {
         Ok(PreparedPortrayalChange {
             base_instruction_count,
             portrayal: PreparedPortrayal {
-                catalogue_registry,
+                scene: PreparedScene {
+                    context: next,
+                    coverage,
+                    catalogue_registry,
+                    ic_changed,
+                },
                 cell_resources,
-                context: next,
-                coverage,
-                ic_changed,
                 raster_scene: scene,
             },
             symbols,
@@ -5379,12 +5320,13 @@ impl ChartApp {
             after_lua.elapsed().as_secs_f64() * 1e3
         );
         Ok(PreparedPortrayal {
-            catalogue_registry,
+            scene: PreparedScene {
+                context: next,
+                coverage: coverage_inventory,
+                catalogue_registry,
+                ic_changed,
+            },
             cell_resources: None,
-            context: next,
-            coverage: coverage_inventory,
-            ic_changed,
-
             raster_scene: None,
         })
     }
@@ -5396,37 +5338,20 @@ impl ChartApp {
     ) -> Result<ferrite_gpu::CellPortrayalResources> {
         let bindings = self
             .engine
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(cell_index, cell)| {
-                let owner = registry
-                    .owner_for(&EngineState::catalogue_dataset_key(&cell.dsid)?)
-                    .context("Missing cell PC resource owner")?;
-                validated_lua_context(owner.pc(), Some(&request.settings))?;
-                Ok(ferrite_gpu::CellPortrayalResourceBinding {
-                    cell_index,
-                    catalogue: Arc::clone(owner.pc()),
-                    shallow_pattern: ferrite_s101::shallow_pattern_contract(owner.pc()),
-                })
+            .cell_resource_bindings(registry, &request.settings)?
+            .into_iter()
+            .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
+                cell_index: binding.cell_index,
+                catalogue: binding.catalogue,
+                shallow_pattern: binding.shallow_pattern,
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         let mut resources =
             ferrite_gpu::CellPortrayalResources::prepare(&bindings, &request.profile, 4096)?;
-        let preset = match request.settings.display_mode {
-            DisplayMode::Base => ferrite_s101::DisplayPreset::Base,
-            DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
-            DisplayMode::All => ferrite_s101::DisplayPreset::Other,
-        };
-        for (index, cell) in self.engine.cells.iter().enumerate() {
-            let owner = registry
-                .owner_for(&EngineState::catalogue_dataset_key(&cell.dsid)?)
-                .context("Missing cell viewing-group owner")?;
-            let mut groups = ferrite_s101::viewing_groups_for_preset(owner.pc(), preset)?;
-            groups.extend(primary_viewing_layers::resolve(
-                owner.pc(),
-                &request.settings,
-            )?);
+        for index in 0..self.engine.cells.len() {
+            let groups = self
+                .engine
+                .cell_viewing_groups(registry, index, &request.settings)?;
             resources.capture_viewing_groups_for_cell(index, Some(groups))?;
         }
         Ok(resources)
@@ -5474,11 +5399,14 @@ impl ChartApp {
     ) -> Option<ferrite_gpu::PreparedRasterScenePublication> {
         self.poll_scene_build(true);
         let PreparedPortrayal {
-            context: mut next,
-            catalogue_registry,
+            scene:
+                PreparedScene {
+                    context: mut next,
+                    coverage,
+                    catalogue_registry,
+                    ic_changed,
+                },
             cell_resources,
-            coverage,
-            ic_changed,
             raster_scene,
         } = prepared;
         if Self::static_line_relation_reuse_enabled(
@@ -5729,128 +5657,18 @@ impl ChartApp {
         radius: f32,
         indexed: bool,
     ) -> Vec<RenderedSymbol> {
-        if !x.is_finite() || !y.is_finite() || !radius.is_finite() || radius < 0. {
-            return Vec::new();
-        }
-
-        let wrapping = self
-            .renderer
-            .as_ref()
-            .is_some_and(|r| r.longitude_wrapping_enabled());
-        let offsets = [0., -360., 360.];
-        let mut nearby = Vec::new();
-        for symbol in &self.rendered_symbols {
-            for &shift in &offsets[..if wrapping { 3 } else { 1 }] {
-                let pass = if shift < 0. {
-                    1
-                } else if shift > 0. {
-                    2
-                } else {
-                    0
-                };
-                let screen = match &self.renderer {
-                    Some(renderer) => match renderer
-                        .displayed_symbol_screen([symbol.screen_x, symbol.screen_y], pass)
-                    {
-                        Some(screen) => screen,
-                        None => continue,
-                    },
-                    None => [symbol.screen_x, symbol.screen_y],
-                };
-                let distance = (screen[0] - x as f32).hypot(screen[1] - y as f32);
-                if distance <= radius {
-                    if let (Some(renderer), Some(source)) = (&self.renderer, symbol.source) {
-                        if !renderer.coverage_fragment_visible(source, pass, [x as f32, y as f32]) {
-                            continue;
-                        }
-                    }
-                    let mut hit = symbol.clone();
-                    hit.screen_x = screen[0];
-                    hit.screen_y = screen[1];
-                    hit.longitude_shift = shift;
-                    nearby.push((hit, distance as f64));
-                }
-            }
-        }
-        if let Some(renderer) = &self.renderer {
-            let candidates: std::borrow::Cow<'_, [usize]> = if indexed {
-                std::borrow::Cow::Owned(renderer.selection_candidates_in_context(
-                    &self.engine.render_context,
-                    ferrite_render::ScreenPoint::new(x as f32, y as f32),
-                    radius as f64 * 0.4,
-                ))
-            } else {
-                std::borrow::Cow::Borrowed(renderer.displayed_geometry())
-            };
-            for &index in candidates.iter() {
-                let Some(instruction) = self.engine.render_context.raw_instructions().get(index)
-                else {
-                    continue;
-                };
-                let (kind, cell_index, feature_id) = match instruction {
-                    DrawingInstruction::Line(line) => (1, line.cell_index, line.feature_id),
-                    DrawingInstruction::Area(area) => (2, area.cell_index, area.feature_id),
-                    _ => continue,
-                };
-                let Some(feature_id) = feature_id else {
-                    continue;
-                };
-                if let Some(wrapped_hit) = ferrite_render::hit_geometry_wrapped_visible_in_context(
-                    &self.engine.render_context,
-                    index,
-                    ferrite_render::ScreenPoint::new(x as f32, y as f32),
-                    radius as f64 * 0.4,
-                    renderer.displayed_line_spans(index),
-                    wrapping,
-                ) {
-                    let hit = wrapped_hit.hit;
-                    let coverage_pass = if wrapped_hit.longitude_shift < 0. {
-                        1
-                    } else if wrapped_hit.longitude_shift > 0. {
-                        2
-                    } else {
-                        0
-                    };
-                    if !renderer.coverage_fragment_visible(
-                        index,
-                        coverage_pass,
-                        [hit.nearest.x, hit.nearest.y],
-                    ) {
-                        continue;
-                    }
-                    let world = self
-                        .engine
-                        .render_context
-                        .scaler
-                        .screen_to_world(hit.nearest);
-                    nearby.push((
-                        RenderedSymbol {
-                            source: Some(index),
-                            plane: instruction
-                                .display_plane()
-                                .composition_plane(ferrite_kernel::CompositionStage::Chart),
-                            kind,
-                            cell_index,
-                            feature_id,
-                            world_x: world.x - wrapped_hit.longitude_shift,
-                            world_y: world.y,
-                            longitude_shift: wrapped_hit.longitude_shift,
-                            screen_x: hit.nearest.x,
-                            screen_y: hit.nearest.y,
-                            priority: instruction.priority().0,
-                            symbol_ref: String::new(),
-                        },
-                        hit.distance,
-                    ));
-                }
-            }
-        }
-        nearby.sort_by(RenderedSymbol::compare_hits);
-        let mut seen = std::collections::HashSet::new();
-        nearby
-            .into_iter()
-            .filter_map(|(hit, _)| seen.insert((hit.cell_index, hit.feature_id)).then_some(hit))
-            .collect()
+        let surface = self.renderer.as_ref().map(RendererPickSurface);
+        ferrite_engine::pick::find_features_at(
+            &self.engine.render_context,
+            &self.rendered_symbols,
+            surface
+                .as_ref()
+                .map(|s| s as &dyn ferrite_engine::pick::PickSurface),
+            x,
+            y,
+            radius,
+            indexed,
+        )
     }
 
     fn describe_hit(&mut self, sym: &RenderedSymbol) -> SelectedFeature {
@@ -5871,54 +5689,22 @@ impl ChartApp {
                 };
             }
         }
-        // Use cell_index to look up feature in the correct cell
-        // This fixes the bug where multiple cells have the same feature_id
-        // but different feature types
-        let feature = if let Some(cell_idx) = sym.cell_index {
-            // Look up in the specific cell the symbol came from
-            self.engine
-                .cells
-                .get(cell_idx as usize)
-                .and_then(|cell| cell.features.get(&sym.feature_id))
-        } else {
-            // An index-free hit cannot identify an ENC feature or its FC owner.
-            None
-        };
-
-        let feature_code = feature
-            .and_then(|f| f.feature_code.as_deref())
-            .unwrap_or(&sym.symbol_ref)
-            .to_string();
-        let source_fc = sym
-            .cell_index
-            .and_then(|index| self.engine.catalogue_owner_for_cell(index as usize))
-            .map(|owner| {
-                let fc: &ferrite_feature_catalog::FeatureCatalogue = owner.fc();
-                fc
-            });
-        let fields = feature
-            .map(|f| dataset_pick_fields::resolve(source_fc, &feature_code, &f.attributes))
-            .unwrap_or_default();
-        let definition = fields.resolved.then_some(fields.definition).flatten();
-
+        // The engine looks the feature up in the cell the symbol came from
+        // (feature ids repeat across cells), with that cell's own FC.
+        let report = self
+            .engine
+            .describe_feature(sym.cell_index, sym.feature_id, &sym.symbol_ref);
         SelectedFeature {
-            feature_type: feature_code,
+            feature_type: report.feature_type,
             feature_id: sym.feature_id,
-            foid: feature
-                .and_then(|f| f.foid.as_ref())
-                .map(ToString::to_string),
+            foid: report.foid,
             cell_index: sym.cell_index,
-            primitive_type: feature
-                .map(|f| format!("{:?}", f.primitive_type))
-                .unwrap_or_else(|| "Unknown".into()),
-            source: sym
-                .cell_index
-                .and_then(|i| self.engine.cells.get(i as usize))
-                .map(|c| c.file_path.display().to_string()),
-            attributes: fields.attributes,
+            primitive_type: report.primitive_type,
+            source: report.source,
+            attributes: report.attributes,
             world_pos: (sym.world_x, sym.world_y),
             longitude_shift: sym.longitude_shift,
-            definition,
+            definition: report.definition,
             symbol_name: (sym.kind == 0).then(|| sym.symbol_ref.clone()),
         }
     }
@@ -7671,12 +7457,15 @@ impl ChartApp {
             ..
         } = change;
         let PreparedPortrayal {
-            context: mut next,
-            catalogue_registry,
+            scene:
+                PreparedScene {
+                    context: mut next,
+                    coverage,
+                    catalogue_registry,
+                    ..
+                },
             cell_resources,
-            coverage,
             raster_scene,
-            ..
         } = portrayal;
         anyhow::ensure!(
             next.raw_instructions().len() <= 500_000

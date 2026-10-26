@@ -1434,6 +1434,7 @@ dependencies = [
  "ferrite-s102",
  "ferrite-s421",
  "ferrite-security",
+ "ferrite-xslt",
  "libc",
  "openssl",
  "quick-xml 0.37.5",

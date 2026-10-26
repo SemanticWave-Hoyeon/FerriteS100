@@ -39,6 +39,7 @@ ferrite-s101.workspace = true
 ferrite-s102.workspace = true
 ferrite-s421 = { path = "../ferrite-s421" }
 ferrite-security.workspace = true
+ferrite-xslt = { path = "../ferrite-xslt" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -1,5 +1,6 @@
 //! Feature and portrayal catalogue loading, status and cache identity.
 use crate::dataset_discovery;
+use crate::platform::{DataSource, NativeDataSource};
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::{BoundFeatureCatalogue, FeatureCatalogue};
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
@@ -105,9 +106,17 @@ pub fn validate_pc(pc: &PortrayalCatalogue, path: &Path) -> CatalogueStatus {
 
 /// Load Feature Catalogue from XML file
 pub fn load_feature_catalogue(path: &Path) -> Result<BoundFeatureCatalogue> {
+    load_feature_catalogue_from(&NativeDataSource, path)
+}
+
+/// [`load_feature_catalogue`] through a data source.
+pub fn load_feature_catalogue_from(
+    data: &dyn DataSource,
+    path: &Path,
+) -> Result<BoundFeatureCatalogue> {
     info!("Loading Feature Catalogue: {}", path.display());
 
-    if !path.exists() {
+    if !data.exists(path) {
         anyhow::bail!(
             "Feature Catalogue directory not found: {}\n\
              Expected layout: <app>/Catalogues/FC/S-101/*Feature_Catalogue*.xml.\n\
@@ -118,13 +127,16 @@ pub fn load_feature_catalogue(path: &Path) -> Result<BoundFeatureCatalogue> {
     }
 
     // If path is a directory, scan for FC XML file
-    let fc_file = if path.is_dir() {
-        dataset_discovery::feature_catalogue_file(path)?
+    let fc_file = if data.is_dir(path) {
+        dataset_discovery::feature_catalogue_file_in(data, path)?
     } else {
         path.to_path_buf()
     };
 
-    let fc = FeatureCatalogue::load_bound(&fc_file)
+    let fc = data
+        .read_limited(&fc_file, FeatureCatalogue::MAX_XML_SIZE)
+        .map_err(ferrite_feature_catalog::FCError::from)
+        .and_then(|bytes| FeatureCatalogue::bound_from_bytes(&fc_file, &bytes))
         .with_context(|| format!("Failed to load Feature Catalogue: {}", fc_file.display()))?;
 
     info!("FC loaded successfully");
@@ -145,9 +157,17 @@ pub fn load_feature_catalogue(path: &Path) -> Result<BoundFeatureCatalogue> {
 /// Surfacing the error early forces the user to fix the install/path instead
 /// of seeing a broken render.
 pub fn load_portrayal_catalogue(path: &Path) -> Result<BoundPortrayalCatalogue> {
+    load_portrayal_catalogue_from(&NativeDataSource, path)
+}
+
+/// [`load_portrayal_catalogue`] through a data source.
+pub fn load_portrayal_catalogue_from(
+    data: &dyn DataSource,
+    path: &Path,
+) -> Result<BoundPortrayalCatalogue> {
     info!("Loading Portrayal Catalogue: {}", path.display());
 
-    if !path.exists() {
+    if !data.exists(path) {
         anyhow::bail!(
             "Portrayal Catalogue directory not found: {}\n\
              Expected layout: <app>/Catalogues/PC/S-101/ with ColorProfiles/, Symbols/, Rules/.\n\
@@ -157,7 +177,9 @@ pub fn load_portrayal_catalogue(path: &Path) -> Result<BoundPortrayalCatalogue> 
         );
     }
 
-    let pc = PortrayalCatalogue::load_bound(path)
+    let pc = data
+        .portrayal_sources(path)
+        .and_then(|sources| PortrayalCatalogue::bound_from_sources(path, sources))
         .with_context(|| format!("Failed to load Portrayal Catalogue: {}", path.display()))?;
 
     if pc.color_profiles.profiles.is_empty() {

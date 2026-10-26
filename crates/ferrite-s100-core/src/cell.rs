@@ -104,25 +104,69 @@ impl S101Cell {
         base_input: &Path,
         updates: &[PathBuf],
     ) -> Result<(Self, CellSourceIdentity)> {
+        let max = crate::updates::UpdateLimits::default().max_dataset_bytes;
+        Self::materialize_chain(
+            source,
+            || bounded_update_parser(base_input, max),
+            updates.len(),
+            |index| bounded_update_parser(&updates[index], max),
+        )
+    }
+
+    /// [`S101Cell::load_update_chain_from_with_identity`] over inputs already
+    /// in memory (base, then updates in order): same limits, validation and
+    /// identity. `source` is only recorded as the cell's path.
+    pub fn load_update_chain_bytes_with_identity(
+        source: &Path,
+        base: Vec<u8>,
+        updates: Vec<Vec<u8>>,
+    ) -> Result<(Self, CellSourceIdentity)> {
+        let max = crate::updates::UpdateLimits::default().max_dataset_bytes;
+        let mut updates: Vec<Option<Vec<u8>>> = updates.into_iter().map(Some).collect();
+        let count = updates.len();
+        Self::materialize_chain(
+            source,
+            || bounded_bytes_parser(base, max),
+            count,
+            |index| {
+                let bytes = updates[index]
+                    .take()
+                    .ok_or_else(|| S100Error::InvalidRecord("Update input reused".into()))?;
+                bounded_bytes_parser(bytes, max)
+            },
+        )
+    }
+
+    /// Parse one dataset already in memory, as [`S101Cell::load_from_with_identity`].
+    pub fn load_bytes_with_identity(
+        source: &Path,
+        bytes: Vec<u8>,
+    ) -> Result<(Self, CellSourceIdentity)> {
+        Self::load_update_chain_bytes_with_identity(source, bytes, Vec::new())
+    }
+
+    fn materialize_chain(
+        source: &Path,
+        base_parser: impl FnOnce() -> Result<Iso8211Parser>,
+        update_count: usize,
+        mut update_parser: impl FnMut(usize) -> Result<Iso8211Parser>,
+    ) -> Result<(Self, CellSourceIdentity)> {
         use crate::updates::{S100RecordStore, UpdateLimits};
         use sha2::Digest;
         let limits = UpdateLimits::default();
-        if updates.is_empty() {
-            return Self::parse_owned_with_identity(
-                source,
-                bounded_update_parser(base_input, limits.max_dataset_bytes)?,
-            );
+        if update_count == 0 {
+            return Self::parse_owned_with_identity(source, base_parser()?);
         }
-        if updates.len() > 999 {
+        if update_count > 999 {
             return Err(S100Error::InvalidRecord(
                 "Update-chain input count budget exceeded".into(),
             ));
         }
         let mut chain = sha2::Sha256::new();
         chain.update(b"FerriteS100/S101/ordered-raw-update-chain/v1\0");
-        chain.update((updates.len() as u64 + 1).to_le_bytes());
+        chain.update((update_count as u64 + 1).to_le_bytes());
         let mut total_bytes = 0usize;
-        let mut parser = bounded_update_parser(base_input, limits.max_dataset_bytes)?;
+        let mut parser = base_parser()?;
         hash_chain_input(
             &mut chain,
             0,
@@ -176,8 +220,8 @@ impl S101Cell {
             &store,
             feature_types.str_to_num.get("DataCoverage").copied(),
         )?;
-        for (index, path) in updates.iter().enumerate() {
-            let mut parser = bounded_update_parser(path, limits.max_dataset_bytes)?;
+        for index in 0..update_count {
+            let mut parser = update_parser(index)?;
             hash_chain_input(
                 &mut chain,
                 index + 1,
@@ -1655,15 +1699,29 @@ impl std::fmt::Display for CellStatistics {
 /// retain the same identification parser as ordinary base loading.
 /// Caps are receiver resource limits, not product-schema limits.
 pub fn inspect_dataset_identification(path: &Path) -> Result<DatasetIdentification> {
-    use ferrite_iso8211::Leader;
-    use std::io::{Read, Seek, SeekFrom};
-    const MAX_METADATA_RECORD: usize = 1024 * 1024;
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
-    let size = metadata.len();
-    if !metadata.is_file()
-        || size > crate::updates::UpdateLimits::default().max_dataset_bytes as u64
-    {
+    if !metadata.is_file() {
+        return Err(S100Error::InvalidRecord(
+            "Identification dataset byte/type budget exceeded".into(),
+        ));
+    }
+    inspect_identification_from(file, metadata.len())
+}
+
+/// [`inspect_dataset_identification`] of a dataset already in memory.
+pub fn inspect_dataset_identification_bytes(bytes: &[u8]) -> Result<DatasetIdentification> {
+    inspect_identification_from(std::io::Cursor::new(bytes), bytes.len() as u64)
+}
+
+fn inspect_identification_from(
+    mut file: impl std::io::Read + std::io::Seek,
+    size: u64,
+) -> Result<DatasetIdentification> {
+    use ferrite_iso8211::Leader;
+    use std::io::SeekFrom;
+    const MAX_METADATA_RECORD: usize = 1024 * 1024;
+    if size > crate::updates::UpdateLimits::default().max_dataset_bytes as u64 {
         return Err(S100Error::InvalidRecord(
             "Identification dataset byte/type budget exceeded".into(),
         ));
@@ -1760,6 +1818,16 @@ fn hash_chain_input(
 
 fn bounded_update_parser(path: &Path, max: usize) -> Result<Iso8211Parser> {
     Ok(Iso8211Parser::from_file_bounded(path, max)?)
+}
+/// The in-memory counterpart of [`bounded_update_parser`] (same budget error).
+fn bounded_bytes_parser(bytes: Vec<u8>, max: usize) -> Result<Iso8211Parser> {
+    if bytes.len() > max {
+        return Err(ferrite_iso8211::Iso8211Error::Parse(
+            "ISO 8211 input byte budget exceeded".into(),
+        )
+        .into());
+    }
+    Ok(Iso8211Parser::from_bytes(bytes))
 }
 fn parse_edition(s: &str) -> Result<(u16, u16)> {
     let parts: Vec<_> = s.split('.').collect();

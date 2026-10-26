@@ -4,15 +4,16 @@
 //! host application.
 use crate::catalogue::hash_bound_catalogue_inputs;
 use crate::chart_cells::{canonical_cell_digest, CANONICAL_CELL_PARTS};
+use crate::platform::Platform;
 use crate::portrayal::{
     try_lua_portrayal, try_lua_portrayal_for_cells, validated_lua_context, AreaTriangulator,
-    CellPortrayalSelection, PortrayalChangeRequest,
+    CellCaches, CellPortrayalSelection, PortrayalChangeRequest,
 };
 use crate::{
     cell_source_identity, decoded_chart_cache, interoperability, primary_viewing_layers,
     s101_catalogue_selection, s101_lifecycle_metadata, s101_update_plan,
     s102_depth_policy::DepthPolicy, s102_journal_admission, s102_original_inputs,
-    secure_instruction_cache, CellHydrationSource,
+    CellHydrationSource,
 };
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
@@ -133,9 +134,76 @@ pub struct EngineState {
     pub verified_count: usize,
     pub unsigned_count: usize,
     pub decoded_chart_cache: decoded_chart_cache::SharedDecodedChartCache,
+    /// Services the state reads inputs, caches and time through.
+    pub platform: Platform,
 }
 
 impl EngineState {
+    /// An empty chart state with the bound catalogue pair: no datasets, the
+    /// whole world in view (ellipsoidal Mercator), nothing published.
+    pub fn new(
+        platform: Platform,
+        fc: Arc<BoundFeatureCatalogue>,
+        pc: Arc<BoundPortrayalCatalogue>,
+        fc_status: CatalogueStatus,
+        pc_status: CatalogueStatus,
+        profile: String,
+        catalogue_inventory: PathBuf,
+    ) -> Self {
+        let mut render_context = RenderContext::new(ferrite_render::Viewport::new(1920.0, 1080.0));
+        render_context
+            .scaler
+            .set_projection(ferrite_render::FlatProjection::EllipsoidalMercator);
+        Self {
+            render_context,
+            bounds: GeoBounds::new(-180.0, -90.0, 180.0, 90.0),
+            base_instruction_count: 0,
+            current_profile_name: profile,
+            fc,
+            pc,
+            catalogue_inventory,
+            catalogue_registry: Default::default(),
+            fc_status,
+            pc_status,
+            s102_pc_status: CatalogueStatus::default(),
+            s102_fc_status: CatalogueStatus::default(),
+            s102_fc: None,
+            s102_pc: None,
+            cells: Vec::new(),
+            loaded_source_identities: Default::default(),
+            loaded_chain_paths: Vec::new(),
+            loaded_discovery: Default::default(),
+            cancellation_history_path: platform
+                .user
+                .cancellation_history_path()
+                .unwrap_or_default(),
+            coverage_inventory: None,
+            coverage_memo: None,
+            cell_hydration: HashMap::new(),
+            cell_release_pending: false,
+            resident_cells: None,
+            residency_camera: None,
+            ic: None,
+            ic_combination: None,
+            ic_assigned_vectors: 0,
+            s102_trials: Vec::new(),
+            bathymetry: Vec::new(),
+            bathymetry_bounds: Default::default(),
+            depth_policies: HashMap::new(),
+            depth_inputs: HashMap::new(),
+            s102_original_inputs: Default::default(),
+            s102_journal_gate: None,
+            require_signatures: false,
+            operational_mode: false,
+            verified_count: 0,
+            unsigned_count: 0,
+            decoded_chart_cache: Arc::new(std::sync::Mutex::new(
+                decoded_chart_cache::DecodedChartCache::new(),
+            )),
+            platform,
+        }
+    }
+
     pub fn catalogue_dataset_key(id: &ferrite_s100_core::DatasetIdentification) -> Result<String> {
         Ok(serde_json::to_string(&s101_update_plan::dataset_key(id)?)?)
     }
@@ -355,7 +423,7 @@ impl EngineState {
         if self.cells.is_empty() || std::env::var_os("FERRITE_NO_CACHE").is_some() {
             return None;
         }
-        let cache_dir = secure_instruction_cache::root()?;
+        let cache_dir = self.platform.cache.root()?;
         use std::hash::{Hash, Hasher};
         let mut common = std::collections::hash_map::DefaultHasher::new();
         "cell-portrayal-v1".hash(&mut common);
@@ -366,7 +434,10 @@ impl EngineState {
                 .enumerate()
                 .map(|(cell_index, cell)| {
                     let mut hasher = common.clone();
-                    let canonical = std::fs::canonicalize(&cell.file_path)
+                    let canonical = self
+                        .platform
+                        .data
+                        .canonicalize(&cell.file_path)
                         .unwrap_or_else(|_| cell.file_path.clone());
                     #[cfg(windows)]
                     let key = canonical.to_string_lossy().to_lowercase();
@@ -446,32 +517,25 @@ impl EngineState {
             return Ok(());
         }
         let started = std::time::Instant::now();
-        let results: Vec<Result<S101Cell>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = jobs
-                .iter()
-                .map(|(_, key, source)| {
-                    scope.spawn(move || -> Result<S101Cell> {
-                        let (mut cell, identity) = source.plan.load()?;
-                        anyhow::ensure!(
-                            identity.sha256() == key,
-                            "Released S-101 cell source changed; reopen it"
-                        );
-                        source.plan.validate_materialized(&cell)?;
-                        for codes in &source.codes {
-                            cell.normalize_feature_codes(codes);
-                        }
-                        Ok(cell)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Hydration panicked")))
-                })
-                .collect()
-        });
+        let results: Vec<Result<S101Cell>> = crate::platform::parallel_map(
+            self.platform.executor.as_ref(),
+            &jobs,
+            |(_, key, source)| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<S101Cell> {
+                    let (mut cell, identity) = source.plan.load()?;
+                    anyhow::ensure!(
+                        identity.sha256() == key,
+                        "Released S-101 cell source changed; reopen it"
+                    );
+                    source.plan.validate_materialized(&cell)?;
+                    for codes in &source.codes {
+                        cell.normalize_feature_codes(codes);
+                    }
+                    Ok(cell)
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Hydration panicked")))
+            },
+        );
         for ((index, key, _), result) in jobs.iter().zip(results) {
             let mut cell = result?;
             cell.file_path = std::mem::take(&mut self.cells[*index].file_path);
@@ -695,7 +759,11 @@ impl EngineState {
             &self.current_profile_name,
             settings,
             CellPortrayalSelection {
-                caches: cell_caches.as_deref(),
+                caches: cell_caches.as_deref().map(|paths| CellCaches {
+                    paths,
+                    store: self.platform.cache.as_ref(),
+                    data: self.platform.data.as_ref(),
+                }),
                 resident: self.resident_cells.as_deref(),
             },
             triangulate,

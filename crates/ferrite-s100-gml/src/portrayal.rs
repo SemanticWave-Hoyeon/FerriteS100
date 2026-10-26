@@ -742,19 +742,34 @@ impl XsltPortrayal {
         Self::load_with_limits(pc_dir, Limits::default())
     }
     pub fn load_with_limits(pc_dir: &Path, limits: Limits) -> Result<Self> {
+        Self::load_from(&ferrite_xslt::NativeModules, pc_dir, limits)
+    }
+
+    /// Load from a module source instead of the file system (the same files,
+    /// read through `source`).
+    pub fn load_from(
+        source: &dyn ferrite_xslt::ModuleSource,
+        pc_dir: &Path,
+        limits: Limits,
+    ) -> Result<Self> {
         let pc = pc_dir.join("portrayal_catalogue.xml");
-        let info = match std::fs::read_to_string(&pc) {
-            Ok(text) => CatalogueInfo::parse(&text).with_context(|| pc.display().to_string())?,
+        let info = match source.read(&pc) {
+            Ok(bytes) => {
+                let text = String::from_utf8(bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    .with_context(|| pc.display().to_string())?;
+                CatalogueInfo::parse(&text).with_context(|| pc.display().to_string())?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => CatalogueInfo::default(),
             Err(e) => return Err(e).with_context(|| pc.display().to_string()),
         };
         let rules = pc_dir.join("Rules");
         let main = info.main_rule.clone().unwrap_or_else(|| "main.xsl".into());
         let path = rules.join(&main);
-        if !path.is_file() {
+        if !source.is_file(&path) {
             bail!("Top level portrayal rule {} not found", path.display());
         }
-        let sheet = Stylesheet::load(&path, &rules, limits)
+        let sheet = Stylesheet::load_from(source, &path, &rules, limits)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         Ok(Self {
             info,

@@ -1,4 +1,5 @@
 //! Application directory discovery; filesystem metadata is not product data.
+use crate::platform::{DataSource, EntryKind, NativeDataSource};
 use std::path::Path;
 
 pub fn is_dataset_file(path: &Path, extension: &str) -> bool {
@@ -12,10 +13,16 @@ pub fn is_dataset_file(path: &Path, extension: &str) -> bool {
 
 /// FC folders must resolve deterministically to one real XML file.
 pub fn feature_catalogue_file(root: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let mut files = std::fs::read_dir(root)?
-        .map(|entry| entry.map(|e| e.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    files.retain(|p| p.is_file() && is_dataset_file(p, "xml"));
+    feature_catalogue_file_in(&NativeDataSource, root)
+}
+
+/// [`feature_catalogue_file`] through a data source.
+pub fn feature_catalogue_file_in(
+    data: &dyn DataSource,
+    root: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let mut files: Vec<_> = data.read_dir(root)?.into_iter().map(|e| e.path).collect();
+    files.retain(|p| data.is_file(p) && is_dataset_file(p, "xml"));
     files.sort();
     anyhow::ensure!(files.len() == 1, "FC folder must contain exactly one catalogue XML (found {}); select an explicit file for multiple versions", files.len());
     Ok(files.remove(0))
@@ -237,29 +244,33 @@ mod catalogue_discovery_tests {
 pub fn discover_recursive_files(
     root: &Path,
 ) -> anyhow::Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)> {
+    discover_recursive_files_in(&NativeDataSource, root)
+}
+
+/// [`discover_recursive_files`] through a data source.
+pub fn discover_recursive_files_in(
+    data: &dyn DataSource,
+    root: &Path,
+) -> anyhow::Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)> {
     anyhow::ensure!(
-        std::fs::symlink_metadata(root)?.is_dir(),
+        data.kind(root)? == EntryKind::Dir,
         "Dataset folder must be a real directory"
     );
     let mut charts = Vec::new();
     let mut rasters = Vec::new();
-    for (count, entry) in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .enumerate()
-    {
+    for (count, entry) in data.walk(root).enumerate() {
         anyhow::ensure!(
             count < 100_000,
             "Recursive dataset discovery exceeds entry limit"
         );
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if entry.kind != EntryKind::File {
             continue;
         }
-        if crate::s101_update_plan::is_chart_file(entry.path()) {
-            charts.push(entry.into_path());
-        } else if is_dataset_file(entry.path(), "h5") || is_dataset_file(entry.path(), "hdf5") {
-            rasters.push(entry.into_path());
+        if crate::s101_update_plan::is_chart_file(&entry.path) {
+            charts.push(entry.path);
+        } else if is_dataset_file(&entry.path, "h5") || is_dataset_file(&entry.path, "hdf5") {
+            rasters.push(entry.path);
         }
         anyhow::ensure!(
             charts.len() + rasters.len() <= 4096,

@@ -123,6 +123,55 @@ impl CatalogueSources {
                 files.insert(rel, Arc::from(bytes));
             }
         }
+        Self::seal(root, files, directories)
+    }
+    /// A snapshot of files supplied in memory (relative path, bytes), for a
+    /// host without a file system. The same limits apply; directories are
+    /// those holding the files. Paths must be relative and normal.
+    pub fn from_files(
+        root: &Path,
+        files: impl IntoIterator<Item = (PathBuf, Arc<[u8]>)>,
+    ) -> Result<Arc<Self>> {
+        let limits = DEFAULT_LIMITS;
+        let mut map = BTreeMap::new();
+        let mut directories = BTreeSet::new();
+        directories.insert(PathBuf::new());
+        let mut total = 0usize;
+        for (relative, bytes) in files {
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|c| !matches!(c, Component::Normal(_)))
+            {
+                return Err(invalid("PC source path escapes snapshot"));
+            }
+            if relative.components().count() > limits.depth + 1 {
+                return Err(invalid("PC snapshot directory depth limit exceeded"));
+            }
+            if bytes.len() > limits.file.min(limits.total.saturating_sub(total)) {
+                return Err(invalid(format!(
+                    "PC snapshot byte limit exceeded: {} (file 50 MiB, total 512 MiB)",
+                    relative.display()
+                )));
+            }
+            total += bytes.len();
+            let mut parent = relative.parent();
+            while let Some(dir) = parent {
+                directories.insert(dir.to_path_buf());
+                parent = dir.parent();
+            }
+            map.insert(relative, bytes);
+            if map.len() + directories.len() > limits.entries {
+                return Err(invalid("PC snapshot entry limit exceeded"));
+            }
+        }
+        Self::seal(root, map, directories)
+    }
+    fn seal(
+        root: &Path,
+        files: BTreeMap<PathBuf, Arc<[u8]>>,
+        directories: BTreeSet<PathBuf>,
+    ) -> Result<Arc<Self>> {
         let mut hash = Sha256::new();
         hash.update(b"ferrite-pc-source-map-v1\0");
         for directory in &directories {
@@ -237,6 +286,10 @@ impl std::ops::Deref for BoundPortrayalCatalogue {
     }
 }
 impl BoundPortrayalCatalogue {
+    /// The parsed catalogue, without its sources.
+    pub fn into_catalogue(self) -> PortrayalCatalogue {
+        self.catalogue
+    }
     pub fn sources(&self) -> Arc<CatalogueSources> {
         Arc::clone(&self.sources)
     }

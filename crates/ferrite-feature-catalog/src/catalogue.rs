@@ -67,7 +67,8 @@ impl FeatureCatalogue {
 
     /// Maximum allowed XML file size (50 MB)
     /// Security: Prevents resource exhaustion from oversized files
-    const MAX_XML_SIZE: u64 = 50 * 1024 * 1024;
+    /// Receiver byte budget of a Feature Catalogue XML document.
+    pub const MAX_XML_SIZE: u64 = 50 * 1024 * 1024;
 
     fn read_bounded(path: &Path) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -119,6 +120,24 @@ impl FeatureCatalogue {
         let bytes = Self::read_bounded(path)?;
         let digest = sha2::Sha256::digest(&bytes).into();
         let (catalogue, extras) = Self::parse_bytes(path, &bytes)?;
+        Ok(BoundFeatureCatalogue {
+            catalogue,
+            extras,
+            digest,
+        })
+    }
+
+    /// [`FeatureCatalogue::load_bound`] from bytes already in memory. `path` is
+    /// only recorded as [`FeatureCatalogue::source_path`].
+    pub fn bound_from_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> Result<BoundFeatureCatalogue> {
+        use sha2::Digest;
+        if bytes.len() as u64 > Self::MAX_XML_SIZE {
+            return Err(crate::FCError::InvalidValue(
+                "FC XML byte limit exceeded (50 MiB)".into(),
+            ));
+        }
+        let digest = sha2::Sha256::digest(bytes).into();
+        let (catalogue, extras) = Self::parse_bytes(path.as_ref(), bytes)?;
         Ok(BoundFeatureCatalogue {
             catalogue,
             extras,

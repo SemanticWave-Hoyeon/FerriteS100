@@ -11,10 +11,16 @@
 //! [`chart_cells`]) and the S-124/S-129 overlay registry; renderer-specific
 //! pieces (area triangulation, overlay symbol sources) are supplied by the
 //! host. Behaviour is unchanged from the application modules.
+//!
+//! Stage 4 adds the platform services ([`platform`]: data source, cache
+//! store, user store, clock, executor) the engine reads through, and the
+//! public facade [`ChartEngine`] ([`chart_engine`]) with renderer-agnostic
+//! prepared scenes ([`scene`]) and picking ([`pick`]).
 
 pub mod catalogue;
 pub mod cell_source_identity;
 pub mod chart_cells;
+pub mod chart_engine;
 pub mod chart_publication;
 pub mod dataset_discovery;
 pub mod dataset_open_plan;
@@ -23,6 +29,8 @@ pub mod dataset_signature_policy;
 pub mod decoded_chart_cache;
 pub mod gml_overlay;
 pub mod interoperability;
+pub mod pick;
+pub mod platform;
 pub mod portrayal;
 pub mod portrayal_cache;
 pub mod primary_viewing_layers;
@@ -39,9 +47,11 @@ pub mod s102_journal_admission;
 pub mod s102_original_inputs;
 pub mod s102_trial_worker;
 pub mod s421_dataset_input;
+pub mod scene;
 pub mod secure_instruction_cache;
 
 mod chart_load;
 mod state;
+pub use chart_engine::{ChartEngine, DatasetSource, EngineConfig, SignaturePolicy, View};
 pub use chart_load::{CellHydrationSource, ChartLoadResult};
 pub use state::{CellHydration, CellScene, ChangeCellScene, EngineState, ViewportPixels};

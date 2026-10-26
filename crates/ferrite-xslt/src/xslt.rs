@@ -228,7 +228,35 @@ impl fmt::Debug for Stylesheet {
     }
 }
 
-struct Loader {
+/// Where stylesheet modules are read from. [`NativeModules`] reads the file
+/// system; a host without one supplies the module bytes itself. Paths are
+/// compared after [`ModuleSource::canonicalize`], which must resolve `.` and
+/// `..` and fail for a missing module.
+pub trait ModuleSource {
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf>;
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    /// Whether `path` names a readable module file.
+    fn is_file(&self, path: &Path) -> bool {
+        self.canonicalize(path).is_ok()
+    }
+}
+
+/// Stylesheet modules read from the file system.
+pub struct NativeModules;
+impl ModuleSource for NativeModules {
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        path.canonicalize()
+    }
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+}
+
+struct Loader<'s> {
+    source: &'s dyn ModuleSource,
     templates: Vec<Template>,
     globals: Vec<(QName, VarValue, bool)>,
     decimal_formats: HashMap<Option<String>, DecimalFormat>,
@@ -268,10 +296,21 @@ fn keep_whitespace(node: &roxmltree::Node) -> bool {
 impl Stylesheet {
     /// Load a stylesheet. Imported and included files must lie within `root`.
     pub fn load(path: &Path, root: &Path, limits: Limits) -> Result<Self> {
-        let root = root
-            .canonicalize()
+        Self::load_from(&NativeModules, path, root, limits)
+    }
+
+    /// Load a stylesheet whose modules come from `source`.
+    pub fn load_from(
+        source: &dyn ModuleSource,
+        path: &Path,
+        root: &Path,
+        limits: Limits,
+    ) -> Result<Self> {
+        let root = source
+            .canonicalize(root)
             .map_err(|e| XsltError(format!("Rule directory {}: {e}", root.display())))?;
         let mut loader = Loader {
+            source,
             templates: Vec::new(),
             globals: Vec::new(),
             decimal_formats: HashMap::new(),
@@ -301,6 +340,7 @@ impl Stylesheet {
         let dir = std::env::temp_dir();
         let _ = dir;
         let mut loader = Loader {
+            source: &NativeModules,
             templates: Vec::new(),
             globals: Vec::new(),
             decimal_formats: HashMap::new(),
@@ -328,12 +368,13 @@ impl Stylesheet {
     }
 }
 
-impl Loader {
+impl Loader<'_> {
     fn resolve_href(&self, base: &Path, href: &str) -> Result<PathBuf> {
         let dir = base.parent().unwrap_or(Path::new("."));
         let path = dir.join(href.replace('\\', "/"));
-        let canonical = path
-            .canonicalize()
+        let canonical = self
+            .source
+            .canonicalize(&path)
             .map_err(|e| XsltError(format!("Cannot open {}: {e}", path.display())))?;
         if !canonical.starts_with(&self.root) {
             return Err(XsltError(format!(
@@ -351,8 +392,9 @@ impl Loader {
         if self.modules > self.limits.modules {
             return Err(XsltError("Too many stylesheet modules".into()));
         }
-        let canonical = path
-            .canonicalize()
+        let canonical = self
+            .source
+            .canonicalize(path)
             .map_err(|e| XsltError(format!("Cannot open {}: {e}", path.display())))?;
         if self.loading.contains(&canonical) {
             return Err(XsltError(format!(
@@ -360,7 +402,9 @@ impl Loader {
                 canonical.display()
             )));
         }
-        let bytes = std::fs::read(&canonical)
+        let bytes = self
+            .source
+            .read(&canonical)
             .map_err(|e| XsltError(format!("Cannot read {}: {e}", canonical.display())))?;
         let text = decode_xml_bytes(&bytes);
         let doc = dom::parse(&text, Some(canonical.clone()), Some(&keep_whitespace))
@@ -489,7 +533,9 @@ impl Loader {
                 .attribute("href")
                 .ok_or_else(|| XsltError("xsl:include without href".into()))?;
             let path = self.resolve_href(base, &href)?;
-            let bytes = std::fs::read(&path)
+            let bytes = self
+                .source
+                .read(&path)
                 .map_err(|e| XsltError(format!("Cannot read {}: {e}", path.display())))?;
             let doc = dom::parse(
                 &decode_xml_bytes(&bytes),
@@ -528,7 +574,9 @@ impl Loader {
                 path.display()
             )));
         }
-        let bytes = std::fs::read(path)
+        let bytes = self
+            .source
+            .read(path)
             .map_err(|e| XsltError(format!("Cannot read {}: {e}", path.display())))?;
         let doc = dom::parse(
             &decode_xml_bytes(&bytes),

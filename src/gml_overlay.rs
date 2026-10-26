@@ -32,8 +32,11 @@ pub(crate) use ferrite_engine::gml_overlay::{
 
 /// The overlay registry with the renderer's symbol sources registered for
 /// each loaded product portrayal catalogue.
-pub(crate) fn load_overlays(base: &Path) -> GmlOverlays {
-    GmlOverlays::load(base, |id, bound| {
+pub(crate) fn load_overlays(
+    platform: &ferrite_engine::platform::Platform,
+    base: &Path,
+) -> GmlOverlays {
+    GmlOverlays::load_with(platform, base, |id, bound| {
         ferrite_gpu::register_overlay_symbol_source(
             id,
             ferrite_gpu::OverlaySymbolSource::from_bound(bound),
@@ -734,7 +737,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = load_overlays(&base);
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &base);
         assert!(g.catalogue_errors.is_empty(), "{:?}", g.catalogue_errors);
         let mut paths = discover(
             &data.join("UKHO-S100-2026/ExchangeSets/S-124_GB"),
@@ -851,7 +854,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = load_overlays(&base);
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &base);
         let text = std::fs::read_to_string(&path).unwrap().replace(
             "</S124:members>",
             "<S124:TextPlacement gml:id=\"TP1\"><S124:text>TEST LABEL</S124:text>\
@@ -890,7 +893,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = load_overlays(&base);
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &base);
         let (dataset, _) = g.read(&path, &path).unwrap();
         assert!(matches!(
             g.add(dataset, Provenance::Unverified).unwrap(),
@@ -946,7 +949,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("navwarn").join("alice.json");
         let start = |path: &Path| {
-            let mut g = load_overlays(&root());
+            let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &root());
             g.attach_user_store(path.to_path_buf(), "alice".into());
             g
         };
@@ -1053,7 +1056,7 @@ mod tests {
         .unwrap();
         assert!(!read_user_state(&path).unwrap().unwrap().correct_pc_errata);
         // No store: nothing written, startup unaffected.
-        let mut g = load_overlays(&root());
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &root());
         assert_eq!(g.user_status(), "User state not saved");
         let c = s124_dataset(&g, 72, "", "");
         assert!(matches!(
@@ -1076,7 +1079,7 @@ mod tests {
     /// 24 h new-message indication keeps running on the real clock.
     #[test]
     fn navwarn_lifecycle_follows_viewing_time() {
-        let mut g = load_overlays(&root());
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &root());
         let range = "<S124:fixedDateRange><S124:dateEnd>2026-02-12</S124:dateEnd>\
                      <S124:dateStart>2026-02-10</S124:dateStart></S124:fixedDateRange>";
         let ds = s124_dataset(
@@ -1138,7 +1141,7 @@ mod tests {
     /// source (no source cell).
     #[test]
     fn overlay_symbol_preview_resolves_registered_source() {
-        let mut g = load_overlays(&root());
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &root());
         let ds = s124_dataset(&g, 90, "", "");
         assert!(matches!(
             g.add(ds, Provenance::Unverified).unwrap(),
@@ -1193,7 +1196,7 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        let mut g = load_overlays(&base);
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &base);
         let (dataset, _) = g.read(&path, &path).unwrap();
         assert!(matches!(
             g.add(dataset, Provenance::Unverified).unwrap(),
@@ -1217,7 +1220,7 @@ mod tests {
     /// one is reported, and a dataset opened in the same batch counts.
     #[test]
     fn exchange_set_cancellation_sees_loaded_datasets() {
-        let mut g = load_overlays(&root());
+        let mut g = load_overlays(&ferrite_engine::platform::Platform::native(), &root());
         let mut loaded = s124_dataset(&g, 90, "", "");
         loaded.source = Some(PathBuf::from("/charts/124GB00LOADED.GML"));
         g.add(loaded, Provenance::Unverified).unwrap();

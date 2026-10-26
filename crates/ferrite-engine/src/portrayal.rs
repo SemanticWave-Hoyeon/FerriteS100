@@ -1,5 +1,6 @@
 //! S-101 cell portrayal through the catalogue's Lua rules, with per-cell
 //! instruction caches.
+use crate::platform::{CacheStore, DataSource};
 use crate::portrayal_cache::{encode_cache_payload, verify_and_deserialize_cache, wrap_cache};
 use crate::{primary_viewing_layers, secure_instruction_cache};
 use anyhow::{Context, Result};
@@ -10,7 +11,6 @@ use ferrite_render::host_settings::SettingsState;
 use ferrite_render::{DrawingInstruction, RenderContext};
 use ferrite_s100_core::S101Cell;
 use ferrite_s101::convert_lua_results_for_cell;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use tracing::{info, warn};
@@ -114,8 +114,17 @@ pub fn try_lua_portrayal(
 /// Which cells to portray (None: all) and where their caches live (None: none).
 #[derive(Default, Clone, Copy)]
 pub struct CellPortrayalSelection<'a> {
-    pub caches: Option<&'a [Option<PathBuf>]>,
+    pub caches: Option<CellCaches<'a>>,
     pub resident: Option<&'a [bool]>,
+}
+
+/// Per-cell cache entries (by global cell index) in a cache store; cell
+/// source modification times come from the data source.
+#[derive(Clone, Copy)]
+pub struct CellCaches<'a> {
+    pub paths: &'a [Option<PathBuf>],
+    pub store: &'a dyn CacheStore,
+    pub data: &'a dyn DataSource,
 }
 
 /// A per-cell portrayal: fresh Lua results, or instructions from the cache.
@@ -134,19 +143,23 @@ enum CellPortrayal {
 
 /// Read a cell cache written for the same inputs, if it is not older than
 /// the cell's file; any rejection simply portrays the cell again.
-pub fn read_cell_cache(path: &Path, cell: &S101Cell) -> Option<Vec<DrawingInstruction>> {
-    let cache_time = fs::metadata(path).ok()?.modified().ok()?;
-    if fs::metadata(&cell.file_path)
-        .ok()
-        .and_then(|m| m.modified().ok())
+pub fn read_cell_cache(
+    caches: &CellCaches<'_>,
+    path: &Path,
+    cell: &S101Cell,
+) -> Option<Vec<DrawingInstruction>> {
+    let cache_time = caches.store.modified(path)?;
+    if caches
+        .data
+        .modified(&cell.file_path)
         .is_some_and(|t| t > cache_time)
     {
         return None;
     }
-    let data = secure_instruction_cache::read(path).ok()?;
+    let data = caches.store.read(path).ok()?;
     match verify_and_deserialize_cache(&data) {
         Ok(instructions) => {
-            secure_instruction_cache::mark_used(path);
+            caches.store.mark_used(path);
             Some(instructions)
         }
         Err(error) => {
@@ -156,12 +169,16 @@ pub fn read_cell_cache(path: &Path, cell: &S101Cell) -> Option<Vec<DrawingInstru
     }
 }
 
-pub fn write_cell_cache(path: &Path, instructions: &[DrawingInstruction]) -> bool {
+pub fn write_cell_cache(
+    store: &dyn CacheStore,
+    path: &Path,
+    instructions: &[DrawingInstruction],
+) -> bool {
     if instructions.len() as u64 > secure_instruction_cache::MAX_INSTRUCTIONS {
         return false;
     }
     match encode_cache_payload(instructions) {
-        Ok(payload) => match secure_instruction_cache::write_atomic(path, &wrap_cache(&payload)) {
+        Ok(payload) => match store.write(path, &wrap_cache(&payload)) {
             Ok(()) => true,
             Err(error) => {
                 warn!("Cell cache write failed: {error}");
@@ -186,7 +203,7 @@ pub fn try_lua_portrayal_for_cells<'a>(
     render_context: &mut RenderContext,
     profile_name: &str,
     settings: Option<&SettingsState>,
-    cell_caches: Option<&[Option<PathBuf>]>,
+    cell_caches: Option<CellCaches<'_>>,
     triangulate: AreaTriangulator,
 ) -> Result<()> {
     let context = validated_lua_context(pc, settings)?;
@@ -262,11 +279,15 @@ pub fn try_lua_portrayal_for_cells<'a>(
                     }
                     let position = schedule[claimed];
                     let (cell_index, cell) = cells[position];
-                    let cache = cell_caches
-                        .and_then(|paths| paths.get(cell_index))
-                        .and_then(Option::as_deref);
+                    let cache = cell_caches.as_ref().and_then(|caches| {
+                        caches
+                            .paths
+                            .get(cell_index)
+                            .and_then(Option::as_deref)
+                            .map(|path| (caches, path))
+                    });
                     if let Some(mut instructions) =
-                        cache.and_then(|path| read_cell_cache(path, cell))
+                        cache.and_then(|(caches, path)| read_cell_cache(caches, path, cell))
                     {
                         // Renumber exactly as convert_lua_results_for_cell would:
                         // the cell index, and the S-101 dependency namespace.
@@ -333,8 +354,9 @@ pub fn try_lua_portrayal_for_cells<'a>(
                         // scene's stable sort then only merges cell runs.
                         instructions.sort_by_cached_key(DrawingInstruction::render_order);
                         ferrite_render::intern_line_styles(&mut instructions);
-                        let written =
-                            cache.is_some_and(|path| write_cell_cache(path, &instructions));
+                        let written = cache.is_some_and(|(caches, path)| {
+                            write_cell_cache(caches.store, path, &instructions)
+                        });
                         Ok(CellPortrayal::Fresh {
                             instructions,
                             results: results.len(),
@@ -388,7 +410,9 @@ pub fn try_lua_portrayal_for_cells<'a>(
         total_results, cached_cells
     );
     if written_cells {
-        secure_instruction_cache::prune_root();
+        if let Some(caches) = &cell_caches {
+            caches.store.prune();
+        }
     }
     Ok(())
 }

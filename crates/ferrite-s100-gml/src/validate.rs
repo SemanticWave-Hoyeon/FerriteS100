@@ -142,6 +142,16 @@ impl Supplement {
         let len = std::fs::metadata(path)?.len();
         ensure!(len <= 64 * 1024 * 1024, "Feature catalogue too large");
         let text = std::fs::read_to_string(path)?;
+        Self::parse(&text)
+    }
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= 64 * 1024 * 1024,
+            "Feature catalogue too large"
+        );
+        Self::parse(std::str::from_utf8(bytes).context("Feature catalogue is not UTF-8")?)
+    }
+    fn parse(text: &str) -> Result<Self> {
         let doc = roxmltree::Document::parse_with_options(
             text.trim_start_matches('\u{feff}'),
             roxmltree::ParsingOptions {
@@ -310,6 +320,16 @@ impl<'a> Validator<'a> {
     /// catalogue source when the catalogue model lacks them.
     pub fn new(fc: &'a FeatureCatalogue) -> Self {
         let extra = Supplement::load(&fc.source_path).unwrap_or_else(|e| {
+            tracing::warn!("Feature catalogue supplement unavailable: {e:#}");
+            Supplement::default()
+        });
+        Self { fc, extra }
+    }
+
+    /// As [`Validator::new`], with the catalogue source supplied as bytes
+    /// (a host without a file system).
+    pub fn with_catalogue_bytes(fc: &'a FeatureCatalogue, source: &[u8]) -> Self {
+        let extra = Supplement::from_bytes(source).unwrap_or_else(|e| {
             tracing::warn!("Feature catalogue supplement unavailable: {e:#}");
             Supplement::default()
         });

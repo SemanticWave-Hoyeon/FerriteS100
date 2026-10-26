@@ -7,4 +7,4 @@ pub mod xslt;
 
 pub use dom::{parse, serialize, Builder, Document, NodeKind, NodeRef, ParseError, QName};
 pub use eval::Value;
-pub use xslt::{Limits, Output, Stylesheet, XsltError};
+pub use xslt::{Limits, ModuleSource, NativeModules, Output, Stylesheet, XsltError};

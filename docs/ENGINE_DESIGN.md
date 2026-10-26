@@ -84,7 +84,7 @@ trait ProductAdapter {
 | 1 | 순수 도메인 모듈을 `ferrite-engine`으로 이동, 애플리케이션은 import만 변경. 동작 변경 없음 | 낮음 |
 | 2 | `main.rs`의 포트레이얼 파이프라인을 `engine::portrayal`로 이동, `ChartApp`의 해도 상태를 `EngineState`로 분리 | 높음 |
 | 3 | `ferrite-wgpu`를 `ferrite-gpu`(렌더러, egui·winit·s421 비의존, 차트 텍스트는 epaint)와 `ferrite-ui`(egui)로 분리. 렌더러는 `SurfaceHost`·`UiLayer`·차트 텍스트 백엔드를 주입받음 | 완료 |
-| 4~6 | 파사드·플랫폼 서비스, 기능 플래그·CLI·C ABI, 웹(wasm). 4a절 참고 | 중간 |
+| 4~6 | 파사드·플랫폼 서비스(4 완료), 기능 플래그·CLI·C ABI, 웹(wasm). 4a절 참고 | 중간 |
 | 7 (선택) | S-57/S-52 어댑터 | 별도 프로젝트 규모 |
 
 ## 4a. 이식성 목표 (단계 4~6으로 재편)
@@ -124,7 +124,7 @@ XSLT(`ferrite-xslt`), GML(`ferrite-s100-gml`), 커널(`ferrite-kernel`), ISO 821
 
 | 단계 | 내용 |
 |---|---|
-| 4 | `ChartEngine` 파사드와 플랫폼 서비스 트레이트(`DataSource`, `CacheStore`, `UserStore`, `Clock`, `Executor`). 엔진·s102·gml·security의 파일·스레드·시계 접근을 서비스로 치환. 네이티브 구현은 기존 동작과 동일 |
+| 4 | **완료.** `ferrite_engine::platform`에 `Platform`(`DataSource`·`CacheStore`·`UserStore`·`Clock`·`Executor`)과 네이티브·메모리·순차 구현을 두고 `EngineState`·`GmlOverlays`에 주입했다. 카탈로그(FC 바이트, PC `CatalogueSources::from_files`), 데이터셋 탐색, S-124/S-129 카탈로그·XSLT 규칙(`ferrite_xslt::ModuleSource`)·데이터셋 읽기와 검증, 셀 포트레이얼 캐시, NAVWARN 사용자 상태, 하이드레이션 병렬 실행이 서비스를 거친다. `S101Cell::load_update_chain_bytes_with_identity`, `inspect_dataset_identification_bytes`로 파일 없이 셀을 연다. `chart_engine::ChartEngine`(`new`·`open`→`OpenJob`(`poll`·`wait`·`cancel`)·`install`·`set_display`·`prepare`→`PreparedScene`·`pick`·`feature`), `pick`(`PickSurface`, `find_features_at`, `FeatureReport`), `scene`(`PreparedScene`, 셀 리소스 바인딩, `prepare_flat_coverage`)를 추가했고 앱은 `EngineState::new`, `PreparedScene`, 엔진 피킹·`describe_feature`·리소스 바인딩을 쓴다. 예제 `crates/ferrite-engine/examples/inspect.rs`, 메모리 소스만으로 S-101·S-124를 열고 장면을 준비하는 테스트(`tests/in_memory_open.rs`). **5단계로 넘긴 네이티브 전용 경로**: S-101 서명 검증과 업데이트 계획기(`s101_update_plan`, `dataset_signature_policy`, `ferrite-security`의 경로 기반 스냅샷), 취소 이력(`chart_publication::HistoryStore`), 설치 카탈로그 인벤토리 선택(`s101_catalogue_selection`), S-102 전체(HDF5, 저널, 시험 워커), S-421 입력, S-124/S-129 교환 세트 검증·shapefile 가져오기, Lua 포트레이얼 워커 풀과 앱 로더의 스레드(`parallel` 기능으로 `Executor`에 연결 예정), PC 캡처의 rayon 병렬 읽기 |
 | 5 | 기능 플래그 정리(`parallel`, `lua-native`, `crypto-openssl`/`crypto-rust`, `s102-hdf5`). 순수 Rust 암호 백엔드. `ferrite-cli`(헤드리스 렌더·검증·검사)와 `ferrite-capi`(C ABI, cbindgen 헤더, C 예제) |
 | 6 | `ferrite-wasm`: wasm32 빌드(파일 없이 바이트로 열기, 순차 실행, WebGPU/WebGL2 렌더), 최소 웹 데모. Lua 포트레이얼은 미리 계산한 Part 9a 결과 또는 WASI/emscripten 빌드 중 선택 |
 

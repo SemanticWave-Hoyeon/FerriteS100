@@ -4,6 +4,9 @@
 //! The overlay registry ([`GmlOverlays`]) loads the product catalogues and
 //! datasets, evaluates the S-124 lifecycle and portrays the datasets; its
 //! user-interface glue (rows, symbol registration) stays in the application.
+use crate::platform::{
+    Clock, DataSource, EntryKind, FileRecord, NativeDataSource, Platform, SourceModules, UserRecord,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ferrite_feature_catalog::FeatureCatalogue;
@@ -49,22 +52,36 @@ const IMPORT_EXTENSIONS: [&str; 3] = ["kml", "gpx", "shp"];
 /// S-124 / S-129 from the root element of a GML file (namespace or
 /// productIdentifier in the first 64 KiB).
 pub fn sniff_product(path: &Path) -> Option<Product> {
-    use std::io::Read;
-    if !(crate::dataset_discovery::is_dataset_file(path, "gml")
-        || crate::dataset_discovery::is_dataset_file(path, "xml"))
-        || path
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("CATALOG.XML"))
-    {
+    sniff_product_in(&NativeDataSource, path)
+}
+
+/// [`sniff_product`] through a data source.
+pub fn sniff_product_in(data: &dyn DataSource, path: &Path) -> Option<Product> {
+    if !sniffable(path) {
         return None;
     }
-    let mut head = Vec::with_capacity(64 * 1024);
-    std::fs::File::open(path)
-        .ok()?
-        .take(64 * 1024)
-        .read_to_end(&mut head)
-        .ok()?;
-    let text = String::from_utf8_lossy(&head);
+    let head = data.read_limited(path, 64 * 1024 - 1).ok()?;
+    sniff_head(&head)
+}
+
+/// [`sniff_product`] of a dataset already in memory.
+pub fn sniff_product_bytes(path: &Path, bytes: &[u8]) -> Option<Product> {
+    if !sniffable(path) {
+        return None;
+    }
+    sniff_head(&bytes[..bytes.len().min(64 * 1024)])
+}
+
+fn sniffable(path: &Path) -> bool {
+    (crate::dataset_discovery::is_dataset_file(path, "gml")
+        || crate::dataset_discovery::is_dataset_file(path, "xml"))
+        && !path
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("CATALOG.XML"))
+}
+
+fn sniff_head(head: &[u8]) -> Option<Product> {
+    let text = String::from_utf8_lossy(head);
     let mut reader = quick_xml::Reader::from_str(text.trim_start_matches('\u{feff}'));
     loop {
         use quick_xml::events::Event;
@@ -118,33 +135,43 @@ pub fn is_overlay_file(path: &Path) -> bool {
 /// loaded and not cancelled ([`GmlOverlays::on_system`]); exchange-set check
 /// S-158-129 19 (cancellation of a dataset not on the system) uses it.
 pub fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Vec<PathBuf>> {
+    discover_in(&NativeDataSource, root, on_system)
+}
+
+/// [`discover`] through a data source. Exchange-set validation reads the
+/// exchange set by path and runs only on a source of local files (stage 5).
+pub fn discover_in(
+    data: &dyn DataSource,
+    root: &Path,
+    on_system: &HashSet<String>,
+) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut catalogues = Vec::new();
-    for (count, entry) in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .enumerate()
-    {
+    for (count, entry) in data.walk(root).enumerate() {
         anyhow::ensure!(count < 100_000, "Overlay discovery exceeds entry limit");
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if entry.kind != EntryKind::File {
             continue;
         }
-        let path = entry.path();
+        let path = entry.path.as_path();
         if path
             .file_name()
             .is_some_and(|n| n.eq_ignore_ascii_case("CATALOG.XML"))
         {
             catalogues.extend(path.parent().map(Path::to_path_buf));
-        } else if is_import_file(path, false) || sniff_product(path).is_some() {
-            found.push(entry.into_path());
+        } else if is_import_file(path, false) || sniff_product_in(data, path).is_some() {
+            found.push(entry.path);
             anyhow::ensure!(found.len() <= 4096, "Overlay dataset inputs exceed 4096");
         }
     }
     found.sort();
     // A cancellation-only exchange set holds no dataset files; it is still
     // checked (S-101-only sets report no S-124/S-129 products and are skipped).
-    log_exchange_set_checks(exchange_set_reports(catalogues, &found, on_system));
+    if data.local_paths() {
+        log_exchange_set_checks(exchange_set_reports(catalogues, &found, on_system));
+    } else if !catalogues.is_empty() {
+        info!("Exchange-set validation skipped: needs local files (stage 5)");
+    }
     Ok(found)
 }
 
@@ -264,9 +291,16 @@ fn log_exchange_set_checks(
 // ─────────────────────────────────────────────────────────────────────────
 
 pub struct UserStateStore {
-    pub path: PathBuf,
+    pub record: Box<dyn UserRecord>,
     pub user: String,
     pub status: String,
+}
+
+fn user_state_file(path: &Path) -> FileRecord {
+    FileRecord {
+        path: path.to_path_buf(),
+        temporary_prefix: ".navwarn-state",
+    }
 }
 
 const USER_STATE_VERSION: u8 = 1;
@@ -309,20 +343,24 @@ pub struct StoredUserState {
 
 /// The stored state and the user it was saved for; None when there is no file.
 pub fn read_user_state(path: &Path) -> Result<Option<StoredUserState>> {
-    use std::io::Read;
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    read_user_record(&user_state_file(path))
+}
+
+/// [`read_user_state`] from any user record.
+pub fn read_user_record(record: &dyn UserRecord) -> Result<Option<StoredUserState>> {
+    let Some(bytes) = record.read(MAX_USER_STATE_BYTES)? else {
+        return Ok(None);
     };
-    let mut bytes = Vec::new();
-    file.take(MAX_USER_STATE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    parse_user_state(&bytes).map(Some)
+}
+
+/// Decode a stored user state document.
+pub fn parse_user_state(bytes: &[u8]) -> Result<StoredUserState> {
     anyhow::ensure!(
         bytes.len() as u64 <= MAX_USER_STATE_BYTES,
         "S-124 user state exceeds {MAX_USER_STATE_BYTES} bytes"
     );
-    let doc: UserStateDocument = serde_json::from_slice(&bytes)?;
+    let doc: UserStateDocument = serde_json::from_slice(bytes)?;
     anyhow::ensure!(
         doc.version == USER_STATE_VERSION,
         "Unsupported S-124 user state version {}",
@@ -357,11 +395,11 @@ pub fn read_user_state(path: &Path) -> Result<Option<StoredUserState>> {
         displayed: doc.displayed.into_iter().collect(),
         received: doc.received.into_iter().collect(),
     };
-    Ok(Some(StoredUserState {
+    Ok(StoredUserState {
         state,
         user: doc.user,
         correct_pc_errata: doc.correct_pc_errata,
-    }))
+    })
 }
 
 /// Replace the stored state atomically (temporary file, then rename).
@@ -371,7 +409,18 @@ pub fn write_user_state(
     state: &NavwarnUserState,
     correct_pc_errata: bool,
 ) -> Result<()> {
-    use std::io::Write;
+    let bytes = encode_user_state(user, state, correct_pc_errata, Utc::now())?;
+    user_state_file(path).write(&bytes)?;
+    Ok(())
+}
+
+/// The stored document of a user state, saved at `saved`.
+pub fn encode_user_state(
+    user: &str,
+    state: &NavwarnUserState,
+    correct_pc_errata: bool,
+    saved: DateTime<Utc>,
+) -> Result<Vec<u8>> {
     let mut classification: Vec<_> = state.classification.iter().collect();
     classification.sort();
     let mut received: Vec<_> = state.received.iter().collect();
@@ -380,7 +429,7 @@ pub fn write_user_state(
     let doc = UserStateDocument {
         version: USER_STATE_VERSION,
         user: user.to_owned(),
-        saved: Utc::now(),
+        saved,
         classification: classification
             .into_iter()
             .filter(|(k, _)| k.len() <= MAX_USER_STATE_KEY)
@@ -409,50 +458,16 @@ pub fn write_user_state(
             .collect(),
         correct_pc_errata,
     };
-    let bytes = serde_json::to_vec_pretty(&doc)?;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(parent)?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let temporary = parent.join(format!(".navwarn-state-{}-{nonce}.tmp", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    Ok(serde_json::to_vec_pretty(&doc)?)
 }
 
 /// Keep an unreadable state file for inspection instead of overwriting it.
 pub fn set_aside(path: &Path) {
-    let mut name = path.as_os_str().to_owned();
-    name.push(format!(
-        ".unreadable-{}",
-        Utc::now().format("%Y%m%dT%H%M%SZ")
-    ));
-    if let Err(error) = std::fs::rename(path, &name) {
-        warn!("Could not set aside {}: {error}", path.display());
-    }
+    set_aside_record(&user_state_file(path), Utc::now());
+}
+
+fn set_aside_record(record: &dyn UserRecord, now: DateTime<Utc>) {
+    record.set_aside(&format!(".unreadable-{}", now.format("%Y%m%dT%H%M%SZ")));
 }
 
 /// Viewing time of the S-101 date-dependent portrayal setting as an instant:
@@ -605,6 +620,8 @@ const S124_IMPLICIT_GROUPS: [u32; 2] = [26, 12210];
 
 pub struct ProductCatalogues {
     pub fc: Arc<FeatureCatalogue>,
+    /// Catalogue source bytes for validation, when not read by path.
+    fc_source: Option<Arc<[u8]>>,
     xslt: XsltPortrayal,
     /// Catalogue used for Part 9a conversion: symbol references namespaced
     /// with the product prefix, implicit viewing groups declared (so the
@@ -619,29 +636,47 @@ pub struct ProductCatalogues {
 }
 
 impl ProductCatalogues {
-    fn load(base: &Path, product: Product, register_symbols: SymbolRegistrar) -> Result<Self> {
+    fn load(
+        data: &dyn DataSource,
+        catalogues: &Path,
+        product: Product,
+        register_symbols: SymbolRegistrar,
+    ) -> Result<Self> {
         let id = product.identifier();
-        let fc_dir = base.join("Catalogues/FC").join(id);
-        let fc_file = crate::dataset_discovery::feature_catalogue_file(&fc_dir)
+        let fc_dir = catalogues.join("FC").join(id);
+        let fc_file = crate::dataset_discovery::feature_catalogue_file_in(data, &fc_dir)
             .with_context(|| format!("{id} feature catalogue in {}", fc_dir.display()))?;
-        let fc = FeatureCatalogue::load(&fc_file)
+        tracing::info!("Loading Feature Catalogue: {}", fc_file.display());
+        let fc_bytes = data
+            .read_limited(&fc_file, FeatureCatalogue::MAX_XML_SIZE)
+            .map_err(ferrite_feature_catalog::FCError::from)
+            .with_context(|| format!("{id} feature catalogue {}", fc_file.display()))?;
+        let fc = FeatureCatalogue::from_bytes_with_extras(&fc_file, &fc_bytes)
+            .map(|(fc, _)| fc)
             .with_context(|| format!("{id} feature catalogue {}", fc_file.display()))?;
         anyhow::ensure!(
             fc.product_id.is_empty() || fc.product_id == id,
             "Expected {id} feature catalogue, found {}",
             fc.product_id
         );
-        let pc_dir = base.join("Catalogues/PC").join(id);
-        let bound = PortrayalCatalogue::load_bound(&pc_dir)
-            .with_context(|| format!("{id} portrayal catalogue {}", pc_dir.display()))?;
+        let pc_dir = catalogues.join("PC").join(id);
+        let load_pc = || {
+            data.portrayal_sources(&pc_dir)
+                .and_then(|sources| PortrayalCatalogue::bound_from_sources(&pc_dir, sources))
+                .with_context(|| format!("{id} portrayal catalogue {}", pc_dir.display()))
+        };
+        let bound = load_pc()?;
         anyhow::ensure!(
             register_symbols(id, &bound),
             "Invalid overlay symbol prefix {id}"
         );
-        let mut pc = PortrayalCatalogue::load(&pc_dir)
-            .with_context(|| format!("{id} portrayal catalogue {}", pc_dir.display()))?;
+        let mut pc = load_pc()?.into_catalogue();
         pc.namespace_symbol_references(id);
-        let xslt = XsltPortrayal::load(&pc_dir)?;
+        let xslt = XsltPortrayal::load_from(
+            &SourceModules(data),
+            &pc_dir,
+            ferrite_xslt::Limits::default(),
+        )?;
         let declared_groups = pc.viewing_groups.groups.len();
         let mut implicit_groups = HashSet::new();
         if product == Product::S124 {
@@ -688,6 +723,9 @@ impl ProductCatalogues {
         );
         Ok(Self {
             fc: Arc::new(fc),
+            // A local source re-reads the catalogue file for each validation,
+            // as before; other sources keep the bytes read here.
+            fc_source: (!data.local_paths()).then(|| Arc::from(fc_bytes)),
             xslt,
             pc,
             implicit_groups,
@@ -811,12 +849,36 @@ pub struct GmlOverlays {
     pub installed: Option<(u64, u64)>,
     pub ui_revision: u64,
     notes_logged: HashSet<String>,
+    data: Arc<dyn DataSource>,
+    clock: Arc<dyn Clock>,
 }
 
 impl GmlOverlays {
     pub fn load(base: &Path, register_symbols: SymbolRegistrar) -> Self {
+        Self::load_with(&Platform::native(), base, register_symbols)
+    }
+
+    /// [`GmlOverlays::load`] on a platform: catalogues and datasets are read
+    /// through its data source and lifecycles use its clock.
+    pub fn load_with(platform: &Platform, base: &Path, register_symbols: SymbolRegistrar) -> Self {
+        Self::load_catalogues(platform, &base.join("Catalogues"), register_symbols)
+    }
+
+    /// [`GmlOverlays::load_with`] from a catalogue folder holding
+    /// `FC/<product>` and `PC/<product>`.
+    pub fn load_catalogues(
+        platform: &Platform,
+        catalogues: &Path,
+        register_symbols: SymbolRegistrar,
+    ) -> Self {
+        let data = Arc::clone(&platform.data);
         let mut errors = Vec::new();
-        let mut load = |product| match ProductCatalogues::load(base, product, register_symbols) {
+        let mut load = |product| match ProductCatalogues::load(
+            data.as_ref(),
+            catalogues,
+            product,
+            register_symbols,
+        ) {
             Ok(c) => Some(c),
             Err(error) => {
                 let message = format!("{} catalogues unavailable: {error:#}", product.identifier());
@@ -868,7 +930,13 @@ impl GmlOverlays {
             installed: None,
             ui_revision: 0,
             notes_logged: HashSet::new(),
+            data,
+            clock: Arc::clone(&platform.clock),
         }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.clock.utc()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -934,25 +1002,74 @@ impl GmlOverlays {
     pub fn read(&self, path: &Path, bytes_path: &Path) -> Result<(Dataset, Option<&'static str>)> {
         if is_import_file(path, true) {
             let fc = self.s124.as_ref().map(|c| c.fc.as_ref());
-            let bytes_format = ferrite_s100_gml::import::ImportFormat::detect(
-                path,
-                &std::fs::read(path).with_context(|| path.display().to_string())?,
-            )
-            .context("Unrecognised import format")?;
-            let dataset = ferrite_s100_gml::import::import_path_with(path, fc, Utc::now())?;
+            let bytes = self
+                .data
+                .read(path)
+                .with_context(|| path.display().to_string())?;
+            let bytes_format = ferrite_s100_gml::import::ImportFormat::detect(path, &bytes)
+                .context("Unrecognised import format")?;
+            // Shapefile companions are found beside the file: native only.
+            let dataset = if self.data.local_paths() {
+                ferrite_s100_gml::import::import_path_with(path, fc, self.now())?
+            } else {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("import");
+                let mut dataset = ferrite_s100_gml::import::import_bytes(
+                    &bytes,
+                    bytes_format,
+                    name,
+                    fc,
+                    self.now(),
+                )
+                .with_context(|| path.display().to_string())?;
+                dataset.source = Some(path.to_path_buf());
+                dataset
+            };
             return Ok((dataset, Some(bytes_format.label())));
         }
-        let product = sniff_product(path).context("Not an S-124 or S-129 GML dataset")?;
+        let product = sniff_product_in(self.data.as_ref(), path)
+            .context("Not an S-124 or S-129 GML dataset")?;
         let catalogues = self
             .catalogues(product)
             .with_context(|| format!("{} catalogues are not installed", product.identifier()))?;
-        let mut dataset = ferrite_s100_gml::read_file(
-            bytes_path,
-            Some(&catalogues.fc),
-            ferrite_s100_gml::ReadLimits::default(),
-        )?;
+        let limits = ferrite_s100_gml::ReadLimits::default();
+        let meta = self
+            .data
+            .len(bytes_path)
+            .with_context(|| format!("Cannot open {}", bytes_path.display()))?;
+        anyhow::ensure!(
+            meta as usize <= limits.bytes,
+            "{} exceeds the {} byte dataset limit",
+            bytes_path.display(),
+            limits.bytes
+        );
+        let bytes = self
+            .data
+            .read(bytes_path)
+            .with_context(|| format!("Cannot read {}", bytes_path.display()))?;
+        let mut dataset = ferrite_s100_gml::read_bytes(&bytes, Some(&catalogues.fc), limits)
+            .with_context(|| bytes_path.display().to_string())?;
         dataset.source = Some(path.to_path_buf());
         Ok((dataset, None))
+    }
+
+    /// Read an S-124/S-129 GML dataset supplied as bytes; `path` names it.
+    pub fn read_bytes(&self, path: &Path, bytes: &[u8]) -> Result<Dataset> {
+        let product =
+            sniff_product_bytes(path, bytes).context("Not an S-124 or S-129 GML dataset")?;
+        let catalogues = self
+            .catalogues(product)
+            .with_context(|| format!("{} catalogues are not installed", product.identifier()))?;
+        let mut dataset = ferrite_s100_gml::read_bytes(
+            bytes,
+            Some(&catalogues.fc),
+            ferrite_s100_gml::ReadLimits::default(),
+        )
+        .with_context(|| path.display().to_string())?;
+        dataset.source = Some(path.to_path_buf());
+        Ok(dataset)
     }
 
     pub fn add(&mut self, dataset: Dataset, provenance: Provenance) -> Result<Added> {
@@ -973,12 +1090,15 @@ impl GmlOverlays {
             .source
             .as_deref()
             .filter(|_| !dataset.imported)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len());
+            .and_then(|p| self.data.len(p).ok());
         let mut issues = dataset.issues.clone();
-        issues.extend(
-            ferrite_s100_gml::validate::Validator::new(&catalogues.fc).validate(&dataset, size),
-        );
+        let validator = match &catalogues.fc_source {
+            Some(source) => {
+                ferrite_s100_gml::validate::Validator::with_catalogue_bytes(&catalogues.fc, source)
+            }
+            None => ferrite_s100_gml::validate::Validator::new(&catalogues.fc),
+        };
+        issues.extend(validator.validate(&dataset, size));
         let id = self.next_id;
         self.next_id += 1;
         let name = dataset.display_name();
@@ -1023,13 +1143,13 @@ impl GmlOverlays {
         let received = if dataset.product == Product::S124 {
             let (received, recorded) = self
                 .user
-                .receive(&navwarn::dataset_key(&dataset), Utc::now());
+                .receive(&navwarn::dataset_key(&dataset), self.now());
             if recorded {
                 self.persist_user_state();
             }
             received
         } else {
-            Utc::now()
+            self.now()
         };
         self.datasets.push(OverlayDataset {
             id,
@@ -1138,7 +1258,7 @@ impl GmlOverlays {
                 .registry
                 .as_ref()
                 .is_none_or(|old| signature(old) != signature(&registry));
-        let clock = Utc::now();
+        let clock = self.now();
         let new_flags: Vec<bool> = (0..registry.messages.len())
             .map(|i| {
                 let meets = self.user.classification_of(&registry.messages[i])
@@ -1176,7 +1296,7 @@ impl GmlOverlays {
     /// Instant the S-124 lifecycle (status, fixedDateRange) is evaluated at:
     /// the user's viewing time, else the system clock.
     pub fn lifecycle_time(&self) -> DateTime<Utc> {
-        self.viewing_time.unwrap_or_else(Utc::now)
+        self.viewing_time.unwrap_or_else(|| self.now())
     }
 
     /// Follow the viewing time setting (None: system clock). Returns true
@@ -1197,7 +1317,13 @@ impl GmlOverlays {
     /// A missing file starts empty; an unreadable one is set aside and the
     /// application starts with an empty state (never fails).
     pub fn attach_user_store(&mut self, path: PathBuf, user: String) {
-        let status = match read_user_state(&path) {
+        self.attach_user_record(Box::new(user_state_file(&path)), user);
+    }
+
+    /// [`GmlOverlays::attach_user_store`] for any user record (e.g. from
+    /// [`crate::platform::UserStore::navwarn_state`]).
+    pub fn attach_user_record(&mut self, record: Box<dyn UserRecord>, user: String) {
+        let status = match read_user_record(record.as_ref()) {
             Ok(Some(StoredUserState {
                 state: stored,
                 user: stored_user,
@@ -1206,7 +1332,7 @@ impl GmlOverlays {
                 if stored_user != user {
                     warn!(
                         "S-124 user state {} was saved by user {stored_user:?}, loaded for {user:?}",
-                        path.display()
+                        record.describe()
                     );
                 }
                 // Loaded state first; anything recorded this session wins.
@@ -1229,7 +1355,7 @@ impl GmlOverlays {
                     self.user.classification.len(),
                     self.user.displayed.len(),
                     self.user.received.len(),
-                    path.display()
+                    record.describe()
                 );
                 format!("User {user} · state restored")
             }
@@ -1237,9 +1363,9 @@ impl GmlOverlays {
             Err(error) => {
                 warn!(
                     "S-124 user state {} unreadable, starting empty: {error:#}",
-                    path.display()
+                    record.describe()
                 );
-                set_aside(&path);
+                set_aside_record(record.as_ref(), self.now());
                 format!("User {user} · saved state unreadable, started empty")
             }
         };
@@ -1254,7 +1380,11 @@ impl GmlOverlays {
                 .receive(&navwarn::dataset_key(&d.dataset), d.received);
             d.received = received;
         }
-        self.user_store = Some(UserStateStore { path, user, status });
+        self.user_store = Some(UserStateStore {
+            record,
+            user,
+            status,
+        });
         self.invalidate();
         self.ui_revision = 0;
     }
@@ -1293,16 +1423,19 @@ impl GmlOverlays {
     }
 
     fn persist_user_state(&mut self) {
+        let now = self.now();
         let Some(store) = &mut self.user_store else {
             return;
         };
-        self.user.prune(Utc::now());
-        match write_user_state(&store.path, &store.user, &self.user, self.correct_pc_errata) {
+        self.user.prune(now);
+        let written = encode_user_state(&store.user, &self.user, self.correct_pc_errata, now)
+            .and_then(|bytes| Ok(store.record.write(&bytes)?));
+        match written {
             Ok(()) => store.status = format!("User {} · state saved", store.user),
             Err(error) => {
                 warn!(
                     "S-124 user state not saved to {}: {error:#}",
-                    store.path.display()
+                    store.record.describe()
                 );
                 store.status = format!("User {} · state NOT saved: {error}", store.user);
             }
