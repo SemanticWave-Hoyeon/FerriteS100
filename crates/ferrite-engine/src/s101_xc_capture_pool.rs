@@ -53,7 +53,7 @@ impl Pool {
         Ok(owner)
     }
 }
-pub(crate) fn retain_unverified(path: &Path, bytes: &[u8]) -> Result<Arc<[u8]>> {
+pub fn retain_unverified(path: &Path, bytes: &[u8]) -> Result<Arc<[u8]>> {
     static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(Pool::default()))
         .lock()

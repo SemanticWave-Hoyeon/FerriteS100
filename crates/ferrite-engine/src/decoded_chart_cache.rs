@@ -7,15 +7,15 @@ use std::{
 };
 const BYTES: usize = 96 * 1024 * 1024;
 const ENTRIES: usize = 32;
-pub(crate) type SharedDecodedChartCache = Arc<Mutex<DecodedChartCache>>;
-pub(crate) type DecodedChartCache = Cache<(S101Cell, CellSourceIdentity)>;
+pub type SharedDecodedChartCache = Arc<Mutex<DecodedChartCache>>;
+pub type DecodedChartCache = Cache<(S101Cell, CellSourceIdentity)>;
 struct Entry<T> {
     key: [u8; 32],
     value: T,
     charge: usize,
 }
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-pub(crate) struct Statistics {
+pub struct Statistics {
     pub requests: u64,
     pub hits: u64,
     pub misses: u64,
@@ -26,7 +26,7 @@ pub(crate) struct Statistics {
     pub charged_payload_bytes: usize,
     pub allocation_payload_limit_bytes: usize,
 }
-pub(crate) struct Cache<T> {
+pub struct Cache<T> {
     entries: VecDeque<Entry<T>>,
     bytes: usize,
     generation: u64,
@@ -35,7 +35,8 @@ pub(crate) struct Cache<T> {
     statistics: Statistics,
 }
 impl<T: Clone> Cache<T> {
-    pub(crate) fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self::with_limit(BYTES)
     }
     fn with_limit(limit: usize) -> Self {
@@ -48,7 +49,7 @@ impl<T: Clone> Cache<T> {
             statistics: Statistics::default(),
         }
     }
-    pub(crate) fn statistics(&self) -> Statistics {
+    pub fn statistics(&self) -> Statistics {
         Statistics {
             retained_entries: self.entries.len(),
             charged_payload_bytes: self.bytes.saturating_add(
@@ -60,10 +61,10 @@ impl<T: Clone> Cache<T> {
             ..self.statistics
         }
     }
-    pub(crate) fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.generation
     }
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.statistics.resets = self.statistics.resets.saturating_add(1);
         self.entries.clear();
         self.bytes = 0;
@@ -73,7 +74,7 @@ impl<T: Clone> Cache<T> {
             self.exhausted = true;
         }
     }
-    pub(crate) fn get(&mut self, key: &[u8; 32]) -> Option<T> {
+    pub fn get(&mut self, key: &[u8; 32]) -> Option<T> {
         self.statistics.requests = self.statistics.requests.saturating_add(1);
         let index = if self.exhausted {
             None
@@ -91,13 +92,7 @@ impl<T: Clone> Cache<T> {
         Some(value)
     }
     // The caller owns its live worker copy; only this independent immutable snapshot is retained.
-    pub(crate) fn insert(
-        &mut self,
-        key: [u8; 32],
-        value: T,
-        charge: usize,
-        generation: u64,
-    ) -> bool {
+    pub fn insert(&mut self, key: [u8; 32], value: T, charge: usize, generation: u64) -> bool {
         let overhead = self.entries.capacity().checked_mul(size_of::<Entry<T>>());
         let Some(available) = overhead.and_then(|n| self.limit.checked_sub(n)) else {
             return false;
@@ -127,7 +122,7 @@ impl Cache<(S101Cell, CellSourceIdentity)> {
         false
     }
 
-    pub(crate) fn remember(
+    pub fn remember(
         &mut self,
         key: [u8; 32],
         raw: &(S101Cell, CellSourceIdentity),

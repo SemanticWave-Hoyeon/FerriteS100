@@ -14,7 +14,7 @@ struct PreviousCell {
 
 /// A removal is pinned to the owned cell actually validated, not its live path.
 /// Validation is product-specific; this type does not assert authentication.
-pub(crate) struct ValidatedRemoval {
+pub struct ValidatedRemoval {
     key: (String, String),
     edition: u16,
     previous_update: Option<u16>,
@@ -23,14 +23,14 @@ pub(crate) struct ValidatedRemoval {
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CancellationRecord {
+pub struct CancellationRecord {
     pub key: (String, String),
     pub cancelled_edition: u16,
     pub cancellation_update: u16,
     pub issue_date: chrono::NaiveDate,
 }
 impl ValidatedRemoval {
-    pub(crate) fn validate(
+    pub fn validate(
         cancellation: &ferrite_s101::cancellation::Cancellation,
         metadata: &ferrite_s101::cancellation::CancellationMetadata,
         purpose: ferrite_security::DatasetPurpose,
@@ -59,7 +59,7 @@ impl ValidatedRemoval {
     }
 }
 impl ValidatedRemoval {
-    pub(crate) fn announcement(
+    pub fn announcement(
         cancellation: &ferrite_s101::cancellation::Cancellation,
         metadata: &ferrite_s101::cancellation::CancellationMetadata,
         purpose: ferrite_security::DatasetPurpose,
@@ -87,13 +87,13 @@ impl ValidatedRemoval {
             },
         })
     }
-    pub(crate) fn record(&self) -> &CancellationRecord {
+    pub fn record(&self) -> &CancellationRecord {
         &self.record
     }
-    pub(crate) fn removes_content(&self) -> bool {
+    pub fn removes_content(&self) -> bool {
         self.source_identity.is_some()
     }
-    pub(crate) fn key(&self) -> &(String, String) {
+    pub fn key(&self) -> &(String, String) {
         &self.key
     }
 }
@@ -101,11 +101,11 @@ impl ValidatedRemoval {
 /// A small tombstone prevents name reuse with an older issue date. It retains
 /// no chart geometry, attributes or cancelled file content.
 #[derive(Default, Clone)]
-pub(crate) struct CancellationHistory {
+pub struct CancellationHistory {
     by_dataset: BTreeMap<(String, String), CancellationRecord>,
 }
 impl CancellationHistory {
-    pub(crate) fn record(&mut self, records: Vec<CancellationRecord>) {
+    pub fn record(&mut self, records: Vec<CancellationRecord>) {
         for record in records {
             match self.by_dataset.entry(record.key.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -119,7 +119,7 @@ impl CancellationHistory {
             }
         }
     }
-    pub(crate) fn validate_cancellation(&self, record: &CancellationRecord) -> Result<()> {
+    pub fn validate_cancellation(&self, record: &CancellationRecord) -> Result<()> {
         if let Some(previous) = self.by_dataset.get(&record.key) {
             ensure!(
                 record.issue_date > previous.issue_date || record == previous,
@@ -128,7 +128,7 @@ impl CancellationHistory {
         }
         Ok(())
     }
-    pub(crate) fn validate_reuse(
+    pub fn validate_reuse(
         &self,
         id: &ferrite_s100_core::DatasetIdentification,
         issue_date: Option<chrono::NaiveDate>,
@@ -158,7 +158,7 @@ struct HistoryDocument {
 const MAX_HISTORY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HISTORY_RECORDS: usize = 10_000;
 impl CancellationHistory {
-    pub(crate) fn read(path: &std::path::Path) -> Result<Self> {
+    pub fn read(path: &std::path::Path) -> Result<Self> {
         use std::io::Read;
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
@@ -262,13 +262,13 @@ fn replace_history_file(
 }
 /// Hold an OS file lock across fresh history validation, atomic file replacement
 /// and the synchronous visible publication. No network or chart file is deleted.
-pub(crate) struct HistoryStore {
+pub struct HistoryStore {
     path: PathBuf,
     _lock: std::fs::File,
     pub history: CancellationHistory,
 }
 impl HistoryStore {
-    pub(crate) fn begin(path: &std::path::Path) -> Result<Self> {
+    pub fn begin(path: &std::path::Path) -> Result<Self> {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("History has no parent"))?;
@@ -287,7 +287,7 @@ impl HistoryStore {
             history,
         })
     }
-    pub(crate) fn persist(&mut self, records: Vec<CancellationRecord>) -> Result<()> {
+    pub fn persist(&mut self, records: Vec<CancellationRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -301,30 +301,8 @@ impl HistoryStore {
         Ok(())
     }
 }
-pub(crate) fn default_history_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("FERRITE_S101_HISTORY_PATH") {
-        return PathBuf::from(path);
-    }
-    if cfg!(test) || ferrite_wgpu::background_test::enabled() {
-        return std::env::temp_dir()
-            .join(format!("ferrite-s101-history-{}", std::process::id()))
-            .join("history.json");
-    }
-    #[cfg(target_os = "windows")]
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    let base =
-        std::env::var_os("HOME").map(|p| PathBuf::from(p).join("Library/Application Support"));
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")));
-    base.unwrap_or_else(|| PathBuf::from("."))
-        .join("FerriteS100/s101-cancellations.json")
-}
-
 #[must_use = "Commit only after portrayal preparation succeeds, or roll back"]
-pub(crate) struct CellPublication {
+pub struct CellPublication {
     previous_len: usize,
     replaced: Vec<PreviousCell>,
     removed: Vec<(PreviousCell, CancellationRecord)>,
@@ -333,7 +311,7 @@ pub(crate) struct CellPublication {
 impl CellPublication {
     /// Validate every key before mutating any cell. No unchanged cell is cloned.
     #[cfg(test)]
-    pub(crate) fn stage(
+    pub fn stage(
         cells: &mut Vec<S101Cell>,
         identities: &mut LoadedSourceIdentities,
         paths: &mut Vec<Vec<PathBuf>>,
@@ -343,7 +321,7 @@ impl CellPublication {
     }
     /// Validate the complete batch, then compact all removals in one linear
     /// move pass. Retained cell geometry is never cloned.
-    pub(crate) fn stage_changes(
+    pub fn stage_changes(
         cells: &mut Vec<S101Cell>,
         identities: &mut LoadedSourceIdentities,
         paths: &mut Vec<Vec<PathBuf>>,
@@ -465,7 +443,7 @@ impl CellPublication {
         }
         Ok(transaction)
     }
-    pub(crate) fn rollback(
+    pub fn rollback(
         self,
         cells: &mut Vec<S101Cell>,
         identities: &mut LoadedSourceIdentities,
@@ -504,14 +482,14 @@ impl CellPublication {
             }
         }
     }
-    pub(crate) fn cancellations(&self) -> Vec<CancellationRecord> {
+    pub fn cancellations(&self) -> Vec<CancellationRecord> {
         self.removed
             .iter()
             .map(|(_, record)| record.clone())
             .chain(self.announcements.iter().cloned())
             .collect()
     }
-    pub(crate) fn commit(self) -> Vec<CancellationRecord> {
+    pub fn commit(self) -> Vec<CancellationRecord> {
         // Dropping old cells releases removed/replaced content. The caller
         // records tombstones only after visible portrayal preparation succeeds.
         self.removed
@@ -523,7 +501,7 @@ impl CellPublication {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
     use ferrite_s100_core::{Coordinate, PointRecord, RecordId};
     use std::{
@@ -919,11 +897,7 @@ pub(crate) mod tests {
         assert!(history.validate_reuse(&zero, Some(tomorrow)).is_err());
         assert!(history.validate_reuse(&cells[1].dsid, None).is_ok());
     }
-    pub(crate) fn physical_cancellation_fixture(
-        profile: &str,
-        edition: &str,
-        filename: &str,
-    ) -> Vec<u8> {
+    pub fn physical_cancellation_fixture(profile: &str, edition: &str, filename: &str) -> Vec<u8> {
         let definition=b"000000000\x1fDataset identification\x1fRCNM!RCID!ENSP!ENED!PRSP!PRED!PROF!DSNM!DSTL!DSRD!DSLG!DSAB!DSED!*DSTC\x1f(b11,b14,7A(),A(8),3A(),b11)\x1e";
         let mut header = b"000003LE1 0000038 ! 4504".to_vec();
         header[..5].copy_from_slice(format!("{:05}", 38 + definition.len()).as_bytes());

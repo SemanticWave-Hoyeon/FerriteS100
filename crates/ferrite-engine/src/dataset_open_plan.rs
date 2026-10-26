@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
-pub(crate) struct Plan {
+pub struct Plan {
     /// One loader batch, not independent update loads or unauthenticated DSID selection.
     pub charts: Vec<PathBuf>,
     /// Explicit physical files selected by the user. Folder discovery is never
@@ -132,7 +132,7 @@ fn classify_rasters(plan: &mut Plan, files: Vec<PathBuf>) {
 }
 
 /// `on_system`: see [`crate::gml_overlay::discover`].
-pub(crate) fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Plan> {
+pub fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Plan> {
     let (charts, rasters) = crate::dataset_discovery::discover_recursive_files(root)?;
     let mut plan = Plan {
         charts,
@@ -182,7 +182,7 @@ pub(crate) fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Plan>
     Ok(plan)
 }
 
-pub(crate) fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
+pub fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
     ensure!(
         std::fs::symlink_metadata(path)?.is_file(),
         "Selected dataset must be a real file"

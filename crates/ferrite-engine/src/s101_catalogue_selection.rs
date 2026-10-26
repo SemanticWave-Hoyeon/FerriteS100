@@ -8,7 +8,7 @@ use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
 use ferrite_s100_core::DatasetIdentification;
 use std::path::{Path, PathBuf};
 
-pub(crate) enum Selection {
+pub enum Selection {
     KeepCurrent,
     /// Owner must stage the complete pair/cache/UI change transactionally.
     /// Never attach either catalogue to a cell already portrayed with another pair.
@@ -18,7 +18,7 @@ pub(crate) enum Selection {
         notice: String,
     },
 }
-pub(crate) fn dataset_version(d: &DatasetIdentification) -> Result<SpecificationVersion> {
+pub fn dataset_version(d: &DatasetIdentification) -> Result<SpecificationVersion> {
     let pred = d.product_edition.parse::<SpecificationVersion>()?;
     let prsp = d
         .product_identifier
@@ -83,7 +83,7 @@ fn resolve_pair_for_loading(
 /// New owner admission only. Retained compatible owners are not automatically rebound.
 /// Prefer exact Edition+Revision captured FC/PC; S-101 same-Edition later Revision
 /// compatibility remains an explicit fallback, not a generic S-100 rule.
-pub(crate) fn resolve_pair_exact_first(
+pub fn resolve_pair_exact_first(
     incoming: &[DatasetIdentification],
     loaded: &[DatasetIdentification],
     current_fc: &FeatureCatalogue,
@@ -233,25 +233,25 @@ fn resolve_pair_with_policy(
     anyhow::bail!("SSE133: Dataset S-101 {}.{}.{} has no compatible installed FC/PC pair; current FC {} / PC {}. Install same-Edition catalogues with sufficient Revisions; incompatible data is not portrayed.",target.edition,target.revision,target.clarification,current_fc.version,current_pc.version)
 }
 /// Immutable captured pair; this binding confers no dataset authentication.
-pub(crate) struct DatasetCatalogueOwner {
+pub struct DatasetCatalogueOwner {
     fc: std::sync::Arc<BoundFeatureCatalogue>,
     pc: std::sync::Arc<BoundPortrayalCatalogue>,
 }
 impl DatasetCatalogueOwner {
-    pub(crate) fn new(
+    pub fn new(
         fc: std::sync::Arc<BoundFeatureCatalogue>,
         pc: std::sync::Arc<BoundPortrayalCatalogue>,
     ) -> Result<Self> {
         ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
         Ok(Self { fc, pc })
     }
-    pub(crate) fn fc(&self) -> &std::sync::Arc<BoundFeatureCatalogue> {
+    pub fn fc(&self) -> &std::sync::Arc<BoundFeatureCatalogue> {
         &self.fc
     }
-    pub(crate) fn pc(&self) -> &std::sync::Arc<BoundPortrayalCatalogue> {
+    pub fn pc(&self) -> &std::sync::Arc<BoundPortrayalCatalogue> {
         &self.pc
     }
-    pub(crate) fn digests(&self) -> ([u8; 32], [u8; 32]) {
+    pub fn digests(&self) -> ([u8; 32], [u8; 32]) {
         (*self.fc.source_digest(), *self.pc.source_digest())
     }
     fn accepts(&self, d: &DatasetIdentification) -> bool {
@@ -265,10 +265,10 @@ impl DatasetCatalogueOwner {
     }
 }
 /// Caller supplies the captured parsed input identity, never a later live-path hash.
-pub(crate) struct DatasetCatalogueRequest {
-    pub(crate) dataset_key: String,
-    pub(crate) source_identity: [u8; 32],
-    pub(crate) identification: DatasetIdentification,
+pub struct DatasetCatalogueRequest {
+    pub dataset_key: String,
+    pub source_identity: [u8; 32],
+    pub identification: DatasetIdentification,
 }
 #[derive(Clone)]
 struct DatasetCatalogueBinding {
@@ -277,11 +277,11 @@ struct DatasetCatalogueBinding {
 }
 /// Private staging value. Failure cannot change a published registry.
 #[derive(Clone, Default)]
-pub(crate) struct DatasetCatalogueRegistry {
+pub struct DatasetCatalogueRegistry {
     bindings: std::collections::BTreeMap<String, DatasetCatalogueBinding>,
 }
 /// Opaque loading snapshot. No live-path lookup and no pointer-as-authority hash.
-pub(crate) struct DatasetCatalogueCheckpoint {
+pub struct DatasetCatalogueCheckpoint {
     rows: Vec<CatalogueCheckpointRow>,
 }
 struct CatalogueCheckpointRow {
@@ -291,7 +291,7 @@ struct CatalogueCheckpointRow {
     owner: std::sync::Arc<DatasetCatalogueOwner>,
 }
 impl DatasetCatalogueRegistry {
-    pub(crate) fn checkpoint(&self) -> DatasetCatalogueCheckpoint {
+    pub fn checkpoint(&self) -> DatasetCatalogueCheckpoint {
         DatasetCatalogueCheckpoint {
             rows: self
                 .bindings
@@ -305,7 +305,7 @@ impl DatasetCatalogueRegistry {
                 .collect(),
         }
     }
-    pub(crate) fn matches_checkpoint(&self, checkpoint: &DatasetCatalogueCheckpoint) -> bool {
+    pub fn matches_checkpoint(&self, checkpoint: &DatasetCatalogueCheckpoint) -> bool {
         self.bindings.len() == checkpoint.rows.len()
             && self
                 .bindings
@@ -318,26 +318,20 @@ impl DatasetCatalogueRegistry {
                         && std::sync::Arc::ptr_eq(&binding.owner, &old.owner)
                 })
     }
-    pub(crate) fn owner_for(
-        &self,
-        dataset_key: &str,
-    ) -> Option<&std::sync::Arc<DatasetCatalogueOwner>> {
+    pub fn owner_for(&self, dataset_key: &str) -> Option<&std::sync::Arc<DatasetCatalogueOwner>> {
         self.bindings.get(dataset_key).map(|b| &b.owner)
     }
-    pub(crate) fn binding_identity(
-        &self,
-        dataset_key: &str,
-    ) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
+    pub fn binding_identity(&self, dataset_key: &str) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
         self.bindings.get(dataset_key).map(|b| {
             let (fc, pc) = b.owner.digests();
             (b.source_identity, fc, pc)
         })
     }
     /// Exact retained keys only; cell ordering must be changed atomically by App.
-    pub(crate) fn retain_keys(&mut self, keys: &std::collections::BTreeSet<String>) {
+    pub fn retain_keys(&mut self, keys: &std::collections::BTreeSet<String>) {
         self.bindings.retain(|key, _| keys.contains(key));
     }
-    pub(crate) fn stage(
+    pub fn stage(
         &self,
         requests: &[DatasetCatalogueRequest],
         fallback: std::sync::Arc<DatasetCatalogueOwner>,

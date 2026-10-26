@@ -7,13 +7,13 @@ use roxmltree::Node;
 use std::collections::BTreeMap;
 const XC: &str = "http://www.iho.int/s100/xc/5.2";
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct XcProduct {
+pub struct XcProduct {
     pub identifier: String,
     pub version: String,
     pub registry_number: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScaleConsistency {
+pub enum ScaleConsistency {
     LegacyNotApplied,
     CancellationRequiresRetainedOriginal,
     NumericAgreementPolygonUnverified,
@@ -49,7 +49,7 @@ fn optional_text(node: Node<'_, '_>, name: &str) -> Result<String> {
     }
     Ok(raw)
 }
-pub(crate) fn capture_product(entry: Node<'_, '_>) -> Result<Option<XcProduct>> {
+pub fn capture_product(entry: Node<'_, '_>) -> Result<Option<XcProduct>> {
     let mut found = children(entry, "productSpecification");
     let Some(n) = found.next() else {
         return Ok(None);
@@ -111,7 +111,7 @@ fn product2(
     // Registry index is not product number101 (public SHOM uses214).
     Ok(true)
 }
-pub(crate) fn validate_profile(
+pub fn validate_profile(
     product: Option<&XcProduct>,
     purpose: DatasetPurpose,
     rows: &[XcDataCoverage],
@@ -162,7 +162,7 @@ pub(crate) fn validate_profile(
         ScaleConsistency::NumericAgreementPolygonUnverified
     })
 }
-pub(crate) fn compare_effective(
+pub fn compare_effective(
     product: Option<&XcProduct>,
     purpose: DatasetPurpose,
     rows: &[XcDataCoverage],

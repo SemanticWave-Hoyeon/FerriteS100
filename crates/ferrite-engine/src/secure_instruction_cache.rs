@@ -7,17 +7,17 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub(crate) const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
-pub(crate) const MAX_INSTRUCTIONS: u64 = 100_000;
+pub const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_INSTRUCTIONS: u64 = 100_000;
 /// Whole cache directory budget; the least recently used files go first.
-pub(crate) const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Cache directory beside the executable (`<exe dir>/cache/portrayal-v1`).
 /// A macOS bundle keeps it beside the `.app`: writing inside the bundle would
 /// invalidate its signature. If that location cannot be a private, writable
 /// directory (e.g. Program Files), the per-user OS cache directory is used.
-pub(crate) fn root() -> Option<PathBuf> {
+pub fn root() -> Option<PathBuf> {
     executable_root()
         .filter(|path| prepare_root(path).is_ok())
         .or_else(|| {
@@ -148,7 +148,7 @@ fn open_regular_with(path: &Path, write: bool) -> std::io::Result<fs::File> {
     }
     Ok(file)
 }
-pub(crate) fn read(path: &Path) -> std::io::Result<Vec<u8>> {
+pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
     read_bounded(path, MAX_CACHE_BYTES)
 }
 fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -168,7 +168,7 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if bytes.len() as u64 > MAX_CACHE_BYTES {
         return Err(invalid("Cache exceeds byte budget"));
     }
@@ -248,7 +248,7 @@ fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Record a cache hit for least-recently-used pruning. Called only after the
 /// file was accepted, so it cannot make a stale cache look current.
-pub(crate) fn mark_used(path: &Path) {
+pub fn mark_used(path: &Path) {
     if let Ok(file) = open_regular_with(path, true) {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
@@ -262,7 +262,7 @@ fn is_cache_file_name(name: &str) -> bool {
 /// Keep the cache directory within `budget` bytes by removing the least
 /// recently used cache files. Only this module's regular cache files are
 /// considered; links, directories and other names are never touched.
-pub(crate) fn prune(root: &Path, budget: u64) -> std::io::Result<u64> {
+pub fn prune(root: &Path, budget: u64) -> std::io::Result<u64> {
     let mut files = Vec::new();
     let mut total = 0u64;
     for entry in fs::read_dir(root)? {
@@ -295,7 +295,7 @@ pub(crate) fn prune(root: &Path, budget: u64) -> std::io::Result<u64> {
 }
 
 /// Prune the application cache root after writes; failures only log.
-pub(crate) fn prune_root() {
+pub fn prune_root() {
     if let Some(root) = root() {
         match prune(&root, MAX_TOTAL_BYTES) {
             Ok(0) => {}

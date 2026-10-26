@@ -5,7 +5,7 @@ use ferrite_security::{AuthenticatedSnapshot, AuthorizedDatasets, Unauthenticate
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path, sync::Arc};
 
-pub(crate) struct CapturedInput {
+pub struct CapturedInput {
     pub authenticated: Option<Arc<AuthenticatedSnapshot>>,
     pub unchecked: Option<Arc<UnauthenticatedSnapshot>>,
     length: u64,

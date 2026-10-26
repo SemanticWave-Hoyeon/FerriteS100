@@ -9,7 +9,7 @@ const GCO: &str = "http://standards.iso.org/iso/19115/-3/gco/1.0";
 const MAX_COVERAGES: usize = 4096;
 const MAX_LEXICAL: usize = 128;
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum XcScale {
+pub enum XcScale {
     Absent,
     Positive {
         lexical: String,
@@ -23,7 +23,7 @@ pub(crate) enum XcScale {
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct XcDataCoverage {
+pub struct XcDataCoverage {
     pub entry_range: Range<usize>,
     pub bounding_polygon_range: Range<usize>,
     pub minimum: XcScale,
@@ -98,7 +98,7 @@ fn scale(row: Node<'_, '_>, name: &str) -> Result<XcScale> {
         denominator,
     })
 }
-pub(crate) fn capture(entry: Node<'_, '_>) -> Result<Vec<XcDataCoverage>> {
+pub fn capture(entry: Node<'_, '_>) -> Result<Vec<XcDataCoverage>> {
     let mut rows = Vec::new();
     for row in entry.children().filter(|n| is(*n, "dataCoverage")) {
         ensure!(

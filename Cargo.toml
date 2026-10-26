@@ -21,6 +21,7 @@ members = [
     "crates/ferrite-mcp",
     "crates/ferrite-xslt",
     "crates/ferrite-s100-gml",
+    "crates/ferrite-engine",
 ]
 exclude = [
     "plugins/route-plugin",
@@ -104,6 +105,7 @@ ferrite-lua = { path = "crates/ferrite-lua", default-features = false }
 ferrite-plugin-api = { path = "crates/ferrite-plugin-api" }
 ferrite-plugin-loader = { path = "crates/ferrite-plugin-loader" }
 ferrite-mcp = { path = "crates/ferrite-mcp" }
+ferrite-engine = { path = "crates/ferrite-engine", default-features = false }
 
 [package]
 name = "ferrite-s100"
@@ -120,10 +122,11 @@ winres = "0.1"
 
 [features]
 default = ["lua54"]
-lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferrite-wgpu/lua54"]
-lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-wgpu/lua55"]
+lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferrite-wgpu/lua54", "ferrite-engine/lua54"]
+lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-wgpu/lua55", "ferrite-engine/lua55"]
 
 [dependencies]
+ferrite-engine.workspace = true
 quick-xml.workspace = true
 roxmltree = "=0.20.0"
 chrono.workspace = true
@@ -171,6 +174,8 @@ tempfile = "3"
 
 # HDF5 fixture authoring for end-to-end coverage examples only.
 [dev-dependencies]
+# Test-only engine helpers the application tests use.
+ferrite-engine = { workspace = true, features = ["test-support"] }
 # Test-only actual ECDSA fixture; already used by ferrite-security.
 openssl = { version = "0.10", features = ["vendored"] }
 base64 = "=0.22.1"

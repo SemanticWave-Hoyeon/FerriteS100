@@ -8,11 +8,11 @@ use std::{
 };
 
 /// An operational session cannot downgrade authentication through UI settings.
-pub(crate) fn verification_enabled(ui: Option<bool>, requested: bool, operational: bool) -> bool {
+pub fn verification_enabled(ui: Option<bool>, requested: bool, operational: bool) -> bool {
     operational || ui.unwrap_or(requested)
 }
 
-pub(crate) fn dataset_snapshot(
+pub fn dataset_snapshot(
     report: &AuthorizedDatasets,
     path: &Path,
     require_signature: bool,
@@ -30,7 +30,7 @@ pub(crate) fn dataset_snapshot(
     Ok(snapshot)
 }
 
-pub(crate) fn unchecked_datasets(paths: &[PathBuf]) -> Result<AuthorizedDatasets> {
+pub fn unchecked_datasets(paths: &[PathBuf]) -> Result<AuthorizedDatasets> {
     let mut report = AuthorizedDatasets {
         dataset_discovery: Default::default(),
         snapshots: Default::default(),

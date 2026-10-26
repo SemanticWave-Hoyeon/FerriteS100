@@ -4,12 +4,12 @@
 use ferrite_feature_catalog::FeatureCatalogue;
 use ferrite_s100_core::Attribute;
 #[derive(Default)]
-pub(crate) struct CataloguePickFields {
+pub struct CataloguePickFields {
     pub definition: Option<String>,
     pub attributes: Vec<(String, String)>,
     pub resolved: bool,
 }
-pub(crate) fn resolve(
+pub fn resolve(
     catalogue: Option<&FeatureCatalogue>,
     feature_code: &str,
     attributes: &[Attribute],

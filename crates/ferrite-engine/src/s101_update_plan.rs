@@ -10,7 +10,7 @@ use std::{
 const MAX_INPUTS: usize = 4096;
 const MAX_ENTRIES: usize = 100_000;
 
-pub(crate) fn is_chart_file(path: &Path) -> bool {
+pub fn is_chart_file(path: &Path) -> bool {
     !path
         .file_name()
         .is_some_and(|n| n.as_encoded_bytes().starts_with(b"._"))
@@ -35,7 +35,7 @@ fn stem(path: &Path) -> Result<String> {
 
 /// A selected update also needs its base and predecessors. Loaded bases are
 /// candidates, never substitutes for newly authenticated/parsed input bytes.
-pub(crate) fn expand_candidates(selected: &[PathBuf], loaded: &[PathBuf]) -> Result<Vec<PathBuf>> {
+pub fn expand_candidates(selected: &[PathBuf], loaded: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let names: BTreeSet<_> = selected.iter().map(|p| stem(p)).collect::<Result<_>>()?;
     let mut roots = selected.to_vec();
     roots.extend(
@@ -77,7 +77,7 @@ pub(crate) fn expand_candidates(selected: &[PathBuf], loaded: &[PathBuf]) -> Res
     Ok(inputs.into_iter().collect())
 }
 
-pub(crate) struct Input {
+pub struct Input {
     pub original: PathBuf,
     pub data: PathBuf,
     pub id: DatasetIdentification,
@@ -86,12 +86,12 @@ pub(crate) struct Input {
     data_length: u64,
     data_sha256: [u8; 32],
 }
-pub(crate) struct Plan {
+pub struct Plan {
     pub base: Input,
     pub updates: Vec<Input>,
 }
 
-pub(crate) fn dataset_key(id: &DatasetIdentification) -> Result<(String, String)> {
+pub fn dataset_key(id: &DatasetIdentification) -> Result<(String, String)> {
     let path = Path::new(&id.dataset_name);
     ensure!(
         !id.dataset_name.contains(['/', '\\']),
@@ -103,8 +103,8 @@ pub(crate) fn dataset_key(id: &DatasetIdentification) -> Result<(String, String)
 }
 
 /// Only inspect private authenticated inputs when verification is required.
-#[cfg(test)]
-pub(crate) fn authorized_plans(
+#[cfg(any(test, feature = "test-support"))]
+pub fn authorized_plans(
     candidates: Vec<PathBuf>,
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
@@ -117,14 +117,14 @@ pub(crate) fn authorized_plans(
     plans(inputs)
 }
 
-pub(crate) struct CancellationPlan {
+pub struct CancellationPlan {
     input: Input,
     target: Option<DatasetIdentification>,
     target_identity: Option<ferrite_s100_core::CellSourceIdentity>,
     previous_issue_date: Option<chrono::NaiveDate>,
 }
 impl CancellationPlan {
-    pub(crate) fn load(self) -> Result<crate::chart_publication::ValidatedRemoval> {
+    pub fn load(self) -> Result<crate::chart_publication::ValidatedRemoval> {
         self.input.verify_captured()?;
         let bytes = read_cancellation_bytes(&self.input.data)?;
         let cancellation =
@@ -187,7 +187,7 @@ fn parse_captured_cancellation(
 }
 /// Cancellation is considered only when explicitly selected, never triggered
 /// by discovering an old cancellation sibling while opening a different base.
-pub(crate) fn authorized_batch(
+pub fn authorized_batch(
     candidates: Vec<PathBuf>,
     selected: &[PathBuf],
     authorization: &ferrite_security::AuthorizedDatasets,
@@ -299,7 +299,7 @@ pub(crate) fn authorized_batch(
 /// Folder discovery is not an explicit cancellation operation. Capture each
 /// authorized original once, then isolate failures by logical dataset; successful
 /// groups still use the existing edition/reissue/duplicate/chain planner.
-pub(crate) fn authorized_folder_plans(
+pub fn authorized_folder_plans(
     mut candidates: Vec<PathBuf>,
     authorization: &ferrite_security::AuthorizedDatasets,
     require_signature: bool,
@@ -612,7 +612,7 @@ fn insert_operation(
     Ok(())
 }
 
-pub(crate) fn plans(inputs: Vec<Input>) -> Result<Vec<Plan>> {
+pub fn plans(inputs: Vec<Input>) -> Result<Vec<Plan>> {
     ensure!(inputs.len() <= MAX_INPUTS, "Too many S-101 chain inputs");
     let mut groups: BTreeMap<(String, String), Vec<Input>> = BTreeMap::new();
     for input in inputs {
@@ -694,7 +694,7 @@ fn filename_counter(id: &DatasetIdentification) -> Result<u16> {
         .parse()?)
 }
 impl Plan {
-    pub(crate) fn validate_against_loaded(&self, loaded: &DatasetIdentification) -> Result<()> {
+    pub fn validate_against_loaded(&self, loaded: &DatasetIdentification) -> Result<()> {
         if dataset_key(loaded)? == dataset_key(&self.base.id)? {
             let ending = self
                 .updates
@@ -706,13 +706,11 @@ impl Plan {
         }
         Ok(())
     }
-    pub(crate) fn ending_metadata(
-        &self,
-    ) -> Option<&crate::s101_lifecycle_metadata::MetadataEvidence> {
+    pub fn ending_metadata(&self) -> Option<&crate::s101_lifecycle_metadata::MetadataEvidence> {
         self.updates.last().unwrap_or(&self.base).metadata.as_ref()
     }
     /// Ordered captured raw-byte identity only; does not authenticate live paths.
-    pub(crate) fn captured_source_identity_sha(&self) -> [u8; 32] {
+    pub fn captured_source_identity_sha(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         if self.updates.is_empty() {
             self.base.data_sha256
@@ -731,7 +729,7 @@ impl Plan {
             hash.finalize().into()
         }
     }
-    pub(crate) fn load(&self) -> Result<(S101Cell, ferrite_s100_core::CellSourceIdentity)> {
+    pub fn load(&self) -> Result<(S101Cell, ferrite_s100_core::CellSourceIdentity)> {
         let chain: Vec<_> = std::iter::once(&self.base)
             .chain(self.updates.iter())
             .collect();
@@ -754,7 +752,7 @@ impl Plan {
     }
     /// Call only after the existing authorization/planning/cancellation checks.
     /// Cache raw parser output BEFORE normalization or Feature Catalogue resolution.
-    pub(crate) fn load_with_decoded_cache(
+    pub fn load_with_decoded_cache(
         &self,
         cache: &crate::decoded_chart_cache::SharedDecodedChartCache,
     ) -> Result<(S101Cell, ferrite_s100_core::CellSourceIdentity)> {
@@ -789,14 +787,14 @@ impl Plan {
         }
         Ok(result)
     }
-    pub(crate) fn input_paths(&self) -> Vec<PathBuf> {
+    pub fn input_paths(&self) -> Vec<PathBuf> {
         std::iter::once(&self.base)
             .chain(self.updates.iter())
             .map(|i| i.original.clone())
             .collect()
     }
     /// Recheck metadata from the owned parse, not just the earlier planning read.
-    pub(crate) fn validate_materialized(&self, cell: &S101Cell) -> Result<()> {
+    pub fn validate_materialized(&self, cell: &S101Cell) -> Result<()> {
         let expected = self
             .updates
             .last()

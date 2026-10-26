@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 #[derive(Debug)]
-pub(crate) enum RouteInputError {
+pub enum RouteInputError {
     Io(String),
     TooLarge,
     Malformed(String),
@@ -31,7 +31,7 @@ impl fmt::Display for RouteInputError {
 }
 impl std::error::Error for RouteInputError {}
 #[derive(Debug, Clone)]
-pub(crate) struct CapturedRouteInput {
+pub struct CapturedRouteInput {
     path: PathBuf,
     xml: Arc<str>,
     sha256: [u8; 32],
@@ -41,7 +41,7 @@ impl CapturedRouteInput {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn xml(&self) -> &str {
         &self.xml
     }
@@ -60,7 +60,7 @@ impl CapturedRouteInput {
         }
     }
 }
-pub(crate) fn capture_if_route(path: &Path) -> Result<Option<CapturedRouteInput>, RouteInputError> {
+pub fn capture_if_route(path: &Path) -> Result<Option<CapturedRouteInput>, RouteInputError> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| RouteInputError::Io(e.to_string()))?;
     if !meta.is_file() {
         return Err(RouteInputError::Io(
@@ -167,7 +167,7 @@ fn classify_owned(
 }
 /// Extra product discovery; existing numeric/HDF scanner remains byte-identical.
 /// Non-S421 XML catalogues are not reclassified as routes.
-pub(crate) fn discover_routes(
+pub fn discover_routes(
     root: &Path,
 ) -> Result<(Vec<CapturedRouteInput>, Vec<String>), RouteInputError> {
     if !std::fs::symlink_metadata(root)

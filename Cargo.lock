@@ -1414,6 +1414,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-engine"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "ferrite-feature-catalog",
+ "ferrite-interoperability",
+ "ferrite-iso8211",
+ "ferrite-kernel",
+ "ferrite-lua",
+ "ferrite-portrayal-catalog",
+ "ferrite-render",
+ "ferrite-s100-core",
+ "ferrite-s100-gml",
+ "ferrite-s101",
+ "ferrite-s102",
+ "ferrite-s421",
+ "ferrite-security",
+ "libc",
+ "openssl",
+ "quick-xml 0.37.5",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "walkdir",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "ferrite-feature-catalog"
 version = "2.0.0"
 dependencies = [
@@ -1588,6 +1621,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "ferrite-engine",
  "ferrite-feature-catalog",
  "ferrite-interoperability",
  "ferrite-iso8211",

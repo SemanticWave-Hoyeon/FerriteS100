@@ -1,0 +1,38 @@
+{
+  "comment": "Fixed S-101 regression poses. Paths are relative to the repository (TestData is local and git-ignored) or to its parent (catalogue inventory).",
+  "window": [1920, 1018],
+  "inventory": "../S101-Catalogues",
+  "datasets": {
+    "mixed": {
+      "comment": "UKHO trial cells and the SHOM exchange set: per-owner catalogue path (no cell cache).",
+      "charts": [
+        "TestData/UKHO-S101/Complete_S10X_datasets/Complete S10X datasets/S-101 Trial Cells",
+        "TestData/SHOM-S101/ExchangeSets/S100_ENC_ROOT_AcrossTheCHannel_product_Edition1_2026-03-25T06_53_12"
+      ]
+    },
+    "shom_cached": {
+      "comment": "SHOM only with the matching 2.0.0 catalogues: the per-cell portrayal cache path.",
+      "charts": [
+        "TestData/SHOM-S101/ExchangeSets/S100_ENC_ROOT_AcrossTheCHannel_product_Edition1_2026-03-25T06_53_12"
+      ],
+      "fc": "{inventory}/2.0.0/FC/101_Feature_Catalogue_2.0.0.xml",
+      "pc": "{inventory}/2.0.0/PC"
+    }
+  },
+  "poses": [
+    {"name": "overview", "dataset": "mixed"},
+    {"name": "channel_islands_z4", "dataset": "mixed", "center": "49.40,-2.40", "zoom": 4},
+    {"name": "jersey_z20", "dataset": "mixed", "center": "49.21,-2.13", "zoom": 20},
+    {"name": "guernsey_z25", "dataset": "mixed", "center": "49.46,-2.55", "zoom": 25},
+    {"name": "portsmouth_z12", "dataset": "mixed", "center": "50.79,-1.11", "zoom": 12},
+    {"name": "portsmouth_z60", "dataset": "mixed", "center": "50.79,-1.11", "zoom": 60},
+    {"name": "solent_z6", "dataset": "mixed", "center": "50.75,-1.30", "zoom": 6},
+    {"name": "portsmouth_z12_night", "dataset": "mixed", "center": "50.79,-1.11", "zoom": 12, "palette": "Night"},
+    {"name": "jersey_z20_night", "dataset": "mixed", "center": "49.21,-2.13", "zoom": 20, "palette": "Night"},
+    {"name": "cached_overview", "dataset": "shom_cached", "cache": true},
+    {"name": "cached_channel_islands_z4", "dataset": "shom_cached", "center": "49.40,-2.40", "zoom": 4, "cache": true},
+    {"name": "cached_jersey_z20", "dataset": "shom_cached", "center": "49.21,-2.13", "zoom": 20, "cache": true},
+    {"name": "cached_guernsey_z25", "dataset": "shom_cached", "center": "49.46,-2.55", "zoom": 25, "cache": true},
+    {"name": "cached_st_malo_z10", "dataset": "shom_cached", "center": "48.65,-2.02", "zoom": 10, "cache": true}
+  ]
+}

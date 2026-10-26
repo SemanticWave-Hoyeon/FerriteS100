@@ -16,7 +16,7 @@ struct Polygon {
     holes: Vec<Ring>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RegionStatus {
+pub enum RegionStatus {
     ExactRepresentationAgreement,
     Unverified,
 }
@@ -248,11 +248,7 @@ fn check_maps(a: &RegionalScales, b: &RegionalScales) -> Result<RegionStatus> {
     );
     Ok(RegionStatus::ExactRepresentationAgreement)
 }
-pub(crate) fn compare(
-    bytes: &[u8],
-    rows: &[XcDataCoverage],
-    cell: &S101Cell,
-) -> Result<RegionStatus> {
+pub fn compare(bytes: &[u8], rows: &[XcDataCoverage], cell: &S101Cell) -> Result<RegionStatus> {
     if rows.len() > 4096
         || cell.coord_factor.to_bits() != (1.0f64 / 10_000_000.0).to_bits()
         || cell.coord_factor_y.to_bits() != (1.0f64 / 10_000_000.0).to_bits()

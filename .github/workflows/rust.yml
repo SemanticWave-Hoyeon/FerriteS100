@@ -43,6 +43,9 @@ jobs:
     - name: Test S-100 MCP service
       run: cargo test -p ferrite-mcp --locked
 
+    - name: Test chart engine
+      run: cargo test -p ferrite-engine --locked
+
     - name: Run tests
       run: cargo test --verbose
 

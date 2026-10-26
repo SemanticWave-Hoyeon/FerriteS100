@@ -234,7 +234,7 @@ mod catalogue_discovery_tests {
 /// Recursive collection discovery used by the open-all planner. Unlike the
 /// legacy single-delivery API, nested catalogue containers are not pruned.
 /// Paths remain original: signature verification belongs to the loader.
-pub(crate) fn discover_recursive_files(
+pub fn discover_recursive_files(
     root: &Path,
 ) -> anyhow::Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)> {
     anyhow::ensure!(

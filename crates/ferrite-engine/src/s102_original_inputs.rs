@@ -12,16 +12,16 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const MAX_FILES: usize = 512;
+pub const MAX_FILES: usize = 512;
 const EVIDENCE_BUDGET: usize = 128 * 1024 * 1024;
 #[derive(Clone)]
-pub(crate) struct OwnedOriginalInput {
-    pub(crate) original: OriginalDatasetAuthentication,
-    pub(crate) snapshot: Arc<AuthenticatedSnapshot>,
+pub struct OwnedOriginalInput {
+    pub original: OriginalDatasetAuthentication,
+    pub snapshot: Arc<AuthenticatedSnapshot>,
 }
-pub(crate) type Registry = BTreeMap<PathBuf, Arc<OwnedOriginalInput>>;
+pub type Registry = BTreeMap<PathBuf, Arc<OwnedOriginalInput>>;
 
-pub(crate) fn capture(
+pub fn capture(
     report: &AuthorizedDatasets,
     canonical: &Path,
     snapshot: Option<&Arc<AuthenticatedSnapshot>>,
@@ -82,7 +82,7 @@ fn container_charge(registry: &Registry, total: &mut usize) -> Result<()> {
 /// Build the replacement privately; account OLD and NEXT live containers, distinct
 /// record owners, and the authorization report's separately cloned URI storage.
 /// Shared Arc identity is used solely for live owned-storage accounting.
-pub(crate) fn stage<'a>(
+pub fn stage<'a>(
     old: &Registry,
     incoming: impl IntoIterator<Item = (&'a Path, Option<&'a Arc<OwnedOriginalInput>>)>,
     report: &AuthorizedDatasets,

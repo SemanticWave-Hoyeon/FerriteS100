@@ -46,12 +46,12 @@ impl CapturedCoverageCatalogue {
 }
 
 #[derive(Clone)]
-pub(crate) struct MetadataEvidence {
+pub struct MetadataEvidence {
     pub purpose: DatasetPurpose,
     pub edition: u32,
     pub update: Option<u32>,
     pub issue_date: NaiveDate,
-    pub(crate) data_coverage: Vec<XcDataCoverage>,
+    pub data_coverage: Vec<XcDataCoverage>,
     product_specification: Option<crate::s101_xc_consistency::XcProduct>,
     coverage_catalogue: Option<CapturedCoverageCatalogue>,
     original_canonical_key: PathBuf,
@@ -60,7 +60,7 @@ pub(crate) struct MetadataEvidence {
     provenance: Provenance,
 }
 impl MetadataEvidence {
-    pub(crate) fn compatible_optional(a: Option<&Self>, b: Option<&Self>) -> bool {
+    pub fn compatible_optional(a: Option<&Self>, b: Option<&Self>) -> bool {
         match (a, b) {
             (None, None) => true,
             (Some(a), Some(b)) => a.same_operation(b),
@@ -72,7 +72,7 @@ impl MetadataEvidence {
     /// Compare the operation, retaining one complete path-bound proof. Unverified
     /// catalogues may package the same operation differently. Authenticated
     /// copies require the same signed catalogue identity as well.
-    pub(crate) fn same_operation(&self, other: &Self) -> bool {
+    pub fn same_operation(&self, other: &Self) -> bool {
         self.purpose == other.purpose
             && self.edition == other.edition
             && self.update == other.update
@@ -90,7 +90,7 @@ impl MetadataEvidence {
     }
     /// `original` is the retained canonical authorization key, not a live path
     /// to reopen. A deleted/changed original or catalogue cannot change evidence.
-    pub(crate) fn verify_resource(&self, original: &Path, retained_data: &Path) -> Result<()> {
+    pub fn verify_resource(&self, original: &Path, retained_data: &Path) -> Result<()> {
         ensure!(
             original == self.original_canonical_key,
             "Lifecycle metadata original canonical key mismatch"
@@ -137,10 +137,7 @@ impl MetadataEvidence {
         );
         Ok(())
     }
-    pub(crate) fn validate_xc_profile(
-        &self,
-        id: &ferrite_s100_core::DatasetIdentification,
-    ) -> Result<()> {
+    pub fn validate_xc_profile(&self, id: &ferrite_s100_core::DatasetIdentification) -> Result<()> {
         crate::s101_xc_consistency::validate_profile(
             self.product_specification.as_ref(),
             self.purpose,
@@ -149,7 +146,7 @@ impl MetadataEvidence {
         )?;
         Ok(())
     }
-    pub(crate) fn validate_effective_xc_scales(
+    pub fn validate_effective_xc_scales(
         &self,
         cell: &ferrite_s100_core::S101Cell,
     ) -> Result<crate::s101_xc_consistency::ScaleConsistency> {
@@ -160,7 +157,7 @@ impl MetadataEvidence {
             cell,
         )
     }
-    pub(crate) fn validate_xc_regions(
+    pub fn validate_xc_regions(
         &self,
         cell: &ferrite_s100_core::S101Cell,
     ) -> Result<crate::s101_xc_region::RegionStatus> {
@@ -178,7 +175,7 @@ impl MetadataEvidence {
         };
         crate::s101_xc_region::compare(capture.bytes(), &self.data_coverage, cell)
     }
-    pub(crate) fn is_authenticated(&self) -> bool {
+    pub fn is_authenticated(&self) -> bool {
         matches!(self.provenance, Provenance::AuthenticatedCatalogue)
     }
 }
@@ -350,7 +347,7 @@ fn capture_authenticated_rows(
 /// canonical XML path and the SHA-256 of the exact bytes read. Each capture
 /// still reads and hashes the live XML; only identical bytes reuse a parse.
 #[derive(Default)]
-pub(crate) struct CaptureCache {
+pub struct CaptureCache {
     catalogues: std::collections::HashMap<(PathBuf, [u8; 32]), Arc<UnverifiedCatalogue>>,
 }
 /// Per discovery entry, in document order: its resolved resource path, the
@@ -441,7 +438,7 @@ fn parse_unverified(root: &Path, xml: &str) -> std::result::Result<Vec<Unverifie
 }
 
 #[cfg(test)]
-pub(crate) fn capture(
+pub fn capture(
     original: &Path,
     retained_data: &Path,
     authorization: &AuthorizedDatasets,
@@ -457,7 +454,7 @@ pub(crate) fn capture(
 
 /// `retained_fingerprint` is the (size, SHA-256) of `retained_data` already
 /// computed by the caller from the same retained snapshot.
-pub(crate) fn capture_cached(
+pub fn capture_cached(
     original: &Path,
     retained_data: &Path,
     retained_fingerprint: Option<(u64, [u8; 32])>,

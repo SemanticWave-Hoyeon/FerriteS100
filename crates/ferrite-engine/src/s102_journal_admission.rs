@@ -13,7 +13,7 @@ use std::{
 };
 
 /// An explicit option cannot silently disappear on malformed/missing values.
-pub(crate) fn history_path(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>> {
+pub fn history_path(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>> {
     let mut args = args.into_iter();
     let mut chosen = None;
     while let Some(arg) = args.next() {
@@ -42,7 +42,7 @@ pub(crate) fn history_path(args: impl IntoIterator<Item = String>) -> Result<Opt
     Ok(chosen)
 }
 
-pub(crate) struct Gate {
+pub struct Gate {
     store: Store,
     blocked: bool,
     successful_checks: u64,
@@ -52,7 +52,7 @@ impl Gate {
     /// parent. Store opens read/write, acquires an exclusive OS lock and syncs the
     /// existing file/namespace; this is not a read-only file operation.
     /// Missing/corrupt history is an error: never implicit initialization here.
-    pub(crate) fn open_existing(trusted_path: &Path) -> Result<Self> {
+    pub fn open_existing(trusted_path: &Path) -> Result<Self> {
         private_location(trusted_path)?;
         let store = Store::open(trusted_path)?;
         validate_opened_private_location(&store)?;
@@ -62,10 +62,10 @@ impl Gate {
             successful_checks: 0,
         })
     }
-    pub(crate) fn successful_checks(&self) -> u64 {
+    pub fn successful_checks(&self) -> u64 {
         self.successful_checks
     }
-    pub(crate) fn require_ready(&self) -> Result<()> {
+    pub fn require_ready(&self) -> Result<()> {
         ensure!(
             !self.blocked && !self.store.recovery_required(),
             "S102 journal recovery must precede scene use"
@@ -76,14 +76,14 @@ impl Gate {
     }
     /// Future cancellation transaction calls this for any indeterminate durable
     /// write. UI unload/clear must not reset it. No automatic unblock API is offered.
-    pub(crate) fn block_for_recovery(&mut self) {
+    pub fn block_for_recovery(&mut self) {
         self.blocked = true;
     }
 
     /// Call after authenticated capture, BEFORE decoding, and again before scene
     /// publication with the SAME retained parser snapshot owner. A UI signature
     /// toggle never replaces these private authentication inputs.
-    pub(crate) fn check_input(
+    pub fn check_input(
         &mut self,
         record: Option<&Arc<OwnedOriginalInput>>,
         parser_snapshot: Option<&Arc<AuthenticatedSnapshot>>,

@@ -3,42 +3,43 @@ use ferrite_s100_core::CellSourceIdentity;
 use std::hash::{Hash, Hasher};
 
 #[derive(Default)]
-pub(crate) struct LoadedSourceIdentities {
+pub struct LoadedSourceIdentities {
     by_cell: Vec<CellSourceIdentity>,
 }
 impl LoadedSourceIdentities {
-    pub(crate) fn push(&mut self, identity: CellSourceIdentity) {
+    pub fn push(&mut self, identity: CellSourceIdentity) {
         self.by_cell.push(identity);
     }
-    pub(crate) fn replace(&mut self, index: usize, identity: CellSourceIdentity) {
+    pub fn replace(&mut self, index: usize, identity: CellSourceIdentity) {
         *self
             .by_cell
             .get_mut(index)
             .expect("Cell/source identity indices stay aligned") = identity;
     }
-    pub(crate) fn remove(&mut self, index: usize) -> CellSourceIdentity {
+    pub fn remove(&mut self, index: usize) -> CellSourceIdentity {
         self.by_cell.remove(index)
     }
-    pub(crate) fn insert(&mut self, index: usize, identity: CellSourceIdentity) {
+    pub fn insert(&mut self, index: usize, identity: CellSourceIdentity) {
         self.by_cell.insert(index, identity);
     }
-    pub(crate) fn len(&self) -> usize {
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
         self.by_cell.len()
     }
-    pub(crate) fn get(&self, index: usize) -> Option<CellSourceIdentity> {
+    pub fn get(&self, index: usize) -> Option<CellSourceIdentity> {
         self.by_cell.get(index).copied()
     }
-    pub(crate) fn truncate(&mut self, len: usize) {
+    pub fn truncate(&mut self, len: usize) {
         self.by_cell.truncate(len);
     }
     /// Move the aligned identity vector during cancellation compaction.
-    pub(crate) fn take_all(&mut self) -> Vec<CellSourceIdentity> {
+    pub fn take_all(&mut self) -> Vec<CellSourceIdentity> {
         std::mem::take(&mut self.by_cell)
     }
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.by_cell.clear();
     }
-    pub(crate) fn hash_for_cell<H: Hasher>(&self, index: usize, hash: &mut H) -> Option<()> {
+    pub fn hash_for_cell<H: Hasher>(&self, index: usize, hash: &mut H) -> Option<()> {
         self.by_cell.get(index)?.hash(hash);
         Some(())
     }

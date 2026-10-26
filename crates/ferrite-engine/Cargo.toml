@@ -1,0 +1,54 @@
+[package]
+name = "ferrite-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "S-100 chart engine: dataset discovery, opening, signatures, update chains, caches and product adapters, independent of windowing, GUI and GPU"
+
+[features]
+default = ["lua54"]
+lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54"]
+lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55"]
+# Test-only helpers used by the application's own tests.
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+quick-xml.workspace = true
+roxmltree = "=0.20.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = "3"
+tracing.workspace = true
+walkdir.workspace = true
+
+ferrite-feature-catalog.workspace = true
+ferrite-interoperability.workspace = true
+ferrite-iso8211.workspace = true
+ferrite-kernel.workspace = true
+ferrite-lua.workspace = true
+ferrite-portrayal-catalog.workspace = true
+ferrite-render.workspace = true
+ferrite-s100-core.workspace = true
+ferrite-s100-gml = { path = "../ferrite-s100-gml" }
+ferrite-s101.workspace = true
+ferrite-s102.workspace = true
+ferrite-s421 = { path = "../ferrite-s421" }
+ferrite-security.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# Test-only actual ECDSA fixture; already used by ferrite-security.
+openssl = { version = "0.10", features = ["vendored"] }
+base64 = "=0.22.1"

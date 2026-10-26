@@ -100,18 +100,11 @@ impl CoverageLifecycleResize {
     }
 }
 
-mod cell_source_identity;
-mod chart_publication;
-mod dataset_discovery;
-mod dataset_open_plan;
-mod dataset_pick_fields;
-mod dataset_signature_policy;
-mod decoded_chart_cache;
+mod app_data_paths;
 mod diagnostics_tracing;
 mod flat_event_burst;
 mod flat_event_coalescing;
 mod gpu_usage;
-mod interoperability;
 mod llm_chat;
 mod native_mcp;
 mod native_s421;
@@ -120,27 +113,22 @@ mod plugins;
 mod point_retention_audit;
 mod primary_viewing_layers;
 mod process_stats;
-mod s101_catalogue_selection;
-mod s101_lifecycle_metadata;
-mod s101_update_plan;
-mod s101_xc_capture_pool;
-mod s101_xc_consistency;
-mod s101_xc_coverage;
-mod s101_xc_region;
-mod s102_depth_policy;
-mod s102_input_capture;
-mod s102_journal_admission;
-mod s102_original_inputs;
 mod s102_quality_worker;
-mod s102_trial_worker;
-mod s421_dataset_input;
-mod secure_instruction_cache;
 mod thread_stats;
 mod ui_feature_audit;
 
 mod flat_eventloop_diagnostics;
 mod flat_service_trajectory;
 mod gml_overlay;
+
+use ferrite_engine::{
+    cell_source_identity, chart_publication, dataset_discovery, dataset_open_plan,
+    dataset_pick_fields, dataset_signature_policy, decoded_chart_cache, interoperability,
+    s101_catalogue_selection, s101_lifecycle_metadata, s101_update_plan, s102_depth_policy,
+    s102_input_capture, s102_journal_admission, s102_original_inputs, s102_trial_worker,
+    s421_dataset_input, secure_instruction_cache,
+};
+use ferrite_engine::{CellHydrationSource, ChartLoadResult};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -250,7 +238,7 @@ use ferrite_kernel::{depth_selection::DepthReference, NumericCoverageSource};
 use ferrite_lua::{ContextParameters as LuaContextParameters, PortrayalEngine, TypeCatalogue};
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
 use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext, Viewport, WorldPoint};
-use ferrite_s100_core::{CellSourceIdentity, S101Cell};
+use ferrite_s100_core::S101Cell;
 use ferrite_s101::{convert_lua_results_for_cell, lookup_pc_color};
 use ferrite_s102::{
     BathymetryCoverage, BathymetryPortrayal, ConservativeCoverage, DatumCoverage, DepthSettings,
@@ -772,24 +760,6 @@ fn chart_data_bounds(
     bounds
 }
 
-/// Result of background chart loading
-struct ChartLoadResult {
-    base_metadata: Option<s101_lifecycle_metadata::MetadataEvidence>,
-    metadata: Option<s101_lifecycle_metadata::MetadataEvidence>,
-    input_paths: Vec<PathBuf>,
-    cell: S101Cell,
-    source_identity: CellSourceIdentity,
-    hydration: Option<CellHydrationSource>,
-}
-
-/// How to re-materialize a cell whose records were released: the exact load
-/// plan (retained authenticated inputs) and the feature codes it was
-/// normalized with, in order (load, then each catalogue change).
-#[derive(Clone)]
-struct CellHydrationSource {
-    plan: Arc<s101_update_plan::Plan>,
-    codes: Vec<Arc<Vec<String>>>,
-}
 struct CellHydration {
     source: CellHydrationSource,
     /// Statistics of a released cell (None while its records are resident).
@@ -1427,7 +1397,7 @@ impl ChartApp {
             loaded_source_identities: Default::default(),
             loaded_chain_paths: Vec::new(),
             loaded_discovery: Default::default(),
-            cancellation_history_path: chart_publication::default_history_path(),
+            cancellation_history_path: app_data_paths::default_history_path(),
             coverage_inventory: None,
             coverage_memo: None,
             cell_hydration: std::collections::HashMap::new(),
@@ -16958,7 +16928,7 @@ fn init_logging(log_path: &Path, debug_mode: bool) -> Result<()> {
     // doesn't drown out the log on every adapter probe.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "info,ferrite_s100=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug,ferrite_wgpu=debug,wgpu_hal::vulkan::conv=error",
+            "info,ferrite_s100=debug,ferrite_engine=debug,ferrite_s100_core=debug,ferrite_plugin_loader=debug,ferrite_wgpu=debug,wgpu_hal::vulkan::conv=error",
         )
     });
 
