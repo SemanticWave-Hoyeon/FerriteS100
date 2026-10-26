@@ -184,7 +184,23 @@ pub struct WebCanvas {
 impl WebCanvas {
     /// The renderer of canvas element `canvas_id` at `density` device pixels
     /// per CSS pixel (the canvas's `width`/`height` are its pixel size).
-    pub async fn create(canvas_id: String, density: f64) -> Result<WebCanvas, JsError> {
+    /// `backend` is `"auto"` (default: WebGPU when the browser offers it,
+    /// else WebGL2), `"webgpu"` or `"webgl2"`.
+    pub async fn create(
+        canvas_id: String,
+        density: f64,
+        backend: Option<String>,
+    ) -> Result<WebCanvas, JsError> {
+        let backends = match backend.as_deref().unwrap_or("auto") {
+            "auto" => wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+            "webgpu" => wgpu::Backends::BROWSER_WEBGPU,
+            "webgl2" => wgpu::Backends::GL,
+            other => {
+                return Err(JsError::new(&format!(
+                    "Unknown backend {other:?} (auto, webgpu, webgl2)"
+                )))
+            }
+        };
         let canvas: web_sys::HtmlCanvasElement = web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| d.get_element_by_id(&canvas_id))
@@ -194,9 +210,10 @@ impl WebCanvas {
         let size = PhysicalSize::new(canvas.width().max(1), canvas.height().max(1));
         let surface = Arc::new(HeadlessSurface::new(size, density));
         let host = Arc::clone(&surface);
-        let renderer = WgpuRenderer::new(
+        let renderer = WgpuRenderer::new_with_backends(
             wgpu::SurfaceTarget::Canvas(canvas),
             Arc::clone(&surface) as Arc<dyn SurfaceHost>,
+            backends,
             |device, _| HeadlessUi::new(device, host),
         )
         .await
@@ -208,7 +225,7 @@ impl WebCanvas {
         })
     }
 
-    /// GPU adapter and backend ("WebGPU" or "WebGL2").
+    /// GPU adapter and backend ("WebGPU" or "WebGL2"), e.g. "ANGLE (...) (WebGL2)".
     pub fn adapter(&self) -> String {
         let state = &self.renderer.state;
         let backend = match state.adapter_backend {
@@ -216,7 +233,12 @@ impl WebCanvas {
             wgpu::Backend::Gl => "WebGL2",
             _ => "other",
         };
-        format!("{} ({backend})", state.gpu_name)
+        // Browsers may hide the WebGPU adapter name.
+        if state.gpu_name.is_empty() {
+            backend.to_owned()
+        } else {
+            format!("{} ({backend})", state.gpu_name)
+        }
     }
 
     /// Match the drawing buffer to `width` x `height` physical pixels.

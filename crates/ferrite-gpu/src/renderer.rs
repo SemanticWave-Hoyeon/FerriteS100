@@ -2104,6 +2104,20 @@ impl<U: UiLayer> WgpuRenderer<U> {
         Self::with_state(GpuState::new(target, window).await?, ui).await
     }
 
+    /// [`Self::new`] on an instance limited to `backends`.
+    pub async fn new_with_backends(
+        target: wgpu::SurfaceTarget<'static>,
+        window: Arc<dyn crate::SurfaceHost>,
+        backends: wgpu::Backends,
+        ui: impl FnOnce(&wgpu::Device, wgpu::TextureFormat) -> U,
+    ) -> Result<Self> {
+        Self::with_state(
+            GpuState::new_with_backends(target, window, backends).await?,
+            ui,
+        )
+        .await
+    }
+
     /// A renderer without a window surface: frames are drawn only into
     /// offscreen textures ([`Self::render_offscreen`], screenshots). `window`
     /// reports the target size and density.

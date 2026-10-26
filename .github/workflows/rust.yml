@@ -46,6 +46,15 @@ jobs:
     - name: Test chart engine
       run: cargo test -p ferrite-engine --locked
 
+    - name: Test renderer, UI, CLI and web core
+      run: cargo test -p ferrite-gpu -p ferrite-ui -p ferrite-cli -p ferrite-wasm --locked
+
+    - name: Test C API
+      if: runner.os != 'Windows'
+      run: |
+        cargo build -p ferrite-capi --locked
+        cargo test -p ferrite-capi --locked
+
     - name: Run tests
       run: cargo test --verbose
 
@@ -62,6 +71,28 @@ jobs:
 
     - name: Run Clippy
       run: cargo clippy -- -D warnings
+
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: wasm32-unknown-unknown
+
+    - name: Engine without native dependencies
+      run: cargo check -p ferrite-engine --no-default-features --features crypto-rust --locked
+
+    - name: Pure-Rust crypto backend
+      run: cargo test -p ferrite-security --no-default-features --features crypto-rust --locked
+
+    - name: WebAssembly build
+      run: |
+        cargo check -p ferrite-engine --target wasm32-unknown-unknown --no-default-features --features crypto-rust --locked
+        cargo check -p ferrite-wasm --target wasm32-unknown-unknown --locked
 
   fmt:
     runs-on: ubuntu-latest

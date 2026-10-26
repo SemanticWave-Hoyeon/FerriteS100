@@ -13,6 +13,11 @@ let gpu = null;
 const camera = { lat: NaN, lon: NaN, zoom: 1 };
 let view = null;
 let opened = 0;
+// Renderer backend: ?backend=auto|webgpu|webgl2 (the select reloads the page).
+const BACKENDS = ["auto", "webgpu", "webgl2"];
+const requested = new URLSearchParams(location.search).get("backend") ?? "auto";
+const backend = BACKENDS.includes(requested) ? requested : "auto";
+let adapter = "";
 
 const mercY = (lat) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
 const latOf = (y) => (360 / Math.PI) * Math.atan(Math.exp(y)) - 90;
@@ -32,8 +37,14 @@ function scheduleRender(delay = 0) {
   pending = setTimeout(render, delay);
 }
 
+// Below this CSS size the canvas is still being laid out (e.g. a pane that is
+// opening); fitting the data to it would produce a meaningless scale that the
+// camera would then keep. The ResizeObserver renders once the canvas grows.
+const MIN_CANVAS_CSS_PX = 64;
+
 function render() {
   if (!engine || !gpu || opened === 0) return;
+  if (canvas.clientWidth < MIN_CANVAS_CSS_PX || canvas.clientHeight < MIN_CANVAS_CSS_PX) return;
   const { dpr, width, height } = pixelSize();
   canvas.width = width;
   canvas.height = height;
@@ -49,7 +60,7 @@ function render() {
     camera.lat = latOf((mercY(view.north) + mercY(view.south)) / 2);
     camera.lon = (view.east + view.west) / 2;
     canvas.style.transform = "";
-    $("hud").textContent =
+    $("hud").textContent = `${adapter} · ` +
       `${summary.instructions} instructions · 1:${Math.round(summary.display_scale)} · ` +
       `zoom ${summary.zoom.toFixed(2)} · ${camera.lat.toFixed(4)}, ${camera.lon.toFixed(4)} · ` +
       `prepare ${(t1 - t0).toFixed(0)} ms, draw ${(t2 - t1).toFixed(0)} ms`;
@@ -144,6 +155,11 @@ function setupInput() {
   $("files").addEventListener("change", async (e) => addFiles(await readFileList(e.target.files)));
   $("samples").addEventListener("click", () => loadSamples().catch((e) => status(`Samples: ${e}`)));
   $("fit").addEventListener("click", () => { camera.lat = NaN; camera.lon = NaN; camera.zoom = 1; scheduleRender(); });
+  $("backend").addEventListener("change", (e) => {
+    const url = new URL(location.href);
+    url.searchParams.set("backend", e.target.value);
+    location.assign(url);
+  });
   $("palette").addEventListener("change", (e) => {
     try { engine.set_palette(e.target.value); scheduleRender(); } catch (error) { status(error.message); }
   });
@@ -229,10 +245,13 @@ async function main() {
   const { dpr, width, height } = pixelSize();
   canvas.width = width;
   canvas.height = height;
-  gpu = await WebCanvas.create("chart", dpr);
+  $("backend").value = backend;
+  gpu = await WebCanvas.create("chart", dpr, backend);
+  adapter = gpu.adapter();
+  $("hud").textContent = adapter;
   setupInput();
   const notes = JSON.parse(engine.catalogue_notes());
-  status(`Ready: ${gpu.adapter()}${notes.length ? `\n${notes.join("\n")}` : ""}\nDrop files or load the samples.`);
+  status(`Ready: ${adapter} [backend ${backend}]${notes.length ? `\n${notes.join("\n")}` : ""}\nDrop files or load the samples.`);
 }
 
 main().catch((error) => status(`Start failed: ${error.message ?? error}`));

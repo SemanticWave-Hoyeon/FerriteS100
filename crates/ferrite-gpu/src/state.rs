@@ -53,10 +53,20 @@ impl GpuState {
         target: wgpu::SurfaceTarget<'static>,
         window: Arc<dyn SurfaceHost>,
     ) -> Result<Self> {
+        Self::new_with_backends(target, window, wgpu::Backends::all()).await
+    }
+
+    /// [`Self::new`] restricted to `backends` (the web demo uses
+    /// `BROWSER_WEBGPU` or `GL` to force a browser backend).
+    pub async fn new_with_backends(
+        target: wgpu::SurfaceTarget<'static>,
+        window: Arc<dyn SurfaceHost>,
+        backends: wgpu::Backends,
+    ) -> Result<Self> {
         let size = window.inner_size();
 
         // Create instance
-        let instance = Self::instance().await;
+        let instance = Self::instance(backends).await;
 
         // Create surface
         let surface = instance
@@ -139,11 +149,11 @@ impl GpuState {
         })
     }
 
-    /// A wgpu instance on every backend. On the web WebGPU is used when the
-    /// browser offers it, otherwise WebGL2.
-    async fn instance() -> wgpu::Instance {
+    /// A wgpu instance on `backends`. On the web WebGPU is used when it is
+    /// requested and the browser offers it, otherwise WebGL2 (if requested).
+    async fn instance(backends: wgpu::Backends) -> wgpu::Instance {
         let descriptor = wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends,
             ..Default::default()
         };
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -208,7 +218,7 @@ impl GpuState {
     /// density of the offscreen target.
     pub async fn new_headless(window: Arc<dyn SurfaceHost>) -> Result<Self> {
         let size = window.inner_size();
-        let instance = Self::instance().await;
+        let instance = Self::instance(wgpu::Backends::all()).await;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
