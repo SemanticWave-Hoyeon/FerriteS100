@@ -6,7 +6,7 @@ use ferrite_engine::chart_engine::{
     Camera, ChartEngine, DatasetSource, FeatureId, OpenReport, View, Zoom,
 };
 use ferrite_engine::platform::{
-    CacheStore, Clock, MemoryCacheStore, MemoryDataSource, Platform, SequentialExecutor,
+    CacheEntry, CacheStore, Clock, MemoryCacheStore, MemoryDataSource, Platform, SequentialExecutor,
 };
 use ferrite_engine::scene::PreparedScene;
 use ferrite_engine::{PortrayalSource, ViewportPixels};
@@ -16,10 +16,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+// In-memory paths are dataset and authorization keys and must be absolute:
+// `/x` is absolute in the browser (Unix-style paths) but has no drive on
+// Windows, where native builds (tests) use the virtual drive `C:`
+// (`ferrite_engine::platform::memory_path`).
 /// Where catalogue files live in the in-memory data source.
+#[cfg(not(windows))]
 pub const CATALOGUE_ROOT: &str = "/catalogues";
+#[cfg(windows)]
+pub const CATALOGUE_ROOT: &str = "C:/catalogues";
 /// Where added dataset files are named (their identity only).
+#[cfg(not(windows))]
 pub const DATA_ROOT: &str = "/data";
+#[cfg(windows)]
+pub const DATA_ROOT: &str = "C:/data";
 
 /// Magic of a catalogue bundle (see [`parse_bundle`]).
 pub const BUNDLE_MAGIC: &[u8; 4] = b"FSB1";
@@ -92,10 +102,20 @@ impl PageCacheStore {
 
     /// Store an entry loaded from elsewhere (not reported as written).
     pub fn preload(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.preload_checked(name, bytes, false)
+    }
+
+    /// [`Self::preload`]; `verified`: the host checked the payload's
+    /// SHA-256 against the entry's stored hash, so the engine's first read
+    /// does not hash it again ([`MemoryCacheStore::write_verified`]).
+    pub fn preload_checked(&self, name: &str, bytes: &[u8], verified: bool) -> Result<()> {
         let path = self.entry(name)?;
-        self.memory
-            .write(&path, bytes)
-            .with_context(|| format!("Cannot store {name}"))
+        if verified {
+            self.memory.write_verified(&path, bytes)
+        } else {
+            self.memory.write(&path, bytes)
+        }
+        .with_context(|| format!("Cannot store {name}"))
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -139,6 +159,16 @@ impl CacheStore for PageCacheStore {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(bytes)
+    }
+    /// Remembers integrity checks (entries change only through writes).
+    fn read_entry(&self, path: &Path) -> std::io::Result<CacheEntry> {
+        let entry = self.memory.read_entry(path)?;
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(entry)
+    }
+    fn mark_verified(&self, path: &Path, version: u64) {
+        self.memory.mark_verified(path, version)
     }
     fn modified(&self, path: &Path) -> Option<SystemTime> {
         self.memory.modified(path)
@@ -286,6 +316,10 @@ impl WebEngineCore {
     /// Store a precomputed S-101 cell payload (`.ferrite_pre_<key>` written
     /// by `ferrite precompute`) in the memory cache store.
     pub fn load_precomputed(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.load_precomputed_checked(name, bytes, false)
+    }
+
+    fn load_precomputed_checked(&mut self, name: &str, bytes: &[u8], verified: bool) -> Result<()> {
         let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
         // Web servers often hide dot files; the leading dot is optional.
         let file = match file.strip_prefix('.') {
@@ -296,7 +330,7 @@ impl WebEngineCore {
             file.starts_with(".ferrite_pre_") && !file.contains(".."),
             "Not a precomputed payload name: {name}"
         );
-        self.cache.preload(&file, bytes)?;
+        self.cache.preload_checked(&file, bytes, verified)?;
         self.payloads += 1;
         self.scene_current = false;
         Ok(())
@@ -374,10 +408,28 @@ impl WebEngineCore {
     /// reported again by [`Self::take_cache_writes`]); a precomputed payload
     /// (`.ferrite_pre_*`) counts as loaded like [`Self::load_precomputed`].
     pub fn load_cache_entry(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.load_cache_entry_checked(name, bytes, None)
+    }
+
+    /// [`Self::load_cache_entry`] with the SHA-256 of the entry's payload
+    /// (`bytes[40..]`) computed by the host (e.g. Web Crypto, much faster
+    /// than hashing in WebAssembly). When it equals the hash stored in the
+    /// entry, the engine's read skips its own SHA-256 check (magic, schema
+    /// version and decoding are still checked); otherwise the entry is
+    /// stored unchecked and the engine verifies it as usual.
+    pub fn load_cache_entry_checked(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        payload_sha256: Option<&[u8]>,
+    ) -> Result<()> {
+        let verified = payload_sha256.is_some_and(|digest| {
+            ferrite_engine::portrayal_cache::stored_digest(bytes) == Some(digest)
+        });
         if name.starts_with(".ferrite_pre_") {
-            return self.load_precomputed(name, bytes);
+            return self.load_precomputed_checked(name, bytes, verified);
         }
-        self.cache.preload(name, bytes)
+        self.cache.preload_checked(name, bytes, verified)
     }
 
     /// Set the residency threshold (estimated instructions from which only
@@ -789,6 +841,42 @@ mod tests {
         );
         assert!(cache.take_writes().is_empty());
         assert_eq!(cache.len(), 2);
+    }
+
+    /// A host-computed payload SHA-256 equal to the stored hash marks the
+    /// entry checked (the engine's read then skips hashing); a wrong or
+    /// missing digest leaves the check to the engine.
+    #[test]
+    fn host_digest_marks_matching_entries_checked() {
+        use ferrite_engine::portrayal_cache::{encode_cache_payload, stored_digest, wrap_cache};
+        let root = repository();
+        let mut core = WebEngineCore::new(catalogue_files(&root), Arc::new(SystemClock)).unwrap();
+        let file = wrap_cache(&encode_cache_payload(&[]).unwrap());
+        // wrap_cache stores the payload's SHA-256.
+        let digest: [u8; 32] = stored_digest(&file).unwrap().try_into().unwrap();
+        let checked = |core: &WebEngineCore, name: &str| {
+            let path = core.cache.entry(name).unwrap();
+            core.cache.memory.read_entry(&path).unwrap().verified
+        };
+        core.load_cache_entry_checked(".ferrite_cell_a.bin", &file, Some(&digest))
+            .unwrap();
+        assert!(checked(&core, ".ferrite_cell_a.bin"));
+        let mut wrong = digest;
+        wrong[0] ^= 1;
+        core.load_cache_entry_checked(".ferrite_cell_b.bin", &file, Some(&wrong))
+            .unwrap();
+        assert!(!checked(&core, ".ferrite_cell_b.bin"));
+        core.load_cache_entry(".ferrite_cell_c.bin", &file).unwrap();
+        assert!(!checked(&core, ".ferrite_cell_c.bin"));
+        core.load_cache_entry_checked(".ferrite_pre_d.bin", &file, Some(&digest))
+            .unwrap();
+        assert!(checked(&core, ".ferrite_pre_d.bin"));
+        assert_eq!(core.payloads, 1);
+        // Not a cache file: never marked checked.
+        core.load_cache_entry_checked(".ferrite_s102_e.bin", b"text", Some(&digest))
+            .unwrap();
+        assert!(!checked(&core, ".ferrite_s102_e.bin"));
+        assert!(core.take_cache_writes().is_empty());
     }
 
     #[test]

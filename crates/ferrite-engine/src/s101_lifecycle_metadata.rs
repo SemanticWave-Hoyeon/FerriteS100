@@ -322,8 +322,12 @@ fn resource_path(data: &dyn DataSource, root: &Path, uri: &str) -> Result<PathBu
                 && !part.contains('\0')),
         "Unsafe lifecycle exchange-relative resource path"
     );
+    // Joined part by part: under a Windows verbatim root `/` is not a separator.
+    let joined = name
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part));
     let path = data
-        .canonicalize(&root.join(name))
+        .canonicalize(&joined)
         .context("Missing lifecycle catalogue resource")?;
     ensure!(
         path.starts_with(root) && data.is_file(&path),

@@ -19,7 +19,7 @@ use ferrite_cli::{
 use ferrite_engine::chart_engine::{
     Camera, ChartEngine, DatasetSource, DisplayOptions, OpenReport, View, Zoom,
 };
-use ferrite_engine::platform::{DirectoryCacheStore, NoCacheStore, Platform};
+use ferrite_engine::platform::{memory_path, DirectoryCacheStore, NoCacheStore, Platform};
 use ferrite_engine::scene::PreparedScene;
 use ferrite_engine::{PortrayalSource, ViewportPixels};
 use std::cell::RefCell;
@@ -285,6 +285,9 @@ pub unsafe extern "C" fn ferrite_engine_open_files(
 /// Open datasets held in memory. `names[i]` identifies `data[i]` (`lengths[i]`
 /// bytes): its file name decides the product and the update chain (e.g.
 /// `101FR00369400.000`). The bytes are copied. No signature verification.
+/// A root-relative name (`/xs/S100_ROOT/...`) is an absolute memory key on
+/// every platform: on Windows it is placed on the virtual drive `C:`
+/// ([`memory_path`]), so reported sources read `C:\xs\...` there.
 #[no_mangle]
 pub unsafe extern "C" fn ferrite_engine_open_bytes(
     handle: *mut FerriteEngine,
@@ -310,7 +313,7 @@ pub unsafe extern "C" fn ferrite_engine_open_bytes(
             } else {
                 Arc::from(std::slice::from_raw_parts(pointer, length))
             };
-            files.push((PathBuf::from(name), bytes));
+            files.push((memory_path(name), bytes));
         }
         open(handle, DatasetSource::Bytes(files))
     })

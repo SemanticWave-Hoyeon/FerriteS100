@@ -17,6 +17,10 @@ const TRIAL: &str = "TestData/UKHO-S101/Complete_S10X_datasets/Complete S10X dat
 fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
+/// A platform-absolute in-memory key (memory paths are authorization keys).
+fn mem(path: &str) -> PathBuf {
+    ferrite_engine::platform::memory_path(path)
+}
 fn shom(n: u32) -> PathBuf {
     repository().join(format!(
         "{SHOM}/102FR00SMALOG00000{n}/102FR00SMALOG00000{n}.H5"
@@ -33,7 +37,7 @@ fn catalogues(memory: &mut MemoryDataSource, products: &[&str]) {
             .copy_tree(
                 &NativeDataSource,
                 &root.join("Catalogues").join(product),
-                &Path::new("/mem/Catalogues").join(product),
+                &mem("/mem/Catalogues").join(product),
             )
             .unwrap();
         assert!(copied > 0, "{product}");
@@ -43,7 +47,7 @@ fn catalogues(memory: &mut MemoryDataSource, products: &[&str]) {
 fn new_engine(memory: MemoryDataSource, cache: Arc<MemoryCacheStore>) -> ChartEngine {
     assert!(!memory.local_paths());
     let platform = Platform::in_memory(memory).with_cache(cache);
-    ChartEngine::new(EngineConfig::new(platform, "/mem/Catalogues")).unwrap()
+    ChartEngine::new(EngineConfig::new(platform, mem("/mem/Catalogues"))).unwrap()
 }
 
 /// (bounds, width, height, rgba) of every tile, consuming the scene.
@@ -80,12 +84,12 @@ fn opens_and_prepares_s102_entirely_from_memory() {
     catalogues(&mut memory, &["FC/S-101", "PC/S-101", "PC/S-102"]);
     for n in [1, 4] {
         memory.insert(
-            format!("/mem/data/102FR00SMALOG00000{n}.H5"),
+            mem(&format!("/mem/data/102FR00SMALOG00000{n}.H5")),
             std::fs::read(shom(n)).unwrap(),
         );
     }
     memory.insert(
-        "/mem/data/102GBTD5N5090W00140.h5",
+        mem("/mem/data/102GBTD5N5090W00140.h5"),
         std::fs::read(repository().join(TRIAL)).unwrap(),
     );
     let cache = Arc::new(MemoryCacheStore::default());
@@ -95,7 +99,7 @@ fn opens_and_prepares_s102_entirely_from_memory() {
         "{:?}",
         engine.state().s102_pc_status
     );
-    let job = engine.open(DatasetSource::Folder("/mem/data".into()));
+    let job = engine.open(DatasetSource::Folder(mem("/mem/data")));
     let opened = job.wait().unwrap();
     assert_eq!(opened.bathymetry_count(), 3);
     let report = engine.install(opened).unwrap();
@@ -168,14 +172,14 @@ fn prepare_with_lua_then_precomputed(mut engine: ChartEngine, cache: Arc<MemoryC
     catalogues(&mut memory, &["FC/S-101", "PC/S-101", "PC/S-102"]);
     for n in [1, 4] {
         memory.insert(
-            format!("/mem/data/102FR00SMALOG00000{n}.H5"),
+            mem(&format!("/mem/data/102FR00SMALOG00000{n}.H5")),
             std::fs::read(shom(n)).unwrap(),
         );
     }
     let mut precomputed = new_engine(memory, cache);
     precomputed.set_portrayal_source(ferrite_engine::portrayal::PortrayalSource::Precomputed);
     precomputed
-        .open_blocking(DatasetSource::Folder("/mem/data".into()))
+        .open_blocking(DatasetSource::Folder(mem("/mem/data")))
         .unwrap();
     let again = tiles(precomputed.prepare(&View::fit(800, 600)).unwrap());
     assert_eq!(again, lua);
@@ -183,10 +187,10 @@ fn prepare_with_lua_then_precomputed(mut engine: ChartEngine, cache: Arc<MemoryC
     // Without the exported instructions a Lua-less host fails clearly.
     let mut memory = MemoryDataSource::new();
     catalogues(&mut memory, &["FC/S-101", "PC/S-101", "PC/S-102"]);
-    memory.insert("/mem/data/a.H5", std::fs::read(shom(1)).unwrap());
+    memory.insert(mem("/mem/data/a.H5"), std::fs::read(shom(1)).unwrap());
     let mut cold = new_engine(memory, Arc::new(MemoryCacheStore::default()));
     cold.set_portrayal_source(ferrite_engine::portrayal::PortrayalSource::Precomputed);
-    cold.open_blocking(DatasetSource::Folder("/mem/data".into()))
+    cold.open_blocking(DatasetSource::Folder(mem("/mem/data")))
         .unwrap();
     let error = cold.prepare(&View::fit(800, 600)).err().unwrap();
     assert!(
@@ -207,7 +211,7 @@ fn bytes_source_without_s102_catalogue_is_refused_with_an_issue() {
     assert!(engine.state().s102_pc.is_none());
     let report = engine
         .open_blocking(DatasetSource::Bytes(vec![(
-            "/host/102FR00SMALOG000001.H5".into(),
+            mem("/host/102FR00SMALOG000001.H5"),
             std::fs::read(shom(1)).unwrap().into(),
         )]))
         .unwrap();
@@ -222,7 +226,7 @@ fn bytes_source_without_s102_catalogue_is_refused_with_an_issue() {
     // Malformed HDF5 bytes are an issue, never a panic.
     let report = engine
         .open_blocking(DatasetSource::Bytes(vec![(
-            "/host/broken.h5".into(),
+            mem("/host/broken.h5"),
             b"\x89HDF\r\n\x1a\nnot really".to_vec().into(),
         )]))
         .unwrap();
@@ -252,10 +256,10 @@ fn facade_tiles_match_the_viewer_pipeline() {
     let path = shom(4);
     let mut memory = MemoryDataSource::new();
     catalogues(&mut memory, &["FC/S-101", "PC/S-101", "PC/S-102"]);
-    memory.insert("/mem/data/one.H5", std::fs::read(&path).unwrap());
+    memory.insert(mem("/mem/data/one.H5"), std::fs::read(&path).unwrap());
     let mut engine = new_engine(memory, Arc::new(MemoryCacheStore::default()));
     engine
-        .open_blocking(DatasetSource::Folder("/mem/data".into()))
+        .open_blocking(DatasetSource::Folder(mem("/mem/data")))
         .unwrap();
     let mut options = engine.s102_options().clone();
     options.tile_edge = 97; // several tiles, partial edges

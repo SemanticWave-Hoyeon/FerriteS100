@@ -84,7 +84,9 @@ int32_t ferrite_engine_open_files(FerriteEngine *engine,
 
 /* Open datasets held in memory: names[i] (file name, e.g.
  * "101FR00369400.000") identifies data[i] of lengths[i] bytes. The bytes
- * are copied. No signature verification. */
+ * are copied. No signature verification. A root-relative name ("/xs/...")
+ * is an absolute memory key on every platform; on Windows it is placed on
+ * the virtual drive C: (reported as C:\xs\...). */
 int32_t ferrite_engine_open_bytes(FerriteEngine *engine,
                                   const char *const *names,
                                   const uint8_t *const *data,

@@ -10,6 +10,22 @@ const PAYLOAD = /^\.?ferrite_pre_/;
 // Cache entry name of a dropped payload (the engine's leading dot is optional).
 const payloadEntry = (base) => (base.startsWith(".") ? base : `.${base}`);
 
+// SHA-256 of a cache entry's payload (after the 40-byte header: magic,
+// schema version, stored hash) with Web Crypto, which hashes natively and
+// off this thread. The engine compares it with the stored hash and then
+// skips hashing the payload in WebAssembly, the bulk of a cache-hit
+// preparation (see WebEngine.load_cache_entry_digest). Null without Web
+// Crypto (insecure context): the engine checks the entry itself.
+async function payloadDigest(bytes) {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle || bytes.byteLength < 40) return null;
+  try {
+    return new Uint8Array(await subtle.digest("SHA-256", bytes.subarray(40)));
+  } catch {
+    return null;
+  }
+}
+
 // Test hook for the fallbacks of engine-client.js, comma-separated flags of
 // the page's ?simulate=:
 //   no-webgpu        neither the page nor workers offer WebGPU
@@ -116,14 +132,18 @@ export class EngineHost {
   // preparation still portrays with Lua) the per-cell Lua caches.
   async preload() {
     const t0 = performance.now();
-    const out = { wanted: 0, loaded: 0, bytes: 0, kinds: {}, ms: 0 };
+    const out = { wanted: 0, loaded: 0, bytes: 0, kinds: {}, digestMs: 0, ms: 0 };
     for (let round = 0; round < 2; round++) {
       const names = JSON.parse(this.engine.missing_cache_entries());
       if (!names.length) break;
       out.wanted += names.length;
       const entries = this.cache ? await this.cache.getMany(names) : [];
-      for (const [name, bytes] of entries) {
-        this.engine.load_cache_entry(name, bytes);
+      const hashed = performance.now();
+      const digests = await Promise.all(entries.map(([, bytes]) => payloadDigest(bytes)));
+      out.digestMs += performance.now() - hashed;
+      for (const [index, [name, bytes]] of entries.entries()) {
+        if (digests[index]) this.engine.load_cache_entry_digest(name, bytes, digests[index]);
+        else this.engine.load_cache_entry(name, bytes);
         const kind = entryKind(name);
         out.kinds[kind] = (out.kinds[kind] ?? 0) + 1;
         out.bytes += bytes.byteLength;

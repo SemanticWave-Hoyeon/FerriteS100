@@ -1,5 +1,6 @@
 //! Per-cell portrayal instruction cache format: magic, schema version and a
 //! SHA-256 corruption check around a bincode instruction payload.
+use crate::platform::CacheStore;
 use crate::secure_instruction_cache;
 use ferrite_render::DrawingInstruction;
 use sha2::{Digest, Sha256};
@@ -32,6 +33,40 @@ pub fn wrap_cache(payload: &[u8]) -> Vec<u8> {
 pub fn verify_and_deserialize_cache(
     data: &[u8],
 ) -> std::result::Result<Vec<ferrite_render::DrawingInstruction>, String> {
+    check_and_deserialize_cache(data, true)
+}
+
+/// Read entry `path` of `store` and deserialize it like
+/// [`verify_and_deserialize_cache`]. The SHA-256 check is skipped when the
+/// store vouches that these exact bytes passed it before
+/// ([`CacheStore::read_entry`], in-memory stores only); a passing check is
+/// recorded for the next read ([`CacheStore::mark_verified`]). Magic and
+/// schema version are always checked. Err: the entry could not be read
+/// (`Ok(Err(..))`: it was read and rejected).
+pub fn read_and_deserialize_cache(
+    store: &dyn CacheStore,
+    path: &std::path::Path,
+) -> std::io::Result<std::result::Result<Vec<DrawingInstruction>, String>> {
+    let entry = store.read_entry(path)?;
+    let decoded = check_and_deserialize_cache(&entry.bytes, !entry.verified);
+    if let (Ok(_), false, Some(version)) = (&decoded, entry.verified, entry.version) {
+        store.mark_verified(path, version);
+    }
+    Ok(decoded)
+}
+
+/// The payload SHA-256 stored in a cache file (`[8..40]` after the magic
+/// and schema version), None when `data` is no cache file. A host that
+/// hashed the payload (`data[40..]`) itself can compare it with this and
+/// store the entry as checked ([`crate::platform::MemoryCacheStore::write_verified`]).
+pub fn stored_digest(data: &[u8]) -> Option<&[u8]> {
+    (data.len() >= 40 && &data[..4] == CACHE_MAGIC).then(|| &data[8..40])
+}
+
+fn check_and_deserialize_cache(
+    data: &[u8],
+    check_digest: bool,
+) -> std::result::Result<Vec<ferrite_render::DrawingInstruction>, String> {
     const HEADER_LEN: usize = 4 + 4 + 32; // magic + version + hash
     if data.len() as u64 > secure_instruction_cache::MAX_CACHE_BYTES {
         return Err("cache exceeds byte budget".into());
@@ -54,8 +89,7 @@ pub fn verify_and_deserialize_cache(
     // Verify SHA-256 hash
     let stored_hash = &data[8..40];
     let payload = &data[HEADER_LEN..];
-    let computed_hash = Sha256::digest(payload);
-    if computed_hash.as_slice() != stored_hash {
+    if check_digest && Sha256::digest(payload).as_slice() != stored_hash {
         return Err("SHA-256 integrity check failed (file tampered or corrupted)".into());
     }
     decode_cache_payload(payload)
@@ -179,6 +213,71 @@ mod instruction_cache_schema_tests {
         assert!(verify_and_deserialize_cache(&wrap_cache(&payload))
             .unwrap_err()
             .contains("deserialization failed"));
+    }
+
+    /// An in-memory store remembers a passed SHA-256 check per write: the
+    /// next read of the same bytes skips it, a rewrite checks again, and a
+    /// corrupted entry is still rejected. Host-checked entries
+    /// (`write_verified`) start checked; stores without memory (the default
+    /// `read_entry`) check every read.
+    #[test]
+    fn memory_store_remembers_integrity_checks_per_write() {
+        use crate::platform::{CacheStore, MemoryCacheStore, NoCacheStore};
+        use ferrite_render::PointInstruction;
+        use std::path::Path;
+        let instructions = vec![DrawingInstruction::Point(PointInstruction::new(
+            "S".into(),
+            WorldPoint::new(1., 2.),
+        ))];
+        let file = wrap_cache(&encode_cache_payload(&instructions).unwrap());
+        assert_eq!(stored_digest(&file), Some(&Sha256::digest(&file[40..])[..]));
+        assert_eq!(stored_digest(b"FRC"), None);
+        let store = MemoryCacheStore::default();
+        let path = Path::new("/memory-cache/portrayal-v1/.ferrite_cell_x.bin");
+        store.write(path, &file).unwrap();
+        assert!(!store.read_entry(path).unwrap().verified);
+        assert_eq!(
+            read_and_deserialize_cache(&store, path)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.read_entry(path).unwrap().verified);
+        assert_eq!(
+            read_and_deserialize_cache(&store, path)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        // A rewrite (here corrupted) is checked again and rejected.
+        let mut corrupted = file.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        store.write(path, &corrupted).unwrap();
+        assert!(!store.read_entry(path).unwrap().verified);
+        assert!(read_and_deserialize_cache(&store, path)
+            .unwrap()
+            .unwrap_err()
+            .contains("SHA-256"));
+        assert!(!store.read_entry(path).unwrap().verified);
+        // A check recorded for an earlier write does not carry over.
+        let stale = store.read_entry(path).unwrap().version.unwrap();
+        store.write(path, &file).unwrap();
+        store.mark_verified(path, stale);
+        assert!(!store.read_entry(path).unwrap().verified);
+        // Entries the host checked start verified; magic and schema
+        // version are still checked.
+        store.write_verified(path, &file).unwrap();
+        assert!(store.read_entry(path).unwrap().verified);
+        let mut old_schema = file.clone();
+        old_schema[4] ^= 1;
+        store.write_verified(path, &old_schema).unwrap();
+        assert!(read_and_deserialize_cache(&store, path)
+            .unwrap()
+            .unwrap_err()
+            .contains("schema"));
+        assert!(read_and_deserialize_cache(&NoCacheStore, path).is_err());
     }
 
     /// Large cells are written as segments decoded in parallel; the result

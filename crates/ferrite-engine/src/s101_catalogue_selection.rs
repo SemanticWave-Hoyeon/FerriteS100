@@ -738,7 +738,7 @@ mod tests {
             .copy_tree(
                 &NativeDataSource,
                 &f.root.join("inventory"),
-                Path::new("/mem/inventory"),
+                &crate::platform::memory_path("/mem/inventory"),
             )
             .unwrap();
         // The folder is gone: only the memory copy can be selected from.
@@ -753,7 +753,7 @@ mod tests {
             &[],
             &fc,
             &pc,
-            Path::new("/mem/inventory"),
+            &crate::platform::memory_path("/mem/inventory"),
         )
         .unwrap()
         else {
@@ -763,7 +763,7 @@ mod tests {
         assert_eq!(installed_pc.version, "2.0.1");
         assert_eq!(
             installed_fc.source_path,
-            Path::new("/mem/inventory/2.0.1/FC/FC.xml")
+            crate::platform::memory_path("/mem/inventory/2.0.1/FC/FC.xml")
         );
         let fallback = std::sync::Arc::new(
             DatasetCatalogueOwner::new(std::sync::Arc::new(fc), std::sync::Arc::new(pc)).unwrap(),
@@ -773,7 +773,7 @@ mod tests {
                 &memory,
                 &[request("SHOM", "2.0", 2)],
                 fallback.clone(),
-                Path::new("/mem/inventory"),
+                &crate::platform::memory_path("/mem/inventory"),
             )
             .unwrap();
         assert_eq!(staged.owner_for("SHOM").unwrap().fc().version, "2.0.1");
@@ -782,7 +782,7 @@ mod tests {
                 &memory,
                 &[request("SHOM", "2.0", 2)],
                 fallback,
-                Path::new("/mem/absent"),
+                &crate::platform::memory_path("/mem/absent"),
             )
             .is_err());
     }

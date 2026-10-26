@@ -537,8 +537,13 @@ fn resource_relative_name(name: &str) -> Result<String> {
 }
 fn resource_path(source: &dyn ExchangeSource, root: &Path, name: &str) -> Result<PathBuf> {
     let name = resource_relative_name(name)?;
+    // Joined part by part: under a Windows verbatim root (`\\?\C:\...`, as
+    // canonicalization returns) `/` is not a separator.
+    let joined = name
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part));
     let path = source
-        .canonicalize(&root.join(&name))
+        .canonicalize(&joined)
         .with_context(|| format!("Missing exchange resource {name}"))?;
     ensure!(
         path.starts_with(root),

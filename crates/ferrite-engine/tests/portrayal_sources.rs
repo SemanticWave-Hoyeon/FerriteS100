@@ -15,6 +15,11 @@ fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// A platform-absolute in-memory key (memory paths are authorization keys).
+fn mem(path: &str) -> PathBuf {
+    ferrite_engine::platform::memory_path(path)
+}
+
 fn catalogues(root: &Path) -> MemoryDataSource {
     let mut memory = MemoryDataSource::new();
     for product in ["FC/S-101", "PC/S-101"] {
@@ -22,7 +27,7 @@ fn catalogues(root: &Path) -> MemoryDataSource {
             .copy_tree(
                 &NativeDataSource,
                 &root.join("Catalogues").join(product),
-                &Path::new("/in-memory/Catalogues").join(product),
+                &mem("/in-memory/Catalogues").join(product),
             )
             .unwrap();
     }
@@ -31,15 +36,12 @@ fn catalogues(root: &Path) -> MemoryDataSource {
 
 fn engine(memory: MemoryDataSource, cache: Arc<MemoryCacheStore>) -> ChartEngine {
     let platform = Platform::in_memory(memory).with_cache(cache);
-    ChartEngine::new(EngineConfig::new(platform, "/in-memory/Catalogues")).unwrap()
+    ChartEngine::new(EngineConfig::new(platform, mem("/in-memory/Catalogues"))).unwrap()
 }
 
 fn cell_bytes(root: &Path) -> Option<Vec<(PathBuf, Arc<[u8]>)>> {
     let bytes = std::fs::read(root.join(S101_CELL)).ok()?;
-    Some(vec![(
-        PathBuf::from("/host/101FR00369400.000"),
-        Arc::from(bytes),
-    )])
+    Some(vec![(mem("/host/101FR00369400.000"), Arc::from(bytes))])
 }
 
 fn scene_payload(engine: &mut ChartEngine) -> anyhow::Result<Vec<u8>> {
@@ -114,7 +116,7 @@ fn host_bytes_open_like_files() {
         .open_blocking(DatasetSource::Bytes(
             bytes
                 .into_iter()
-                .chain([(PathBuf::from("/host/notes.txt"), Arc::from(&b"x"[..]))])
+                .chain([(mem("/host/notes.txt"), Arc::from(&b"x"[..]))])
                 .collect(),
         ))
         .unwrap();
@@ -122,7 +124,7 @@ fn host_bytes_open_like_files() {
     assert_eq!(report.datasets[0].product, "S-101");
     assert_eq!(
         report.datasets[0].source.as_deref(),
-        Some(Path::new("/host/101FR00369400.000"))
+        Some(mem("/host/101FR00369400.000").as_path())
     );
     assert!(
         report

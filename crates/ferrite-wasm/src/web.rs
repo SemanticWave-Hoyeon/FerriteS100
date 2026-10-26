@@ -118,6 +118,22 @@ impl WebEngine {
         self.core.load_cache_entry(name, bytes).map_err(js_error)
     }
 
+    /// [`WebEngine::load_cache_entry`] with the SHA-256 of the entry's
+    /// payload (`bytes.subarray(40)`, e.g. from `crypto.subtle.digest`).
+    /// When it matches the hash stored in the entry, the engine does not
+    /// hash the payload again in WebAssembly (the bulk of a cache-hit
+    /// preparation); otherwise the entry is checked as usual.
+    pub fn load_cache_entry_digest(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        payload_sha256: &[u8],
+    ) -> Result<(), JsError> {
+        self.core
+            .load_cache_entry_checked(name, bytes, Some(payload_sha256))
+            .map_err(js_error)
+    }
+
     /// Cache entries the engine wrote since the last call, as an array of
     /// `[name, Uint8Array]` pairs to persist.
     pub fn take_cache_writes(&self) -> js_sys::Array {

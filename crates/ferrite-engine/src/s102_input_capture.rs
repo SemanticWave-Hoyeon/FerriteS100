@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn data_source_capture_holds_bytes_under_the_same_budget() {
         use crate::platform::MemoryDataSource;
-        let source = Path::new("/mem/coverage.h5");
+        let source = &crate::platform::memory_path("/mem/coverage.h5");
         let data = MemoryDataSource::new().with(source, b"12345".to_vec());
         let report =
             crate::dataset_signature_policy::unchecked_datasets_in(&data, &[source.into()])

@@ -238,6 +238,23 @@ fn normalize(path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// A platform-absolute in-memory key for a root-relative virtual path such
+/// as `/xs/CATALOG.XML`. In-memory paths that act as dataset, catalogue or
+/// authorization keys must be absolute ([`Path::is_absolute`]); `/x` is
+/// absolute on Unix-style platforms (WebAssembly included) and is returned
+/// unchanged there, while on Windows it has no drive, so it is placed on the
+/// virtual drive `C:` (`C:/xs/CATALOG.XML`; forward slashes are separators
+/// there). Other paths (already absolute, or relative) are unchanged.
+pub fn memory_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if cfg!(windows) && path.has_root() && !path.is_absolute() {
+        let mut keyed = std::ffi::OsString::from("C:");
+        keyed.push(path.as_os_str());
+        return PathBuf::from(keyed);
+    }
+    path.to_path_buf()
+}
+
 fn not_found(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -421,6 +438,33 @@ pub trait CacheStore: Send + Sync {
     fn mark_used(&self, path: &Path);
     /// Keep the store within its budget; failures only log.
     fn prune(&self);
+    /// [`Self::read`], also telling whether these exact bytes already passed
+    /// the portrayal cache integrity check (SHA-256,
+    /// [`crate::portrayal_cache::verify_and_deserialize_cache`]). Only a
+    /// store whose entries cannot change except through [`Self::write`] may
+    /// remember that (in-memory stores); the default never does, so every
+    /// read is checked again.
+    fn read_entry(&self, path: &Path) -> io::Result<CacheEntry> {
+        Ok(CacheEntry {
+            bytes: self.read(path)?,
+            verified: false,
+            version: None,
+        })
+    }
+    /// Record that the entry read as `version` ([`CacheEntry::version`])
+    /// passed the integrity check; ignored when it was replaced meanwhile.
+    fn mark_verified(&self, _path: &Path, _version: u64) {}
+}
+
+/// An entry read with [`CacheStore::read_entry`].
+#[derive(Debug)]
+pub struct CacheEntry {
+    pub bytes: Vec<u8>,
+    /// These bytes passed the integrity check before.
+    pub verified: bool,
+    /// Identity of this write of the entry, when the store can remember
+    /// checks ([`CacheStore::mark_verified`]).
+    pub version: Option<u64>,
 }
 
 /// The application's private cache directory
@@ -547,7 +591,17 @@ impl CacheStore for NoCacheStore {
 /// A cache held in memory (same byte budget per entry as the native one;
 /// the whole store is bounded by [`MemoryCacheStore::with_budget`]).
 /// Memory cache entries: use order and bytes.
-type MemoryCacheEntries = HashMap<PathBuf, (u64, Arc<[u8]>)>;
+#[derive(Debug)]
+struct MemoryCacheEntry {
+    /// Write or last use order (`modified`, pruning).
+    tick: u64,
+    bytes: Arc<[u8]>,
+    /// Unique per write; a check is remembered only for the write it read.
+    version: u64,
+    /// These bytes passed the portrayal cache integrity check.
+    verified: bool,
+}
+type MemoryCacheEntries = HashMap<PathBuf, MemoryCacheEntry>;
 
 #[derive(Debug)]
 pub struct MemoryCacheStore {
@@ -574,6 +628,34 @@ impl MemoryCacheStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Store an entry whose integrity the caller already checked
+    /// ([`CacheStore::read_entry`] then reports it verified), e.g. bytes a
+    /// host verified with its own SHA-256 against the entry's stored hash.
+    pub fn write_verified(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.insert(path, bytes, true)
+    }
+    fn insert(&self, path: &Path, bytes: &[u8], verified: bool) -> io::Result<()> {
+        if bytes.len() as u64 > crate::secure_instruction_cache::MAX_CACHE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cache exceeds byte budget",
+            ));
+        }
+        let tick = self.next();
+        self.entries
+            .lock()
+            .map_err(|_| io::Error::other("Memory cache poisoned"))?
+            .insert(
+                path.to_path_buf(),
+                MemoryCacheEntry {
+                    tick,
+                    bytes: Arc::from(bytes),
+                    version: tick,
+                    verified,
+                },
+            );
+        Ok(())
+    }
     fn next(&self) -> u64 {
         self.tick
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -591,34 +673,42 @@ impl CacheStore for MemoryCacheStore {
             .map_err(|_| io::Error::other("Memory cache poisoned"))?;
         entries
             .get(path)
-            .map(|(_, bytes)| bytes.to_vec())
+            .map(|entry| entry.bytes.to_vec())
             .ok_or_else(|| not_found(path))
     }
     /// Entries carry their write/use order as a time after the epoch.
     fn modified(&self, path: &Path) -> Option<SystemTime> {
         let entries = self.entries.lock().ok()?;
-        let (tick, _) = entries.get(path)?;
-        Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(*tick))
+        let tick = entries.get(path)?.tick;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(tick))
     }
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        if bytes.len() as u64 > crate::secure_instruction_cache::MAX_CACHE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Cache exceeds byte budget",
-            ));
-        }
-        let tick = self.next();
-        self.entries
-            .lock()
-            .map_err(|_| io::Error::other("Memory cache poisoned"))?
-            .insert(path.to_path_buf(), (tick, Arc::from(bytes)));
-        Ok(())
+        self.insert(path, bytes, false)
     }
     fn mark_used(&self, path: &Path) {
         let tick = self.next();
         if let Ok(mut entries) = self.entries.lock() {
             if let Some(entry) = entries.get_mut(path) {
-                entry.0 = tick;
+                entry.tick = tick;
+            }
+        }
+    }
+    fn read_entry(&self, path: &Path) -> io::Result<CacheEntry> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| io::Error::other("Memory cache poisoned"))?;
+        let entry = entries.get(path).ok_or_else(|| not_found(path))?;
+        Ok(CacheEntry {
+            bytes: entry.bytes.to_vec(),
+            verified: entry.verified,
+            version: Some(entry.version),
+        })
+    }
+    fn mark_verified(&self, path: &Path, version: u64) {
+        if let Ok(mut entries) = self.entries.lock() {
+            if let Some(entry) = entries.get_mut(path).filter(|e| e.version == version) {
+                entry.verified = true;
             }
         }
     }
@@ -626,16 +716,16 @@ impl CacheStore for MemoryCacheStore {
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
-        let mut total: u64 = entries.values().map(|(_, b)| b.len() as u64).sum();
+        let mut total: u64 = entries.values().map(|e| e.bytes.len() as u64).sum();
         let mut order: Vec<(u64, PathBuf)> =
-            entries.iter().map(|(p, (t, _))| (*t, p.clone())).collect();
+            entries.iter().map(|(p, e)| (e.tick, p.clone())).collect();
         order.sort();
         for (_, path) in order {
             if total <= self.budget {
                 break;
             }
-            if let Some((_, bytes)) = entries.remove(&path) {
-                total = total.saturating_sub(bytes.len() as u64);
+            if let Some(entry) = entries.remove(&path) {
+                total = total.saturating_sub(entry.bytes.len() as u64);
             }
         }
     }
@@ -1171,6 +1261,24 @@ mod tests {
             data.canonicalize(Path::new("/set/b/./x.gml")).unwrap(),
             PathBuf::from("/set/b/x.gml")
         );
+    }
+
+    #[test]
+    fn memory_paths_are_platform_absolute_keys() {
+        let key = memory_path("/xs/S100_ROOT/CATALOG.XML");
+        assert!(key.is_absolute(), "{}", key.display());
+        assert!(key.ends_with("xs/S100_ROOT/CATALOG.XML"));
+        assert_eq!(memory_path(&key), key);
+        assert_eq!(memory_path("relative/x"), PathBuf::from("relative/x"));
+        if cfg!(windows) {
+            assert_eq!(key, PathBuf::from(r"C:\xs\S100_ROOT\CATALOG.XML"));
+        } else {
+            assert_eq!(key, PathBuf::from("/xs/S100_ROOT/CATALOG.XML"));
+        }
+        // Memory keys normalize the same either way.
+        let data = MemoryDataSource::new().with(key.clone(), b"x".to_vec());
+        assert_eq!(data.canonicalize(&key).unwrap(), key);
+        assert!(data.is_dir(&memory_path("/xs")));
     }
 
     #[test]

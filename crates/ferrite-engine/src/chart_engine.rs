@@ -124,7 +124,8 @@ pub enum DatasetSource {
     /// [`SignaturePolicy::Required`] they are verified from the bytes and
     /// S-101 chains planned by the S-101 update planner (include the
     /// signature files and exchange catalogue among the inputs; paths must
-    /// be absolute, they are the authorization keys).
+    /// be absolute, they are the authorization keys: on Windows a root-relative
+    /// `/x` is not, see [`crate::platform::memory_path`]).
     Bytes(Vec<(PathBuf, Arc<[u8]>)>),
 }
 

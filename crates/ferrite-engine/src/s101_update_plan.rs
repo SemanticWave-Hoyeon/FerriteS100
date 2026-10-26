@@ -1670,20 +1670,20 @@ mod tests {
     }
     #[test]
     fn memory_source_plans_unchecked_chains_and_cancellations_like_files() {
-        use crate::platform::MemoryDataSource;
+        use crate::platform::{memory_path as mem, MemoryDataSource};
         let fixture = crate::chart_publication::tests::physical_cancellation_fixture;
         let xml = r#"<S100_ExchangeCatalogue xmlns="http://www.iho.int/s100/xc/5.2"><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.002</fileName><purpose>4</purpose><editionNumber>4</editionNumber><updateNumber>2</updateNumber><issueDate>2024-10-16</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata><datasetDiscoveryMetadata><S100_DatasetDiscoveryMetadata><fileName>101AA00TEST.003</fileName><purpose>5</purpose><editionNumber>4</editionNumber><updateNumber>3</updateNumber><issueDate>2024-10-17</issueDate><productSpecification><version>2.0</version><productIdentifier>S-101</productIdentifier><number>214</number></productSpecification><dataCoverage><boundingPolygon/><optimumDisplayScale>12000</optimumDisplayScale><maximumDisplayScale>6000</maximumDisplayScale><minimumDisplayScale>45000</minimumDisplayScale></dataCoverage></S100_DatasetDiscoveryMetadata></datasetDiscoveryMetadata></S100_ExchangeCatalogue>"#;
         let base_bytes = fixture("1", "4.002", "101AA00TEST.002");
         let memory = MemoryDataSource::new()
-            .with("/mem/xs/101AA00TEST.002", base_bytes.clone())
+            .with(mem("/mem/xs/101AA00TEST.002"), base_bytes.clone())
             .with(
-                "/mem/xs/101AA00TEST.003",
+                mem("/mem/xs/101AA00TEST.003"),
                 fixture("2", "0", "101AA00TEST.003"),
             )
-            .with("/mem/xs/OTHER.000", Vec::new())
-            .with("/mem/xs/CATALOG.XML", xml.as_bytes().to_vec());
-        let base = PathBuf::from("/mem/xs/101AA00TEST.002");
-        let cancel = PathBuf::from("/mem/xs/101AA00TEST.003");
+            .with(mem("/mem/xs/OTHER.000"), Vec::new())
+            .with(mem("/mem/xs/CATALOG.XML"), xml.as_bytes().to_vec());
+        let base = mem("/mem/xs/101AA00TEST.002");
+        let cancel = mem("/mem/xs/101AA00TEST.003");
         // Sibling discovery through the source.
         assert_eq!(
             expand_candidates_in(&memory, std::slice::from_ref(&cancel), &[]).unwrap(),

@@ -66,6 +66,12 @@ ferrite-xslt = { path = "../ferrite-xslt" }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ferrite-s421 = { path = "../ferrite-s421" }
 
+# ARMv8 SHA-256 instructions (runtime-detected) for the portrayal cache check,
+# as the root package selects for the viewer: without it, builds of the engine
+# alone (CLI, C ABI, examples) hash cache payloads in software.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

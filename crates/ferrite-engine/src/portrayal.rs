@@ -1,7 +1,7 @@
 //! S-101 cell portrayal through the catalogue's Lua rules, with per-cell
 //! instruction caches.
 use crate::platform::{CacheStore, DataSource, Executor};
-use crate::portrayal_cache::{encode_cache_payload, verify_and_deserialize_cache, wrap_cache};
+use crate::portrayal_cache::{encode_cache_payload, read_and_deserialize_cache, wrap_cache};
 use crate::{primary_viewing_layers, secure_instruction_cache};
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
@@ -161,8 +161,7 @@ pub fn read_cell_cache(
     {
         return None;
     }
-    let data = caches.store.read(path).ok()?;
-    match verify_and_deserialize_cache(&data) {
+    match read_and_deserialize_cache(caches.store, path).ok()? {
         Ok(instructions) => {
             caches.store.mark_used(path);
             Some(instructions)
@@ -381,16 +380,14 @@ fn precomputed_portrayal_for_cells<'a>(
             )
         };
         let key = precomputed.key(fc, pc, cell_index).with_context(missing)?;
-        let data = precomputed
-            .store
-            .read(&key)
-            .with_context(|| format!("{} [{}]", missing(), key.display()))?;
-        let mut instructions = verify_and_deserialize_cache(&data).map_err(|error| {
-            anyhow::anyhow!(
-                "Precomputed portrayal of {} rejected: {error}",
-                cell.file_path.display()
-            )
-        })?;
+        let mut instructions = read_and_deserialize_cache(precomputed.store, &key)
+            .with_context(|| format!("{} [{}]", missing(), key.display()))?
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Precomputed portrayal of {} rejected: {error}",
+                    cell.file_path.display()
+                )
+            })?;
         renumber_stored(&mut instructions, cell_index);
         Ok::<_, anyhow::Error>(instructions)
     });

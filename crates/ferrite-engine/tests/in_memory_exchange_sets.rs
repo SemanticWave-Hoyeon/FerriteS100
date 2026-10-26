@@ -38,6 +38,11 @@ fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// A platform-absolute in-memory key (memory paths are authorization keys).
+fn mem(path: &str) -> PathBuf {
+    ferrite_engine::platform::memory_path(path)
+}
+
 fn present(paths: &[&str]) -> bool {
     let root = repository();
     let ok = paths.iter().all(|p| root.join(p).exists())
@@ -57,7 +62,7 @@ fn catalogues() -> MemoryDataSource {
             .copy_tree(
                 &NativeDataSource,
                 &root.join("Catalogues").join(product),
-                &Path::new("/m/Catalogues").join(product),
+                &mem("/m/Catalogues").join(product),
             )
             .unwrap();
     }
@@ -87,7 +92,7 @@ fn required(platform: Platform, catalogues: impl Into<PathBuf>) -> ChartEngine {
 fn memory_engine(memory: MemoryDataSource, user: &MemoryUserStore) -> ChartEngine {
     let mut platform = Platform::in_memory(memory).with_clock(clock());
     platform.user = Arc::new(user.clone());
-    required(platform, "/m/Catalogues")
+    required(platform, mem("/m/Catalogues"))
 }
 
 fn native_engine(history: &Path) -> ChartEngine {
@@ -145,13 +150,13 @@ fn required_signatures_plan_in_memory_exchange_sets_like_the_native_folder_path(
 
         let mut memory = catalogues();
         memory
-            .copy_tree(&NativeDataSource, &root.join(&folder), Path::new("/xs"))
+            .copy_tree(&NativeDataSource, &root.join(&folder), &mem("/xs"))
             .unwrap();
         assert!(!memory.local_paths());
         let user = MemoryUserStore::default();
         let mut engine = memory_engine(memory, &user);
         let report = engine
-            .open_blocking(DatasetSource::Folder("/xs".into()))
+            .open_blocking(DatasetSource::Folder(mem("/xs")))
             .unwrap();
 
         assert!(!report.datasets.is_empty(), "{report:#?}");
@@ -169,7 +174,7 @@ fn required_signatures_plan_in_memory_exchange_sets_like_the_native_folder_path(
         assert!(engine
             .datasets()
             .iter()
-            .all(|d| d.source.as_ref().is_some_and(|p| p.starts_with("/xs"))));
+            .all(|d| d.source.as_ref().is_some_and(|p| p.starts_with(mem("/xs")))));
         assert!(!temp.path().join("history.json").exists());
     }
     // The whole May set: ed2 of 101FR00571300 supersedes its edition 1
@@ -179,12 +184,12 @@ fn required_signatures_plan_in_memory_exchange_sets_like_the_native_folder_path(
         .copy_tree(
             &NativeDataSource,
             &root.join(SHOM_MAY).join(ED1ER2),
-            Path::new("/xs"),
+            &mem("/xs"),
         )
         .unwrap();
     let mut engine = memory_engine(memory, &MemoryUserStore::default());
     engine
-        .open_blocking(DatasetSource::Folder("/xs".into()))
+        .open_blocking(DatasetSource::Folder(mem("/xs")))
         .unwrap();
     let cell = &engine.state().cells[0];
     assert_eq!(cell.dsid.dataset_name, "101FR00571300.000");
@@ -199,7 +204,7 @@ fn ed1er2_source() -> MemoryDataSource {
         .copy_tree(
             &NativeDataSource,
             &repository().join(SHOM_MAY).join(ED1ER2),
-            Path::new("/xs/load"),
+            &mem("/xs/load"),
         )
         .unwrap();
     memory
@@ -213,13 +218,13 @@ fn tampered_update_in_memory_is_rejected() {
         return;
     }
     let mut memory = ed1er2_source();
-    let mut bytes = memory.read(Path::new(UPDATE_2)).unwrap();
+    let mut bytes = memory.read(&mem(UPDATE_2)).unwrap();
     let at = bytes.len() / 2;
     bytes[at] ^= 0x01;
-    memory.insert(UPDATE_2, bytes);
+    memory.insert(mem(UPDATE_2), bytes);
     let mut engine = memory_engine(memory, &MemoryUserStore::default());
     let error = engine
-        .open_blocking(DatasetSource::Folder("/xs".into()))
+        .open_blocking(DatasetSource::Folder(mem("/xs")))
         .err()
         .expect("tampered update rejected");
     assert!(format!("{error:#}").contains("signature"), "{error:#}");
@@ -228,16 +233,14 @@ fn tampered_update_in_memory_is_rejected() {
     // Removing the update from the exchange set does not downgrade either.
     let complete = ed1er2_source();
     let mut missing = MemoryDataSource::new();
-    for entry in complete.walk(Path::new("/")).filter_map(Result::ok) {
-        if entry.kind == ferrite_engine::platform::EntryKind::File
-            && entry.path != Path::new(UPDATE_2)
-        {
+    for entry in complete.walk(&mem("/")).filter_map(Result::ok) {
+        if entry.kind == ferrite_engine::platform::EntryKind::File && entry.path != mem(UPDATE_2) {
             missing.insert(entry.path.clone(), complete.read(&entry.path).unwrap());
         }
     }
     let mut engine = memory_engine(missing, &MemoryUserStore::default());
     assert!(engine
-        .open_blocking(DatasetSource::Folder("/xs".into()))
+        .open_blocking(DatasetSource::Folder(mem("/xs")))
         .is_err());
 }
 
@@ -335,9 +338,15 @@ fn signed_cancellation(memory: &mut MemoryDataSource) -> (String, Vec<u8>) {
         "<se:StandaloneDigitalSignature xmlns:se=\"{SE}\"><se:filename>CATALOG.XML</se:filename><se:certificates>{container}</se:certificates><se:digitalSignature id=\"CAT\" certificateRef=\"LEAF\">{}</se:digitalSignature></se:StandaloneDigitalSignature>",
         sign(&leaf_key, catalogue.as_bytes())
     );
-    memory.insert(CANCEL, data);
-    memory.insert("/xs/cancel/S100_ROOT/CATALOG.XML", catalogue.into_bytes());
-    memory.insert("/xs/cancel/S100_ROOT/CATALOG.SIGN", signature.into_bytes());
+    memory.insert(mem(CANCEL), data);
+    memory.insert(
+        mem("/xs/cancel/S100_ROOT/CATALOG.XML"),
+        catalogue.into_bytes(),
+    );
+    memory.insert(
+        mem("/xs/cancel/S100_ROOT/CATALOG.SIGN"),
+        signature.into_bytes(),
+    );
     ("TEST".into(), root.to_pem().unwrap())
 }
 
@@ -351,20 +360,20 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
     let user = MemoryUserStore::default();
     let mut platform = Platform::in_memory(memory).with_clock(clock());
     platform.user = Arc::new(user.clone());
-    let mut config = EngineConfig::new(platform, "/m/Catalogues");
+    let mut config = EngineConfig::new(platform, mem("/m/Catalogues"));
     config.signatures = SignaturePolicy::Required;
     config.trust_anchors = vec![iho(), anchor];
     let mut engine = ChartEngine::new(config).unwrap();
 
     let report = engine
-        .open_blocking(DatasetSource::Folder("/xs/load".into()))
+        .open_blocking(DatasetSource::Folder(mem("/xs/load")))
         .unwrap();
     assert_eq!(report.datasets.len(), 1, "{report:#?}");
     assert!(engine.cancellation_history().unwrap().is_empty());
 
     // A cancellation discovered in a folder is never applied.
     let report = engine
-        .open_blocking(DatasetSource::Folder("/xs/cancel".into()))
+        .open_blocking(DatasetSource::Folder(mem("/xs/cancel")))
         .unwrap();
     assert!(report.cancellations.is_empty());
     assert!(report
@@ -377,7 +386,7 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
     // Explicitly selected: verified, validated against the loaded edition 1
     // update 2 (authenticated issueDate 2026-03-24), applied and recorded.
     let report = engine
-        .open_blocking(DatasetSource::Files(vec![CANCEL.into()]))
+        .open_blocking(DatasetSource::Files(vec![mem(CANCEL)]))
         .unwrap();
     assert!(report.issues.is_empty(), "{:#?}", report.issues);
     assert_eq!(report.cancellations.len(), 1, "{report:#?}");
@@ -395,7 +404,7 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
 
     // The cancelled name with its older issueDate cannot come back.
     let error = engine
-        .open_blocking(DatasetSource::Folder("/xs/load".into()))
+        .open_blocking(DatasetSource::Folder(mem("/xs/load")))
         .err()
         .expect("reuse rejected");
     assert!(
@@ -405,7 +414,7 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
     assert!(engine.state().cells.is_empty());
     // Selected explicitly, the stale chain is skipped with a notice.
     let report = engine
-        .open_blocking(DatasetSource::Files(vec![PathBuf::from(UPDATE_2)]))
+        .open_blocking(DatasetSource::Files(vec![mem(UPDATE_2)]))
         .unwrap();
     assert!(report.datasets.is_empty(), "{report:#?}");
     assert!(report
@@ -419,13 +428,13 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
     let anchor = signed_cancellation(&mut memory);
     let mut platform = Platform::in_memory(memory).with_clock(clock());
     platform.user = Arc::new(user.clone());
-    let mut config = EngineConfig::new(platform, "/m/Catalogues");
+    let mut config = EngineConfig::new(platform, mem("/m/Catalogues"));
     config.signatures = SignaturePolicy::Required;
     config.trust_anchors = vec![anchor];
     let mut engine = ChartEngine::new(config).unwrap();
     assert_eq!(engine.cancellation_history().unwrap().records().count(), 1);
     let report = engine
-        .open_blocking(DatasetSource::Files(vec![CANCEL.into()]))
+        .open_blocking(DatasetSource::Files(vec![mem(CANCEL)]))
         .unwrap();
     // A fresh synthetic producer signs different bytes than the recorded
     // one; the record itself (key, edition, update, date) is the same.
@@ -442,43 +451,42 @@ fn s421_route_is_captured_from_memory() {
     }
     let bytes = std::fs::read(root.join(S421_ROUTE)).unwrap();
     let mut memory = catalogues();
-    memory.insert("/routes/RTE-TEST-GMIN.s421.gml", bytes.clone());
+    memory.insert(mem("/routes/RTE-TEST-GMIN.s421.gml"), bytes.clone());
 
     let (routes, notices) =
-        ferrite_engine::s421_dataset_input::discover_routes_in(&memory, Path::new("/routes"))
-            .unwrap();
+        ferrite_engine::s421_dataset_input::discover_routes_in(&memory, &mem("/routes")).unwrap();
     assert!(notices.is_empty(), "{notices:?}");
     assert_eq!(routes.len(), 1);
     assert_eq!(
         routes[0].path(),
-        Path::new("/routes/RTE-TEST-GMIN.s421.gml")
+        mem("/routes/RTE-TEST-GMIN.s421.gml").as_path()
     );
     assert_eq!(routes[0].allowed_xml(false).unwrap().as_bytes(), &bytes[..]);
 
     let mut engine = ChartEngine::new(EngineConfig::new(
         Platform::in_memory(memory.clone()),
-        "/m/Catalogues",
+        mem("/m/Catalogues"),
     ))
     .unwrap();
     let report = engine
-        .open_blocking(DatasetSource::Folder("/routes".into()))
+        .open_blocking(DatasetSource::Folder(mem("/routes")))
         .unwrap();
     assert_eq!(engine.routes().len(), 1, "{report:#?}");
     assert_eq!(engine.routes()[0].sha256(), routes[0].sha256());
     assert!(report.notices.iter().any(|n| n.contains("S-421 route")));
     // Opening it again is a no-op.
     let report = engine
-        .open_blocking(DatasetSource::Files(vec![
-            "/routes/RTE-TEST-GMIN.s421.gml".into()
-        ]))
+        .open_blocking(DatasetSource::Files(vec![mem(
+            "/routes/RTE-TEST-GMIN.s421.gml",
+        )]))
         .unwrap();
     assert_eq!(engine.routes().len(), 1);
     assert!(report.notices.iter().any(|n| n.contains("Already open")));
 
     // Required signatures: bare GML routes are not admitted.
-    let mut engine = required(Platform::in_memory(memory), "/m/Catalogues");
+    let mut engine = required(Platform::in_memory(memory), mem("/m/Catalogues"));
     let report = engine
-        .open_blocking(DatasetSource::Folder("/routes".into()))
+        .open_blocking(DatasetSource::Folder(mem("/routes")))
         .unwrap();
     assert!(engine.routes().is_empty());
     assert!(

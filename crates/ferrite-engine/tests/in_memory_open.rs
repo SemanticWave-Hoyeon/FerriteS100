@@ -15,6 +15,11 @@ fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// A platform-absolute in-memory key (memory paths are authorization keys).
+fn mem(path: &str) -> PathBuf {
+    ferrite_engine::platform::memory_path(path)
+}
+
 /// Everything the engine reads, under paths that exist nowhere on disk.
 fn memory_source(root: &Path) -> MemoryDataSource {
     let native = NativeDataSource;
@@ -24,17 +29,17 @@ fn memory_source(root: &Path) -> MemoryDataSource {
             .copy_tree(
                 &native,
                 &root.join("Catalogues").join(product),
-                &Path::new("/in-memory/Catalogues").join(product),
+                &mem("/in-memory/Catalogues").join(product),
             )
             .unwrap();
         assert!(copied > 0, "{product}");
     }
     memory.insert(
-        "/in-memory/data/101FR00369400.000",
+        mem("/in-memory/data/101FR00369400.000"),
         std::fs::read(root.join(S101_CELL)).unwrap(),
     );
     memory.insert(
-        "/in-memory/data/124GB00S1Y2026N36.GML",
+        mem("/in-memory/data/124GB00S1Y2026N36.GML"),
         std::fs::read(root.join(S124_DATASET)).unwrap(),
     );
     memory
@@ -53,14 +58,14 @@ fn opens_and_prepares_a_scene_entirely_from_memory() {
     let cache = std::sync::Arc::new(ferrite_engine::platform::MemoryCacheStore::default());
     let platform = platform.with_cache(cache.clone());
     let mut engine =
-        ChartEngine::new(EngineConfig::new(platform, "/in-memory/Catalogues")).unwrap();
+        ChartEngine::new(EngineConfig::new(platform, mem("/in-memory/Catalogues"))).unwrap();
     assert!(
         engine.overlays().s124.is_some(),
         "{:?}",
         engine.catalogue_errors()
     );
 
-    let job = engine.open(DatasetSource::Folder("/in-memory/data".into()));
+    let job = engine.open(DatasetSource::Folder(mem("/in-memory/data")));
     let report = engine.install(job.wait().unwrap()).unwrap();
     let products: Vec<_> = report.datasets.iter().map(|d| d.product.as_str()).collect();
     assert_eq!(products, ["S-101", "S-124"], "{report:#?}");
@@ -76,7 +81,7 @@ fn opens_and_prepares_a_scene_entirely_from_memory() {
     assert_eq!(cell.id, DatasetId::Cell(0));
     assert_eq!(
         cell.source.as_deref(),
-        Some(Path::new("/in-memory/data/101FR00369400.000"))
+        Some(mem("/in-memory/data/101FR00369400.000").as_path())
     );
     assert!(cell.features > 0);
     assert!(!engine.feature_types(DatasetId::Cell(0)).is_empty());
@@ -117,8 +122,8 @@ fn opens_and_prepares_a_scene_entirely_from_memory() {
     let report = engine.feature(hit.into()).expect("feature report");
     assert!(!report.feature_type.is_empty());
     assert_eq!(
-        report.source.as_deref(),
-        Some("/in-memory/data/101FR00369400.000")
+        report.source.as_deref().map(Path::new),
+        Some(mem("/in-memory/data/101FR00369400.000").as_path())
     );
 }
 
@@ -133,12 +138,12 @@ fn unsigned_s101_from_memory_is_rejected_under_required_signatures() {
     }
     let mut config = EngineConfig::new(
         Platform::in_memory(memory_source(&root)),
-        "/in-memory/Catalogues",
+        mem("/in-memory/Catalogues"),
     );
     config.signatures = ferrite_engine::chart_engine::SignaturePolicy::Required;
     let mut engine = ChartEngine::new(config).unwrap();
     let error = engine
-        .open(DatasetSource::Folder("/in-memory/data".into()))
+        .open(DatasetSource::Folder(mem("/in-memory/data")))
         .wait()
         .err()
         .expect("rejected");
@@ -163,7 +168,7 @@ fn signed_exchange_source(root: &Path) -> MemoryDataSource {
             .copy_tree(
                 &native,
                 &root.join("Catalogues").join(product),
-                &Path::new("/in-memory/Catalogues").join(product),
+                &mem("/in-memory/Catalogues").join(product),
             )
             .unwrap();
     }
@@ -171,7 +176,7 @@ fn signed_exchange_source(root: &Path) -> MemoryDataSource {
         .copy_tree(
             &native,
             &root.join(S124_EXCHANGE),
-            Path::new("/in-memory/xs/S100_ROOT"),
+            &mem("/in-memory/xs/S100_ROOT"),
         )
         .unwrap();
     assert!(copied >= 7, "{copied}");
@@ -190,14 +195,14 @@ fn open_signed(
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
         )));
     }
-    let mut config = EngineConfig::new(platform, "/in-memory/Catalogues");
+    let mut config = EngineConfig::new(platform, mem("/in-memory/Catalogues"));
     config.signatures = ferrite_engine::chart_engine::SignaturePolicy::Required;
     config.trust_anchors = vec![(
         "IHO".into(),
         std::fs::read(root.join("Trust/IHO-S100-5.2.pem")).unwrap(),
     )];
     let mut engine = ChartEngine::new(config).unwrap();
-    let job = engine.open(DatasetSource::Folder("/in-memory/xs".into()));
+    let job = engine.open(DatasetSource::Folder(mem("/in-memory/xs")));
     engine.install(job.wait().unwrap()).unwrap()
 }
 
@@ -231,7 +236,7 @@ fn required_signatures_verify_an_in_memory_exchange_set() {
 
     // One altered byte in one dataset: the exchange set no longer verifies.
     let mut tampered = memory.clone();
-    let dataset = Path::new("/in-memory/xs/S100_ROOT/S-124/DATASET_FILES/124GB00S1Y2026N36.GML");
+    let dataset = &mem("/in-memory/xs/S100_ROOT/S-124/DATASET_FILES/124GB00S1Y2026N36.GML");
     let mut bytes = memory.read(dataset).unwrap();
     let at = bytes.len() / 2;
     bytes[at] ^= 0x20;
