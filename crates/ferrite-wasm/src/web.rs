@@ -91,17 +91,29 @@ impl WebEngine {
     }
 
     /// Names of the cache entries the next portrayal reads that the page's
-    /// cache does not hold (JSON array): the per-cell Lua portrayal caches
-    /// of the opened cells for the current display. A page with a
-    /// persistent cache (IndexedDB) loads them with
+    /// cache does not hold (JSON array): the S-102 rule instructions, the
+    /// precomputed payloads of the opened cells and, when the preparation
+    /// portrays with Lua, the per-cell Lua portrayal caches for the current
+    /// display. When payload names (`.ferrite_pre_*`) are listed, call again
+    /// after loading them (whether Lua runs depends on what was found). A
+    /// page with a persistent cache (IndexedDB) loads them with
     /// [`WebEngine::load_cache_entry`] before [`WebEngine::set_view`] /
     /// [`WebEngine::prepare`] and saves [`WebEngine::take_cache_writes`]
-    /// afterwards.
+    /// (and the payloads it was given) afterwards.
     pub fn missing_cache_entries(&mut self) -> String {
         serde_json::json!(self.core.missing_cache_entries()).to_string()
     }
 
-    /// Store a cache entry saved by an earlier page (`.ferrite_*` name).
+    /// Estimated instruction count from which only the cells near the view
+    /// are portrayed (residency; 0 always); negative or NaN restores the
+    /// engine default.
+    pub fn set_residency_threshold(&mut self, threshold: f64) {
+        self.core
+            .set_residency_threshold((threshold >= 0.).then_some(threshold as usize));
+    }
+
+    /// Store a cache entry saved by an earlier page (`.ferrite_*` name; a
+    /// `.ferrite_pre_*` payload counts as loaded).
     pub fn load_cache_entry(&mut self, name: &str, bytes: &[u8]) -> Result<(), JsError> {
         self.core.load_cache_entry(name, bytes).map_err(js_error)
     }
@@ -374,6 +386,18 @@ impl WebCanvas {
         } else {
             format!("{} ({backend})", state.gpu_name)
         }
+    }
+
+    /// Stage timings of the last frame's emission (JSON: `view_only`,
+    /// `setup_ms`, `prefill_ms`, `bathymetry_ms`, `instructions_ms`).
+    pub fn emit_timings(&self) -> String {
+        self.emitter.timings().to_json().to_string()
+    }
+
+    /// Whether frames of a re-projected scene reuse the scene's emission
+    /// set-up (default true; false sets every frame up again, to compare).
+    pub fn set_view_only_reuse(&mut self, reuse: bool) {
+        self.emitter.set_view_only_reuse(reuse);
     }
 
     /// Match the drawing buffer to `width` x `height` physical pixels.

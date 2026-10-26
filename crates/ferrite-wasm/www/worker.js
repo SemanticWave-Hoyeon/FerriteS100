@@ -2,7 +2,11 @@
 // portrayal (Lua), opening and drawing into the OffscreenCanvas the page
 // transferred. Requests are { id, op, args } and run one at a time in
 // arrival order; replies are { id, ok, result } or { id, ok: false, error }.
-import { EngineHost } from "./host.js";
+import { EngineHost, simulate } from "./host.js";
+
+// Test hook (?simulate=... of the page, passed in this module's URL): see
+// engine-client.js. Applied before the engine or the GPU is touched.
+simulate(new URL(import.meta.url).searchParams.get("simulate"), "worker");
 
 const host = new EngineHost();
 let queue = Promise.resolve();

@@ -66,13 +66,20 @@ function canUseWorker(canvas) {
 
 // mode: "auto" (worker when it can render with the requested backend),
 // "on" (worker, still falling back on failure) or "off" (main thread).
-export async function connect({ canvas, backend, density, mode = "auto", persistentCache = true, log = () => {} }) {
+// options: further EngineHost.start options (residency, viewReuse,
+// cacheBudget). simulate: the test flags of host.js `simulate` (applied to
+// the page by the caller before connecting; passed on to the worker).
+export async function connect({ canvas, backend, density, mode = "auto", persistentCache = true, options = {},
+  simulate = "", log = () => {} }) {
   const width = canvas.width;
   const height = canvas.height;
+  const fallbacks = [];
   if (mode !== "off" && canUseWorker(canvas)) {
     let worker = null;
     try {
-      worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+      const url = new URL("./worker.js", import.meta.url);
+      if (simulate) url.searchParams.set("simulate", simulate);
+      worker = new Worker(url, { type: "module" });
       const engine = new WorkerEngine(worker);
       const ready = await Promise.race([
         engine.ready,
@@ -88,8 +95,9 @@ export async function connect({ canvas, backend, density, mode = "auto", persist
       const offscreen = canvas.transferControlToOffscreen();
       try {
         const info = await engine.callTransfer("start",
-          [{ canvas: offscreen, density, backend: workerBackend, persistentCache }], [offscreen]);
-        return { kind: "worker", canvas, info: { ...info, workerWebGpu: ready.webgpu }, call: engine.call.bind(engine) };
+          [{ ...options, canvas: offscreen, density, backend: workerBackend, persistentCache }], [offscreen]);
+        return { kind: "worker", canvas, info: { ...info, workerWebGpu: ready.webgpu }, fallbacks,
+          call: engine.call.bind(engine) };
       } catch (error) {
         // The canvas belongs to the failed worker now: use a fresh one.
         const fresh = canvas.cloneNode(false);
@@ -101,11 +109,14 @@ export async function connect({ canvas, backend, density, mode = "auto", persist
       }
     } catch (error) {
       worker?.terminate();
+      fallbacks.push(String(error.message ?? error));
       log(`Worker rendering unavailable (${error.message ?? error}); using the main thread`);
     }
+  } else if (mode !== "off") {
+    fallbacks.push("no OffscreenCanvas or module workers");
   }
   const engine = new LocalEngine();
   if (!canvas.id) canvas.id = "chart";
-  const info = await engine.call("start", { canvas: canvas.id, density, backend, persistentCache });
-  return { kind: "main", canvas, info, call: engine.call.bind(engine) };
+  const info = await engine.call("start", { ...options, canvas: canvas.id, density, backend, persistentCache });
+  return { kind: "main", canvas, info, fallbacks, call: engine.call.bind(engine) };
 }

@@ -3,6 +3,7 @@
 // when the browser cannot render from workers (engine-client.js); either
 // way the page talks to it through `engine.call(op, ...)`.
 import { connect } from "./engine-client.js";
+import { simulate } from "./host.js";
 
 const $ = (id) => document.getElementById(id);
 let canvas = $("chart");
@@ -24,8 +25,19 @@ const backend = BACKENDS.includes(params.get("backend")) ? params.get("backend")
 // Engine thread: ?worker=auto|on|off.
 const WORKER_MODES = ["auto", "on", "off"];
 const workerMode = WORKER_MODES.includes(params.get("worker")) ? params.get("worker") : "auto";
-// Persistent portrayal cache: ?cache=0 disables it.
+// Persistent portrayal cache: ?cache=0 disables it; ?cachebudget=MB sets
+// its least-recently-used byte budget (default 512 MiB).
 const persistentCache = params.get("cache") !== "0";
+const cacheBudget = Number(params.get("cachebudget")) > 0 ? Number(params.get("cachebudget")) * 1e6 : null;
+// Residency threshold (estimated instructions; 0: always): ?residency=N.
+const residency = params.has("residency") && Number.isFinite(Number(params.get("residency")))
+  ? Number(params.get("residency")) : null;
+// ?viewreuse=0: re-projected frames set the emission up again (comparisons).
+const viewReuse = params.get("viewreuse") !== "0";
+// Test hook for the engine-thread fallbacks: ?simulate=no-webgpu,
+// no-offscreen, no-worker-gpu, worker-gpu-fail (see host.js `simulate`).
+const simulated = params.get("simulate") ?? "";
+simulate(simulated, "page");
 let adapter = "";
 
 const mercY = (lat) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
@@ -147,20 +159,27 @@ async function renderOnce() {
     const timing = {
       prepare: frame.prepareMs, draw: frame.drawMs, total, reprojected: summary.reprojected,
       portrayal: summary.portrayal, instructions: summary.instructions, cacheReads: summary.cache_reads,
-      preload: frame.preload, saved: frame.saved, uiMaxGap: ui.maxGap, longTask, probeMax: probing ? ui.probeMax : null, thread: engine.kind,
+      resident: summary.resident_cells, cells: summary.cells, zoom: summary.zoom, emit: frame.emit,
+      memory: frame.memory, preload: frame.preload, saved: frame.saved, uiMaxGap: ui.maxGap, longTask,
+      probeMax: probing ? ui.probeMax : null, thread: engine.kind,
     };
     timings.push(timing);
     const source = summary.portrayal == null ? "" :
       ` · S-101 ${summary.portrayal === "lua" ? "Lua" : "precomputed"}`;
     const s102 = summary.bathymetry_files ? ` · S-102 ${summary.bathymetry_files} file(s)` : "";
     const resident = summary.resident_cells == null ? "" : ` · ${summary.resident_cells}/${summary.cells} cells resident`;
-    const cache = frame.preload ? ` · cache ${frame.preload.loaded}/${frame.preload.wanted} from IndexedDB` : "";
-    const savedText = frame.saved?.saved ? `, ${frame.saved.saved} saved` : "";
+    const kinds = (counts) => Object.entries(counts ?? {}).map(([k, n]) => `${n} ${k}`).join(", ");
+    const cache = frame.preload ? ` · cache ${frame.preload.loaded}/${frame.preload.wanted} from IndexedDB` +
+      `${frame.preload.loaded ? ` (${kinds(frame.preload.kinds)})` : ""}, ${summary.cache_reads} read` : "";
+    const savedText = frame.saved?.saved ? `, ${frame.saved.saved} saved (${kinds(frame.saved.kinds)})` : "";
+    const emitText = frame.emit ? ` (emit ${frame.emit.instructions_ms.toFixed(0)}` +
+      `${frame.emit.view_only ? ", view-only" : `, set-up ${(frame.emit.setup_ms + frame.emit.prefill_ms).toFixed(0)}`})` : "";
+    const memory = frame.memory?.wasmBytes ? ` · wasm ${(frame.memory.wasmBytes / 2 ** 20).toFixed(0)} MiB` : "";
     $("hud").textContent = `${adapter} · ${engine.kind === "worker" ? "worker" : "main thread"}${source}${s102} · ` +
       `${summary.instructions} instructions · 1:${Math.round(summary.display_scale)} · ` +
       `zoom ${summary.zoom.toFixed(2)} · ${camera.lat.toFixed(4)}, ${camera.lon.toFixed(4)}${resident} · ` +
       `${summary.reprojected ? "view" : "portray"} ${frame.prepareMs.toFixed(0)} ms, draw ${frame.drawMs.toFixed(0)} ms` +
-      `${cache}${savedText} · UI max frame gap ${ui.maxGap.toFixed(0)} ms, ` +
+      `${emitText}${cache}${savedText}${memory} · UI max frame gap ${ui.maxGap.toFixed(0)} ms, ` +
       `longest main-thread task ${longTask.toFixed(0)} ms` +
       `${probing ? `, longest block ${ui.probeMax.toFixed(0)} ms` : ""}`;
   } catch (error) {
@@ -199,8 +218,8 @@ async function showReport() {
 async function addFiles(files) {
   let message;
   try {
-    const { payloads, data, report, openMs } = await engine.call("addFiles", files);
-    message = `${payloads} precomputed payload(s) stored`;
+    const { payloads, kept, data, report, openMs } = await engine.call("addFiles", files);
+    message = `${payloads} precomputed payload(s) stored` + (kept ? ` (${kept} kept in IndexedDB)` : "");
     if (report) {
       opened += report.datasets.length;
       const bathymetry = report.bathymetry?.length ?? 0;
@@ -360,6 +379,7 @@ async function main() {
   $("thread").value = workerMode;
   const notices = [];
   engine = await connect({ canvas, backend, density: dpr, mode: workerMode, persistentCache,
+    options: { residency, viewReuse, cacheBudget }, simulate: simulated,
     log: (text) => notices.push(text) });
   canvas = engine.canvas;
   const { info } = engine;
@@ -374,12 +394,15 @@ async function main() {
     `${engine.kind === "worker" ? "worker (OffscreenCanvas)" : "main thread"}, ` +
     `S-101 ${info.lua ? "Lua portrayal in the browser" : "precomputed payloads only"}, ` +
     `portrayal cache: ${info.cache}` +
+    `${simulated ? `\nSimulating: ${simulated}` : ""}` +
     `${notices.length ? `\n${notices.join("\n")}` : ""}` +
     `${info.notes.length ? `\n${info.notes.join("\n")}` : ""}\nDrop files or load the samples.`);
   // For scripted checks: the engine connection, the camera, frame timings
   // and the main-thread frame monitor.
   window.ferrite = {
-    engine, camera, timings, render, ui, loadSamples,
+    engine, camera, timings, render, ui, loadSamples, simulated,
+    // The current frame as image bytes (see host.js `snapshot`).
+    snapshot: (type, quality) => engine.call("snapshot", type, quality),
     setPortrayal: async (v) => { await engine.call("setPortrayal", v); $("portrayal").value = v; },
     setCamera: (lat, lon, zoom) => {
       Object.assign(camera, { lat, lon, zoom }); cameraVersion++; return render();

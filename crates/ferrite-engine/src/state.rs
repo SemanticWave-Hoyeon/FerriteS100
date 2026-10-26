@@ -151,6 +151,10 @@ pub struct EngineState {
     /// Write precomputed payloads of every cell portrayed with Lua to the
     /// platform cache store (see [`PrecomputedCells`]).
     pub precomputed_export: bool,
+    /// Residency estimate threshold of this state; None: the process-wide
+    /// [`Self::residency_threshold`] (hosts without environment variables,
+    /// such as the web, set it here).
+    pub residency_threshold_override: Option<usize>,
 }
 
 impl EngineState {
@@ -222,6 +226,7 @@ impl EngineState {
             platform,
             portrayal_source: PortrayalSource::default(),
             precomputed_export: false,
+            residency_threshold_override: None,
         }
     }
 
@@ -726,7 +731,10 @@ impl EngineState {
         let estimate: usize = (0..self.cells.len())
             .map(|i| self.cell_feature_count(i) * 5)
             .sum();
-        if estimate < Self::residency_threshold() {
+        let threshold = self
+            .residency_threshold_override
+            .unwrap_or_else(Self::residency_threshold);
+        if estimate < threshold {
             return None;
         }
         let size = viewport?;

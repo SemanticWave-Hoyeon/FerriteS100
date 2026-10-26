@@ -462,6 +462,14 @@ impl ChartEngine {
         self.s102 = options;
     }
 
+    /// Estimated instruction count from which preparations portray only the
+    /// cells near the view (residency); None restores the default
+    /// (`FERRITE_RESIDENCY_THRESHOLD` or 1,500,000; 0 always activates it).
+    /// Applies from the next [`Self::prepare`].
+    pub fn set_residency_threshold(&mut self, threshold: Option<usize>) {
+        self.state.residency_threshold_override = threshold;
+    }
+
     /// The chart state (cells, catalogues, coverage).
     pub fn state(&self) -> &EngineState {
         &self.state
@@ -1138,6 +1146,35 @@ impl ChartEngine {
             .cell_instruction_cache_paths(Some(&self.display.settings));
         self.state.current_profile_name = previous;
         paths.into_iter().flatten().flatten().collect()
+    }
+
+    /// Cache-store entries of precomputed payloads
+    /// ([`crate::portrayal::PrecomputedCells`]) for the opened S-101 cells
+    /// with the current display, i.e. what a [`Self::prepare`] with
+    /// [`PortrayalSource::Precomputed`] reads; empty without cells or cache
+    /// store. A host keeping payloads in an asynchronous store loads these
+    /// before preparing.
+    pub fn precomputed_cell_entries(&self) -> Vec<PathBuf> {
+        let common =
+            EngineState::precomputed_common(Some(&self.display.settings), &self.display.profile);
+        let identities = self.state.cell_identities();
+        let cells = crate::portrayal::PrecomputedCells {
+            store: self.state.platform.cache.as_ref(),
+            common,
+            identities: &identities,
+            export: false,
+        };
+        (0..self.state.cells.len())
+            .filter_map(|index| cells.key(&self.state.fc, &self.state.pc, index))
+            .collect()
+    }
+
+    /// Cache-store entry of the S-102 portrayal rule's instructions the
+    /// next [`Self::prepare`] reads for the loaded bathymetry with the
+    /// current display (precomputed portrayal, or Lua with
+    /// [`crate::s102_scene::S102Options::reuse_rule_instructions`]).
+    pub fn s102_cache_entry(&self) -> Option<PathBuf> {
+        crate::s102_scene::s102_instruction_entry(&self.state, &self.display.settings)
     }
 
     /// Move `scene` to `view` without portraying again, as the viewer's

@@ -43,12 +43,20 @@ pub struct S102Options {
     pub depth_adjustments: Option<std::sync::Arc<[u8]>>,
     /// Raster tile edge in samples (keep within the GPU texture limit).
     pub tile_edge: usize,
+    /// With Lua portrayal, use the PC rule's instruction string from the
+    /// cache store when an intact entry for this PC and these contour
+    /// settings exists ([`s102_instruction_entry`]), and write it after
+    /// evaluating the rule otherwise; the rule is deterministic in those
+    /// inputs. Hosts with a persistent cache (the web's IndexedDB) then
+    /// skip Lua for S-102. Off by default.
+    pub reuse_rule_instructions: bool,
 }
 impl Default for S102Options {
     fn default() -> Self {
         Self {
             depth_adjustments: None,
             tile_edge: DEFAULT_TILE_EDGE,
+            reuse_rule_instructions: false,
         }
     }
 }
@@ -364,7 +372,37 @@ pub fn prepare_scene(
         Ok(BathymetryScene::default())
     }
     #[cfg(feature = "s102-pure")]
-    prepare(state, profile, settings, options.tile_edge)
+    prepare(
+        state,
+        profile,
+        settings,
+        options.tile_edge,
+        options.reuse_rule_instructions,
+    )
+}
+
+/// Cache-store entry of the S-102 PC rule's instruction string for the
+/// contour settings of `settings` (read by preparations of loaded
+/// bathymetry with [`crate::PortrayalSource::Precomputed`] or
+/// [`S102Options::reuse_rule_instructions`]); None without loaded S-102,
+/// S-102 PC or cache store.
+pub fn s102_instruction_entry(state: &EngineState, settings: &SettingsState) -> Option<PathBuf> {
+    #[cfg(not(feature = "s102-pure"))]
+    {
+        let _ = (state, settings);
+        None
+    }
+    #[cfg(feature = "s102-pure")]
+    {
+        if state.bathymetry.is_empty() {
+            return None;
+        }
+        instructions_key(
+            state.platform.cache.as_ref(),
+            state.s102_pc.as_ref()?,
+            depth_settings(settings),
+        )
+    }
 }
 
 /// Default raster tile edge (the viewer's default before its GPU limit).
@@ -622,10 +660,37 @@ mod opened {
         settings: DepthSettings,
         source: PortrayalSource,
         export: bool,
+        reuse: bool,
         store: &dyn CacheStore,
     ) -> Result<BathymetryPortrayal> {
+        // Reuse (a Lua build): an intact stored string stands for the rule's
+        // output whatever the S-101 source; anything else (missing,
+        // corrupt) evaluates the rule again.
         #[cfg(feature = "lua-native")]
-        if source == PortrayalSource::Lua {
+        if source == PortrayalSource::Lua || reuse {
+            if reuse {
+                if let Some(key) = instructions_key(store, pc, settings) {
+                    if let Ok(bytes) = store.read(&key) {
+                        match decode_instructions(&bytes).and_then(|text| {
+                            BathymetryPortrayal::from_bound_instructions(
+                                Arc::clone(pc),
+                                profile,
+                                settings,
+                                &text,
+                            )
+                        }) {
+                            Ok(portrayal) => {
+                                store.mark_used(&key);
+                                return Ok(portrayal);
+                            }
+                            Err(error) => tracing::warn!(
+                                "Stored S-102 instructions rejected ({error:#}); evaluating the rule"
+                            ),
+                        }
+                    }
+                }
+            }
+            let export = export || reuse;
             let portrayal =
                 BathymetryPortrayal::from_bound_catalogue(Arc::clone(pc), profile, settings)?;
             if export {
@@ -639,7 +704,7 @@ mod opened {
             }
             return Ok(portrayal);
         }
-        let _ = (source, export);
+        let _ = (source, export, reuse);
         let missing = "No precomputed S-102 portrayal instructions for this S-102 PC and \
                        contour settings in the cache store; export them with a lua-native \
                        build (ChartEngine::set_precomputed_export)";
@@ -661,6 +726,7 @@ mod opened {
         profile: &str,
         settings: &SettingsState,
         edge: usize,
+        reuse: bool,
     ) -> Result<BathymetryScene> {
         if state.bathymetry.is_empty() {
             return Ok(BathymetryScene::default());
@@ -677,6 +743,7 @@ mod opened {
             depth_settings(settings),
             state.portrayal_source,
             state.precomputed_export,
+            reuse,
             state.platform.cache.as_ref(),
         )?;
         let active_ic = settings

@@ -177,6 +177,9 @@ pub struct WebEngineCore {
     payloads: usize,
     /// Where the S-101 instructions of the current scene came from.
     used_source: Option<PortrayalSource>,
+    /// Payload and S-102 entry names already offered to the page by
+    /// [`Self::missing_cache_entries`] (looked up once per page).
+    offered: BTreeSet<String>,
 }
 
 /// Whether this build runs the portrayal catalogue's Lua rules (feature
@@ -234,6 +237,13 @@ impl WebEngineCore {
         let mut engine = ChartEngine::new(engine_config(platform, CATALOGUE_ROOT))?;
         // Chosen per preparation (`PortrayalChoice`); without Lua always payloads.
         engine.set_portrayal_source(PortrayalSource::Precomputed);
+        // S-102: with Lua, the rule's instruction string goes through the
+        // cache store, so a page with the stored entry skips Lua for S-102
+        // (without Lua the entry is required anyway).
+        engine.set_s102_options(ferrite_engine::s102_scene::S102Options {
+            reuse_rule_instructions: LUA_AVAILABLE,
+            ..Default::default()
+        });
         Ok(Self {
             engine,
             cache,
@@ -246,11 +256,17 @@ impl WebEngineCore {
             portrayal: PortrayalChoice::Auto,
             payloads: 0,
             used_source: None,
+            offered: BTreeSet::new(),
         })
     }
 
     pub fn engine(&self) -> &ChartEngine {
         &self.engine
+    }
+
+    #[cfg(all(test, feature = "lua-wasm", feature = "s102-pure"))]
+    fn engine_mut(&mut self) -> &mut ChartEngine {
+        &mut self.engine
     }
 
     /// Queue a dataset file for the next [`Self::open`]; `path` is its
@@ -287,26 +303,89 @@ impl WebEngineCore {
     }
 
     /// Names of the cache entries the next portrayal reads and the page's
-    /// cache store does not hold yet: the per-cell Lua portrayal caches of
-    /// the opened cells for the current display
-    /// ([`ChartEngine::cell_cache_entries`]). The page loads them from its
-    /// persistent store ([`Self::load_cache_entry`]) before preparing.
+    /// cache store does not hold yet, for the page to load from its
+    /// persistent store ([`Self::load_cache_entry`]) before preparing:
+    ///
+    /// - the S-102 rule instructions of the loaded bathymetry
+    ///   ([`ChartEngine::s102_cache_entry`]);
+    /// - unless Lua is chosen, the precomputed payloads of the opened cells
+    ///   ([`ChartEngine::precomputed_cell_entries`]); when any are listed,
+    ///   only these two kinds are, since whether Lua runs depends on the
+    ///   payloads found: call again after loading them;
+    /// - when the next preparation portrays with Lua ([`Self::lua_needed`]),
+    ///   the per-cell Lua portrayal caches of the opened cells for the
+    ///   current display ([`ChartEngine::cell_cache_entries`]).
+    ///
+    /// Payload and S-102 names are listed once per page (a page store that
+    /// lacks them keeps lacking them).
     pub fn missing_cache_entries(&mut self) -> Vec<String> {
-        if !LUA_AVAILABLE || self.portrayal == PortrayalChoice::Precomputed {
-            return Vec::new();
+        let file_name = |path: &PathBuf| path.file_name()?.to_str().map(str::to_owned);
+        let mut once = Vec::new();
+        if let Some(name) = self.engine.s102_cache_entry().as_ref().and_then(file_name) {
+            once.push(name);
         }
-        self.engine
-            .cell_cache_entries()
-            .iter()
-            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
-            .filter(|name| !self.cache.contains(name))
-            .collect()
+        if self.portrayal != PortrayalChoice::Lua {
+            once.extend(
+                self.engine
+                    .precomputed_cell_entries()
+                    .iter()
+                    .filter_map(file_name),
+            );
+        }
+        once.retain(|name| !self.cache.contains(name) && !self.offered.contains(name));
+        self.offered.extend(once.iter().cloned());
+        if once.iter().any(|name| name.starts_with(".ferrite_pre_")) {
+            return once;
+        }
+        if self.lua_needed() {
+            once.extend(
+                self.engine
+                    .cell_cache_entries()
+                    .iter()
+                    .filter_map(file_name)
+                    .filter(|name| !self.cache.contains(name)),
+            );
+        }
+        once
+    }
+
+    /// Whether the next preparation portrays S-101 cells with Lua: Lua is
+    /// built and chosen, or `auto` lacks a payload of an opened cell (then
+    /// the preparation falls back to Lua for every cell).
+    pub fn lua_needed(&mut self) -> bool {
+        if !LUA_AVAILABLE || self.engine.state().cells.is_empty() {
+            return false;
+        }
+        match self.portrayal {
+            PortrayalChoice::Lua => true,
+            PortrayalChoice::Precomputed => false,
+            PortrayalChoice::Auto => {
+                self.payloads == 0
+                    || !self.engine.precomputed_cell_entries().iter().all(|path| {
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|name| self.cache.contains(name))
+                    })
+            }
+        }
     }
 
     /// Store a cache entry the page kept from an earlier session (not
-    /// reported again by [`Self::take_cache_writes`]).
+    /// reported again by [`Self::take_cache_writes`]); a precomputed payload
+    /// (`.ferrite_pre_*`) counts as loaded like [`Self::load_precomputed`].
     pub fn load_cache_entry(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        if name.starts_with(".ferrite_pre_") {
+            return self.load_precomputed(name, bytes);
+        }
         self.cache.preload(name, bytes)
+    }
+
+    /// Set the residency threshold (estimated instructions from which only
+    /// cells near the view are portrayed; None: the engine default). The
+    /// next view change portrays again.
+    pub fn set_residency_threshold(&mut self, threshold: Option<usize>) {
+        self.engine.set_residency_threshold(threshold);
+        self.scene_current = false;
     }
 
     /// Cache entries written since the last call, for the page to persist.
@@ -889,8 +968,14 @@ mod tests {
         };
         let summary = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
         let mut first = open();
+        // The cell's precomputed payload is looked up first (once); without
+        // one the cell is portrayed with Lua and its Lua cache is wanted.
+        let payload = first.missing_cache_entries();
+        assert_eq!(payload.len(), 1, "{payload:?}");
+        assert!(payload[0].starts_with(".ferrite_pre_"), "{payload:?}");
         let wanted = first.missing_cache_entries();
         assert_eq!(wanted.len(), 1, "{wanted:?}");
+        assert!(wanted[0].starts_with(".ferrite_cell_"), "{wanted:?}");
         let a = summary(
             first
                 .set_view(320, 240, 1.0, f64::NAN, f64::NAN, 2.0, false)
@@ -905,6 +990,7 @@ mod tests {
         assert!(first.missing_cache_entries().is_empty());
 
         let mut second = open();
+        assert_eq!(second.missing_cache_entries(), payload);
         assert_eq!(second.missing_cache_entries(), wanted);
         for (name, bytes) in &saved {
             second.load_cache_entry(name, bytes).unwrap();
@@ -1002,5 +1088,196 @@ mod tests {
             .prepare(320, 240, 1.0, 48.64, -2.02, 2.0, false)
             .unwrap();
         assert!(draw(&mut fresh) == once, "re-projected S-102 frame differs");
+    }
+
+    /// Dropped precomputed payloads and the S-102 rule instructions persist
+    /// like Lua caches: a page that loads them back portrays neither S-101
+    /// nor S-102 with Lua and draws what the page with the dropped payload
+    /// drew.
+    #[cfg(all(feature = "lua-wasm", feature = "s102-pure"))]
+    #[test]
+    fn payloads_and_s102_instructions_serve_the_next_page() {
+        let root = repository();
+        let cell = root.join(
+            "TestData/SHOM-S101/NormalizedExchangeSets/S100_ENC_ROOT_AcrossTheCHannel_product_Edition1_2026-03-25T06_53_12/S100_ROOT/S-101/DATASET_FILES/101FR00471610/101FR00471610.000",
+        );
+        let h5 = root.join(
+            "TestData/SHOM-S102/ExchangeSets/S100_ENC_ROOT_SAINTMALO_5m_2026-05-26/S100_ROOT/S-102/DATASET_FILES/102FR00SMALOG000001/102FR00SMALOG000001.H5",
+        );
+        if !cell.is_file() || !h5.is_file() || !root.join("Catalogues/PC/S-102").is_dir() {
+            eprintln!("TestData not present; skipped");
+            return;
+        }
+        let files = [
+            ("101FR00471610.000", std::fs::read(&cell).unwrap()),
+            ("102FR00SMALOG000001.H5", std::fs::read(&h5).unwrap()),
+        ];
+        let open = || {
+            let mut core =
+                WebEngineCore::new(catalogue_files(&root), Arc::new(SystemClock)).unwrap();
+            for (name, bytes) in &files {
+                core.add_file(name, bytes.clone()).unwrap();
+            }
+            core.open().unwrap();
+            core
+        };
+        let summary = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        let view = |core: &mut WebEngineCore| {
+            summary(
+                core.set_view(320, 240, 1.0, 48.66, -2.05, 1.5, false)
+                    .unwrap(),
+            )
+        };
+        // A Lua build exports the cell's payload (what `ferrite precompute`
+        // writes) and the S-102 rule instructions.
+        let mut export = open();
+        export.engine_mut().set_precomputed_export(true);
+        view(&mut export);
+        let exported = export.take_cache_writes();
+        let payload = exported
+            .iter()
+            .find(|(name, _)| name.starts_with(".ferrite_pre_"))
+            .expect("payload exported")
+            .clone();
+        let s102 = exported
+            .iter()
+            .find(|(name, _)| name.starts_with(".ferrite_s102_"))
+            .expect("S-102 instructions written")
+            .clone();
+
+        // The user drops the payload: precomputed S-101, S-102 by Lua (its
+        // instructions are written for the page to keep).
+        let mut dropped = open();
+        dropped.load_precomputed(&payload.0, &payload.1).unwrap();
+        let a = view(&mut dropped);
+        assert_eq!(a["portrayal"], "precomputed", "{a}");
+        assert_eq!(a["bathymetry_files"], 1, "{a}");
+        let written: Vec<String> = dropped
+            .take_cache_writes()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(written, vec![s102.0.clone()]);
+
+        // Reload: the page offers both entries, loads them, needs no Lua
+        // cache, reads both and writes nothing.
+        let mut reload = open();
+        let mut wanted = reload.missing_cache_entries();
+        wanted.sort();
+        let mut expected = vec![payload.0.clone(), s102.0.clone()];
+        expected.sort();
+        assert_eq!(wanted, expected);
+        for (name, bytes) in [&payload, &s102] {
+            reload.load_cache_entry(name, bytes).unwrap();
+        }
+        assert!(!reload.lua_needed());
+        assert!(reload.missing_cache_entries().is_empty());
+        let b = view(&mut reload);
+        assert_eq!(b["portrayal"], "precomputed", "{b}");
+        assert_eq!(b["cache_reads"], 2, "{b}");
+        assert_eq!(a["instructions"], b["instructions"]);
+        assert!(reload.take_cache_writes().is_empty());
+        assert!(
+            draw(&mut dropped) == draw(&mut reload),
+            "reloaded frame differs"
+        );
+
+        // A corrupt S-102 entry is rejected and the rule evaluated again.
+        let mut corrupt = open();
+        let mut bad = s102.1.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        corrupt.load_cache_entry(&s102.0, &bad).unwrap();
+        corrupt.load_cache_entry(&payload.0, &payload.1).unwrap();
+        let c = view(&mut corrupt);
+        assert_eq!(c["instructions"], a["instructions"]);
+        let rewritten = corrupt.take_cache_writes();
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0], s102);
+    }
+
+    /// Residency on a small chart set (threshold 0): zooming into one cell
+    /// leaves the resident set, so `set_view` portrays again; moves that keep
+    /// it re-project. Both match a fresh preparation of the same view.
+    #[cfg(feature = "lua-wasm")]
+    #[test]
+    fn set_view_follows_residency_changes() {
+        let root = repository();
+        let dir = root.join(
+            "TestData/SHOM-S101/NormalizedExchangeSets/S100_ENC_ROOT_AcrossTheCHannel_product_Edition1_2026-03-25T06_53_12/S100_ROOT/S-101/DATASET_FILES",
+        );
+        if !dir.is_dir() {
+            eprintln!("TestData not present; skipped");
+            return;
+        }
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            for file in std::fs::read_dir(entry.unwrap().path()).unwrap() {
+                let path = file.unwrap().path();
+                files.push((
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+        files.sort();
+        let open = || {
+            let mut core =
+                WebEngineCore::new(catalogue_files(&root), Arc::new(SystemClock)).unwrap();
+            core.set_residency_threshold(Some(0));
+            for (name, bytes) in &files {
+                core.add_file(name, bytes.clone()).unwrap();
+            }
+            core.open().unwrap();
+            core
+        };
+        let summary = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        let mut moving = open();
+        let overview = summary(
+            moving
+                .set_view(320, 240, 1.0, f64::NAN, f64::NAN, 1.0, false)
+                .unwrap(),
+        );
+        let resident = |s: &serde_json::Value| s["resident_cells"].as_u64().unwrap();
+        let overview_cells = resident(&overview);
+        assert!(overview_cells > 0, "{overview}");
+        // Zoom into Saint-Malo harbour (largest-scale cell), move a little,
+        // then zoom out to the overview.
+        let views = [
+            (48.64, -2.03, 60.0),
+            (48.641, -2.031, 70.0),
+            (f64::NAN, f64::NAN, 1.0),
+        ];
+        let mut outcomes = Vec::new();
+        for (lat, lon, zoom) in views {
+            let s = summary(
+                moving
+                    .set_view(320, 240, 1.0, lat, lon, zoom, false)
+                    .unwrap(),
+            );
+            let mut fresh = open();
+            let f = summary(fresh.prepare(320, 240, 1.0, lat, lon, zoom, false).unwrap());
+            assert_eq!(s["instructions"], f["instructions"], "{s} {f}");
+            assert_eq!(s["resident_cells"], f["resident_cells"], "{s} {f}");
+            assert!(
+                draw(&mut moving) == draw(&mut fresh),
+                "frame at {lat},{lon} x{zoom} differs"
+            );
+            outcomes.push((s["reprojected"].as_bool().unwrap(), resident(&s)));
+        }
+        // In: another resident set (portrayed again); a small move keeps it
+        // (re-projected); out: the overview's set again (portrayed again).
+        assert!(
+            !outcomes[0].0 && outcomes[0].1 != overview_cells,
+            "{outcomes:?}"
+        );
+        assert!(
+            outcomes[1].0 && outcomes[1].1 == outcomes[0].1,
+            "{outcomes:?}"
+        );
+        assert!(
+            !outcomes[2].0 && outcomes[2].1 == overview_cells,
+            "{outcomes:?}"
+        );
     }
 }

@@ -24,7 +24,11 @@ S-101 cells then draw only from precomputed payloads. S-102 bathymetry
 The page runs the engine in a Web Worker drawing into an OffscreenCanvas
 (worker.js, host.js), falling back to the main thread when the browser
 cannot render from workers (engine-client.js); ?worker=off forces the main
-thread. Per-cell portrayal caches persist in IndexedDB (cache-db.js).
+thread. Portrayal cache entries persist in IndexedDB (cache-db.js): per-cell
+Lua caches, S-102 rule instructions and dropped precomputed payloads.
+Page parameters for checks: ?simulate=no-webgpu,no-offscreen,no-worker-gpu,
+worker-gpu-fail (fallback paths), ?residency=N (residency threshold),
+?viewreuse=0 (no view-only emission reuse), ?cachebudget=MB.
 
 --sample copies datasets to OUT/samples (listed in samples.json, loaded by
 the page's "Load samples" button); --precomputed copies the .ferrite_pre_*

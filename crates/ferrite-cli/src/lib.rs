@@ -170,6 +170,56 @@ pub struct SceneEmitter {
     /// The bathymetry scene whose tiles the renderer holds
     /// ([`ferrite_engine::s102_scene::BathymetryScene::id`]).
     rasters: Option<Arc<()>>,
+    /// The scene emitted last and what its emission set up once.
+    emitted: Option<EmittedScene>,
+    /// Stage timings of the last [`Self::emit`].
+    timings: EmitTimings,
+    /// Set every frame up as a scene's first (for comparisons).
+    always_full: bool,
+}
+
+/// What a scene's first emission prepared that its re-projected frames
+/// reuse, as the viewer's navigation rebuilds reuse what its scene
+/// publication prepared (`rebuild_view_ex` after `emit_published_scene`):
+/// renderer palette and settings, symbol rasterization, area triangulation,
+/// viewing groups and per-catalogue cell resources.
+struct EmittedScene {
+    /// [`ferrite_engine::s102_scene::BathymetryScene::id`], unique per
+    /// preparation (kept alive, so the identity is not reused).
+    scene: Arc<()>,
+    /// Catalogue digest and colour profile.
+    key: ([u8; 32], String),
+    /// Display settings the renderer was given.
+    settings: ferrite_render::host_settings::SettingsState,
+    visible: std::collections::HashSet<u32>,
+    resources: Option<ferrite_gpu::CellPortrayalResources>,
+}
+
+/// Milliseconds spent in the stages of one [`SceneEmitter::emit`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmitTimings {
+    /// The frame re-used the scene's set-up (a re-projected view).
+    pub view_only: bool,
+    /// Palette, settings, viewing groups, cell resources.
+    pub setup_ms: f64,
+    /// Symbol prefetch and area triangulation (first frame of a scene).
+    pub prefill_ms: f64,
+    /// S-102 raster publication or re-projection.
+    pub bathymetry_ms: f64,
+    /// Instruction emission (geometry, symbols, text) into the frame.
+    pub instructions_ms: f64,
+}
+
+impl EmitTimings {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "view_only": self.view_only,
+            "setup_ms": self.setup_ms,
+            "prefill_ms": self.prefill_ms,
+            "bathymetry_ms": self.bathymetry_ms,
+            "instructions_ms": self.instructions_ms,
+        })
+    }
 }
 
 impl SceneEmitter {
@@ -177,9 +227,29 @@ impl SceneEmitter {
         Self::default()
     }
 
+    /// Stage timings of the last [`Self::emit`].
+    pub fn timings(&self) -> EmitTimings {
+        self.timings
+    }
+
+    /// Whether re-projected frames reuse their scene's set-up (default);
+    /// off, every frame is set up as a scene's first (measurements).
+    pub fn set_view_only_reuse(&mut self, reuse: bool) {
+        self.always_full = !reuse;
+        self.emitted = None;
+    }
+
     /// Emit `scene` (prepared by `engine` for a view of the renderer's size)
     /// at camera zoom `zoom` (1: all data; the viewer's zoom level, used for
     /// symbol decluttering) into `renderer`'s next frame.
+    ///
+    /// Later frames of the same scene (moved with
+    /// [`ChartEngine::reproject`]) take the viewer's navigation path: the
+    /// instructions are emitted for the new view, but palette, settings,
+    /// symbols, triangulations, viewing groups and cell resources prepared
+    /// by the scene's first frame are reused. The scene must not be emitted
+    /// into another renderer in between (its S-102 tiles already refuse
+    /// that).
     pub fn emit<U: UiLayer>(
         &mut self,
         renderer: &mut WgpuRenderer<U>,
@@ -187,97 +257,149 @@ impl SceneEmitter {
         scene: &mut PreparedScene,
         zoom: f64,
     ) -> Result<()> {
+        let started = ferrite_kernel::time::Instant::now();
+        let ms = |from: ferrite_kernel::time::Instant| from.elapsed().as_secs_f64() * 1000.;
         let state = engine.state();
         let display = engine.display();
         let profile = display.profile.as_str();
         let pc = &state.pc;
-        renderer.set_settings(display.settings.clone());
-        renderer.set_color_profile(profile);
-        renderer.background_color = ferrite_s101::lookup_pc_color(pc, "DEPDW", profile);
-        // Producer reference scales; zero denotes unknown (as the viewer).
-        let reference_scale = state
-            .cells
-            .iter()
-            .filter_map(|cell| {
-                ferrite_s101::coverage_scale::dataset_reference_scale(cell)
-                    .ok()
-                    .flatten()
-            })
-            .min();
-        renderer.set_compilation_scale(reference_scale.unwrap_or(0));
         let key = (*pc.source_digest(), profile.to_string());
-        if self.symbols.as_ref().is_none_or(|(k, _)| *k != key) {
-            renderer.clear_symbol_textures();
-            self.symbols = Some((
-                key,
-                SymbolCache::new_with_pattern_contract(
-                    pc.root_path.join("Symbols"),
-                    pc.sources(),
-                    ferrite_s101::shallow_pattern_contract(pc),
-                ),
-            ));
-        }
-        let symbols = &mut self.symbols.as_mut().expect("set above").1;
-        let visible = state.viewing_groups(&display.settings)?;
         let color_profile = pc
             .color_profiles
             .profiles
             .get(profile)
             .with_context(|| format!("Portrayal catalogue has no colour profile {profile}"))?;
-        let context = &mut scene.context;
+        let view_only = !self.always_full
+            && self.emitted.as_ref().is_some_and(|e| {
+                Arc::ptr_eq(&e.scene, &scene.bathymetry.id)
+                    && e.key == key
+                    && e.settings == display.settings
+            });
+        let mut timings = EmitTimings {
+            view_only,
+            ..EmitTimings::default()
+        };
         renderer.set_zoom_level(zoom);
-        renderer.prefill_area_triangulations(context);
+        if !view_only {
+            self.emitted = None;
+            renderer.set_settings(display.settings.clone());
+            renderer.set_color_profile(profile);
+            renderer.background_color = ferrite_s101::lookup_pc_color(pc, "DEPDW", profile);
+            // Producer reference scales; zero denotes unknown (as the viewer).
+            let reference_scale = state
+                .cells
+                .iter()
+                .filter_map(|cell| {
+                    ferrite_s101::coverage_scale::dataset_reference_scale(cell)
+                        .ok()
+                        .flatten()
+                })
+                .min();
+            renderer.set_compilation_scale(reference_scale.unwrap_or(0));
+            if self.symbols.as_ref().is_none_or(|(k, _)| *k != key) {
+                renderer.clear_symbol_textures();
+                self.symbols = Some((
+                    key.clone(),
+                    SymbolCache::new_with_pattern_contract(
+                        pc.root_path.join("Symbols"),
+                        pc.sources(),
+                        ferrite_s101::shallow_pattern_contract(pc),
+                    ),
+                ));
+            }
+            let visible = state.viewing_groups(&display.settings)?;
+            let resources =
+                if state.requires_cell_resources(&scene.catalogue_registry, &state.fc, pc)? {
+                    // Cells of other catalogue editions draw with their own owners.
+                    let bindings = state
+                        .cell_resource_bindings(&scene.catalogue_registry, &display.settings)?
+                        .into_iter()
+                        .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
+                            cell_index: binding.cell_index,
+                            catalogue: binding.catalogue,
+                            shallow_pattern: binding.shallow_pattern,
+                        })
+                        .collect::<Vec<_>>();
+                    let mut resources =
+                        ferrite_gpu::CellPortrayalResources::prepare(&bindings, profile, 4096)?;
+                    for index in 0..state.cells.len() {
+                        let groups = state.cell_viewing_groups(
+                            &scene.catalogue_registry,
+                            index,
+                            &display.settings,
+                        )?;
+                        resources.capture_viewing_groups_for_cell(index, Some(groups))?;
+                    }
+                    Some(resources)
+                } else {
+                    None
+                };
+            timings.setup_ms = ms(started);
+            let prefill = ferrite_kernel::time::Instant::now();
+            if resources.is_none() {
+                let symbols = &mut self.symbols.as_mut().expect("set above").1;
+                symbols.prefetch_symbols(
+                    scene
+                        .context
+                        .raw_instructions()
+                        .iter()
+                        .filter_map(|i| match i {
+                            ferrite_render::DrawingInstruction::Point(point) => {
+                                Some(point.symbol_ref.as_str())
+                            }
+                            _ => None,
+                        }),
+                    color_profile,
+                );
+            }
+            renderer.prefill_area_triangulations(&scene.context);
+            timings.prefill_ms = ms(prefill);
+            self.emitted = Some(EmittedScene {
+                scene: Arc::clone(&scene.bathymetry.id),
+                key,
+                settings: display.settings.clone(),
+                visible,
+                resources,
+            });
+        }
+        let emitted = self.emitted.as_mut().expect("set above");
+        let symbols = &mut self.symbols.as_mut().expect("set above").1;
+        let context = &mut scene.context;
         renderer.begin_frame();
-        Self::emit_bathymetry(
+        let bathymetry = ferrite_kernel::time::Instant::now();
+        let published = Self::emit_bathymetry(
             &mut self.rasters,
             renderer,
             engine,
             &mut scene.bathymetry,
             &context.scaler,
-        )?;
+        );
+        timings.bathymetry_ms = ms(bathymetry);
+        if let Err(error) = published {
+            self.emitted = None;
+            return Err(error);
+        }
         renderer.set_lon_wrap_pixels(360.0 * context.scaler.scale_x() as f32);
-        if state.requires_cell_resources(&scene.catalogue_registry, &state.fc, pc)? {
-            // Cells of other catalogue editions draw with their own owners.
-            let bindings = state
-                .cell_resource_bindings(&scene.catalogue_registry, &display.settings)?
-                .into_iter()
-                .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
-                    cell_index: binding.cell_index,
-                    catalogue: binding.catalogue,
-                    shallow_pattern: binding.shallow_pattern,
-                })
-                .collect::<Vec<_>>();
-            let mut resources =
-                ferrite_gpu::CellPortrayalResources::prepare(&bindings, profile, 4096)?;
-            for index in 0..state.cells.len() {
-                let groups = state.cell_viewing_groups(
-                    &scene.catalogue_registry,
-                    index,
-                    &display.settings,
-                )?;
-                resources.capture_viewing_groups_for_cell(index, Some(groups))?;
-            }
-            renderer.try_add_instructions_with_resource_owners(
+        let instructions = ferrite_kernel::time::Instant::now();
+        let result = match emitted.resources.as_mut() {
+            Some(resources) => renderer.try_add_instructions_with_resource_owners(
                 context,
-                &mut resources,
-                Some(&visible),
-            )?;
-        } else {
-            symbols.prefetch_symbols(
-                context.raw_instructions().iter().filter_map(|i| match i {
-                    ferrite_render::DrawingInstruction::Point(point) => {
-                        Some(point.symbol_ref.as_str())
-                    }
-                    _ => None,
-                }),
-                color_profile,
-            );
-            renderer.try_add_instructions_with_symbols(
+                resources,
+                Some(&emitted.visible),
+            ),
+            None => renderer.try_add_instructions_with_symbols(
                 context,
                 Some(symbols),
                 Some(color_profile),
-                Some(&visible),
-            )?;
+                Some(&emitted.visible),
+            ),
+        };
+        timings.instructions_ms = ms(instructions);
+        self.timings = timings;
+        if let Err(error) = result {
+            // Set up again on the next frame.
+            self.emitted = None;
+            return Err(error.into());
         }
         Ok(())
     }
@@ -438,6 +560,11 @@ impl OffscreenChartRenderer {
     /// GPU adapter name.
     pub fn adapter(&self) -> &str {
         &self.renderer.state.gpu_name
+    }
+
+    /// The scene emitter (stage timings, view-only reuse).
+    pub fn emitter(&mut self) -> &mut SceneEmitter {
+        &mut self.emitter
     }
 
     /// Draw `scene` (prepared by `engine` for a view of this renderer's

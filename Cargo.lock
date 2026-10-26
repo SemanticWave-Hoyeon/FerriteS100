@@ -1494,6 +1494,7 @@ dependencies = [
  "anyhow",
  "ferrite-engine",
  "ferrite-gpu",
+ "ferrite-kernel",
  "ferrite-portrayal-catalog",
  "ferrite-render",
  "ferrite-s101",
