@@ -740,12 +740,12 @@ impl ChartTextBufferPool {
 }
 /// Bound producer output and explicitly unbound IC compatibility output are
 /// separate variants. Legacy output never acquires a producer certificate.
-#[cfg(feature = "s102-portrayal")]
+#[cfg(feature = "s102-material")]
 pub enum S102RasterMaterial {
     Bound(ferrite_s102::BoundBathymetryMaterial),
     LegacyIc(ferrite_render::RasterLayer),
 }
-#[cfg(feature = "s102-portrayal")]
+#[cfg(feature = "s102-material")]
 impl S102RasterMaterial {
     pub fn bounds(&self) -> ferrite_render::GeoBounds {
         match self {
@@ -757,7 +757,7 @@ impl S102RasterMaterial {
 
 #[derive(Clone)]
 struct GpuRasterLayer {
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     regular_portrayal_owner: Option<Arc<ferrite_s102::BoundBathymetryEvaluation>>,
     // Actual scaler identity used to create THIS geometry; not an old-view stamp.
     prepared_camera: Option<[u64; 16]>,
@@ -2842,7 +2842,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
     }
     /// PC-provenance-preserving regular S102 upload. The callback can only
     /// submit tiles minted by the S102 producer; old unbound APIs stay explicit.
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     pub fn stage_bound_s102_raster_batch<E: From<crate::WgpuError>>(
         &mut self,
         scaler: &ferrite_render::Scaler,
@@ -2854,7 +2854,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
             producer(&mut |material| upload(S102RasterMaterial::Bound(material)))
         })
     }
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     pub fn stage_s102_raster_batch<E: From<crate::WgpuError>>(
         &mut self,
         scaler: &ferrite_render::Scaler,
@@ -3321,7 +3321,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
             .state
             .create_index_buffer(&indices, "coverage-raster-indices");
         Ok(GpuRasterLayer {
-            #[cfg(feature = "s102-portrayal")]
+            #[cfg(feature = "s102-material")]
             regular_portrayal_owner: None,
             prepared_camera: scaler.flat_encoded_identity(),
             continuous_identity,

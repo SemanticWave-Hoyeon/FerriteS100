@@ -399,6 +399,10 @@ pub struct BathymetryScene {
     /// Viewing groups enabled for the display mode (the renderer shows a
     /// tile only when all its groups are enabled); None without bathymetry.
     pub viewing_groups: Option<HashSet<u32>>,
+    /// Identity of this preparation (unique per scene). A host that moves
+    /// the tiles to the GPU (taking them out of `tiles`) compares it to know
+    /// that a later frame of the same, re-projected scene still shows them.
+    pub id: std::sync::Arc<()>,
 }
 impl BathymetryScene {
     pub fn is_empty(&self) -> bool {
@@ -743,6 +747,7 @@ mod opened {
         Ok(BathymetryScene {
             tiles,
             viewing_groups: Some(groups),
+            id: Default::default(),
         })
     }
 

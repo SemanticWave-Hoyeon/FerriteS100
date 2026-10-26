@@ -123,3 +123,91 @@ fn inspects_validates_and_renders() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("No precomputed portrayal"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const S102_FILES: &str =
+    "TestData/SHOM-S102/ExchangeSets/S100_ENC_ROOT_SAINTMALO_5m_2026-05-26/S100_ROOT/S-102/DATASET_FILES";
+
+/// S-102 bathymetry drawn by the CLI (the viewer's raster publication through
+/// `SceneEmitter`), also from precomputed S-101 payloads and S-102 rule
+/// instructions.
+#[test]
+fn renders_s102_bathymetry() {
+    if !root().join(EXCHANGE_SET).is_dir() || !root().join(S102_FILES).is_dir() {
+        eprintln!("TestData not present; skipped");
+        return;
+    }
+    let output = ferrite(&["inspect", "--json", S102_FILES]);
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let bathymetry = json["bathymetry"].as_array().unwrap();
+    assert_eq!(bathymetry.len(), 7, "{json}");
+    assert!(bathymetry
+        .iter()
+        .all(|b| b["instances"] == 1 && !b["bounds"].is_null()));
+
+    let dir = work_dir("s102");
+    // A scale, not a zoom: the same view with and without the S-102 extent.
+    let view = [
+        "--center",
+        "48.645,-2.03",
+        "--scale",
+        "25000",
+        "--size",
+        "320x200",
+    ];
+    let render = |out: &std::path::Path, paths: &[&str], extra: &[&str]| {
+        let mut args = vec!["render"];
+        args.extend(paths);
+        args.extend(["--out", out.to_str().unwrap()]);
+        args.extend(view);
+        args.extend(extra);
+        ferrite(&args)
+    };
+    let with = dir.join("with.png");
+    let output = render(&with, &[EXCHANGE_SET, S102_FILES], &[]);
+    if !output.status.success() && String::from_utf8_lossy(&output.stderr).contains("GPU") {
+        eprintln!("no GPU adapter; render skipped");
+        return;
+    }
+    assert!(output.status.success(), "{output:?}");
+    let without = dir.join("without.png");
+    let output = render(&without, &[EXCHANGE_SET], &[]);
+    assert!(output.status.success(), "{output:?}");
+    let with = image::open(&with).unwrap().to_rgba8();
+    let without_image = image::open(&without).unwrap().to_rgba8();
+    let differing = with
+        .pixels()
+        .zip(without_image.pixels())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        differing > 320 * 200 / 20,
+        "S-102 changes the image ({differing} pixels)"
+    );
+
+    // Precomputed S-101 payloads and S-102 rule instructions draw the same.
+    let payloads = dir.join("payloads");
+    let mut args = vec![
+        "precompute",
+        EXCHANGE_SET,
+        S102_FILES,
+        "--cache-dir",
+        payloads.to_str().unwrap(),
+    ];
+    args.extend(view);
+    let output = ferrite(&args);
+    assert!(output.status.success(), "{output:?}");
+    let precomputed = dir.join("precomputed.png");
+    let output = render(
+        &precomputed,
+        &[EXCHANGE_SET, S102_FILES],
+        &["--precomputed", payloads.to_str().unwrap()],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        image::open(&precomputed).unwrap().to_rgba8().as_raw(),
+        with.as_raw(),
+        "precomputed portrayal draws the same S-101 and S-102 image"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

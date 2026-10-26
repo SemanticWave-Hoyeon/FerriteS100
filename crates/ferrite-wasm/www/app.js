@@ -1,22 +1,31 @@
-// Ferrite S-100 web demo: loads the ferrite-wasm module, the catalogue
-// bundle and user-supplied datasets, and draws with ferrite-gpu on a canvas.
-import init, { WebEngine, WebCanvas } from "./pkg/ferrite_wasm.js";
+// Ferrite S-100 web demo: the page (input, panels, HUD). The chart engine
+// runs in a Web Worker drawing into an OffscreenCanvas, or on this thread
+// when the browser cannot render from workers (engine-client.js); either
+// way the page talks to it through `engine.call(op, ...)`.
+import { connect } from "./engine-client.js";
 
 const $ = (id) => document.getElementById(id);
-const canvas = $("chart");
+let canvas = $("chart");
 const status = (text) => { $("status").textContent = text; };
 
 let engine = null;
-let gpu = null;
 // Camera: centre in degrees (NaN = data centre) and zoom factor over the
-// all-data view; `view` is the last prepared view's bounds.
+// all-data view; `view` is the last drawn view's bounds.
 const camera = { lat: NaN, lon: NaN, zoom: 1 };
+// Bumped by every user camera change, so a frame finishing late does not
+// overwrite a newer camera with its own.
+let cameraVersion = 0;
 let view = null;
 let opened = 0;
+const params = new URLSearchParams(location.search);
 // Renderer backend: ?backend=auto|webgpu|webgl2 (the select reloads the page).
 const BACKENDS = ["auto", "webgpu", "webgl2"];
-const requested = new URLSearchParams(location.search).get("backend") ?? "auto";
-const backend = BACKENDS.includes(requested) ? requested : "auto";
+const backend = BACKENDS.includes(params.get("backend")) ? params.get("backend") : "auto";
+// Engine thread: ?worker=auto|on|off.
+const WORKER_MODES = ["auto", "on", "off"];
+const workerMode = WORKER_MODES.includes(params.get("worker")) ? params.get("worker") : "auto";
+// Persistent portrayal cache: ?cache=0 disables it.
+const persistentCache = params.get("cache") !== "0";
 let adapter = "";
 
 const mercY = (lat) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
@@ -29,6 +38,46 @@ function pixelSize() {
     width: Math.max(1, Math.round(canvas.clientWidth * dpr)),
     height: Math.max(1, Math.round(canvas.clientHeight * dpr)),
   };
+}
+
+// Main-thread responsiveness: the longest gap between animation frames
+// while a frame request is in flight (the first Lua portrayal takes
+// seconds; in a worker the page keeps animating).
+// Long tasks (over 50 ms, reported by the browser even for a hidden page,
+// where animation frames pause) give the longest main-thread block.
+const ui = { busy: false, maxGap: 0, last: 0, longTasks: [] };
+function watchFrames(now) {
+  if (ui.busy && ui.last) ui.maxGap = Math.max(ui.maxGap, now - ui.last);
+  ui.last = now;
+  requestAnimationFrame(watchFrames);
+}
+requestAnimationFrame(watchFrames);
+// ?probe=1: also measure the longest main-thread block with a message-loop
+// probe while a frame is in flight (works in hidden pages, where animation
+// frames pause and long tasks may go unreported; it keeps one core busy).
+const probing = params.get("probe") === "1";
+const probe = new MessageChannel();
+probe.port1.onmessage = () => {
+  const now = performance.now();
+  if (!ui.busy) return;
+  ui.probeMax = Math.max(ui.probeMax, now - ui.probeLast);
+  ui.probeLast = now;
+  probe.port2.postMessage(0);
+};
+function startProbe() {
+  ui.probeMax = 0;
+  ui.probeLast = performance.now();
+  if (probing) probe.port2.postMessage(0);
+}
+try {
+  new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+      ui.longTasks.push({ start: entry.startTime, duration: entry.duration });
+    }
+    ui.longTasks = ui.longTasks.slice(-200);
+  }).observe({ type: "longtask" });
+} catch {
+  // No Long Tasks API: only the frame gap is measured.
 }
 
 let pending = 0;
@@ -44,48 +93,96 @@ const MIN_CANVAS_CSS_PX = 64;
 
 // Per-frame timings (prepare/set_view and draw), for measurements.
 const timings = [];
+let inFlight = false;
+let again = false;
+let dragging = false;
 
-function render() {
-  if (!engine || !gpu || opened === 0) return;
-  if (canvas.clientWidth < MIN_CANVAS_CSS_PX || canvas.clientHeight < MIN_CANVAS_CSS_PX) return;
-  const { dpr, width, height } = pixelSize();
-  canvas.width = width;
-  canvas.height = height;
+// One frame request at a time; requests made meanwhile collapse into one.
+async function render() {
+  if (!engine || opened === 0) return;
+  if (inFlight) { again = true; return; }
+  inFlight = true;
   try {
-    // set_view re-projects the prepared scene when only the camera or size
-    // changed and the resident cells stay; otherwise it portrays again.
-    const t0 = performance.now();
-    const summary = JSON.parse(
-      engine.set_view(width, height, dpr, camera.lat, camera.lon, camera.zoom, false));
-    const t1 = performance.now();
-    engine.render_to_canvas(gpu);
-    const t2 = performance.now();
-    view = summary.bounds;
-    camera.zoom = summary.zoom;
-    camera.lat = latOf((mercY(view.north) + mercY(view.south)) / 2);
-    camera.lon = (view.east + view.west) / 2;
-    canvas.style.transform = "";
-    timings.push({ prepare: t1 - t0, draw: t2 - t1, reprojected: summary.reprojected,
-      portrayal: summary.portrayal, instructions: summary.instructions });
-    const source = summary.portrayal == null ? "" :
-      ` · S-101 ${summary.portrayal === "lua" ? "Lua" : "precomputed"}`;
-    const resident = summary.resident_cells == null ? "" : ` · ${summary.resident_cells}/${summary.cells} cells resident`;
-    $("hud").textContent = `${adapter}${source} · ` +
-      `${summary.instructions} instructions · 1:${Math.round(summary.display_scale)} · ` +
-      `zoom ${summary.zoom.toFixed(2)} · ${camera.lat.toFixed(4)}, ${camera.lon.toFixed(4)}${resident} · ` +
-      `${summary.reprojected ? "view" : "portray"} ${(t1 - t0).toFixed(0)} ms, draw ${(t2 - t1).toFixed(0)} ms`;
-  } catch (error) {
-    status(`Render failed: ${error.message ?? error}`);
+    do {
+      again = false;
+      await renderOnce();
+    } while (again);
+  } finally {
+    inFlight = false;
   }
 }
 
-function showReport() {
-  const report = JSON.parse(engine.report());
+async function renderOnce() {
+  if (canvas.clientWidth < MIN_CANVAS_CSS_PX || canvas.clientHeight < MIN_CANVAS_CSS_PX) return;
+  const { dpr, width, height } = pixelSize();
+  if (engine.kind === "main" && (canvas.width !== width || canvas.height !== height)) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const version = cameraVersion;
+  ui.busy = true;
+  ui.maxGap = 0;
+  ui.last = 0;
+  startProbe();
+  const t0 = performance.now();
+  try {
+    // set_view re-projects the prepared scene when only the camera or size
+    // changed and the resident cells stay; otherwise it portrays again.
+    const frame = await engine.call("render",
+      { width, height, dpr, lat: camera.lat, lon: camera.lon, zoom: camera.zoom });
+    const total = performance.now() - t0;
+    // Long-task entries arrive after the task; wait for them briefly.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const longTask = Math.max(0, ...ui.longTasks.filter((e) => e.start >= t0 - 1).map((e) => e.duration));
+    const { summary } = frame;
+    view = summary.bounds;
+    if (version === cameraVersion) {
+      camera.zoom = summary.zoom;
+      camera.lat = latOf((mercY(view.north) + mercY(view.south)) / 2);
+      camera.lon = (view.east + view.west) / 2;
+    } else {
+      again = true;
+    }
+    if (!dragging) canvas.style.transform = "";
+    const timing = {
+      prepare: frame.prepareMs, draw: frame.drawMs, total, reprojected: summary.reprojected,
+      portrayal: summary.portrayal, instructions: summary.instructions, cacheReads: summary.cache_reads,
+      preload: frame.preload, saved: frame.saved, uiMaxGap: ui.maxGap, longTask, probeMax: probing ? ui.probeMax : null, thread: engine.kind,
+    };
+    timings.push(timing);
+    const source = summary.portrayal == null ? "" :
+      ` · S-101 ${summary.portrayal === "lua" ? "Lua" : "precomputed"}`;
+    const s102 = summary.bathymetry_files ? ` · S-102 ${summary.bathymetry_files} file(s)` : "";
+    const resident = summary.resident_cells == null ? "" : ` · ${summary.resident_cells}/${summary.cells} cells resident`;
+    const cache = frame.preload ? ` · cache ${frame.preload.loaded}/${frame.preload.wanted} from IndexedDB` : "";
+    const savedText = frame.saved?.saved ? `, ${frame.saved.saved} saved` : "";
+    $("hud").textContent = `${adapter} · ${engine.kind === "worker" ? "worker" : "main thread"}${source}${s102} · ` +
+      `${summary.instructions} instructions · 1:${Math.round(summary.display_scale)} · ` +
+      `zoom ${summary.zoom.toFixed(2)} · ${camera.lat.toFixed(4)}, ${camera.lon.toFixed(4)}${resident} · ` +
+      `${summary.reprojected ? "view" : "portray"} ${frame.prepareMs.toFixed(0)} ms, draw ${frame.drawMs.toFixed(0)} ms` +
+      `${cache}${savedText} · UI max frame gap ${ui.maxGap.toFixed(0)} ms, ` +
+      `longest main-thread task ${longTask.toFixed(0)} ms` +
+      `${probing ? `, longest block ${ui.probeMax.toFixed(0)} ms` : ""}`;
+  } catch (error) {
+    status(`Render failed: ${error.message ?? error}`);
+  } finally {
+    ui.busy = false;
+  }
+}
+
+async function showReport() {
+  const report = await engine.call("report");
   const list = $("datasets");
   list.replaceChildren();
   for (const d of report.datasets) {
     const li = document.createElement("li");
     li.textContent = `${d.product} ${d.name} (ed. ${d.edition}, ${d.features} features)`;
+    list.append(li);
+  }
+  for (const b of report.bathymetry ?? []) {
+    const li = document.createElement("li");
+    li.textContent = `S-102 ${b.source.split("/").pop()} (${b.product_specification}, ` +
+      `${b.grid[0]}×${b.grid[1]}${b.inspection_only ? ", inspection only" : ""})`;
     list.append(li);
   }
   const errors = report.issues.filter((i) => i.severity === "error");
@@ -95,38 +192,29 @@ function showReport() {
     li.textContent = `${issue.check}: ${issue.subject}: ${issue.message}`;
     list.append(li);
   }
-  if (!report.datasets.length && !errors.length) list.innerHTML = "<li>None</li>";
+  if (!report.datasets.length && !report.bathymetry?.length && !errors.length) list.innerHTML = "<li>None</li>";
   return report;
 }
 
 async function addFiles(files) {
-  let data = 0;
-  let payloads = 0;
-  for (const { name, bytes } of files) {
-    const base = name.split("/").pop();
-    if (base.startsWith(".ferrite_pre_") || base.startsWith("ferrite_pre_")) {
-      engine.load_precomputed(base, bytes);
-      payloads += 1;
-    } else {
-      engine.add_file(name, bytes);
-      data += 1;
-    }
-  }
-  let message = `${payloads} precomputed payload(s) stored`;
-  if (data) {
-    try {
-      const t0 = performance.now();
-      const report = JSON.parse(engine.open());
+  let message;
+  try {
+    const { payloads, data, report, openMs } = await engine.call("addFiles", files);
+    message = `${payloads} precomputed payload(s) stored`;
+    if (report) {
       opened += report.datasets.length;
+      const bathymetry = report.bathymetry?.length ?? 0;
+      opened += bathymetry;
       message = `Opened ${report.datasets.length} dataset(s) of ${data} file(s) in ` +
-        `${(performance.now() - t0).toFixed(0)} ms; ${message}` +
+        `${openMs.toFixed(0)} ms; ${message}` +
         (report.notices.length ? `\n${report.notices.slice(0, 5).join("\n")}` : "");
-    } catch (error) {
-      message = `Open failed: ${error.message ?? error}`;
+      if (bathymetry) message += `\nS-102: ${bathymetry} file(s)`;
     }
+  } catch (error) {
+    message = `Open failed: ${error.message ?? error}`;
   }
   status(message);
-  showReport();
+  await showReport();
   scheduleRender();
 }
 
@@ -154,6 +242,12 @@ async function loadSamples() {
   await addFiles(files);
 }
 
+function reloadWith(key, value) {
+  const url = new URL(location.href);
+  url.searchParams.set(key, value);
+  location.assign(url);
+}
+
 function setupInput() {
   const drop = $("drop");
   drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
@@ -166,17 +260,20 @@ function setupInput() {
   $("pick-files").addEventListener("click", () => $("files").click());
   $("files").addEventListener("change", async (e) => addFiles(await readFileList(e.target.files)));
   $("samples").addEventListener("click", () => loadSamples().catch((e) => status(`Samples: ${e}`)));
-  $("fit").addEventListener("click", () => { camera.lat = NaN; camera.lon = NaN; camera.zoom = 1; scheduleRender(); });
-  $("backend").addEventListener("change", (e) => {
-    const url = new URL(location.href);
-    url.searchParams.set("backend", e.target.value);
-    location.assign(url);
+  $("fit").addEventListener("click", () => {
+    camera.lat = NaN; camera.lon = NaN; camera.zoom = 1; cameraVersion++; scheduleRender();
   });
-  $("portrayal").addEventListener("change", (e) => {
-    try { engine.set_portrayal(e.target.value); scheduleRender(); } catch (error) { status(error.message); }
+  $("backend").addEventListener("change", (e) => reloadWith("backend", e.target.value));
+  $("thread").addEventListener("change", (e) => reloadWith("worker", e.target.value));
+  $("clear-cache").addEventListener("click", async () => {
+    await engine.call("clearCache");
+    status("Portrayal cache cleared (IndexedDB).");
   });
-  $("palette").addEventListener("change", (e) => {
-    try { engine.set_palette(e.target.value); scheduleRender(); } catch (error) { status(error.message); }
+  $("portrayal").addEventListener("change", async (e) => {
+    try { await engine.call("setPortrayal", e.target.value); scheduleRender(); } catch (error) { status(error.message); }
+  });
+  $("palette").addEventListener("change", async (e) => {
+    try { await engine.call("setPalette", e.target.value); scheduleRender(); } catch (error) { status(error.message); }
   });
 
   // Pan by dragging (CSS preview while dragging), zoom with the wheel about
@@ -185,6 +282,7 @@ function setupInput() {
   canvas.addEventListener("pointerdown", (e) => {
     canvas.setPointerCapture(e.pointerId);
     drag = { x: e.clientX, y: e.clientY, dx: 0, dy: 0 };
+    dragging = true;
   });
   canvas.addEventListener("pointermove", (e) => {
     if (!drag) return;
@@ -195,6 +293,7 @@ function setupInput() {
   canvas.addEventListener("pointerup", (e) => {
     const d = drag;
     drag = null;
+    dragging = false;
     if (!d || !view) return;
     if (Math.hypot(d.dx, d.dy) < 4) {
       canvas.style.transform = "";
@@ -205,6 +304,7 @@ function setupInput() {
     const yPerPx = (mercY(view.north) - mercY(view.south)) / canvas.clientHeight;
     camera.lon -= d.dx * lonPerPx;
     camera.lat = latOf(mercY(camera.lat) + d.dy * yPerPx);
+    cameraVersion++;
     scheduleRender();
   });
   canvas.addEventListener("wheel", (e) => {
@@ -219,16 +319,17 @@ function setupInput() {
     camera.lon = lon + (camera.lon - lon) / factor;
     camera.lat = latOf(y + (mercY(camera.lat) - y) / factor);
     camera.zoom *= factor;
+    cameraVersion++;
     scheduleRender(120);
   }, { passive: false });
   new ResizeObserver(() => scheduleRender(100)).observe(canvas);
 }
 
-function pick(e) {
+async function pick(e) {
   const rect = canvas.getBoundingClientRect();
   const { dpr } = pixelSize();
   try {
-    const hits = JSON.parse(engine.pick_json((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr, 8 * dpr));
+    const hits = await engine.call("pick", (e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr, 8 * dpr);
     const out = $("pick");
     out.replaceChildren();
     if (!hits.length) { out.textContent = "Nothing here."; return; }
@@ -251,28 +352,39 @@ function pick(e) {
 }
 
 async function main() {
-  await init();
-  status("Loading catalogues…");
-  const bundle = new Uint8Array(await (await fetch("catalogues.bin", { cache: "no-store" })).arrayBuffer());
-  engine = WebEngine.from_bundle(bundle);
-  const lua = WebEngine.lua_available();
-  $("portrayal").querySelector("option[value=lua]").disabled = !lua;
-  if (!lua) $("portrayal").value = "precomputed";
-  const select = $("palette");
-  for (const name of JSON.parse(engine.palettes())) select.add(new Option(name, name, name === "Day", name === "Day"));
+  status("Loading engine and catalogues…");
   const { dpr, width, height } = pixelSize();
   canvas.width = width;
   canvas.height = height;
   $("backend").value = backend;
-  gpu = await WebCanvas.create("chart", dpr, backend);
-  adapter = gpu.adapter();
+  $("thread").value = workerMode;
+  const notices = [];
+  engine = await connect({ canvas, backend, density: dpr, mode: workerMode, persistentCache,
+    log: (text) => notices.push(text) });
+  canvas = engine.canvas;
+  const { info } = engine;
+  adapter = info.adapter;
+  $("portrayal").querySelector("option[value=lua]").disabled = !info.lua;
+  if (!info.lua) $("portrayal").value = "precomputed";
+  const select = $("palette");
+  for (const name of info.palettes) select.add(new Option(name, name, name === "Day", name === "Day"));
   $("hud").textContent = adapter;
   setupInput();
-  const notes = JSON.parse(engine.catalogue_notes());
-  status(`Ready: ${adapter} [backend ${backend}], S-101 ${lua ? "Lua portrayal in the browser" : "precomputed payloads only"}` +
-    `${notes.length ? `\n${notes.join("\n")}` : ""}\nDrop files or load the samples.`);
-  // For scripted checks: the engine, the camera and the frame timings.
-  window.ferrite = { engine, camera, timings, render, setPortrayal: (v) => { engine.set_portrayal(v); $("portrayal").value = v; } };
+  status(`Ready in ${info.startMs.toFixed(0)} ms: ${adapter} [backend ${backend}] on the ` +
+    `${engine.kind === "worker" ? "worker (OffscreenCanvas)" : "main thread"}, ` +
+    `S-101 ${info.lua ? "Lua portrayal in the browser" : "precomputed payloads only"}, ` +
+    `portrayal cache: ${info.cache}` +
+    `${notices.length ? `\n${notices.join("\n")}` : ""}` +
+    `${info.notes.length ? `\n${info.notes.join("\n")}` : ""}\nDrop files or load the samples.`);
+  // For scripted checks: the engine connection, the camera, frame timings
+  // and the main-thread frame monitor.
+  window.ferrite = {
+    engine, camera, timings, render, ui, loadSamples,
+    setPortrayal: async (v) => { await engine.call("setPortrayal", v); $("portrayal").value = v; },
+    setCamera: (lat, lon, zoom) => {
+      Object.assign(camera, { lat, lon, zoom }); cameraVersion++; return render();
+    },
+  };
 }
 
 main().catch((error) => status(`Start failed: ${error.message ?? error}`));

@@ -1120,6 +1120,26 @@ impl ChartEngine {
         }))
     }
 
+    /// Cache-store entries a [`Self::prepare`] with the current display reads
+    /// for the opened S-101 cells when they are portrayed with Lua: the
+    /// per-cell instruction caches
+    /// ([`EngineState::cell_instruction_cache_paths`]); empty without cells
+    /// or without a cache. A host whose persistent store is asynchronous
+    /// (the web's IndexedDB) loads these entries into the platform cache
+    /// store before preparing, and saves the entries the preparation wrote.
+    pub fn cell_cache_entries(&mut self) -> Vec<PathBuf> {
+        // The key covers the colour profile `prepare` selects first.
+        let previous = std::mem::replace(
+            &mut self.state.current_profile_name,
+            self.display.profile.clone(),
+        );
+        let paths = self
+            .state
+            .cell_instruction_cache_paths(Some(&self.display.settings));
+        self.state.current_profile_name = previous;
+        paths.into_iter().flatten().flatten().collect()
+    }
+
     /// Move `scene` to `view` without portraying again, as the viewer's
     /// pan/zoom path does (cell instructions do not depend on the view):
     /// the camera, viewport and pixel ratio of [`Self::prepare`] and the flat

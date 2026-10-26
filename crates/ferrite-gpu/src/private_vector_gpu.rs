@@ -1560,10 +1560,10 @@ pub struct PreparedJointVectorRaster {
     raster: PreparedRasterScenePublication,
     next_raster_epoch: Arc<()>,
     continuous_count: usize,
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     s102_target: Option<BoundS102Target>,
 }
-#[cfg(feature = "s102-portrayal")]
+#[cfg(feature = "s102-material")]
 struct BoundS102Target {
     pc: Arc<ferrite_portrayal_catalog::BoundPortrayalCatalogue>,
     profile: String,
@@ -1853,7 +1853,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
             raster,
             next_raster_epoch: Arc::new(()),
             continuous_count,
-            #[cfg(feature = "s102-portrayal")]
+            #[cfg(feature = "s102-material")]
             s102_target: None,
         };
         self.validate_joint_vector_raster(&candidate)?;
@@ -1862,7 +1862,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
     /// Strict regular-S102 PC check on top of the existing camera/GPU guards.
     /// expected_pc must come from the App's retained actual producer catalogue.
     /// This argument is an EXPECTATION; it never manufactures a material owner.
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     pub fn prepare_ready_vector_bound_s102_publication(
         &self,
         vector: ReadyVectorGpuFrame,
@@ -1886,7 +1886,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
         self.validate_private_vector_gpu(vector)?;
         self.validate_raster_scene_publication(&candidate.raster)?;
         let raster = &candidate.raster.raster;
-        #[cfg(feature = "s102-portrayal")]
+        #[cfg(feature = "s102-material")]
         if let Some(target) = &candidate.s102_target {
             // The current boundary covers regular S102 only. Never bypass a
             // missing owner, legacy layer or continuous source with a digest.
@@ -1989,7 +1989,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
             raster,
             next_raster_epoch,
             continuous_count,
-            #[cfg(feature = "s102-portrayal")]
+            #[cfg(feature = "s102-material")]
                 s102_target: _,
         } = candidate;
         let installed = self.install_validated_vector(installation);
@@ -2097,7 +2097,7 @@ pub struct PreparedTargetVectorRaster {
     raster: PreparedRasterScenePublication,
     continuous_count: usize,
     target: TargetRendererIntent,
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     s102_target: Option<BoundS102Target>,
 }
 pub struct PreparedTargetSinglePcVectorRaster(PreparedTargetVectorRaster);
@@ -2156,7 +2156,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
                 profile,
                 emission,
             },
-            #[cfg(feature = "s102-portrayal")]
+            #[cfg(feature = "s102-material")]
             s102_target: None,
         };
         self.validate_target_vector_raster_publication(&candidate)?;
@@ -2225,7 +2225,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
             ));
         }
         let raster = &candidate.raster.raster;
-        #[cfg(feature = "s102-portrayal")]
+        #[cfg(feature = "s102-material")]
         if let Some(bound) = &candidate.s102_target {
             let key = |s: ferrite_s102::DepthSettings| {
                 (
@@ -2333,7 +2333,7 @@ impl PreparedTargetSinglePcVectorRaster {
     }
 }
 impl<U: UiLayer> WgpuRenderer<U> {
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     #[expect(
         clippy::too_many_arguments,
         reason = "Independent target intent and actual retained producer expectation"
@@ -2359,7 +2359,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
         self.validate_target_vector_raster_publication(&candidate)?;
         Ok(candidate)
     }
-    #[cfg(feature = "s102-portrayal")]
+    #[cfg(feature = "s102-material")]
     #[expect(
         clippy::too_many_arguments,
         reason = "SinglePc retains its actual resource mode and producer expectation"
@@ -2462,13 +2462,13 @@ impl<U: UiLayer> WgpuRenderer<U> {
             .any(|l| l.continuous.is_none());
         // Generic raster staging is useful for auditing, but cannot authorize
         // publication of S102 colours. Require the genuine retained producer.
-        #[cfg(feature = "s102-portrayal")]
+        #[cfg(feature = "s102-material")]
         if has_regular && candidate.s102_target.is_none() {
             return Err(bad(
                 "TARGET activation requires bound S102 material authority",
             ));
         }
-        #[cfg(not(feature = "s102-portrayal"))]
+        #[cfg(not(feature = "s102-material"))]
         if has_regular {
             return Err(bad(
                 "Regular TARGET raster activation requires S102 portrayal support",
@@ -2597,7 +2597,7 @@ impl<U: UiLayer> WgpuRenderer<U> {
             raster,
             continuous_count,
             target,
-            #[cfg(feature = "s102-portrayal")]
+            #[cfg(feature = "s102-material")]
                 s102_target: _,
         } = candidate;
         let installed = self.install_validated_vector(installation);

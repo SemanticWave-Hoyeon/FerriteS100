@@ -6,13 +6,15 @@ use ferrite_engine::chart_engine::{
     Camera, ChartEngine, DatasetSource, FeatureId, OpenReport, View, Zoom,
 };
 use ferrite_engine::platform::{
-    Clock, MemoryCacheStore, MemoryDataSource, Platform, SequentialExecutor,
+    CacheStore, Clock, MemoryCacheStore, MemoryDataSource, Platform, SequentialExecutor,
 };
 use ferrite_engine::scene::PreparedScene;
 use ferrite_engine::{PortrayalSource, ViewportPixels};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 /// Where catalogue files live in the in-memory data source.
 pub const CATALOGUE_ROOT: &str = "/catalogues";
@@ -64,12 +66,104 @@ fn relative_name(name: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// The page's cache store: entries in memory ([`MemoryCacheStore`]) that
+/// also records which entries the engine wrote, so the page can persist
+/// them in an asynchronous store (IndexedDB) after a preparation
+/// ([`Self::take_writes`]) and load them back before the next page's
+/// preparation ([`Self::preload`]). The engine's cache API stays
+/// synchronous; persistence happens between engine calls.
+#[derive(Debug, Default)]
+pub struct PageCacheStore {
+    memory: MemoryCacheStore,
+    written: Mutex<BTreeSet<PathBuf>>,
+    /// Entries read since [`Self::take_reads`] (cache hits).
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl PageCacheStore {
+    /// The entry path of cache file `name` (`.ferrite_*`, no separators).
+    pub fn entry(&self, name: &str) -> Result<PathBuf> {
+        ensure!(
+            name.starts_with(".ferrite_") && !name.contains(['/', '\\']) && !name.contains(".."),
+            "Not a cache entry name: {name}"
+        );
+        Ok(self.memory.root().context("No memory cache")?.join(name))
+    }
+
+    /// Store an entry loaded from elsewhere (not reported as written).
+    pub fn preload(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.entry(name)?;
+        self.memory
+            .write(&path, bytes)
+            .with_context(|| format!("Cannot store {name}"))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.entry(name)
+            .is_ok_and(|path| self.memory.modified(&path).is_some())
+    }
+
+    /// Entries written by the engine since the last call (name and bytes;
+    /// entries pruned meanwhile are skipped).
+    pub fn take_writes(&self) -> Vec<(String, Vec<u8>)> {
+        let written = std::mem::take(&mut *self.written.lock().expect("cache lock"));
+        written
+            .into_iter()
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?.to_owned();
+                Some((name, self.memory.read(&path).ok()?))
+            })
+            .collect()
+    }
+
+    /// Number of entries read by the engine since the last call.
+    pub fn take_reads(&self) -> usize {
+        self.reads.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn len(&self) -> usize {
+        self.memory.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.memory.is_empty()
+    }
+}
+
+impl CacheStore for PageCacheStore {
+    fn root(&self) -> Option<PathBuf> {
+        self.memory.root()
+    }
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        let bytes = self.memory.read(path)?;
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(bytes)
+    }
+    fn modified(&self, path: &Path) -> Option<SystemTime> {
+        self.memory.modified(path)
+    }
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        self.memory.write(path, bytes)?;
+        if let Ok(mut written) = self.written.lock() {
+            written.insert(path.to_path_buf());
+        }
+        Ok(())
+    }
+    fn mark_used(&self, path: &Path) {
+        self.memory.mark_used(path)
+    }
+    fn prune(&self) {
+        self.memory.prune()
+    }
+}
+
 /// The engine of a web page: catalogues and datasets from bytes, the
-/// memory cache store holding precomputed S-101 payloads, a sequential
-/// executor and the host's clock.
+/// page's cache store (precomputed S-101 payloads, per-cell portrayal
+/// caches), a sequential executor and the host's clock.
 pub struct WebEngineCore {
     engine: ChartEngine,
-    cache: Arc<MemoryCacheStore>,
+    cache: Arc<PageCacheStore>,
     pending: Vec<(PathBuf, Arc<[u8]>)>,
     opened: OpenReport,
     scene: Option<PreparedScene>,
@@ -132,7 +226,7 @@ impl WebEngineCore {
         for (name, bytes) in catalogue_files {
             data.insert(Path::new(CATALOGUE_ROOT).join(relative_name(&name)?), bytes);
         }
-        let cache = Arc::new(MemoryCacheStore::default());
+        let cache = Arc::new(PageCacheStore::default());
         let platform = Platform::in_memory(data)
             .with_cache(Arc::clone(&cache) as _)
             .with_clock(clock)
@@ -186,13 +280,44 @@ impl WebEngineCore {
             file.starts_with(".ferrite_pre_") && !file.contains(".."),
             "Not a precomputed payload name: {name}"
         );
-        let root = ferrite_engine::platform::CacheStore::root(self.cache.as_ref())
-            .context("No memory cache")?;
-        ferrite_engine::platform::CacheStore::write(self.cache.as_ref(), &root.join(&file), bytes)
-            .with_context(|| format!("Cannot store {name}"))?;
+        self.cache.preload(&file, bytes)?;
         self.payloads += 1;
         self.scene_current = false;
         Ok(())
+    }
+
+    /// Names of the cache entries the next portrayal reads and the page's
+    /// cache store does not hold yet: the per-cell Lua portrayal caches of
+    /// the opened cells for the current display
+    /// ([`ChartEngine::cell_cache_entries`]). The page loads them from its
+    /// persistent store ([`Self::load_cache_entry`]) before preparing.
+    pub fn missing_cache_entries(&mut self) -> Vec<String> {
+        if !LUA_AVAILABLE || self.portrayal == PortrayalChoice::Precomputed {
+            return Vec::new();
+        }
+        self.engine
+            .cell_cache_entries()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .filter(|name| !self.cache.contains(name))
+            .collect()
+    }
+
+    /// Store a cache entry the page kept from an earlier session (not
+    /// reported again by [`Self::take_cache_writes`]).
+    pub fn load_cache_entry(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.cache.preload(name, bytes)
+    }
+
+    /// Cache entries written since the last call, for the page to persist.
+    pub fn take_cache_writes(&self) -> Vec<(String, Vec<u8>)> {
+        self.cache.take_writes()
+    }
+
+    /// Whether the current scene can follow a view change by re-projection
+    /// (then [`Self::set_view`] usually portrays nothing).
+    pub fn scene_current(&self) -> bool {
+        self.scene_current && self.scene.is_some()
     }
 
     /// Select how S-101 cells are portrayed (`auto`, `lua`, `precomputed`);
@@ -412,6 +537,10 @@ impl WebEngineCore {
             "resident_cells": self.engine.state().resident_cells.as_ref()
                 .map(|r| r.iter().filter(|r| **r).count()),
             "cells": self.engine.state().cells.len(),
+            "bathymetry_files": self.engine.state().bathymetry_bounds.len(),
+            // Cache entries read by this preparation (per-cell portrayal
+            // caches and precomputed payloads): hits skip Lua.
+            "cache_reads": self.cache.take_reads(),
         });
         self.scene = Some(scene);
         self.scene_current = true;
@@ -517,7 +646,12 @@ mod tests {
 
     fn catalogue_files(root: &Path) -> Vec<(String, Vec<u8>)> {
         let mut files = Vec::new();
-        for product in ["FC/S-101", "PC/S-101", "FC/S-124", "PC/S-124"] {
+        for product in [
+            "FC/S-101", "PC/S-101", "FC/S-102", "PC/S-102", "FC/S-124", "PC/S-124",
+        ] {
+            if !root.join("Catalogues").join(product).is_dir() {
+                continue;
+            }
             let base = root.join("Catalogues");
             let mut stack = vec![base.join(product)];
             while let Some(dir) = stack.pop() {
@@ -555,6 +689,27 @@ mod tests {
         assert!(parse_bundle(b"ZIP!").is_err());
         assert!(relative_name("../x").is_err());
         assert_eq!(relative_name("/a\\b/./c").unwrap(), PathBuf::from("a/b/c"));
+    }
+
+    #[test]
+    fn page_cache_reports_engine_writes_only() {
+        let cache = PageCacheStore::default();
+        assert!(cache.preload("../x", b"").is_err());
+        assert!(cache.preload(".ferrite_a/b", b"").is_err());
+        assert!(cache.preload("plain.bin", b"").is_err());
+        cache.preload(".ferrite_cell_1.bin", b"kept").unwrap();
+        assert!(cache.contains(".ferrite_cell_1.bin"));
+        assert!(cache.take_writes().is_empty());
+        let path = cache.entry(".ferrite_cell_2.bin").unwrap();
+        cache.write(&path, b"new").unwrap();
+        assert_eq!(cache.read(&path).unwrap(), b"new");
+        assert_eq!(cache.take_reads(), 1);
+        assert_eq!(
+            cache.take_writes(),
+            vec![(".ferrite_cell_2.bin".to_string(), b"new".to_vec())]
+        );
+        assert!(cache.take_writes().is_empty());
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
@@ -708,5 +863,144 @@ mod tests {
         .unwrap();
         assert_eq!(s["portrayal"], "lua", "{s}");
         assert!(core.part9a_dump().unwrap().starts_with("cell\t0\t"));
+    }
+
+    /// The persistent cache protocol of the page: a second page preloads the
+    /// entries the first one wrote and portrays from them (no Lua run), with
+    /// the same result.
+    #[cfg(feature = "lua-wasm")]
+    #[test]
+    fn cell_caches_written_by_one_page_serve_the_next() {
+        let root = repository();
+        let cell = root.join(
+            "TestData/SHOM-S101/NormalizedExchangeSets/S100_ENC_ROOT_AcrossTheCHannel_product_Edition1_2026-03-25T06_53_12/S100_ROOT/S-101/DATASET_FILES/101FR00471610/101FR00471610.000",
+        );
+        if !cell.is_file() {
+            eprintln!("TestData not present; skipped");
+            return;
+        }
+        let open = || {
+            let mut core =
+                WebEngineCore::new(catalogue_files(&root), Arc::new(SystemClock)).unwrap();
+            core.add_file("101FR00471610.000", std::fs::read(&cell).unwrap())
+                .unwrap();
+            core.open().unwrap();
+            core
+        };
+        let summary = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        let mut first = open();
+        let wanted = first.missing_cache_entries();
+        assert_eq!(wanted.len(), 1, "{wanted:?}");
+        let a = summary(
+            first
+                .set_view(320, 240, 1.0, f64::NAN, f64::NAN, 2.0, false)
+                .unwrap(),
+        );
+        assert_eq!(a["cache_reads"], 0, "{a}");
+        let saved = first.take_cache_writes();
+        assert_eq!(
+            saved.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            wanted
+        );
+        assert!(first.missing_cache_entries().is_empty());
+
+        let mut second = open();
+        assert_eq!(second.missing_cache_entries(), wanted);
+        for (name, bytes) in &saved {
+            second.load_cache_entry(name, bytes).unwrap();
+        }
+        assert!(second.missing_cache_entries().is_empty());
+        let b = summary(
+            second
+                .set_view(320, 240, 1.0, f64::NAN, f64::NAN, 2.0, false)
+                .unwrap(),
+        );
+        assert_eq!(b["cache_reads"], 1, "{b}");
+        assert_eq!(a["instructions"], b["instructions"]);
+        assert!(second.take_cache_writes().is_empty());
+        assert!(
+            draw(&mut first) == draw(&mut second),
+            "cached frame differs"
+        );
+        // Another palette needs other entries.
+        second.set_palette("Night").unwrap();
+        assert_eq!(second.missing_cache_entries().len(), 1);
+    }
+
+    /// S-102 from bytes through the web core: opened, portrayed with the
+    /// rule in Lua and drawn by the shared emitter; re-projection keeps the
+    /// uploaded rasters and draws what a fresh preparation draws.
+    #[cfg(all(feature = "lua-wasm", feature = "s102-pure"))]
+    #[test]
+    fn s102_from_bytes_is_drawn() {
+        let root = repository();
+        let dir = root.join(
+            "TestData/SHOM-S102/ExchangeSets/S100_ENC_ROOT_SAINTMALO_5m_2026-05-26/S100_ROOT/S-102/DATASET_FILES",
+        );
+        if !dir.is_dir() || !root.join("Catalogues/PC/S-102").is_dir() {
+            eprintln!("TestData not present; skipped");
+            return;
+        }
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            for file in std::fs::read_dir(entry.unwrap().path()).unwrap() {
+                let path = file.unwrap().path();
+                files.push((
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+        files.sort();
+        let open = |files: &[(String, Vec<u8>)]| {
+            let mut core =
+                WebEngineCore::new(catalogue_files(&root), Arc::new(SystemClock)).unwrap();
+            for (name, bytes) in files {
+                core.add_file(name, bytes.clone()).unwrap();
+            }
+            let report: serde_json::Value = serde_json::from_str(&core.open().unwrap()).unwrap();
+            (core, report)
+        };
+        let (mut core, report) = open(&files);
+        assert_eq!(
+            report["bathymetry"].as_array().unwrap().len(),
+            7,
+            "{report}"
+        );
+        let summary = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        let a = summary(
+            core.set_view(320, 240, 1.0, 48.645, -2.03, 1.0, false)
+                .unwrap(),
+        );
+        assert_eq!(a["bathymetry_files"], 7, "{a}");
+        let mut gpu = ferrite_cli::OffscreenChartRenderer::new(320, 240, 1.0).unwrap();
+        let mut frame = |core: &mut WebEngineCore| {
+            let (engine, scene, zoom, _) = core.scene_mut().unwrap();
+            gpu.render(engine, scene, zoom)
+                .map(|image| image.into_raw())
+        };
+        let drawn = frame(&mut core).unwrap();
+        // Only S-102 is open: the depth shades fill the view.
+        let colours: std::collections::HashSet<&[u8]> = drawn.chunks(4).collect();
+        assert!(colours.len() > 3, "{} colours", colours.len());
+        // The tiles went to `gpu`: another renderer refuses the scene.
+        let (engine, scene, zoom, [w, h]) = core.scene_mut().unwrap();
+        let mut other = ferrite_cli::OffscreenChartRenderer::new(w, h, 1.0).unwrap();
+        assert!(other.render(engine, scene, zoom).is_err());
+        // Re-projected frames keep the rasters on the GPU and draw what a
+        // fresh preparation of the moved view draws.
+        let b = summary(
+            core.set_view(320, 240, 1.0, 48.64, -2.02, 2.0, false)
+                .unwrap(),
+        );
+        assert_eq!(b["reprojected"], true, "{b}");
+        let once = frame(&mut core).unwrap();
+        let twice = frame(&mut core).unwrap();
+        assert!(once == twice, "second frame of the same scene differs");
+        let (mut fresh, _) = open(&files);
+        fresh
+            .prepare(320, 240, 1.0, 48.64, -2.02, 2.0, false)
+            .unwrap();
+        assert!(draw(&mut fresh) == once, "re-projected S-102 frame differs");
     }
 }

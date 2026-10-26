@@ -90,6 +90,42 @@ impl WebEngine {
         self.core.load_precomputed(name, bytes).map_err(js_error)
     }
 
+    /// Names of the cache entries the next portrayal reads that the page's
+    /// cache does not hold (JSON array): the per-cell Lua portrayal caches
+    /// of the opened cells for the current display. A page with a
+    /// persistent cache (IndexedDB) loads them with
+    /// [`WebEngine::load_cache_entry`] before [`WebEngine::set_view`] /
+    /// [`WebEngine::prepare`] and saves [`WebEngine::take_cache_writes`]
+    /// afterwards.
+    pub fn missing_cache_entries(&mut self) -> String {
+        serde_json::json!(self.core.missing_cache_entries()).to_string()
+    }
+
+    /// Store a cache entry saved by an earlier page (`.ferrite_*` name).
+    pub fn load_cache_entry(&mut self, name: &str, bytes: &[u8]) -> Result<(), JsError> {
+        self.core.load_cache_entry(name, bytes).map_err(js_error)
+    }
+
+    /// Cache entries the engine wrote since the last call, as an array of
+    /// `[name, Uint8Array]` pairs to persist.
+    pub fn take_cache_writes(&self) -> js_sys::Array {
+        self.core
+            .take_cache_writes()
+            .into_iter()
+            .map(|(name, bytes)| {
+                let pair = js_sys::Array::new();
+                pair.push(&JsValue::from_str(&name));
+                pair.push(&js_sys::Uint8Array::from(bytes.as_slice()));
+                JsValue::from(pair)
+            })
+            .collect()
+    }
+
+    /// Whether a view change can re-project the current scene (no portrayal).
+    pub fn scene_current(&self) -> bool {
+        self.core.scene_current()
+    }
+
     /// Open the queued files; this open's report as JSON.
     pub fn open(&mut self) -> Result<String, JsError> {
         self.core.open().map_err(js_error)
@@ -225,12 +261,28 @@ impl WebEngine {
     }
 }
 
-/// ferrite-gpu presenting to an HTML canvas.
+/// ferrite-gpu presenting to an HTML canvas, or to an `OffscreenCanvas`
+/// (e.g. in a Web Worker).
 #[wasm_bindgen]
 pub struct WebCanvas {
     renderer: WgpuRenderer<HeadlessUi>,
     surface: Arc<HeadlessSurface>,
     emitter: SceneEmitter,
+    /// An offscreen canvas has no page layout; [`WebCanvas::resize`] sizes it.
+    offscreen: Option<web_sys::OffscreenCanvas>,
+}
+
+fn backends(backend: Option<&str>) -> Result<wgpu::Backends, JsError> {
+    Ok(match backend.unwrap_or("auto") {
+        "auto" => wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+        "webgpu" => wgpu::Backends::BROWSER_WEBGPU,
+        "webgl2" => wgpu::Backends::GL,
+        other => {
+            return Err(JsError::new(&format!(
+                "Unknown backend {other:?} (auto, webgpu, webgl2)"
+            )))
+        }
+    })
 }
 
 #[wasm_bindgen]
@@ -244,16 +296,7 @@ impl WebCanvas {
         density: f64,
         backend: Option<String>,
     ) -> Result<WebCanvas, JsError> {
-        let backends = match backend.as_deref().unwrap_or("auto") {
-            "auto" => wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-            "webgpu" => wgpu::Backends::BROWSER_WEBGPU,
-            "webgl2" => wgpu::Backends::GL,
-            other => {
-                return Err(JsError::new(&format!(
-                    "Unknown backend {other:?} (auto, webgpu, webgl2)"
-                )))
-            }
-        };
+        let backends = backends(backend.as_deref())?;
         let canvas: web_sys::HtmlCanvasElement = web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| d.get_element_by_id(&canvas_id))
@@ -261,10 +304,48 @@ impl WebCanvas {
             .dyn_into()
             .map_err(|_| JsError::new(&format!("#{canvas_id} is not a canvas")))?;
         let size = PhysicalSize::new(canvas.width().max(1), canvas.height().max(1));
+        Self::with_target(
+            wgpu::SurfaceTarget::Canvas(canvas),
+            size,
+            density,
+            backends,
+            None,
+        )
+        .await
+    }
+
+    /// The renderer of an `OffscreenCanvas` (one transferred to a Web Worker
+    /// with `transferControlToOffscreen()`), at `density` device pixels per
+    /// CSS pixel; `backend` as in [`WebCanvas::create`]. WebGPU needs
+    /// `navigator.gpu` in the worker; WebGL2 works on offscreen canvases.
+    pub async fn from_offscreen(
+        canvas: web_sys::OffscreenCanvas,
+        density: f64,
+        backend: Option<String>,
+    ) -> Result<WebCanvas, JsError> {
+        let backends = backends(backend.as_deref())?;
+        let size = PhysicalSize::new(canvas.width().max(1), canvas.height().max(1));
+        Self::with_target(
+            wgpu::SurfaceTarget::OffscreenCanvas(canvas.clone()),
+            size,
+            density,
+            backends,
+            Some(canvas),
+        )
+        .await
+    }
+
+    async fn with_target(
+        target: wgpu::SurfaceTarget<'static>,
+        size: PhysicalSize<u32>,
+        density: f64,
+        backends: wgpu::Backends,
+        offscreen: Option<web_sys::OffscreenCanvas>,
+    ) -> Result<WebCanvas, JsError> {
         let surface = Arc::new(HeadlessSurface::new(size, density));
         let host = Arc::clone(&surface);
         let renderer = WgpuRenderer::new_with_backends(
-            wgpu::SurfaceTarget::Canvas(canvas),
+            target,
             Arc::clone(&surface) as Arc<dyn SurfaceHost>,
             backends,
             |device, _| HeadlessUi::new(device, host),
@@ -275,6 +356,7 @@ impl WebCanvas {
             renderer,
             surface,
             emitter: SceneEmitter::new(),
+            offscreen,
         })
     }
 
@@ -297,6 +379,12 @@ impl WebCanvas {
     /// Match the drawing buffer to `width` x `height` physical pixels.
     pub fn resize(&mut self, width: u32, height: u32) {
         let size = PhysicalSize::new(width.max(1), height.max(1));
+        if let Some(canvas) = &self.offscreen {
+            if canvas.width() != size.width || canvas.height() != size.height {
+                canvas.set_width(size.width);
+                canvas.set_height(size.height);
+            }
+        }
         if self.surface.inner_size() != size {
             self.surface.set_size(size);
             self.renderer.resize(size);

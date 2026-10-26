@@ -3,17 +3,22 @@ name = "ferrite-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Web (wasm32-unknown-unknown) bindings of the S-100 ChartEngine: in-memory platform, sequential execution, precomputed S-101 portrayal and ferrite-gpu rendering into a canvas (WebGPU, WebGL2 fallback)"
+description = "Web (wasm32-unknown-unknown) bindings of the S-100 ChartEngine: in-memory platform, sequential execution, Lua or precomputed S-101 portrayal, S-102 with the pure-Rust HDF5 reader and ferrite-gpu rendering into a canvas or OffscreenCanvas (WebGPU, WebGL2 fallback)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["s102-pure"]
 # S-101 portrayal with the catalogue's Lua rules in the browser: the vendored
 # Lua 5.4 compiled to wasm32 by ferrite-lua-runtime (needs a clang with the
 # WebAssembly target, e.g. Homebrew LLVM, and llvm-ar; see its build script).
 # Off: S-101 cells draw only from precomputed payloads.
 lua-wasm = ["ferrite-engine/lua54", "ferrite-cli/lua54", "dep:ferrite-lua", "ferrite-lua/lua54"]
+
+# S-102 bathymetry read with the pure-Rust HDF5 reader (no C library); its
+# rule runs with Lua under lua-wasm, otherwise from precomputed instructions.
+s102-pure = ["ferrite-cli/s102-pure", "ferrite-engine/s102-pure"]
 
 [[example]]
 name = "part9a_dump"
@@ -33,5 +38,5 @@ tracing.workspace = true
 wasm-bindgen = "=0.2.108"
 wasm-bindgen-futures = "=0.4.58"
 js-sys = "=0.3.85"
-web-sys = { version = "=0.3.85", features = ["Document", "Element", "HtmlCanvasElement", "Window", "console"] }
+web-sys = { version = "=0.3.85", features = ["Document", "Element", "HtmlCanvasElement", "OffscreenCanvas", "Window", "console"] }
 wgpu.workspace = true

@@ -18,7 +18,11 @@ default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl"]
 lua54 = ["ferrite-engine/lua54"]
 lua55 = ["ferrite-engine/lua55"]
 parallel = ["ferrite-engine/parallel"]
-s102-hdf5 = ["ferrite-engine/s102-hdf5"]
+# S-102 bathymetry through the facade, drawn as the viewer draws it: the
+# pure-Rust HDF5 reader (no C, builds for wasm32), and with s102-hdf5 also
+# the HDF5 C library and Lua rule evaluation.
+s102-pure = ["ferrite-engine/s102-pure", "ferrite-gpu/s102-material"]
+s102-hdf5 = ["s102-pure", "ferrite-engine/s102-hdf5"]
 crypto-openssl = ["ferrite-engine/crypto-openssl"]
 crypto-rust = ["ferrite-engine/crypto-rust"]
 

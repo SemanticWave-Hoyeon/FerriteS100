@@ -5,7 +5,11 @@ edition.workspace = true
 description = "wgpu renderer for S-100 charts, independent of windowing and GUI toolkits"
 
 [features]
-s102-portrayal = ["dep:ferrite-s102", "ferrite-s102/crypto-openssl"]
+# Typed S-102 raster materials (`S102RasterMaterial`); the signature backend
+# of ferrite-s102 comes from the dependents (ferrite-cli/-wasm select it).
+s102-material = ["dep:ferrite-s102"]
+# The viewer's selection: S-102 materials with the OpenSSL backend.
+s102-portrayal = ["s102-material", "ferrite-s102/crypto-openssl"]
 lua54 = ["ferrite-s102?/lua54"]
 lua55 = ["ferrite-s102?/lua55"]
 # Test-only hooks used by ferrite-ui tests.

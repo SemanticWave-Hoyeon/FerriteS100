@@ -10,6 +10,7 @@ use ferrite_engine::chart_engine::{
 };
 use ferrite_engine::pick::FeatureReport;
 use ferrite_engine::platform::Platform;
+use ferrite_engine::s102_scene::BathymetrySummary;
 use ferrite_engine::scene::PreparedScene;
 use ferrite_gpu::headless::{HeadlessSurface, HeadlessUi};
 use ferrite_gpu::{PhysicalSize, SurfaceHost, SymbolCache, UiLayer, WgpuRenderer};
@@ -108,7 +109,26 @@ pub fn feature_json(report: &FeatureReport) -> Value {
     })
 }
 
-/// Every opened dataset with the open report's issues and notices.
+/// An opened S-102 file.
+pub fn bathymetry_json(summary: &BathymetrySummary) -> Value {
+    json!({
+        "source": summary.source.display().to_string(),
+        "product_specification": summary.product_specification,
+        "instances": summary.instances,
+        "grid": [summary.grid.0, summary.grid.1],
+        "issue_date": summary.issue_date,
+        "vertical_datums": summary.vertical_datums,
+        "quality_records": summary.quality_records,
+        "bounds": summary.bounds.map(|b| json!({
+            "west": b.min_x, "south": b.min_y, "east": b.max_x, "north": b.max_y,
+        })),
+        "inspection_only": summary.inspection_only,
+        "provenance": summary.provenance,
+    })
+}
+
+/// Every opened dataset (S-102 files under `bathymetry`) with the open
+/// report's issues and notices.
 pub fn inspection_json(engine: &ChartEngine, report: &OpenReport) -> Value {
     json!({
         "datasets": engine
@@ -116,6 +136,7 @@ pub fn inspection_json(engine: &ChartEngine, report: &OpenReport) -> Value {
             .iter()
             .map(|d| dataset_json(engine, d))
             .collect::<Vec<_>>(),
+        "bathymetry": engine.bathymetry().iter().map(bathymetry_json).collect::<Vec<_>>(),
         "issues": report.issues.iter().map(issue_json).collect::<Vec<_>>(),
         "notices": report.notices,
         "catalogue_notes": engine.catalogue_errors(),
@@ -138,13 +159,17 @@ pub fn palettes(engine: &ChartEngine) -> Vec<String> {
 
 /// Emits prepared [`ChartEngine`] scenes into a ferrite-gpu renderer: the
 /// same emission the viewer performs for a frame (palette, display settings,
-/// viewing groups, per-catalogue cell resources, chart text). The renderer
-/// then draws offscreen ([`OffscreenChartRenderer`]) or presents to a
-/// surface (the web canvas of `ferrite-wasm`).
+/// viewing groups, per-catalogue cell resources, chart text, S-102
+/// bathymetry rasters). The renderer then draws offscreen
+/// ([`OffscreenChartRenderer`]) or presents to a surface (the web canvas of
+/// `ferrite-wasm`).
 #[derive(Default)]
 pub struct SceneEmitter {
     /// Symbols of one catalogue and palette (rasterized per palette).
     symbols: Option<(([u8; 32], String), SymbolCache)>,
+    /// The bathymetry scene whose tiles the renderer holds
+    /// ([`ferrite_engine::s102_scene::BathymetryScene::id`]).
+    rasters: Option<Arc<()>>,
 }
 
 impl SceneEmitter {
@@ -203,6 +228,13 @@ impl SceneEmitter {
         renderer.set_zoom_level(zoom);
         renderer.prefill_area_triangulations(context);
         renderer.begin_frame();
+        Self::emit_bathymetry(
+            &mut self.rasters,
+            renderer,
+            engine,
+            &mut scene.bathymetry,
+            &context.scaler,
+        )?;
         renderer.set_lon_wrap_pixels(360.0 * context.scaler.scale_x() as f32);
         if state.requires_cell_resources(&scene.catalogue_registry, &state.fc, pc)? {
             // Cells of other catalogue editions draw with their own owners.
@@ -248,6 +280,111 @@ impl SceneEmitter {
             )?;
         }
         Ok(())
+    }
+}
+
+impl SceneEmitter {
+    /// Publish the S-102 tiles of a scene as the viewer's raster scene
+    /// publication (staged, prepared for the scene's camera with the display
+    /// mode's viewing groups, committed). The tiles move to the GPU (CPU
+    /// pixels are released, as in the viewer), so a scene with bathymetry is
+    /// drawn by one renderer: later frames of the same scene (re-projected
+    /// views) re-project the held rasters, and another renderer refuses it.
+    /// A scene without bathymetry clears them.
+    fn emit_bathymetry<U: UiLayer>(
+        rasters: &mut Option<Arc<()>>,
+        renderer: &mut WgpuRenderer<U>,
+        engine: &ChartEngine,
+        bathymetry: &mut ferrite_engine::s102_scene::BathymetryScene,
+        scaler: &ferrite_render::Scaler,
+    ) -> Result<()> {
+        // S-98 Level 2: an active combination suppressing S-102 clips the
+        // rasters to the area outside the displayed S-101 coverage.
+        let state = engine.state();
+        let suppress = engine.display().settings.interoperability_enabled
+            && state.ic.as_ref().is_some_and(|ic| {
+                let mut displayed = Vec::new();
+                if !state.cells.is_empty() {
+                    displayed.push("S-101");
+                }
+                if !state.bathymetry_bounds.is_empty() {
+                    displayed.push("S-102");
+                }
+                ic.catalogue
+                    .select(state.ic_combination.as_deref(), &displayed)
+                    .ok()
+                    .and_then(|selection| ic.catalogue.active_combination(selection))
+                    .is_some_and(|c| c.suppressed.iter().any(|l| l.product == "S-102"))
+            });
+        renderer.set_raster_layer_suppression(suppress);
+        if bathymetry.tiles.is_empty() {
+            if rasters
+                .as_ref()
+                .is_some_and(|id| Arc::ptr_eq(id, &bathymetry.id))
+            {
+                renderer.update_raster_view(scaler);
+                return Ok(());
+            }
+            if rasters.take().is_some() {
+                renderer.clear_raster_layers();
+            }
+            // Bathymetry whose tiles another renderer took: not silently
+            // drawn without it.
+            ensure!(
+                bathymetry.viewing_groups.is_none(),
+                "The S-102 tiles of this scene went to another renderer; prepare the scene again"
+            );
+            return Ok(());
+        }
+        *rasters = None;
+        Self::publish_bathymetry(renderer, bathymetry, scaler)?;
+        *rasters = Some(Arc::clone(&bathymetry.id));
+        Ok(())
+    }
+
+    #[cfg(feature = "s102-pure")]
+    fn publish_bathymetry<U: UiLayer>(
+        renderer: &mut WgpuRenderer<U>,
+        bathymetry: &mut ferrite_engine::s102_scene::BathymetryScene,
+        scaler: &ferrite_render::Scaler,
+    ) -> Result<()> {
+        use ferrite_engine::s102_scene::BathymetryTile;
+        let tiles = std::mem::take(&mut bathymetry.tiles);
+        let batch = renderer.stage_s102_raster_batch(scaler, |upload| {
+            for tile in tiles {
+                upload(match tile {
+                    BathymetryTile::Bound(material) => {
+                        ferrite_gpu::S102RasterMaterial::Bound(material)
+                    }
+                    BathymetryTile::Composed(layer) => {
+                        ferrite_gpu::S102RasterMaterial::LegacyIc(layer)
+                    }
+                })?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let raster = renderer.prepare_raster_material_publication(batch, true, None)?;
+        let scene = renderer.prepare_raster_scene_publication_with_groups(
+            raster,
+            Some(bathymetry.viewing_groups.clone().unwrap_or_default()),
+        )?;
+        renderer.validate_raster_scene_publication(&scene)?;
+        renderer.commit_raster_scene_publication(scene);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "s102-pure"))]
+    fn publish_bathymetry<U: UiLayer>(
+        _: &mut WgpuRenderer<U>,
+        bathymetry: &mut ferrite_engine::s102_scene::BathymetryScene,
+        _: &ferrite_render::Scaler,
+    ) -> Result<()> {
+        // Without s102-pure the engine builds only composed tiles, and only
+        // with S-102 support; nothing reaches here.
+        anyhow::bail!(
+            "S-102 tiles ({}) need ferrite-cli's s102-pure feature",
+            bathymetry.tiles.len()
+        )
     }
 }
 

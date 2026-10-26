@@ -4,12 +4,13 @@
 Compiles crates/ferrite-wasm for wasm32-unknown-unknown, generates the
 JavaScript bindings with wasm-bindgen (the CLI version must equal the
 wasm-bindgen crate, 0.2.108), copies crates/ferrite-wasm/www and writes the
-catalogue bundle (catalogues.bin: S-101, S-124, S-129 FC/PC). Everything goes
-to --out, outside the repository; cargo output goes to --target-dir.
+catalogue bundle (catalogues.bin: S-101, S-102, S-124, S-129 FC/PC).
+Everything goes to --out, outside the repository; cargo output goes to
+--target-dir.
 
     cargo install wasm-bindgen-cli --version 0.2.108 --locked --root DIR
     python3 -I tools/build_wasm.py --out OUT --wasm-bindgen DIR/bin/wasm-bindgen \\
-        [--target-dir DIR] [--profile release] [--no-lua] \\
+        [--target-dir DIR] [--profile release] [--no-lua] [--no-s102] \\
         [--sample FILE_OR_DIR ...] [--precomputed DIR]
     python3 -m http.server -d OUT 8000      # open http://localhost:8000/
 
@@ -17,7 +18,13 @@ The build portrays S-101 with the catalogue's Lua rules in the browser
 (feature lua-wasm: Lua 5.4 compiled to wasm32 with clang; set FERRITE_WASM_CC
 and FERRITE_WASM_AR when clang/llvm-ar with the WebAssembly target are not
 found, see crates/ferrite-lua-runtime/build.rs). --no-lua builds without it:
-S-101 cells then draw only from precomputed payloads.
+S-101 cells then draw only from precomputed payloads. S-102 bathymetry
+(feature s102-pure, the pure-Rust HDF5 reader) is built unless --no-s102.
+
+The page runs the engine in a Web Worker drawing into an OffscreenCanvas
+(worker.js, host.js), falling back to the main thread when the browser
+cannot render from workers (engine-client.js); ?worker=off forces the main
+thread. Per-cell portrayal caches persist in IndexedDB (cache-db.js).
 
 --sample copies datasets to OUT/samples (listed in samples.json, loaded by
 the page's "Load samples" button); --precomputed copies the .ferrite_pre_*
@@ -38,7 +45,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CRATE = REPO / "crates" / "ferrite-wasm"
-PRODUCTS = ["S-101", "S-124", "S-129"]
+PRODUCTS = ["S-101", "S-102", "S-124", "S-129"]
 WASM_BINDGEN_VERSION = "0.2.108"
 
 
@@ -73,6 +80,8 @@ def main() -> int:
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--no-lua", action="store_true",
                         help="build without Lua portrayal (precomputed S-101 payloads only)")
+    parser.add_argument("--no-s102", action="store_true",
+                        help="build without S-102 bathymetry (feature s102-pure)")
     args = parser.parse_args()
 
     out = args.out.resolve()
@@ -90,7 +99,9 @@ def main() -> int:
     if not args.skip_build:
         subprocess.run(
             ["cargo", "build", "-p", "ferrite-wasm", "--target", "wasm32-unknown-unknown",
-             "--profile", args.profile, *([] if args.no_lua else ["--features", "lua-wasm"])],
+             "--profile", args.profile,
+             *(["--no-default-features"] if args.no_s102 else []),
+             *([] if args.no_lua else ["--features", "lua-wasm"])],
             cwd=REPO, env=env, check=True,
         )
     profile_dir = "debug" if args.profile == "dev" else args.profile

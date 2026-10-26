@@ -5,11 +5,17 @@
 //!   `Platform::in_memory`: catalogues and datasets are bytes supplied by the
 //!   page, work runs on the calling thread (`SequentialExecutor`) and the
 //!   wall clock is JavaScript's `Date.now()`.
-//! - S-101 cells are portrayed from precomputed Part 9a payloads made by a
-//!   native build (`ferrite precompute`); the web build has no Lua.
-//! - [`WebCanvas`] renders prepared scenes with ferrite-gpu into a canvas
-//!   (WebGPU, or WebGL2 when the browser has no WebGPU), presenting to the
-//!   canvas surface; the emission is the CLI's ([`ferrite_cli::SceneEmitter`]).
+//! - S-101 cells are portrayed with the catalogue's Lua rules (feature
+//!   `lua-wasm`) or from precomputed Part 9a payloads made by a native build
+//!   (`ferrite precompute`); S-102 bathymetry is read with the pure-Rust
+//!   HDF5 reader (feature `s102-pure`).
+//! - The page's cache store ([`core::PageCacheStore`]) reports the entries
+//!   the engine wrote, so a page can keep per-cell portrayal caches in
+//!   IndexedDB and load them before the next page's portrayal.
+//! - [`WebCanvas`] renders prepared scenes with ferrite-gpu into a canvas or
+//!   an `OffscreenCanvas` (a Web Worker), with WebGPU or WebGL2, presenting
+//!   to the canvas surface; the emission (S-102 rasters included) is the
+//!   CLI's ([`ferrite_cli::SceneEmitter`]).
 //!
 //! Results are JSON strings; failures are thrown as JavaScript errors.
 pub mod core;
