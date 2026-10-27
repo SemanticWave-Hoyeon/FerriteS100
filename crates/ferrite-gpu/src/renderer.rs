@@ -9714,7 +9714,7 @@ impl VectorEmissionOwned {
                         _ => false,
                     };
 
-                    // CLAUDE.md: "no placeholder colors, no fallbacks". If the symbol
+                    // No placeholder colours and no fallbacks: if the symbol
                     // cannot render, surface it as a real error (logged once per id)
                     // and skip — never paint a hardcoded red square.
                     if !rendered {
