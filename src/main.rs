@@ -104,6 +104,7 @@ use ferrite_engine::{dataset_discovery, dataset_signature_policy};
 use ferrite_engine::{
     CellHydration, CellHydrationSource, CellScene, ChangeCellScene, ChartLoadResult, EngineState,
 };
+use ferrite_s101::layer::catalogue::LAYOUT as S101_CATALOGUES;
 use ferrite_s101::layer::catalogue::{validate_fc, validate_pc};
 use ferrite_s101::layer::cells::{chart_data_bounds, CatalogueNormalization};
 use ferrite_s101::layer::portrayal::{validated_lua_context, PortrayalChangeRequest};
@@ -225,9 +226,9 @@ use ferrite_feature_catalog::BoundFeatureCatalogue;
 use ferrite_gpu::{CatalogueStatus, DisplayMode, SelectedFeature, SettingsState, SymbolCache};
 use ferrite_kernel::{depth_selection::DepthReference, NumericCoverageSource};
 use ferrite_lua::{PortrayalEngine, TypeCatalogue};
+use ferrite_part9a::{convert_lua_results_for_cell, lookup_pc_color};
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
 use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext, Viewport, WorldPoint};
-use ferrite_s101::{convert_lua_results_for_cell, lookup_pc_color};
 use ferrite_s102::{BathymetryCoverage, BathymetryPortrayal, ConservativeCoverage, DatumCoverage};
 use ferrite_security::{
     authorize_datasets, AuthenticatedSnapshot, AuthorizedDatasets, TrustAnchors,
@@ -1225,7 +1226,7 @@ impl ChartApp {
                 if let Some(record) =
                     ferrite_s124::user_state::user_record(platform.user.as_ref(), &user)
                 {
-                    overlays.attach_user_record(ferrite_s100_gml::Product::S124, record, user);
+                    overlays.attach_user_record(ferrite_s124::PRODUCT, record, user);
                 }
                 overlays
             },
@@ -1705,14 +1706,16 @@ impl ChartApp {
     /// remain visible; a failed parse is never presented as a loaded catalogue.
     fn initialize_product_catalogues(&mut self) {
         let fc_path = get_app_base_dir().join("Catalogues/FC/S-102");
-        match load_feature_catalogue(&fc_path).and_then(|fc| {
-            anyhow::ensure!(
-                fc.product_id == "S-102",
-                "Expected S-102 FC, found {}",
-                fc.product_id
-            );
-            Ok(fc)
-        }) {
+        match load_feature_catalogue(&fc_path, &ferrite_s102::layer::CATALOGUE_LAYOUT).and_then(
+            |fc| {
+                anyhow::ensure!(
+                    fc.product_id == "S-102",
+                    "Expected S-102 FC, found {}",
+                    fc.product_id
+                );
+                Ok(fc)
+            },
+        ) {
             Ok(fc) => self
                 .engine
                 .layers
@@ -6086,12 +6089,14 @@ impl ChartApp {
                 "Manual audit cell count mismatch"
             );
             let before = self.capture_catalogue_audit(&output.join("manual-before"))?;
-            let fc = Arc::new(load_feature_catalogue(Path::new(&std::env::var(
-                "FERRITE_ROOT_MANUAL_FC",
-            )?))?);
-            let pc = Arc::new(load_portrayal_catalogue(Path::new(&std::env::var(
-                "FERRITE_ROOT_MANUAL_PC",
-            )?))?);
+            let fc = Arc::new(load_feature_catalogue(
+                Path::new(&std::env::var("FERRITE_ROOT_MANUAL_FC")?),
+                &S101_CATALOGUES,
+            )?);
+            let pc = Arc::new(load_portrayal_catalogue(
+                Path::new(&std::env::var("FERRITE_ROOT_MANUAL_PC")?),
+                &S101_CATALOGUES,
+            )?);
             if mode == "manual-reject" {
                 let error = self
                     .change_catalogue_pair_manually(fc, pc)
@@ -13717,8 +13722,8 @@ impl ApplicationHandler for ChartApp {
                             );
                             let fc_path = &files[0];
                             let pc_path = folder.join("PC");
-                            let fc = load_feature_catalogue(fc_path)?;
-                            let pc = load_portrayal_catalogue(&pc_path)?;
+                            let fc = load_feature_catalogue(fc_path, &S101_CATALOGUES)?;
+                            let pc = load_portrayal_catalogue(&pc_path, &S101_CATALOGUES)?;
                             ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
                             for cell in &self.engine.layers.s101().cells {
                                 ferrite_s101::validate_dataset_catalogues(
@@ -13845,26 +13850,27 @@ impl ApplicationHandler for ChartApp {
                         .set_title("Open Feature Catalogue XML")
                         .pick_file()
                     {
-                        let candidate = load_feature_catalogue(&path).and_then(|new_fc| {
-                            self.ensure_navigation_scene()?;
-                            anyhow::ensure!(
-                                self.loading_state.is_none(),
-                                "Wait for dataset loading to finish before changing catalogues"
-                            );
-                            ferrite_s101::validate_catalogue_pair(
-                                &new_fc,
-                                &self.engine.layers.s101().pc,
-                            )?;
-                            for cell in &self.engine.layers.s101().cells {
-                                ferrite_s101::validate_dataset_catalogues(
-                                    &cell.dsid,
+                        let candidate =
+                            load_feature_catalogue(&path, &S101_CATALOGUES).and_then(|new_fc| {
+                                self.ensure_navigation_scene()?;
+                                anyhow::ensure!(
+                                    self.loading_state.is_none(),
+                                    "Wait for dataset loading to finish before changing catalogues"
+                                );
+                                ferrite_s101::validate_catalogue_pair(
                                     &new_fc,
-                                    &self.engine.layers.s101().pc.product_id,
-                                    &self.engine.layers.s101().pc.version,
+                                    &self.engine.layers.s101().pc,
                                 )?;
-                            }
-                            Ok(new_fc)
-                        });
+                                for cell in &self.engine.layers.s101().cells {
+                                    ferrite_s101::validate_dataset_catalogues(
+                                        &cell.dsid,
+                                        &new_fc,
+                                        &self.engine.layers.s101().pc.product_id,
+                                        &self.engine.layers.s101().pc.version,
+                                    )?;
+                                }
+                                Ok(new_fc)
+                            });
                         match candidate {
                             Ok(new_fc) => {
                                 if let Err(error) = self.change_catalogue_pair_manually(
@@ -13895,30 +13901,31 @@ impl ApplicationHandler for ChartApp {
                         .set_title("Open Portrayal Catalogue Directory")
                         .pick_folder()
                     {
-                        let candidate = load_portrayal_catalogue(&path).and_then(|new_pc| {
-                            self.ensure_navigation_scene()?;
-                            anyhow::ensure!(
-                                self.loading_state.is_none(),
-                                "Wait for dataset loading to finish before changing catalogues"
-                            );
-                            ferrite_s101::validate_catalogue_pair(
-                                &self.engine.layers.s101().fc,
-                                &new_pc,
-                            )?;
-                            for cell in &self.engine.layers.s101().cells {
-                                ferrite_s101::validate_dataset_catalogues(
-                                    &cell.dsid,
+                        let candidate =
+                            load_portrayal_catalogue(&path, &S101_CATALOGUES).and_then(|new_pc| {
+                                self.ensure_navigation_scene()?;
+                                anyhow::ensure!(
+                                    self.loading_state.is_none(),
+                                    "Wait for dataset loading to finish before changing catalogues"
+                                );
+                                ferrite_s101::validate_catalogue_pair(
                                     &self.engine.layers.s101().fc,
-                                    &new_pc.product_id,
-                                    &new_pc.version,
+                                    &new_pc,
                                 )?;
-                            }
-                            primary_viewing_layers::validate_new_primary(
-                                &new_pc,
-                                &self.applied_settings,
-                            )?;
-                            Ok(new_pc)
-                        });
+                                for cell in &self.engine.layers.s101().cells {
+                                    ferrite_s101::validate_dataset_catalogues(
+                                        &cell.dsid,
+                                        &self.engine.layers.s101().fc,
+                                        &new_pc.product_id,
+                                        &new_pc.version,
+                                    )?;
+                                }
+                                primary_viewing_layers::validate_new_primary(
+                                    &new_pc,
+                                    &self.applied_settings,
+                                )?;
+                                Ok(new_pc)
+                            });
                         match candidate {
                             Ok(new_pc) => {
                                 if let Err(error) = self.change_catalogue_pair_manually(
@@ -15439,8 +15446,8 @@ fn run_app() -> Result<()> {
     // event loop on this one (tens of milliseconds each, independent).
     let (fc, pc, event_loop) = std::thread::scope(|scope| -> Result<_> {
         let catalogues = scope.spawn(|| -> Result<_> {
-            let fc = load_feature_catalogue(&config.fc_path)?;
-            let pc = load_portrayal_catalogue(&config.pc_path)?;
+            let fc = load_feature_catalogue(&config.fc_path, &S101_CATALOGUES)?;
+            let pc = load_portrayal_catalogue(&config.pc_path, &S101_CATALOGUES)?;
             Ok((fc, pc))
         });
         let mut event_loop_builder = EventLoop::builder();
@@ -16339,8 +16346,12 @@ mod installed_product_catalogue_tests {
     #[test]
     fn s102_catalogues_are_loaded_before_datasets_and_reused_for_evaluation() {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let fc = Arc::new(load_feature_catalogue(&base.join("Catalogues/FC/S-101")).unwrap());
-        let pc = Arc::new(load_portrayal_catalogue(&base.join("Catalogues/PC/S-101")).unwrap());
+        let fc = Arc::new(
+            load_feature_catalogue(&base.join("Catalogues/FC/S-101"), &S101_CATALOGUES).unwrap(),
+        );
+        let pc = Arc::new(
+            load_portrayal_catalogue(&base.join("Catalogues/PC/S-101"), &S101_CATALOGUES).unwrap(),
+        );
         let cache = SymbolCache::new_with_pattern_contract(
             &pc.root_path.join("Symbols"),
             pc.sources(),

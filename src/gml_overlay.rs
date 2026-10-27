@@ -21,7 +21,7 @@ use anyhow::Result;
 use chrono::Utc;
 use ferrite_gpu::CatalogueStatus;
 use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext};
-use ferrite_s100_gml::{Product, Severity};
+use ferrite_s100_gml::{ProductId, Severity};
 use ferrite_s124::S124Overlay;
 use ferrite_s129::S129Overlay;
 use ferrite_ui::overlay_ui::{NavwarnPanel, NavwarnRequests, NavwarnRow, UkcPanel, UkcPlanRow};
@@ -205,7 +205,11 @@ impl ChartApp {
                 "Imported navigational warnings cannot be authenticated; switch off dataset signature verification to view them (they are never official S-124 data)"
             );
             let (dataset, format) = self.gml_overlays.read(path, path)?;
-            (dataset, Provenance::Imported(format.unwrap_or("import")))
+            let provenance = Provenance::Imported {
+                format: format.unwrap_or("import"),
+                product: dataset.product,
+            };
+            (dataset, provenance)
         } else {
             let report = self.authenticate_paths(&[path.to_path_buf()])?;
             let snapshot =
@@ -476,9 +480,9 @@ impl ChartApp {
         let g = &self.gml_overlays;
         let mut layers = Vec::new();
         let mut catalogues = Vec::new();
-        let products: Vec<Product> = g.products().map(|p| p.product()).collect();
+        let products: Vec<ProductId> = g.products().map(|p| p.product()).collect();
         for product in products {
-            let id = product.identifier();
+            let id = product.as_str();
             let files: Vec<_> = g
                 .datasets
                 .iter()
@@ -626,7 +630,7 @@ mod tests {
             s124.classify(core, id, class);
         }
         fn attach_user_store(&mut self, path: PathBuf, user: String) {
-            self.attach_user_record(Product::S124, Box::new(state_file(&path)), user);
+            self.attach_user_record(ferrite_s124::PRODUCT, Box::new(state_file(&path)), user);
         }
     }
 
@@ -660,7 +664,10 @@ mod tests {
         for path in &paths {
             let (dataset, format) = g.read(path, path).unwrap();
             let provenance = match format {
-                Some(f) => Provenance::Imported(f),
+                Some(format) => Provenance::Imported {
+                    format,
+                    product: dataset.product,
+                },
                 None => Provenance::Unverified,
             };
             assert!(matches!(g.add(dataset, provenance).unwrap(), Added::New));
@@ -678,21 +685,25 @@ mod tests {
         assert!(list
             .iter()
             .all(|i| i.viewing_groups().all(|v| v.0 == OVERLAY_VIEWING_GROUP)));
-        let by_product = |p: Product| {
+        let by_product = |p: ProductId| {
             g.datasets
                 .iter()
                 .filter(|d| d.product() == p)
                 .map(|d| per_dataset(d.id))
                 .sum::<usize>()
         };
-        assert!(by_product(Product::S124) > 0);
-        assert!(by_product(Product::S129) > 0);
+        assert!(by_product(ferrite_s124::PRODUCT) > 0);
+        assert!(by_product(ferrite_s129::PRODUCT) > 0);
         for d in g.datasets.iter().filter(|d| d.dataset.imported) {
             assert!(per_dataset(d.id) > 0, "{} not portrayed", d.name());
         }
         // Every S-129 dataset is portrayed (information box text literal:
         // transparency 1).
-        for d in g.datasets.iter().filter(|d| d.product() == Product::S129) {
+        for d in g
+            .datasets
+            .iter()
+            .filter(|d| d.product() == ferrite_s129::PRODUCT)
+        {
             assert!(per_dataset(d.id) > 0);
         }
         assert!(list
@@ -702,7 +713,7 @@ mod tests {
         let s124_text = list.iter().any(|i| {
             matches!(i, DrawingInstruction::Text(_))
                 && g.dataset(decode_key(i.feature_id().unwrap()).unwrap().0)
-                    .is_some_and(|d| d.product() == Product::S124 && !d.dataset.imported)
+                    .is_some_and(|d| d.product() == ferrite_s124::PRODUCT && !d.dataset.imported)
         });
         eprintln!("S-124 text instructions present: {s124_text}");
         // Picking: attributes come with FC names.
@@ -710,8 +721,9 @@ mod tests {
             .iter()
             .filter_map(|i| i.feature_id())
             .find(|k| {
-                g.locate(*k)
-                    .is_some_and(|(d, f)| d.product() == Product::S124 && f.code == "NavwarnPart")
+                g.locate(*k).is_some_and(|(d, f)| {
+                    d.product() == ferrite_s124::PRODUCT && f.code == "NavwarnPart"
+                })
             })
             .unwrap();
         let pick = g.describe(key).unwrap();
@@ -727,7 +739,7 @@ mod tests {
             rows.len(),
             g.datasets
                 .iter()
-                .filter(|d| d.product() == Product::S124)
+                .filter(|d| d.product() == ferrite_s124::PRODUCT)
                 .count()
         );
         assert!(rows.iter().any(|r| r.imported));
@@ -768,9 +780,14 @@ mod tests {
              <S124:geometry><S100:pointProperty><S100:Point gml:id=\"TPG\"><gml:pos>50.70 -1.10</gml:pos>\
              </S100:Point></S100:pointProperty></S124:geometry></S124:TextPlacement></S124:members>",
         );
-        let fc = g.catalogues(Product::S124).unwrap().fc.clone();
-        let dataset =
-            ferrite_s100_gml::read_bytes(text.as_bytes(), Some(&fc), Default::default()).unwrap();
+        let fc = g.catalogues(ferrite_s124::PRODUCT).unwrap().fc.clone();
+        let dataset = ferrite_s100_gml::read_bytes(
+            text.as_bytes(),
+            &ferrite_engine::products::gml_products(),
+            Some(&fc),
+            Default::default(),
+        )
+        .unwrap();
         assert!(matches!(
             g.add(dataset, Provenance::Unverified).unwrap(),
             Added::New
@@ -842,11 +859,17 @@ mod tests {
              </S124:NavwarnPart></S124:members></S124:Dataset>"
         );
         let fc = g
-            .catalogues(Product::S124)
+            .catalogues(ferrite_s124::PRODUCT)
             .expect("S-124 catalogues")
             .fc
             .clone();
-        ferrite_s100_gml::read_bytes(xml.as_bytes(), Some(&fc), Default::default()).unwrap()
+        ferrite_s100_gml::read_bytes(
+            xml.as_bytes(),
+            &ferrite_engine::products::gml_products(),
+            Some(&fc),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn t(s: &str) -> DateTime<Utc> {
@@ -1045,7 +1068,10 @@ mod tests {
         assert!(!g.set_viewing_time(None));
         assert!(g.set_viewing_time(Some(t("2026-02-11T00:00:00Z"))));
         assert!(g.next_check().is_some());
-        assert_eq!(g.dataset(id).map(|d| d.product()), Some(Product::S124));
+        assert_eq!(
+            g.dataset(id).map(|d| d.product()),
+            Some(ferrite_s124::PRODUCT)
+        );
     }
 
     /// The object panel previews S-124 symbols from the registered overlay
@@ -1170,7 +1196,7 @@ mod tests {
             let reports = exchange_set_reports(vec![set.clone()], found, &on_system);
             assert_eq!(reports.len(), 1);
             let report = reports[0].1.as_ref().unwrap();
-            assert_eq!(report.products, [Product::S124]);
+            assert_eq!(report.products, [ferrite_s124::PRODUCT]);
             let mut objects: Vec<String> = report
                 .issues
                 .iter()

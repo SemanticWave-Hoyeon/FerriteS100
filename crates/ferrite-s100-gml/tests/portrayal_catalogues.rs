@@ -2,7 +2,7 @@
 //! test data, converted to Part 9a instruction strings.
 use ferrite_feature_catalog::FeatureCatalogue;
 use ferrite_s100_gml::portrayal::*;
-use ferrite_s100_gml::{read_file, Dataset, ReadLimits};
+use ferrite_s100_gml::{read_file, Dataset, GmlIdentity, ProductId, ReadLimits};
 use std::path::{Path, PathBuf};
 
 fn root() -> PathBuf {
@@ -23,8 +23,24 @@ fn feature_catalogue(product: &str) -> FeatureCatalogue {
     FeatureCatalogue::load(file).unwrap()
 }
 
+/// The S-124 and S-129 identities (as their product crates register them).
+static PRODUCTS: [&GmlIdentity; 2] = [
+    &GmlIdentity {
+        id: ProductId("S-124"),
+        identifiers: &["S-124", "S124"],
+        code: "124",
+        late_identification_check: "GML",
+    },
+    &GmlIdentity {
+        id: ProductId("S-129"),
+        identifiers: &["S-129", "S129"],
+        code: "129",
+        late_identification_check: "S-158-129/15",
+    },
+];
+
 fn read(path: &Path, fc: &FeatureCatalogue) -> Dataset {
-    read_file(path, Some(fc), ReadLimits::default()).unwrap()
+    read_file(path, &PRODUCTS, Some(fc), ReadLimits::default()).unwrap()
 }
 
 #[test]
@@ -186,15 +202,10 @@ fn undeclared_viewing_groups_are_dropped() {
 
 #[test]
 fn symbol_namespacing_is_idempotent() {
-    use ferrite_s100_gml::Product;
-    assert_eq!(
-        namespaced_symbol(Product::S129, "UKCCONPT"),
-        "S-129/UKCCONPT"
-    );
-    assert_eq!(
-        namespaced_symbol(Product::S129, "S-129/UKCCONPT"),
-        "S-129/UKCCONPT"
-    );
-    assert_eq!(namespaced_symbol(Product::S124, "S-129X"), "S-124/S-129X");
-    assert_eq!(namespaced_symbol(Product::S124, "S-124/A"), "S-124/A");
+    const S124: ProductId = ProductId("S-124");
+    const S129: ProductId = ProductId("S-129");
+    assert_eq!(namespaced_symbol(S129, "UKCCONPT"), "S-129/UKCCONPT");
+    assert_eq!(namespaced_symbol(S129, "S-129/UKCCONPT"), "S-129/UKCCONPT");
+    assert_eq!(namespaced_symbol(S124, "S-129X"), "S-124/S-129X");
+    assert_eq!(namespaced_symbol(S124, "S-124/A"), "S-124/A");
 }

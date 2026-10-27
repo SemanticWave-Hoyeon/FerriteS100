@@ -3,7 +3,7 @@ mod common;
 
 use common::{workspace_file, S124_DIR};
 use ferrite_s100_gml::exchange::validate_exchange_set;
-use ferrite_s100_gml::{Issue, Product, Severity};
+use ferrite_s100_gml::{Issue, ProductId, Severity};
 use ferrite_s124::S124;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,7 +54,7 @@ fn copy_dataset(source: &str, root: &Path, rel: &str, edit: impl Fn(String) -> S
 }
 
 struct Entry<'a> {
-    product: Product,
+    product: ProductId,
     rel: &'a str,
     purpose: &'a str,
     edition: u32,
@@ -64,7 +64,7 @@ struct Entry<'a> {
 }
 
 impl<'a> Entry<'a> {
-    fn new(product: Product, rel: &'a str) -> Self {
+    fn new(product: ProductId, rel: &'a str) -> Self {
         Self {
             product,
             rel,
@@ -77,7 +77,7 @@ impl<'a> Entry<'a> {
     }
     fn xml(&self) -> String {
         let [w, s, e, n] = self.bbox;
-        let id = self.product.identifier();
+        let id = self.product.as_str();
         let fields = [
             ("compressionFlag", "<compressionFlag>false</compressionFlag>".to_string()),
             ("dataProtection", "<dataProtection>false</dataProtection>".into()),
@@ -135,7 +135,7 @@ fn ukho_s124_exchange_set() {
     // The parent of S100_ROOT is accepted.
     let report = validate_exchange_set(&folder, None, &[&S124]).unwrap();
     assert!(report.root.ends_with("S100_ROOT"));
-    assert_eq!(report.products, [Product::S124]);
+    assert_eq!(report.products, [ferrite_s124::PRODUCT]);
     let catalogue = report.catalogue.as_ref().unwrap();
     assert_eq!(catalogue.datasets.len(), 5);
     let d = &catalogue.datasets[0];
@@ -203,8 +203,8 @@ fn s124_synthetic_exchange_sets() {
     let lang = "<S100_SupportFileDiscoveryMetadata><fileName>file:/S-124/SUPPORT_FILES/124GB00LANG.XML</fileName><revisionStatus>new</revisionStatus><editionNumber>1</editionNumber><dataType>XML</dataType><resourcePurpose>languagePack</resourcePurpose></S100_SupportFileDiscoveryMetadata>";
     write(&root, "S-124/SUPPORT_FILES/124GB00LANG.XML", "<x/>");
     let entries = [
-        Entry::new(Product::S124, &a).xml(),
-        Entry::new(Product::S124, &b).xml(),
+        Entry::new(ferrite_s124::PRODUCT, &a).xml(),
+        Entry::new(ferrite_s124::PRODUCT, &b).xml(),
     ];
     write(&root, "CATALOG.XML", &catalogue(&entries, lang));
     write(&root, "CATALOG.SIGN", "sig");
@@ -252,16 +252,16 @@ fn s124_synthetic_exchange_sets() {
             edition: 2,
             version: "1.0.0",
             bbox: [0., 0., 1., 1.],
-            ..Entry::new(Product::S124, &a)
+            ..Entry::new(ferrite_s124::PRODUCT, &a)
         }
         .xml(),
-        Entry::new(Product::S124, &bad_name).xml(),
+        Entry::new(ferrite_s124::PRODUCT, &bad_name).xml(),
         Entry {
             omit: &["issueDate"],
-            ..Entry::new(Product::S124, &big)
+            ..Entry::new(ferrite_s124::PRODUCT, &big)
         }
         .xml(),
-        Entry::new(Product::S124, &ds("124GB00GONE1.GML")).xml(),
+        Entry::new(ferrite_s124::PRODUCT, &ds("124GB00GONE1.GML")).xml(),
         cancellation(&b),
         cancellation(&ds("124GB00OLD1.GML")),
         cancellation(&ds("124GB00OLD2.GML")),

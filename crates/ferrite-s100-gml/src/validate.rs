@@ -485,25 +485,22 @@ impl<'a> Validator<'a> {
     fn dataset_checks(&self, ds: &Dataset, byte_size: Option<u64>, sink: &mut IssueSink) {
         let id = &ds.identification;
         let fc_product = self.fc.product_id.trim();
-        if !fc_product.is_empty() && fc_product != ds.product.identifier() {
+        if !fc_product.is_empty() && fc_product != ds.product.as_str() {
             sink.rule(
                 FcRule::Product,
                 None,
                 format!(
                     "Dataset is {} but the feature catalogue is {fc_product}",
-                    ds.product.identifier()
+                    ds.product
                 ),
             );
         }
         match id.product_identifier() {
-            Some(p) if Product::from_identifier(p) == Some(ds.product) => {}
+            Some(p) if sink.rules.identity().names(p) => {}
             other => sink.rule(
                 FcRule::Product,
                 None,
-                format!(
-                    "productIdentifier {other:?} is not {}",
-                    ds.product.identifier()
-                ),
+                format!("productIdentifier {other:?} is not {}", ds.product),
             ),
         }
         if let Some(edition) = id.product_edition() {
@@ -1167,14 +1164,18 @@ fn incoming(ds: &Dataset) -> Vec<Vec<(usize, usize)>> {
 /// The S-100 dataset file naming convention `<product code><producer
 /// (4 upper-case alphanumerics)><unique part>.GML`; `unique_ok` decides the
 /// product's rule for the unique part.
-pub fn file_name_follows(product: Product, name: &str, unique_ok: impl Fn(&str) -> bool) -> bool {
+pub fn file_name_follows(
+    product: &GmlIdentity,
+    name: &str,
+    unique_ok: impl Fn(&str) -> bool,
+) -> bool {
     let Some((stem, ext)) = name.rsplit_once('.') else {
         return false;
     };
     if !name.is_ascii() || !matches!(ext, "GML" | "gml") {
         return false;
     }
-    let Some(rest) = stem.strip_prefix(product.code()) else {
+    let Some(rest) = stem.strip_prefix(product.code) else {
         return false;
     };
     let (producer, unique) = rest.split_at(rest.len().min(4));
@@ -1339,7 +1340,7 @@ mod tests {
         assert!(truncated_date_ok("gYear", "2024") && !truncated_date_ok("gYear", "2024-01-01"));
         assert!(
             !truncated_date_ok("", "é-----")
-                && !file_name_follows(Product::S124, "124é.GML", |_| true)
+                && !file_name_follows(&crate::reader::tests::S124, "124é.GML", |_| true)
         );
     }
 

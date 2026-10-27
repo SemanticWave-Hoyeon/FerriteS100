@@ -3,7 +3,7 @@
 //! data model (rows and options defined by the product crate, published by
 //! the host) and recording requests the host consumes on the next frame.
 //! Which panels exist depends on the UI's product features (`s124`,
-//! `s129`); hosts reach a product's panel by type ([`PanelRegistry::get`],
+//! `s129`, `s421`); hosts reach a product's panel by type ([`PanelRegistry::get`],
 //! [`PanelRegistry::get_mut`]).
 use ferrite_product_api::PanelDescriptor;
 use std::any::Any;
@@ -30,6 +30,15 @@ pub trait ProductPanel: Any + std::fmt::Debug {
     fn menu_label(&self) -> String {
         self.descriptor().title.to_owned()
     }
+    /// Whether the view menu has an entry for the panel.
+    fn in_menu(&self) -> bool {
+        true
+    }
+    /// Whether the panel is drawn before the host's tool windows
+    /// ([`PanelRegistry::draw_leading`]; a side panel taking screen space).
+    fn leading(&self) -> bool {
+        false
+    }
     /// Draw the window when it is open.
     fn draw(&mut self, ctx: &egui::Context, shared: &mut SharedPanelState);
     fn clone_box(&self) -> Box<dyn ProductPanel>;
@@ -54,13 +63,15 @@ impl Clone for PanelRegistry {
 }
 
 impl Default for PanelRegistry {
-    /// The panels of every product built into the UI (S-124 warning list,
-    /// S-129 plan panel).
+    /// The panels of every product built into the UI (S-421 route panel,
+    /// S-124 warning list, S-129 plan panel).
     // The pushes depend on the enabled features.
     #[allow(clippy::vec_init_then_push)]
     fn default() -> Self {
         #[allow(unused_mut)]
         let mut panels: Vec<Box<dyn ProductPanel>> = Vec::new();
+        #[cfg(feature = "s421")]
+        panels.push(Box::<crate::route_panel::RoutePanel>::default());
         #[cfg(feature = "s124")]
         panels.push(Box::<crate::overlay_ui::NavwarnPanel>::default());
         #[cfg(feature = "s129")]
@@ -108,15 +119,21 @@ impl PanelRegistry {
     pub fn take_options_changed(&mut self) -> bool {
         std::mem::take(&mut self.shared.options_changed)
     }
-    /// Draw every open panel.
-    pub fn draw(&mut self, ctx: &egui::Context) {
-        for panel in &mut self.panels {
+    /// Draw the leading panels ([`ProductPanel::leading`]).
+    pub fn draw_leading(&mut self, ctx: &egui::Context) {
+        for panel in self.panels.iter_mut().filter(|p| p.leading()) {
             panel.draw(ctx, &mut self.shared);
         }
     }
-    /// One view-menu checkbox per panel.
+    /// Draw every other panel (each draws itself when open).
+    pub fn draw(&mut self, ctx: &egui::Context) {
+        for panel in self.panels.iter_mut().filter(|p| !p.leading()) {
+            panel.draw(ctx, &mut self.shared);
+        }
+    }
+    /// One view-menu checkbox per panel with a menu entry.
     pub fn menu(&mut self, ui: &mut egui::Ui) {
-        for panel in &mut self.panels {
+        for panel in self.panels.iter_mut().filter(|p| p.in_menu()) {
             let mut open = panel.is_open();
             if ui.checkbox(&mut open, panel.menu_label()).changed() {
                 panel.set_open(open);

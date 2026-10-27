@@ -1,7 +1,7 @@
 //! Data model of the S-129 under keel clearance plan panel: one row per
 //! loaded plan with its control points. UI crates draw it.
 use ferrite_s100_gml::overlay::OverlayCore;
-use ferrite_s100_gml::{Object, Product};
+use ferrite_s100_gml::Object;
 
 /// The panel the product publishes (drawn by UI crates from this module's
 /// data model).
@@ -41,7 +41,7 @@ pub fn ukc_rows(core: &OverlayCore) -> Vec<UkcPlanRow> {
     for entry in core
         .datasets
         .iter()
-        .filter(|d| d.product() == Product::S129)
+        .filter(|d| d.product() == crate::PRODUCT)
     {
         let ds = &entry.dataset;
         let plan = ds

@@ -21,13 +21,6 @@ use std::sync::Arc;
 
 pub use image::RgbaImage;
 
-// Scenes are drawn with the S-101 portrayal catalogue (palette, symbols,
-// line styles), which the engine's base chart layer provides.
-#[cfg(not(feature = "s101"))]
-compile_error!(
-    "ferrite-cli draws scenes with the S-101 portrayal catalogue: enable the s101 feature"
-);
-
 /// An engine configuration for `platform` and `catalogues` with the GPU
 /// renderer's stored area triangulation and overlay symbol registration
 /// (S-124/S-129 symbols are drawn by ferrite-gpu).
@@ -163,18 +156,12 @@ fn bathymetry(engine: &ChartEngine) -> Vec<Value> {
     }
 }
 
-/// Colour profile names of the bound portrayal catalogue, sorted.
+/// Colour profile names of the scene's portrayal catalogue
+/// ([`scene_catalogue`]), sorted.
 pub fn palettes(engine: &ChartEngine) -> Vec<String> {
-    let mut names: Vec<_> = engine
-        .state()
-        .layers
-        .s101()
-        .pc
-        .color_profiles
-        .profiles
-        .keys()
-        .cloned()
-        .collect();
+    let mut names: Vec<_> = scene_catalogue(engine)
+        .map(|pc| pc.color_profiles.profiles.keys().cloned().collect())
+        .unwrap_or_default();
     names.sort();
     names
 }
@@ -213,8 +200,113 @@ struct EmittedScene {
     key: ([u8; 32], String),
     /// Display settings the renderer was given.
     settings: ferrite_render::host_settings::SettingsState,
-    visible: std::collections::HashSet<u32>,
+    /// Displayed viewing groups (None: all, scenes without the S-101 base
+    /// chart).
+    visible: Option<std::collections::HashSet<u32>>,
     resources: Option<ferrite_gpu::CellPortrayalResources>,
+}
+
+/// The portrayal catalogue scenes are drawn with: the first registered
+/// product layer's installed catalogue (S-101's when built, which the
+/// engine requires; otherwise an overlay or S-102 catalogue).
+pub fn scene_catalogue(
+    engine: &ChartEngine,
+) -> Option<&ferrite_portrayal_catalog::BoundPortrayalCatalogue> {
+    engine.state().layers.scene_catalogue()
+}
+
+/// The smallest producer reference scale of the loaded S-101 cells.
+#[cfg(feature = "s101")]
+fn reference_scale(engine: &ChartEngine) -> Option<u32> {
+    engine
+        .state()
+        .layers
+        .s101()
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            ferrite_s101::coverage_scale::dataset_reference_scale(cell)
+                .ok()
+                .flatten()
+        })
+        .min()
+}
+
+/// Without S-101 no cell has a producer reference scale.
+#[cfg(not(feature = "s101"))]
+fn reference_scale(_engine: &ChartEngine) -> Option<u32> {
+    None
+}
+
+/// The audited S-101 shallow-water pattern selector of `pc` (S-101 only).
+#[cfg(feature = "s101")]
+fn shallow_pattern_contract(
+    pc: &ferrite_portrayal_catalog::BoundPortrayalCatalogue,
+) -> Option<ferrite_render::ShallowPatternContract> {
+    ferrite_s101::shallow_pattern_contract(pc)
+}
+
+#[cfg(not(feature = "s101"))]
+fn shallow_pattern_contract(
+    _pc: &ferrite_portrayal_catalog::BoundPortrayalCatalogue,
+) -> Option<ferrite_render::ShallowPatternContract> {
+    None
+}
+
+/// The S-101 set-up of a scene's first frame: the display mode's viewing
+/// groups and, when cells of other catalogue editions are loaded, their
+/// per-catalogue resources.
+#[cfg(feature = "s101")]
+fn cell_setup(
+    engine: &ChartEngine,
+    scene: &PreparedScene,
+    profile: &str,
+) -> Result<(
+    Option<std::collections::HashSet<u32>>,
+    Option<ferrite_gpu::CellPortrayalResources>,
+)> {
+    let state = engine.state();
+    let display = engine.display();
+    let s101 = state.layers.s101();
+    let visible = s101.viewing_groups(&display.settings)?;
+    let resources =
+        if s101.requires_cell_resources(&scene.catalogue_registry, &s101.fc, &s101.pc)? {
+            // Cells of other catalogue editions draw with their own owners.
+            let bindings = s101
+                .cell_resource_bindings(&scene.catalogue_registry, &display.settings)?
+                .into_iter()
+                .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
+                    cell_index: binding.cell_index,
+                    catalogue: binding.catalogue,
+                    shallow_pattern: binding.shallow_pattern,
+                })
+                .collect::<Vec<_>>();
+            let mut resources =
+                ferrite_gpu::CellPortrayalResources::prepare(&bindings, profile, 4096)?;
+            for index in 0..s101.cells.len() {
+                let groups =
+                    s101.cell_viewing_groups(&scene.catalogue_registry, index, &display.settings)?;
+                resources.capture_viewing_groups_for_cell(index, Some(groups))?;
+            }
+            Some(resources)
+        } else {
+            None
+        };
+    Ok((Some(visible), resources))
+}
+
+/// Without S-101 every viewing group of the scene is displayed and no cell
+/// has resources.
+#[cfg(not(feature = "s101"))]
+fn cell_setup(
+    _engine: &ChartEngine,
+    _scene: &PreparedScene,
+    _profile: &str,
+) -> Result<(
+    Option<std::collections::HashSet<u32>>,
+    Option<ferrite_gpu::CellPortrayalResources>,
+)> {
+    Ok((None, None))
 }
 
 /// Milliseconds spent in the stages of one [`SceneEmitter::emit`].
@@ -281,10 +373,9 @@ impl SceneEmitter {
     ) -> Result<()> {
         let started = ferrite_kernel::time::Instant::now();
         let ms = |from: ferrite_kernel::time::Instant| from.elapsed().as_secs_f64() * 1000.;
-        let state = engine.state();
         let display = engine.display();
         let profile = display.profile.as_str();
-        let pc = &state.layers.s101().pc;
+        let pc = scene_catalogue(engine).context("No portrayal catalogue is installed")?;
         let key = (*pc.source_digest(), profile.to_string());
         let color_profile = pc
             .color_profiles
@@ -304,20 +395,9 @@ impl SceneEmitter {
             self.emitted = None;
             renderer.set_settings(display.settings.clone());
             renderer.set_color_profile(profile);
-            renderer.background_color = ferrite_s101::lookup_pc_color(pc, "DEPDW", profile);
+            renderer.background_color = ferrite_part9a::lookup_pc_color(pc, "DEPDW", profile);
             // Producer reference scales; zero denotes unknown (as the viewer).
-            let reference_scale = state
-                .layers
-                .s101()
-                .cells
-                .iter()
-                .filter_map(|cell| {
-                    ferrite_s101::coverage_scale::dataset_reference_scale(cell)
-                        .ok()
-                        .flatten()
-                })
-                .min();
-            renderer.set_compilation_scale(reference_scale.unwrap_or(0));
+            renderer.set_compilation_scale(reference_scale(engine).unwrap_or(0));
             if self.symbols.as_ref().is_none_or(|(k, _)| *k != key) {
                 renderer.clear_symbol_textures();
                 self.symbols = Some((
@@ -325,42 +405,11 @@ impl SceneEmitter {
                     SymbolCache::new_with_pattern_contract(
                         pc.root_path.join("Symbols"),
                         pc.sources(),
-                        ferrite_s101::shallow_pattern_contract(pc),
+                        shallow_pattern_contract(pc),
                     ),
                 ));
             }
-            let visible = state.layers.s101().viewing_groups(&display.settings)?;
-            let resources = if state.layers.s101().requires_cell_resources(
-                &scene.catalogue_registry,
-                &state.layers.s101().fc,
-                pc,
-            )? {
-                // Cells of other catalogue editions draw with their own owners.
-                let bindings = state
-                    .layers
-                    .s101()
-                    .cell_resource_bindings(&scene.catalogue_registry, &display.settings)?
-                    .into_iter()
-                    .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
-                        cell_index: binding.cell_index,
-                        catalogue: binding.catalogue,
-                        shallow_pattern: binding.shallow_pattern,
-                    })
-                    .collect::<Vec<_>>();
-                let mut resources =
-                    ferrite_gpu::CellPortrayalResources::prepare(&bindings, profile, 4096)?;
-                for index in 0..state.layers.s101().cells.len() {
-                    let groups = state.layers.s101().cell_viewing_groups(
-                        &scene.catalogue_registry,
-                        index,
-                        &display.settings,
-                    )?;
-                    resources.capture_viewing_groups_for_cell(index, Some(groups))?;
-                }
-                Some(resources)
-            } else {
-                None
-            };
+            let (visible, resources) = cell_setup(engine, scene, profile)?;
             timings.setup_ms = ms(started);
             let prefill = ferrite_kernel::time::Instant::now();
             if resources.is_none() {
@@ -413,13 +462,13 @@ impl SceneEmitter {
             Some(resources) => renderer.try_add_instructions_with_resource_owners(
                 context,
                 resources,
-                Some(&emitted.visible),
+                emitted.visible.as_ref(),
             ),
             None => renderer.try_add_instructions_with_symbols(
                 context,
                 Some(symbols),
                 Some(color_profile),
-                Some(&emitted.visible),
+                emitted.visible.as_ref(),
             ),
         };
         timings.instructions_ms = ms(instructions);
@@ -455,6 +504,7 @@ impl SceneEmitter {
         let suppress = engine.display().settings.interoperability_enabled
             && state.ic.as_ref().is_some_and(|ic| {
                 let mut displayed = Vec::new();
+                #[cfg(feature = "s101")]
                 if !state.layers.s101().cells.is_empty() {
                     displayed.push("S-101");
                 }

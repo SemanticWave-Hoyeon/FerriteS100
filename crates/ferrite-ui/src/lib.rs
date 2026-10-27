@@ -41,6 +41,7 @@ pub use object_symbol_preview::{
     prepare_overlay_symbol_preview, prepare_selected_symbol_preview, SelectedSymbolPreview,
 };
 
+#[cfg(feature = "s421")]
 mod route_turn_radius_ui;
 
 pub mod mcp_ui;
@@ -50,6 +51,9 @@ pub mod llm_chat_ui;
 pub mod overlay_ui;
 /// The registered products' panels.
 pub mod panels;
+/// The S-421 route panel (registered panel of the route providers).
+#[cfg(feature = "s421")]
+pub mod route_panel;
 
 /// S-421 readers for the native route editing overlay.
 #[cfg(feature = "s421")]

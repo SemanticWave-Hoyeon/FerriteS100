@@ -31,8 +31,15 @@ impl ApplicationHandler for App {
             .0;
         let mut converted = RenderContext::new(Viewport::new(100., 100.));
         let result=ferrite_lua::PortrayalResult::parse(&area_id.to_string(),"ViewingGroup:27070,90020;ColorFill:CHBLK;AugmentedPoint:GeographicCRS,0,0;PointInstruction:INFORM01;TextInstruction:X","").unwrap();
-        ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut converted, 0, "Day")
-            .unwrap();
+        ferrite_part9a::convert_lua_results_for_cell(
+            &[result],
+            &cell,
+            &pc,
+            &mut converted,
+            0,
+            "Day",
+        )
+        .unwrap();
         assert!(converted
             .raw_instructions()
             .iter()

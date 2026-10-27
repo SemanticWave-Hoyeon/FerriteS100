@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         "",
     )?;
     let mut ctx = RenderContext::new(Viewport::new(240., 180.));
-    ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut ctx, 0, "Day")?;
+    ferrite_part9a::convert_lua_results_for_cell(&[result], &cell, &pc, &mut ctx, 0, "Day")?;
     let mut areas = 0;
     for instruction in ctx.raw_instructions() {
         if let DrawingInstruction::Area(area) = instruction {
@@ -157,7 +157,7 @@ fn main() -> Result<()> {
                 "",
             )?;
             let mut context = RenderContext::new(Viewport::new(240., 180.));
-            ferrite_s101::convert_lua_results_for_cell(
+            ferrite_part9a::convert_lua_results_for_cell(
                 &[parsed],
                 &cell,
                 &pc,
@@ -226,7 +226,7 @@ fn main() -> Result<()> {
     )?;
     let mut empty = RenderContext::new(Viewport::new(240., 180.));
     ensure!(
-        ferrite_s101::convert_lua_results_for_cell(&[missing], &cell, &pc, &mut empty, 0, "Day")
+        ferrite_part9a::convert_lua_results_for_cell(&[missing], &cell, &pc, &mut empty, 0, "Day")
             .is_err()
             && empty.instruction_count() == 0,
         "Invalid style partially mutated context"

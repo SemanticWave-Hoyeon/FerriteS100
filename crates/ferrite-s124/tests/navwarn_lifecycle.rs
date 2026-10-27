@@ -71,7 +71,13 @@ fn dataset(s: &Spec) -> Dataset {
         pubt = s.publication,
         parts = s.parts,
     );
-    read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap()
+    read_bytes(
+        xml.as_bytes(),
+        &[&ferrite_s124::rules::IDENTITY],
+        None,
+        ReadLimits::default(),
+    )
+    .unwrap()
 }
 
 fn eval(ds: &[Dataset], now: &str) -> NavwarnRegistry {
@@ -96,7 +102,15 @@ fn real_ukho_datasets_are_active() {
     names.sort();
     let ds: Vec<Dataset> = names
         .iter()
-        .map(|p| read_file(p, None, ReadLimits::default()).unwrap())
+        .map(|p| {
+            read_file(
+                p,
+                &[&ferrite_s124::rules::IDENTITY],
+                None,
+                ReadLimits::default(),
+            )
+            .unwrap()
+        })
         .collect();
     let r = eval(&ds, "2026-02-14T00:00:00Z");
     assert_eq!(r.messages.len(), 5);

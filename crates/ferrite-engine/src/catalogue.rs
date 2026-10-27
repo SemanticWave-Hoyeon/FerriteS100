@@ -1,32 +1,40 @@
 //! Feature and portrayal catalogue loading (the S-101 status checks and cache
-//! identity are `ferrite_s101::layer::catalogue`).
+//! identity are `ferrite_s101::layer::catalogue`). The product whose
+//! catalogue is loaded names its installed layout ([`CatalogueLayout`]) for
+//! the missing-folder errors.
 use crate::dataset_discovery;
 use crate::platform::{DataSource, NativeDataSource};
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::{BoundFeatureCatalogue, FeatureCatalogue};
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
+pub use ferrite_product_api::CatalogueLayout;
 use std::path::Path;
 use tracing::{debug, info};
 
 /// Load Feature Catalogue from XML file
-pub fn load_feature_catalogue(path: &Path) -> Result<BoundFeatureCatalogue> {
-    load_feature_catalogue_from(&NativeDataSource, path)
+pub fn load_feature_catalogue(
+    path: &Path,
+    layout: &CatalogueLayout,
+) -> Result<BoundFeatureCatalogue> {
+    load_feature_catalogue_from(&NativeDataSource, path, layout)
 }
 
 /// [`load_feature_catalogue`] through a data source.
 pub fn load_feature_catalogue_from(
     data: &dyn DataSource,
     path: &Path,
+    layout: &CatalogueLayout,
 ) -> Result<BoundFeatureCatalogue> {
     info!("Loading Feature Catalogue: {}", path.display());
 
     if !data.exists(path) {
         anyhow::bail!(
             "Feature Catalogue directory not found: {}\n\
-             Expected layout: <app>/Catalogues/FC/S-101/*Feature_Catalogue*.xml.\n\
+             Expected layout: {}.\n\
              If you launched the executable from a build/output directory, ensure the \
              Catalogues/ folder is present alongside it.",
-            path.display()
+            path.display(),
+            layout.feature
         );
     }
 
@@ -60,24 +68,29 @@ pub fn load_feature_catalogue_from(
 /// which would silently degrade every chart render to placeholder fallbacks.
 /// Surfacing the error early forces the user to fix the install/path instead
 /// of seeing a broken render.
-pub fn load_portrayal_catalogue(path: &Path) -> Result<BoundPortrayalCatalogue> {
-    load_portrayal_catalogue_from(&NativeDataSource, path)
+pub fn load_portrayal_catalogue(
+    path: &Path,
+    layout: &CatalogueLayout,
+) -> Result<BoundPortrayalCatalogue> {
+    load_portrayal_catalogue_from(&NativeDataSource, path, layout)
 }
 
 /// [`load_portrayal_catalogue`] through a data source.
 pub fn load_portrayal_catalogue_from(
     data: &dyn DataSource,
     path: &Path,
+    layout: &CatalogueLayout,
 ) -> Result<BoundPortrayalCatalogue> {
     info!("Loading Portrayal Catalogue: {}", path.display());
 
     if !data.exists(path) {
         anyhow::bail!(
             "Portrayal Catalogue directory not found: {}\n\
-             Expected layout: <app>/Catalogues/PC/S-101/ with ColorProfiles/, Symbols/, Rules/.\n\
+             Expected layout: {}.\n\
              If you launched the executable from a build/output directory, ensure the \
              Catalogues/ folder is present alongside it.",
-            path.display()
+            path.display(),
+            layout.portrayal
         );
     }
 

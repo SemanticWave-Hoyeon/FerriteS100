@@ -37,7 +37,7 @@ fn main() -> Result<()> {
         let results = engine.process_cell(&data.read().unwrap(), params.clone())?;
         let mut render =
             ferrite_render::RenderContext::new(ferrite_render::Viewport::new(3420.0, 2082.0));
-        ferrite_s101::convert_lua_results_for_cell(&results, &cell, &pc, &mut render, 0, "Day")
+        ferrite_part9a::convert_lua_results_for_cell(&results, &cell, &pc, &mut render, 0, "Day")
             .unwrap();
         for inst in render.raw_instructions() {
             if let ferrite_render::DrawingInstruction::Line(line) = inst {

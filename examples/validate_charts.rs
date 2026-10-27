@@ -208,7 +208,7 @@ fn main() -> Result<()> {
             .sum();
         let mut render_context =
             ferrite_render::RenderContext::new(ferrite_render::Viewport::new(960., 640.));
-        ferrite_s101::convert_lua_results_for_cell(
+        ferrite_part9a::convert_lua_results_for_cell(
             &results,
             &cell,
             &pc,

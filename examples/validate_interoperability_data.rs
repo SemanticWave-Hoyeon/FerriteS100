@@ -125,7 +125,7 @@ fn main() -> Result<()> {
         let results = engine.process_cell(&data.read().unwrap(), parameters.clone())?;
         let mut context = RenderContext::new(Viewport::new(1200., 800.));
         context.set_bounds(GeoBounds::new(-180., -90., 180., 90.));
-        ferrite_s101::convert_lua_results_for_cell(
+        ferrite_part9a::convert_lua_results_for_cell(
             &results,
             &cell,
             &pc,

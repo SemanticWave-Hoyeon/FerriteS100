@@ -8,7 +8,7 @@ use ferrite_s100_gml::validate::{
     file_name_follows, parse_date_time, upper_alnum, AssociationBinding, FcRule, Incoming,
     IssueSink, Validator,
 };
-use ferrite_s100_gml::{Dataset, Product, Severity};
+use ferrite_s100_gml::{Dataset, GmlIdentity, Severity};
 
 /// S-129 18.2.2: recommended maximum dataset size.
 pub const MAX_DATASET_BYTES: u64 = 20 * 1024 * 1024;
@@ -42,6 +42,15 @@ pub fn s158_129(rule: FcRule) -> Option<u32> {
     })
 }
 
+/// How S-129 datasets name their product; S-158-129 check 15 reports a
+/// DatasetIdentificationInformation that follows the members.
+pub static IDENTITY: GmlIdentity = GmlIdentity {
+    id: crate::PRODUCT,
+    identifiers: &["S-129", "S129"],
+    code: "129",
+    late_identification_check: "S-158-129/15",
+};
+
 /// The S-129 rules (a `static` registered with the engine).
 pub struct S129Rules;
 
@@ -49,8 +58,8 @@ pub struct S129Rules;
 pub static S129: S129Rules = S129Rules;
 
 impl GmlRules for S129Rules {
-    fn product(&self) -> Product {
-        Product::S129
+    fn identity(&self) -> &'static GmlIdentity {
+        &IDENTITY
     }
 
     fn fc_rule_check(&self, rule: FcRule) -> (String, Severity) {
@@ -63,7 +72,7 @@ impl GmlRules for S129Rules {
     /// S-129 18.2.3: `129`, producer, at most 8 upper-case alphanumerics or
     /// underscores.
     fn file_name_ok(&self, name: &str) -> bool {
-        file_name_follows(Product::S129, name, |unique| {
+        file_name_follows(&IDENTITY, name, |unique| {
             unique.len() <= 8 && unique.chars().all(|c| upper_alnum(c) || c == '_')
         })
     }

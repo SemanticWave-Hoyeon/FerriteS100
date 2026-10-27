@@ -1,7 +1,9 @@
-//! S-101 line portrayal geometry: curves and oriented surface boundaries.
+//! Line portrayal geometry: curves and oriented surface boundaries of a
+//! feature in a [`crate::GeometrySource`].
+use crate::GeometrySource;
 use ferrite_render::{ScaleRange, WorldPoint};
 use ferrite_s100_core::{
-    CompositeCurveRecord, CurveRecord, FeatureRecord, RecordId, S101Cell, SurfaceRecord,
+    CompositeCurveRecord, CurveRecord, FeatureRecord, RecordId, SurfaceRecord,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -33,16 +35,16 @@ struct Geometry<'a> {
 }
 /// Explicit references take precedence over feature associations. Masks apply at
 /// every component level; area fills use their full surface through a separate path.
-pub fn resolve_feature_line_geometry(
-    cell: &S101Cell,
+pub fn resolve_feature_line_geometry<G: GeometrySource + ?Sized>(
+    cell: &G,
     feature: &FeatureRecord,
     references: &[(String, bool)],
 ) -> Result<Vec<SpatialLine>, String> {
     resolve(
         Geometry {
-            curves: &cell.curves,
-            composites: &cell.composite_curves,
-            surfaces: &cell.surfaces,
+            curves: cell.curves(),
+            composites: cell.composite_curves(),
+            surfaces: cell.surfaces(),
         },
         feature,
         references,

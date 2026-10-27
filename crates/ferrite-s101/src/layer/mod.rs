@@ -153,6 +153,11 @@ impl ProductLayer for S101Layer {
     fn products(&self) -> Vec<ProductId> {
         vec![PRODUCT]
     }
+    /// The bound S-101 portrayal catalogue (palette and symbols of the
+    /// whole scene).
+    fn portrayal_catalogue(&self) -> Option<&ferrite_portrayal_catalog::BoundPortrayalCatalogue> {
+        Some(&self.pc)
+    }
     fn is_empty(&self) -> bool {
         self.cells.is_empty()
     }

@@ -22,7 +22,15 @@ pub fn fc(relative: &str) -> Option<FeatureCatalogue> {
 }
 
 pub fn read(relative: &str, fc: &FeatureCatalogue) -> Option<Dataset> {
-    Some(read_file(&workspace_file(relative)?, Some(fc), ReadLimits::default()).unwrap())
+    Some(
+        read_file(
+            &workspace_file(relative)?,
+            &[&ferrite_s124::rules::IDENTITY],
+            Some(fc),
+            ReadLimits::default(),
+        )
+        .unwrap(),
+    )
 }
 
 pub fn count(issues: &[Issue], check: &str) -> usize {

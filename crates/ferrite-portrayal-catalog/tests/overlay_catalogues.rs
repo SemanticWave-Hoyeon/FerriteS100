@@ -18,7 +18,7 @@ fn load(product: &str) -> Option<PortrayalCatalogue> {
     Some(PortrayalCatalogue::load(dir).expect("overlay PC loads"))
 }
 
-/// Mirrors `ferrite_s101::lookup_pc_color` profile selection.
+/// Mirrors `ferrite_part9a::lookup_pc_color` profile selection.
 fn color(pc: &PortrayalCatalogue, profile: &str, token: &str) -> Option<SrgbColor> {
     pc.color_profiles
         .profiles

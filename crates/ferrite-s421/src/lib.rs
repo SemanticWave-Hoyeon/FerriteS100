@@ -3,8 +3,9 @@
 //! * Product data and rules, all targets: the bounded published 1.0 / CDV 2.0
 //!   GML subset reader and exporter ([`s421`]), the route model ([`route`],
 //!   [`navigation`], [`haversine`]), the catalogue status ([`catalogue`]),
-//!   the editing portrayal contract ([`editing_style_contract`]) and the
-//!   route panel data model ([`ui`]).
+//!   the editing portrayal contract ([`editing_style_contract`]), the
+//!   plugin UI data a route provider publishes ([`ui`]) and the route panel
+//!   data model UI crates draw from it ([`panel`]).
 //! * [`layer`], all targets: the engine-facing product layer. Route input
 //!   capture and discovery over a data source ([`layer::input`]), the
 //!   product adapter ([`layer::S421`]) and the dataset store
@@ -19,6 +20,7 @@ pub mod editing_style_contract;
 pub mod haversine;
 pub mod layer;
 pub mod navigation;
+pub mod panel;
 pub mod route;
 pub mod s421;
 pub mod ui;

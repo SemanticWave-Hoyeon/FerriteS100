@@ -28,7 +28,7 @@ fn main() -> Result<()> {
         "",
     )?];
     let mut context = RenderContext::new(Viewport::new(640., 400.));
-    ferrite_s101::convert_lua_results_for_cell(&results, &cell, &pc, &mut context, 0, "Day")?;
+    ferrite_part9a::convert_lua_results_for_cell(&results, &cell, &pc, &mut context, 0, "Day")?;
     ensure!(
         context.instruction_count() == 2,
         "Lost augmented instructions"
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     )?];
     let mut empty = RenderContext::new(Viewport::new(640., 400.));
     ensure!(
-        ferrite_s101::convert_lua_results_for_cell(&invalid, &cell, &pc, &mut empty, 0, "Day")
+        ferrite_part9a::convert_lua_results_for_cell(&invalid, &cell, &pc, &mut empty, 0, "Day")
             .is_err(),
         "Nonpoint accepted as augmented Local reference"
     );

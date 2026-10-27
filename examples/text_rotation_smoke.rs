@@ -63,7 +63,7 @@ impl ApplicationHandler for App {
                     c.set_bounds(GeoBounds::new(178.9, lat - 1., 180.9, lat + 1.));
                     let lua_name = if tangent.is_some() { "LineCRS" } else { name };
                     let result=ferrite_lua::PortrayalResult::parse("TEXT-CRS",&format!("ViewingGroup:{vg};Rotation:{lua_name},45;AugmentedPoint:GeographicCRS,179.9,{lat};FontColor:CHBLK;FontSize:24;TextAlignHorizontal:Center;TextAlignVertical:Center;LocalOffset:3,2;TextInstruction:Heading"),"").unwrap();
-                    ferrite_s101::convert_lua_results_for_cell(
+                    ferrite_part9a::convert_lua_results_for_cell(
                         &[result],
                         &cell,
                         &pc,
@@ -140,7 +140,7 @@ impl ApplicationHandler for App {
             "",
         )
         .unwrap();
-        assert!(ferrite_s101::convert_lua_results_for_cell(
+        assert!(ferrite_part9a::convert_lua_results_for_cell(
             &[invalid],
             &cell,
             &pc,

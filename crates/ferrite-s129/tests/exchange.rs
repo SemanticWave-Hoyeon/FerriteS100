@@ -3,7 +3,7 @@ mod common;
 
 use common::{workspace_file, S129_130, S129_200};
 use ferrite_s100_gml::exchange::validate_exchange_set;
-use ferrite_s100_gml::{read_file, Issue, Product, ReadLimits, Severity};
+use ferrite_s100_gml::{read_file, Issue, ProductId, ReadLimits, Severity};
 use ferrite_s129::S129;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -52,7 +52,7 @@ fn copy_dataset(source: &str, root: &Path, rel: &str, edit: impl Fn(String) -> S
 }
 
 struct Entry<'a> {
-    product: Product,
+    product: ProductId,
     rel: &'a str,
     purpose: &'a str,
     edition: u32,
@@ -62,7 +62,7 @@ struct Entry<'a> {
 }
 
 impl<'a> Entry<'a> {
-    fn new(product: Product, rel: &'a str) -> Self {
+    fn new(product: ProductId, rel: &'a str) -> Self {
         Self {
             product,
             rel,
@@ -75,7 +75,7 @@ impl<'a> Entry<'a> {
     }
     fn xml(&self) -> String {
         let [w, s, e, n] = self.bbox;
-        let id = self.product.identifier();
+        let id = self.product.as_str();
         let fields = [
             ("compressionFlag", "<compressionFlag>false</compressionFlag>".to_string()),
             ("dataProtection", "<dataProtection>false</dataProtection>".into()),
@@ -130,10 +130,15 @@ fn s129_synthetic_exchange_sets() {
     let Some(path) = workspace_file(S129_130) else {
         return;
     };
-    let bounds = read_file(&path, None, ReadLimits::default())
-        .unwrap()
-        .geometry_bounds()
-        .unwrap();
+    let bounds = read_file(
+        &path,
+        &[&ferrite_s129::rules::IDENTITY],
+        None,
+        ReadLimits::default(),
+    )
+    .unwrap()
+    .geometry_bounds()
+    .unwrap();
     let ds = |name: &str| format!("S-129/DATASET_FILES/{name}");
     let (a, b) = (ds("12900MCTDS130TS.gml"), ds("12900MCTDS200TS.gml"));
     let root = temp_root("s129-ok");
@@ -143,15 +148,15 @@ fn s129_synthetic_exchange_sets() {
     let entries = [
         Entry {
             bbox: bounds,
-            ..Entry::new(Product::S129, &a)
+            ..Entry::new(ferrite_s129::PRODUCT, &a)
         }
         .xml(),
-        Entry::new(Product::S129, &b).xml(),
+        Entry::new(ferrite_s129::PRODUCT, &b).xml(),
     ];
     write(&root, "CATALOG.XML", &catalogue(&entries, ""));
     write(&root, "CATALOG.SIGN", "sig");
     let report = validate_exchange_set(&root, None, &[&S129]).unwrap();
-    assert_eq!(report.products, [Product::S129]);
+    assert_eq!(report.products, [ferrite_s129::PRODUCT]);
     assert!(report.issues.is_empty(), "{:#?}", report.issues);
 
     let root = temp_root("s129-bad");
@@ -165,15 +170,15 @@ fn s129_synthetic_exchange_sets() {
         Entry {
             version: "1.0.0",
             bbox: [bounds[0], bounds[1], bounds[0] + 0.01, bounds[1] + 0.01],
-            ..Entry::new(Product::S129, &a)
+            ..Entry::new(ferrite_s129::PRODUCT, &a)
         }
         .xml(),
         Entry {
             omit: &["issueTime"],
-            ..Entry::new(Product::S129, &bad_name)
+            ..Entry::new(ferrite_s129::PRODUCT, &bad_name)
         }
         .xml(),
-        Entry::new(Product::S129, &ds("12900MCTDSGONE.gml")).xml(),
+        Entry::new(ferrite_s129::PRODUCT, &ds("12900MCTDSGONE.gml")).xml(),
         cancellation(&b),
         cancellation(&ds("12900MCTDSOLD.gml")),
     ];

@@ -5,33 +5,49 @@ use std::path::PathBuf;
 /// Longitude, latitude in degrees (EPSG:4326 values, easting first).
 pub type Coord = [f64; 2];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Product {
-    S124,
-    S129,
+pub use ferrite_product_api::ProductId;
+
+/// How the datasets of a registered GML product name it. Product crates
+/// (`ferrite-s124`, `ferrite-s129`) supply theirs through
+/// [`crate::product::GmlRules::identity`]; the reader, the exchange-set
+/// validation and the overlay sniffing take the registered identities.
+#[derive(Debug)]
+pub struct GmlIdentity {
+    pub id: ProductId,
+    /// productIdentifier spellings of the product (`"S-124"`, `"S124"`).
+    pub identifiers: &'static [&'static str],
+    /// Product code: dataset file name prefix and the namespace segment
+    /// `S<code>` (`"124"`).
+    pub code: &'static str,
+    /// Check identifier of a DatasetIdentificationInformation that follows
+    /// the members.
+    pub late_identification_check: &'static str,
 }
 
-impl Product {
-    pub fn from_identifier(value: &str) -> Option<Self> {
-        match value.trim() {
-            "S-124" | "S124" => Some(Self::S124),
-            "S-129" | "S129" => Some(Self::S129),
-            _ => None,
-        }
+impl GmlIdentity {
+    /// Whether `value` (a productIdentifier or product folder) names this
+    /// product.
+    pub fn names(&self, value: &str) -> bool {
+        self.identifiers.contains(&value.trim())
     }
-    pub fn identifier(self) -> &'static str {
-        match self {
-            Self::S124 => "S-124",
-            Self::S129 => "S-129",
-        }
+    /// The product specification identifier (`"S-124"`).
+    pub fn identifier(&self) -> &'static str {
+        self.id.as_str()
     }
-    /// File name prefix of the product's datasets (product code digits).
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::S124 => "124",
-            Self::S129 => "129",
-        }
-    }
+}
+
+/// The product of `products` that `value` (a productIdentifier or product
+/// folder) names.
+pub fn identify(products: &[&GmlIdentity], value: &str) -> Option<ProductId> {
+    products.iter().find(|p| p.names(value)).map(|p| p.id)
+}
+
+/// The identity of `product` among `products`.
+pub fn identity_of<'a>(
+    products: &[&'a GmlIdentity],
+    product: ProductId,
+) -> Option<&'a GmlIdentity> {
+    products.iter().copied().find(|p| p.id == product)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +249,7 @@ impl std::fmt::Display for Issue {
 pub struct Dataset {
     pub source: Option<PathBuf>,
     pub sha256: [u8; 32],
-    pub product: Product,
+    pub product: ProductId,
     pub namespace: String,
     pub gml_id: String,
     pub identification: Identification,

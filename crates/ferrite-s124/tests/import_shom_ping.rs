@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use ferrite_s100_gml::{Geometry, Product, Value};
+use ferrite_s100_gml::{Geometry, Value};
 use ferrite_s124::import::*;
 use ferrite_s124::navwarn::{evaluate, NavwarnInput, Status};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ fn fc() -> ferrite_feature_catalog::FeatureCatalogue {
 fn gpx_avinav_cherbourg() {
     let ds = import_path_with(&data("gpx/AVINAV CHERBOURG-72-26.gpx"), None, now()).unwrap();
     assert!(ds.imported);
-    assert_eq!(ds.product, Product::S124);
+    assert_eq!(ds.product, ferrite_s124::PRODUCT);
     let pre = ds.object("PRE").unwrap();
     assert_eq!(
         pre.value(&["messageSeriesIdentifier", "nameOfSeries"]),

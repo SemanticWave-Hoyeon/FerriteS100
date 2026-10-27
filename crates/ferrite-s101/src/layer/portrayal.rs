@@ -1,12 +1,12 @@
 //! S-101 cell portrayal through the catalogue's Lua rules, with per-cell
 //! instruction caches.
-#[cfg(feature = "lua-native")]
-use crate::convert_lua_results_for_cell;
 use crate::layer::portrayal_cache::{encode_cache_payload, read_and_deserialize_cache, wrap_cache};
 use crate::layer::primary_viewing_layers;
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
 use ferrite_lua::ContextParameters as LuaContextParameters;
+#[cfg(feature = "lua-native")]
+use ferrite_part9a::convert_lua_results_for_cell;
 use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
 use ferrite_product_api::platform as secure_instruction_cache;
 use ferrite_product_api::platform::{CacheStore, DataSource, Executor};

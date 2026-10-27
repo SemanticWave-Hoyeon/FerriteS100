@@ -137,6 +137,14 @@ typed_layer!(
 );
 
 impl ProductLayers {
+    /// The portrayal catalogue scenes are drawn with (palette, symbols): the
+    /// first registered layer's that has one installed (the S-101 base
+    /// chart's when S-101 is built).
+    pub fn scene_catalogue(&self) -> Option<&ferrite_portrayal_catalog::BoundPortrayalCatalogue> {
+        self.entries
+            .iter()
+            .find_map(|e| e.layer.portrayal_catalogue())
+    }
     /// The GML overlay layer (S-124, S-129 and any registered GML product).
     pub fn overlays(&self) -> Option<&crate::gml_overlay::GmlOverlays> {
         self.get()

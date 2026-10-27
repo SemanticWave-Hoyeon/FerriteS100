@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ferrite-iso8211",
     "crates/ferrite-s100-core",
+    "crates/ferrite-part9a",
     "crates/ferrite-s101",
     "crates/ferrite-s102",
     "crates/ferrite-s421",
@@ -100,6 +101,7 @@ bincode = "1"
 # Internal crates
 ferrite-iso8211 = { path = "crates/ferrite-iso8211" }
 ferrite-s100-core = { path = "crates/ferrite-s100-core" }
+ferrite-part9a = { path = "crates/ferrite-part9a" }
 ferrite-s101 = { path = "crates/ferrite-s101", default-features = false }
 ferrite-s102 = { path = "crates/ferrite-s102", default-features = false }
 ferrite-kernel = { path = "crates/ferrite-kernel" }
@@ -141,6 +143,7 @@ roxmltree = "=0.20.0"
 chrono.workspace = true
 ferrite-iso8211.workspace = true
 ferrite-s100-core.workspace = true
+ferrite-part9a.workspace = true
 ferrite-s101.workspace = true
 ferrite-s102.workspace = true
 ferrite-s421 = { path = "crates/ferrite-s421" }

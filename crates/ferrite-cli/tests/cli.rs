@@ -35,6 +35,7 @@ fn usage_and_errors_exit_with_status_two() {
 }
 
 #[test]
+#[cfg(feature = "s101")]
 fn inspects_validates_and_renders() {
     if !root().join(EXCHANGE_SET).is_dir() {
         eprintln!("TestData not present; skipped");
@@ -131,6 +132,7 @@ const S102_FILES: &str =
 /// `SceneEmitter`), also from precomputed S-101 payloads and S-102 rule
 /// instructions.
 #[test]
+#[cfg(all(feature = "s101", feature = "s102-pure"))]
 fn renders_s102_bathymetry() {
     if !root().join(EXCHANGE_SET).is_dir() || !root().join(S102_FILES).is_dir() {
         eprintln!("TestData not present; skipped");
@@ -208,6 +210,36 @@ fn renders_s102_bathymetry() {
         image::open(&precomputed).unwrap().to_rgba8().as_raw(),
         with.as_raw(),
         "precomputed portrayal draws the same S-101 and S-102 image"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const S124_EXCHANGE_SET: &str = "TestData/UKHO-S100-2026/ExchangeSets/S-124_GB/S100_ROOT";
+
+/// S-124 warnings drawn with or without the S-101 product (without it the
+/// scene uses the S-124 portrayal catalogue).
+#[test]
+#[cfg(feature = "s124")]
+fn renders_s124_warnings() {
+    if !root().join(S124_EXCHANGE_SET).is_dir() {
+        eprintln!("TestData not present; skipped");
+        return;
+    }
+    let output = ferrite(&["inspect", "--json", S124_EXCHANGE_SET]);
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let datasets = json["datasets"].as_array().unwrap();
+    assert!(!datasets.is_empty());
+    assert!(datasets.iter().all(|d| d["product"] == "S-124"));
+    let dir = work_dir("s124");
+    let png = dir.join("s124.png");
+    let output = ferrite(&["render", S124_EXCHANGE_SET, "--out", png.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let image = image::open(&png).unwrap().to_rgba8();
+    let first = image.get_pixel(0, 0);
+    assert!(
+        image.pixels().any(|p| p != first),
+        "the warnings are drawn over the background"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

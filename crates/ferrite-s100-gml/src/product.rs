@@ -13,7 +13,7 @@
 //!   state, feature filtering, picking and highlight details. Every hook has
 //!   a neutral default, so a product implements only what it adds.
 use crate::exchange::ExchangeRule;
-use crate::model::{Dataset, Product, Severity};
+use crate::model::{Dataset, GmlIdentity, ProductId, Severity};
 use crate::overlay::OverlayCore;
 use crate::portrayal::{CatalogueInfo, ConvertOptions, InputOptions};
 use crate::validate::{FcRule, Incoming, IssueSink, Validator};
@@ -26,7 +26,12 @@ use std::path::Path;
 
 /// Static rules and factory of a GML product.
 pub trait GmlRules: Send + Sync {
-    fn product(&self) -> Product;
+    /// How the product's datasets name it (productIdentifier, namespace,
+    /// file name prefix).
+    fn identity(&self) -> &'static GmlIdentity;
+    fn product(&self) -> ProductId {
+        self.identity().id
+    }
 
     // ── Dataset validation ([`crate::validate`]) ─────────────────────────
 
@@ -101,7 +106,7 @@ pub struct PortrayalSettings {
 /// platform clock and the shared options. Dataset ids are the core's.
 pub trait GmlOverlayProduct: ProductAdapter {
     fn rules(&self) -> &'static dyn GmlRules;
-    fn product(&self) -> Product {
+    fn product(&self) -> ProductId {
         self.rules().product()
     }
 
@@ -145,7 +150,7 @@ pub trait GmlOverlayProduct: ProductAdapter {
         _now: DateTime<Utc>,
         _local_paths: bool,
     ) -> anyhow::Result<(Dataset, &'static str)> {
-        anyhow::bail!("{} imports no other formats", self.product().identifier())
+        anyhow::bail!("{} imports no other formats", self.product())
     }
     /// First receipt time of a dataset being added.
     fn received(&mut self, core: &mut OverlayCore, _dataset: &Dataset) -> DateTime<Utc> {

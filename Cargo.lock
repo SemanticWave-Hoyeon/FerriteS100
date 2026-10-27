@@ -1495,6 +1495,7 @@ dependencies = [
  "ferrite-engine",
  "ferrite-gpu",
  "ferrite-kernel",
+ "ferrite-part9a",
  "ferrite-portrayal-catalog",
  "ferrite-product-api",
  "ferrite-render",
@@ -1520,6 +1521,7 @@ dependencies = [
  "ferrite-iso8211",
  "ferrite-kernel",
  "ferrite-lua",
+ "ferrite-part9a",
  "ferrite-portrayal-catalog",
  "ferrite-product-api",
  "ferrite-render",
@@ -1678,6 +1680,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-part9a"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "ferrite-kernel",
+ "ferrite-lua",
+ "ferrite-portrayal-catalog",
+ "ferrite-render",
+ "ferrite-s100-core",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "ferrite-plugin-api"
 version = "2.0.0"
 dependencies = [
@@ -1772,6 +1788,7 @@ dependencies = [
  "ferrite-kernel",
  "ferrite-lua",
  "ferrite-mcp",
+ "ferrite-part9a",
  "ferrite-plugin-api",
  "ferrite-plugin-loader",
  "ferrite-portrayal-catalog",
@@ -1854,6 +1871,7 @@ dependencies = [
  "ferrite-iso8211",
  "ferrite-kernel",
  "ferrite-lua",
+ "ferrite-part9a",
  "ferrite-portrayal-catalog",
  "ferrite-product-api",
  "ferrite-render",

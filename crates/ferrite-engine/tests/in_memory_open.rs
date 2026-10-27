@@ -62,7 +62,7 @@ fn opens_and_prepares_a_scene_entirely_from_memory() {
     assert!(
         engine
             .overlays()
-            .catalogues(ferrite_s100_gml::Product::S124)
+            .catalogues(ferrite_product_api::ProductId("S-124"))
             .is_some(),
         "{:?}",
         engine.catalogue_errors()

@@ -503,6 +503,9 @@ impl ProductLayer for S102Layer {
     fn products(&self) -> Vec<ProductId> {
         vec![PRODUCT]
     }
+    fn portrayal_catalogue(&self) -> Option<&ferrite_portrayal_catalog::BoundPortrayalCatalogue> {
+        self.pc.as_deref()
+    }
     fn is_empty(&self) -> bool {
         self.bathymetry.is_empty() && self.trials.is_empty()
     }

@@ -105,6 +105,13 @@ pub struct Installed {
 
 /// Load the optional S-102 portrayal catalogue (`PC/S-102`) through the data
 /// source; failures are recorded in the catalogue status.
+/// Where the S-102 catalogues are installed (catalogue load errors).
+pub const CATALOGUE_LAYOUT: ferrite_product_api::CatalogueLayout =
+    ferrite_product_api::CatalogueLayout {
+        feature: "<app>/Catalogues/FC/S-102/*.xml",
+        portrayal: "<app>/Catalogues/PC/S-102/ with ColorProfiles/, Rules/",
+    };
+
 pub fn load_catalogues(layer: &mut S102Layer, data: &dyn DataSource, catalogues: &Path) {
     let pc_path = catalogues.join("PC/S-102");
     if !data.is_dir(&pc_path) {

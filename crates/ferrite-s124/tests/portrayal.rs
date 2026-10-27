@@ -38,7 +38,13 @@ fn datasets(dir: &str, extension: &str) -> Vec<PathBuf> {
 }
 
 fn read(path: &Path, fc: &FeatureCatalogue) -> Dataset {
-    read_file(path, Some(fc), ReadLimits::default()).unwrap()
+    read_file(
+        path,
+        &[&ferrite_s124::rules::IDENTITY],
+        Some(fc),
+        ReadLimits::default(),
+    )
+    .unwrap()
 }
 
 const COMMANDS: &[&str] = &[
@@ -279,8 +285,13 @@ fn s124_text_placement_dropped_by_default() {
          <S124:geometry><S100:pointProperty><S100:Point gml:id=\"TPG\"><gml:pos>50.70 -1.10</gml:pos>\
          </S100:Point></S100:pointProperty></S124:geometry></S124:TextPlacement></S124:members>",
     );
-    let dataset =
-        ferrite_s100_gml::read_bytes(text.as_bytes(), Some(&fc), Default::default()).unwrap();
+    let dataset = ferrite_s100_gml::read_bytes(
+        text.as_bytes(),
+        &[&ferrite_s124::rules::IDENTITY],
+        Some(&fc),
+        Default::default(),
+    )
+    .unwrap();
     let input = input_xml(&dataset, Some(&fc), &InputOptions::default());
     let literal = pc.portray(&input, &[], &ConvertOptions::default()).unwrap();
     assert!(literal

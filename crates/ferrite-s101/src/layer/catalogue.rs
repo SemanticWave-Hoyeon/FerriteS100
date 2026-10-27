@@ -5,6 +5,12 @@ use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
 use ferrite_render::host_settings::CatalogueStatus;
 use std::path::Path;
 
+/// Where the S-101 catalogues are installed (catalogue load errors).
+pub const LAYOUT: ferrite_product_api::CatalogueLayout = ferrite_product_api::CatalogueLayout {
+    feature: "<app>/Catalogues/FC/S-101/*Feature_Catalogue*.xml",
+    portrayal: "<app>/Catalogues/PC/S-101/ with ColorProfiles/, Symbols/, Rules/",
+};
+
 /// Validate Feature Catalogue and create status
 pub fn validate_fc(fc: &FeatureCatalogue, path: &Path) -> CatalogueStatus {
     let mut validation_messages = Vec::new();

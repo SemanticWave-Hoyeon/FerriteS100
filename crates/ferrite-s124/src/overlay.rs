@@ -18,7 +18,7 @@ use ferrite_product_api::{
 use ferrite_s100_gml::overlay::{format_time, OverlayCore};
 use ferrite_s100_gml::portrayal::ConvertOptions;
 use ferrite_s100_gml::product::{GmlOverlayProduct, GmlRules, PortrayalSettings};
-use ferrite_s100_gml::{Dataset, Product};
+use ferrite_s100_gml::Dataset;
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::Path;
@@ -152,7 +152,7 @@ impl ProductAdapter for S124Overlay {
         }
     }
     fn sniff(&self, name: &Path, head: &[u8]) -> Option<Recognised> {
-        if ferrite_s100_gml::overlay::sniff(name, head, &[Product::S124]).is_some() {
+        if ferrite_s100_gml::overlay::sniff(name, head, &[&crate::rules::IDENTITY]).is_some() {
             return Some(Recognised::Dataset);
         }
         let named = name
@@ -252,7 +252,7 @@ impl GmlOverlayProduct for S124Overlay {
 
     /// Datasets whose message status is Cancelled (any reason).
     fn withdrawn(&mut self, core: &mut OverlayCore) -> HashSet<u32> {
-        if !core.datasets.iter().any(|d| d.product() == Product::S124) {
+        if !core.datasets.iter().any(|d| d.product() == crate::PRODUCT) {
             return HashSet::new();
         }
         self.registry(core);
@@ -284,13 +284,13 @@ impl GmlOverlayProduct for S124Overlay {
         let ids: Vec<u32> = core
             .datasets
             .iter()
-            .filter(|d| d.product() == Product::S124)
+            .filter(|d| d.product() == crate::PRODUCT)
             .map(|d| d.id)
             .collect();
         let inputs: Vec<NavwarnInput> = core
             .datasets
             .iter()
-            .filter(|d| d.product() == Product::S124)
+            .filter(|d| d.product() == crate::PRODUCT)
             .map(|d| NavwarnInput {
                 dataset: &d.dataset,
                 received: d.received,
@@ -499,7 +499,7 @@ impl GmlOverlayProduct for S124Overlay {
         for d in core
             .datasets
             .iter_mut()
-            .filter(|d| d.product() == Product::S124)
+            .filter(|d| d.product() == crate::PRODUCT)
         {
             let (received, _) = self
                 .user

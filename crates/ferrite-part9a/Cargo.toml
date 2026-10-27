@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-part9a"
+version.workspace = true
+edition.workspace = true
+description = "Product-neutral S-100 Part 9a drawing instruction conversion (Lua portrayal output to ferrite-render instructions) over the vector records of a geometry source"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+ferrite-kernel.workspace = true
+ferrite-lua.workspace = true
+ferrite-portrayal-catalog.workspace = true
+ferrite-render.workspace = true
+ferrite-s100-core.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

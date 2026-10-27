@@ -37,8 +37,11 @@ const ARC_STEP_DEG: f64 = 2.0;
 /// (guards against reference cycles and hostile nesting).
 const MAX_DEPTH: u32 = 64;
 
+/// Reads a dataset of one of the registered GML `products` (identified by
+/// its productIdentifier, else its namespace).
 pub fn read_file(
     path: &Path,
+    products: &[&GmlIdentity],
     fc: Option<&FeatureCatalogue>,
     limits: ReadLimits,
 ) -> Result<Dataset> {
@@ -51,13 +54,16 @@ pub fn read_file(
         limits.bytes
     );
     let bytes = std::fs::read(path).with_context(|| format!("Cannot read {}", path.display()))?;
-    let mut dataset = read_bytes(&bytes, fc, limits).with_context(|| path.display().to_string())?;
+    let mut dataset =
+        read_bytes(&bytes, products, fc, limits).with_context(|| path.display().to_string())?;
     dataset.source = Some(path.to_path_buf());
     Ok(dataset)
 }
 
+/// [`read_file`] of a dataset's bytes.
 pub fn read_bytes(
     bytes: &[u8],
+    products: &[&GmlIdentity],
     fc: Option<&FeatureCatalogue>,
     limits: ReadLimits,
 ) -> Result<Dataset> {
@@ -127,22 +133,17 @@ pub fn read_bytes(
         }
     }
     let product_id = identification.product_identifier().unwrap_or_default();
-    let product = Product::from_identifier(product_id)
+    let product = products
+        .iter()
+        .find(|p| p.names(product_id))
         .or_else(|| {
-            if namespace.contains("S124") {
-                Some(Product::S124)
-            } else if namespace.contains("S129") {
-                Some(Product::S129)
-            } else {
-                None
-            }
+            products
+                .iter()
+                .find(|p| namespace.contains(&format!("S{}", p.code)))
         })
         .with_context(|| format!("Unsupported product '{product_id}' (namespace {namespace})"))?;
     if late_identification {
-        let check = match product {
-            Product::S129 => "S-158-129/15",
-            Product::S124 => "GML",
-        };
+        let check = product.late_identification_check;
         reader.issue(
             Severity::Warning,
             check,
@@ -187,7 +188,7 @@ pub fn read_bytes(
     Ok(Dataset {
         source: None,
         sha256: Sha256::digest(bytes).into(),
-        product,
+        product: product.id,
         namespace,
         gml_id: root.attribute((GML, "id")).unwrap_or_default().to_string(),
         identification,
@@ -731,8 +732,32 @@ pub(crate) mod tests {
     pub(crate) fn fc(relative: &str) -> Option<FeatureCatalogue> {
         Some(FeatureCatalogue::load(workspace_file(relative)?).unwrap())
     }
+    /// Identities of the S-124 and S-129 datasets the tests read (the
+    /// product crates register the same ones).
+    pub(crate) static S124: GmlIdentity = GmlIdentity {
+        id: ProductId("S-124"),
+        identifiers: &["S-124", "S124"],
+        code: "124",
+        late_identification_check: "GML",
+    };
+    pub(crate) static S129: GmlIdentity = GmlIdentity {
+        id: ProductId("S-129"),
+        identifiers: &["S-129", "S129"],
+        code: "129",
+        late_identification_check: "S-158-129/15",
+    };
+    pub(crate) static KNOWN: [&GmlIdentity; 2] = [&S124, &S129];
+
     pub(crate) fn read(relative: &str, fc: &FeatureCatalogue) -> Option<Dataset> {
-        Some(read_file(&workspace_file(relative)?, Some(fc), ReadLimits::default()).unwrap())
+        Some(
+            read_file(
+                &workspace_file(relative)?,
+                &KNOWN,
+                Some(fc),
+                ReadLimits::default(),
+            )
+            .unwrap(),
+        )
     }
     fn s124(n: u32, fc: &FeatureCatalogue) -> Option<Dataset> {
         let name = match n {
@@ -758,7 +783,7 @@ pub(crate) mod tests {
     fn s124_point_dataset_with_header_reference() {
         let Some(fc) = fc(S124_FC) else { return };
         let Some(ds) = s124(43, &fc) else { return };
-        assert_eq!(ds.product, Product::S124);
+        assert_eq!(ds.product, S124.id);
         assert_eq!(ds.gml_id, "DS_124GB00S2Y2026N43");
         assert_eq!(
             ds.identification.file_identifier(),
@@ -909,7 +934,7 @@ pub(crate) mod tests {
         let Some(fc) = fc(S129_FC) else { return };
         for (file, reversed) in [(S129_130, false), (S129_200, true)] {
             let Some(ds) = read(file, &fc) else { return };
-            assert_eq!(ds.product, Product::S129);
+            assert_eq!(ds.product, S129.id);
             assert!(ds.issues.is_empty(), "{file}: {:?}", ds.issues);
             assert_eq!(ds.objects.len(), 304);
             let count = |c: &str| ds.objects_of(c).count();
@@ -1002,7 +1027,7 @@ pub(crate) mod tests {
             r##"<gml:CompositeCurve gml:id="C1"><gml:curveMember xlink:href="#C2"/></gml:CompositeCurve>
 <gml:CompositeCurve gml:id="C2"><gml:curveMember xlink:href="#C1"/></gml:CompositeCurve>"##,
         );
-        let ds = read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap();
+        let ds = read_bytes(xml.as_bytes(), &KNOWN, None, ReadLimits::default()).unwrap();
         assert!(ds.objects[0].geometry.is_empty());
         assert!(
             ds.issues.iter().any(|i| i.message.contains("too deep")),
@@ -1018,7 +1043,7 @@ pub(crate) mod tests {
 <geometry><S100:curveProperty><gml:OrientableCurve orientation="-"><gml:baseCurve><gml:LineString><gml:posList>1 2 3 4</gml:posList></gml:LineString></gml:baseCurve></gml:OrientableCurve></S100:curveProperty></geometry></UnderKeelClearanceControlPoint>"##,
             "",
         );
-        let ds = read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap();
+        let ds = read_bytes(xml.as_bytes(), &KNOWN, None, ReadLimits::default()).unwrap();
         let o = &ds.objects[0];
         assert_eq!(
             o.attributes[0].value,
@@ -1037,7 +1062,7 @@ pub(crate) mod tests {
     #[test]
     fn late_identification_is_product_specific() {
         let xml = r#"<Dataset xmlns="http://www.iho.int/S129/2.0" xmlns:S100="http://www.iho.int/s100gml/5.0"><members/><S100:DatasetIdentificationInformation><S100:productIdentifier>S-129</S100:productIdentifier></S100:DatasetIdentificationInformation></Dataset>"#;
-        let ds = read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap();
+        let ds = read_bytes(xml.as_bytes(), &KNOWN, None, ReadLimits::default()).unwrap();
         assert_eq!(ds.issues.len(), 1);
         assert_eq!(ds.issues[0].check, "S-158-129/15");
     }
@@ -1049,7 +1074,7 @@ pub(crate) mod tests {
 <UnderKeelClearancePlanArea gml:id="B"><geometry><S100:pointProperty><S100:Point srsName="EPSG:3857"><gml:pos>1 2</gml:pos></S100:Point></S100:pointProperty></geometry></UnderKeelClearancePlanArea>"##,
             "",
         );
-        let ds = read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap();
+        let ds = read_bytes(xml.as_bytes(), &KNOWN, None, ReadLimits::default()).unwrap();
         let messages: Vec<_> = ds.issues.iter().map(|i| i.message.as_str()).collect();
         assert_eq!(messages.len(), 2, "{messages:?}");
         assert!(messages[0].contains("not closed"));

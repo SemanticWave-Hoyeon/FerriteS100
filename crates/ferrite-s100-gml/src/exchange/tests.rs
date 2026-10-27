@@ -1,6 +1,6 @@
 use super::*;
 
-const KNOWN: [Product; 2] = [Product::S124, Product::S129];
+use crate::reader::tests::{KNOWN, S124, S129};
 
 #[test]
 fn file_uris() {
@@ -21,11 +21,11 @@ fn file_uris() {
     assert_eq!(resolve(""), None);
     assert_eq!(
         product_of(None, Some("124GB00X.GML"), &KNOWN),
-        Some(Product::S124)
+        Some(S124.id)
     );
     assert_eq!(
         product_of(None, Some("S-129/DATASET_FILES/x.gml"), &KNOWN),
-        Some(Product::S129)
+        Some(S129.id)
     );
     assert_eq!(product_of(Some("S-101"), Some("S-124/x"), &KNOWN), None);
 }

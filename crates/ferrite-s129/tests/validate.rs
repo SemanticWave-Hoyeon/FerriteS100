@@ -55,7 +55,13 @@ fn s129(members: &str) -> Dataset {
 <S100:DatasetIdentificationInformation><S100:productIdentifier>S-129</S100:productIdentifier><S100:productEdition>2.0.0</S100:productEdition><S100:datasetFileIdentifier>129ABCD01.GML</S100:datasetFileIdentifier></S100:DatasetIdentificationInformation>
 <members>{members}</members></Dataset>"#
     );
-    read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap()
+    read_bytes(
+        xml.as_bytes(),
+        &[&ferrite_s129::rules::IDENTITY],
+        None,
+        ReadLimits::default(),
+    )
+    .unwrap()
 }
 
 #[test]

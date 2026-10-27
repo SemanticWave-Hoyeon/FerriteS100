@@ -36,10 +36,10 @@ crypto-rust = ["ferrite-security/crypto-rust"]
 # S-101 ENC base chart (ferrite-s101 product layer): the bound catalogue pair
 # ChartEngine requires, cell opening and portrayal, coverage clipping.
 s101 = ["dep:ferrite-s101"]
-# The GML products' overlay portrayal shares the Part 9a instruction
-# conversion of the ferrite-s101 crate (linked, not registered).
-s124 = ["dep:ferrite-s124", "dep:ferrite-s101"]
-s129 = ["dep:ferrite-s129", "dep:ferrite-s101"]
+# The GML products' overlay portrayal uses the product-neutral Part 9a
+# instruction conversion (ferrite-part9a), as S-101 cell portrayal does.
+s124 = ["dep:ferrite-s124"]
+s129 = ["dep:ferrite-s129"]
 # S-421 routes (ferrite-s421 product layer): discovery, capture and the
 # route store of ChartEngine.
 s421 = ["dep:ferrite-s421"]
@@ -64,6 +64,7 @@ ferrite-interoperability.workspace = true
 ferrite-iso8211.workspace = true
 ferrite-kernel.workspace = true
 ferrite-lua.workspace = true
+ferrite-part9a.workspace = true
 ferrite-portrayal-catalog.workspace = true
 ferrite-product-api = { path = "../ferrite-product-api" }
 ferrite-render.workspace = true

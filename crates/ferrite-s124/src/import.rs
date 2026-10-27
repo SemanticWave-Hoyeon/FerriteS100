@@ -486,7 +486,7 @@ fn build(
     let mut ds = Dataset {
         source: None,
         sha256: sha,
-        product: Product::S124,
+        product: crate::PRODUCT,
         namespace: S124_NAMESPACE.into(),
         gml_id: format!("IMPORT_{hex}"),
         identification,

@@ -60,7 +60,7 @@ fn convert(
 ) {
     ctx.clear_instructions();
     let p=ferrite_lua::PortrayalResult::parse("990001",&format!("Rotation:LineCRS,0;DrawingPriority:24;LinePlacement:{mode},{offset},,{visible};PointInstruction:DOT"),"").unwrap();
-    ferrite_s101::convert_lua_results_for_cell(&[p], cell, pc, ctx, 0, "Day").unwrap();
+    ferrite_part9a::convert_lua_results_for_cell(&[p], cell, pc, ctx, 0, "Day").unwrap();
     assert!(ctx.raw_instructions().iter().all(|p|matches!(p,DrawingInstruction::Point(p) if p.line_placement.as_ref().is_some_and(|l|l.visible_parts==visible))));
     let bytes = bincode::serialize(ctx.raw_instructions()).unwrap();
     let restored: Vec<DrawingInstruction> = bincode::deserialize(&bytes).unwrap();

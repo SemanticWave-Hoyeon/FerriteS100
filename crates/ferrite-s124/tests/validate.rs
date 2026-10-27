@@ -131,7 +131,13 @@ fn s124(members: &str) -> Dataset {
 <S100:DatasetIdentificationInformation><S100:productIdentifier>S-124</S100:productIdentifier><S100:productEdition>2.0.0</S100:productEdition><S100:datasetFileIdentifier>124GB00IFB1.GML</S100:datasetFileIdentifier></S100:DatasetIdentificationInformation>
 <S124:members>{members}</S124:members></S124:Dataset>"#
     );
-    read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap()
+    read_bytes(
+        xml.as_bytes(),
+        &[&ferrite_s124::rules::IDENTITY],
+        None,
+        ReadLimits::default(),
+    )
+    .unwrap()
 }
 
 const PREAMBLE: &str = r#"<S124:NavwarnPreamble gml:id="PRE"><S124:generalArea><S124:locationName><S124:language>eng</S124:language><S124:text>WIGHT</S124:text></S124:locationName></S124:generalArea><S124:messageSeriesIdentifier><S124:agencyResponsibleForProduction>UKHO</S124:agencyResponsibleForProduction><S124:nameOfSeries>WZ</S124:nameOfSeries><S124:warningNumber>1</S124:warningNumber><S124:warningType code="2"/><S124:year>2026</S124:year></S124:messageSeriesIdentifier><S124:cancellationDate>2026-01-01T00:00:00Z</S124:cancellationDate><S124:intService>true</S124:intService><S124:navwarnTypeGeneral code="8"/><S124:publicationTime>2026-02-13T08:42:41Z</S124:publicationTime>"#;

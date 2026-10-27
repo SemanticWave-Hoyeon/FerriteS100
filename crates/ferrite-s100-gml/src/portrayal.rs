@@ -221,7 +221,7 @@ pub struct PortrayalInput {
     pub document: Rc<Document>,
     pub features: Vec<InputFeature>,
     pub spatials: Vec<InputSpatial>,
-    pub product: Product,
+    pub product: ProductId,
     pub dataset_name: String,
     pub source: Option<PathBuf>,
     pub notes: Vec<Note>,
@@ -964,8 +964,8 @@ fn escape(value: &str) -> String {
     out
 }
 /// `"<product>/<id>"` for a symbol reference, without double-prefixing.
-pub fn namespaced_symbol(product: Product, reference: &str) -> String {
-    let prefix = product.identifier();
+pub fn namespaced_symbol(product: ProductId, reference: &str) -> String {
+    let prefix = product.as_str();
     match reference.strip_prefix(prefix) {
         Some(rest) if rest.starts_with('/') => reference.to_owned(),
         _ => format!("{prefix}/{reference}"),
@@ -2226,7 +2226,7 @@ pub fn synthetic_cell(input: &PortrayalInput, key_of: impl Fn(usize) -> i64) -> 
         dsid: DatasetIdentification {
             dataset_name: input.dataset_name.clone(),
             dataset_title: input.dataset_name.clone(),
-            product_identifier: input.product.identifier().into(),
+            product_identifier: input.product.as_str().into(),
             ..Default::default()
         },
         code_mappings: DatasetCodeMappings::new(),

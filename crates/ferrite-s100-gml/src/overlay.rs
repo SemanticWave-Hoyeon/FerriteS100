@@ -3,7 +3,7 @@
 //! ([`OverlayCore`]) product modules read and update through their
 //! [`crate::product::GmlOverlayProduct`] hooks. The engine's overlay host
 //! owns the core together with the registered product modules.
-use crate::model::{Dataset, Issue, Product};
+use crate::model::{Dataset, GmlIdentity, Issue, ProductId};
 use crate::portrayal::{Portrayal, PortrayalInput};
 use chrono::{DateTime, Utc};
 use ferrite_product_api::platform::Clock;
@@ -31,7 +31,7 @@ pub struct OverlayDataset {
 }
 
 impl OverlayDataset {
-    pub fn product(&self) -> Product {
+    pub fn product(&self) -> ProductId {
         self.dataset.product
     }
     pub fn name(&self) -> String {
@@ -149,7 +149,7 @@ pub fn sniffable_name(path: &Path) -> bool {
 /// The product (of `products`) of a GML dataset from its first bytes: the
 /// root `Dataset` element's namespace (`/S<code>/`), else the
 /// productIdentifier.
-pub fn sniff_head(head: &[u8], products: &[Product]) -> Option<Product> {
+pub fn sniff_head(head: &[u8], products: &[&GmlIdentity]) -> Option<ProductId> {
     let text = String::from_utf8_lossy(head);
     let mut reader = quick_xml::Reader::from_str(text.trim_start_matches('\u{feff}'));
     loop {
@@ -163,8 +163,8 @@ pub fn sniff_head(head: &[u8], products: &[Product]) -> Option<Product> {
                     let value = String::from_utf8_lossy(&attr.value);
                     if attr.key.as_ref().starts_with(b"xmlns") {
                         for product in products {
-                            if value.contains(&format!("/S{}/", product.code())) {
-                                return Some(*product);
+                            if value.contains(&format!("/S{}/", product.code)) {
+                                return Some(product.id);
                             }
                         }
                     }
@@ -177,12 +177,12 @@ pub fn sniff_head(head: &[u8], products: &[Product]) -> Option<Product> {
     }
     products
         .iter()
-        .copied()
         .find(|product| text.contains(&format!("productIdentifier>{}<", product.identifier())))
+        .map(|product| product.id)
 }
 
 /// [`sniff_head`] of a named dataset (at most its first 64 KiB are read).
-pub fn sniff(name: &Path, head: &[u8], products: &[Product]) -> Option<Product> {
+pub fn sniff(name: &Path, head: &[u8], products: &[&GmlIdentity]) -> Option<ProductId> {
     if !sniffable_name(name) {
         return None;
     }

@@ -39,7 +39,13 @@ fn datasets(dir: &str, extension: &str) -> Vec<PathBuf> {
 }
 
 fn read(path: &Path, fc: &FeatureCatalogue) -> Dataset {
-    read_file(path, Some(fc), ReadLimits::default()).unwrap()
+    read_file(
+        path,
+        &[&ferrite_s129::rules::IDENTITY],
+        Some(fc),
+        ReadLimits::default(),
+    )
+    .unwrap()
 }
 
 const COMMANDS: &[&str] = &[

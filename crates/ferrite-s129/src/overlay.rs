@@ -7,7 +7,6 @@ use ferrite_product_api::{
 };
 use ferrite_s100_gml::portrayal::{CatalogueInfo, ConvertOptions, InputOptions};
 use ferrite_s100_gml::product::{GmlOverlayProduct, GmlRules, PortrayalSettings};
-use ferrite_s100_gml::Product;
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::Path;
@@ -40,7 +39,8 @@ impl ProductAdapter for S129Overlay {
         }
     }
     fn sniff(&self, name: &Path, head: &[u8]) -> Option<Recognised> {
-        ferrite_s100_gml::overlay::sniff(name, head, &[Product::S129]).map(|_| Recognised::Dataset)
+        ferrite_s100_gml::overlay::sniff(name, head, &[&crate::rules::IDENTITY])
+            .map(|_| Recognised::Dataset)
     }
     fn panels(&self) -> &'static [PanelDescriptor] {
         std::slice::from_ref(&crate::panel::PANEL)

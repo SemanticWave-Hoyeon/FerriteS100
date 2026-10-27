@@ -52,7 +52,7 @@ impl ApplicationHandler for App {
         r.background_color = Color::BLUE;
         let mut c = RenderContext::new(Viewport::new(size.width as f32, size.height as f32));
         c.set_bounds(GeoBounds::new(-10., -10., 10., 10.));
-        ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut c, 0, "Day")
+        ferrite_part9a::convert_lua_results_for_cell(&[result], &cell, &pc, &mut c, 0, "Day")
             .unwrap();
         let mut area: AreaInstruction = c
             .raw_instructions()

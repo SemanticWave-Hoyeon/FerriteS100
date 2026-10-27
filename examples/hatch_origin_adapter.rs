@@ -43,7 +43,14 @@ fn main() -> anyhow::Result<()> {
                 "",
             )?;
             let mut ctx = RenderContext::new(Viewport::new(240., 180.));
-            ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut ctx, 0, "Day")?;
+            ferrite_part9a::convert_lua_results_for_cell(
+                &[result],
+                &cell,
+                &pc,
+                &mut ctx,
+                0,
+                "Day",
+            )?;
             let areas: Vec<_> = ctx
                 .raw_instructions()
                 .iter()
@@ -88,7 +95,7 @@ fn main() -> anyhow::Result<()> {
         )?;
         let mut ctx = RenderContext::new(Viewport::new(240., 180.));
         anyhow::ensure!(
-            ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut ctx, 0, "Day")
+            ferrite_part9a::convert_lua_results_for_cell(&[result], &cell, &pc, &mut ctx, 0, "Day")
                 .is_err(),
             "Invalid hatch accepted: {tail}"
         );

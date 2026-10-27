@@ -190,7 +190,7 @@ fn substitute_color(
         color.token
     );
     Ok((
-        crate::lookup_pc_color(pc, &color.token, profile),
+        ferrite_part9a::lookup_pc_color(pc, &color.token, profile),
         color.token.clone(),
         1. - color.transparency() as f32,
     ))
@@ -230,9 +230,13 @@ fn resolve_substitute(
             };
             let (pc, profile) =
                 portrayal.context("Line style substitution requires the portrayal catalogue")?;
-            let mut styles =
-                crate::resolve_line_strokes(std::slice::from_ref(reference), None, pc, profile)
-                    .with_context(|| format!("Substitute line style {reference}"))?;
+            let mut styles = ferrite_part9a::resolve_line_strokes(
+                std::slice::from_ref(reference),
+                None,
+                pc,
+                profile,
+            )
+            .with_context(|| format!("Substitute line style {reference}"))?;
             Ok(Some(Substitute::LineStyle {
                 reference: reference.clone(),
                 style: Box::new(styles.remove(0)),
@@ -251,7 +255,7 @@ fn resolve_substitute(
                     pc.get_color(profile, token).is_some(),
                     "Substitute colour {token} is not in profile {profile}"
                 );
-                Ok(crate::lookup_pc_color(pc, token, profile))
+                Ok(ferrite_part9a::lookup_pc_color(pc, token, profile))
             };
             let template = ferrite_render::AreaInstruction::new(Vec::new());
             let area = match fill {
@@ -705,6 +709,27 @@ pub fn plan_interoperability_for_cells_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty portrayal catalogue (the fixture of the Part 9a conversion
+    /// tests in `ferrite-part9a`).
+    fn empty_catalogue() -> ferrite_portrayal_catalog::PortrayalCatalogue {
+        use ferrite_portrayal_catalog::*;
+        PortrayalCatalogue {
+            root_path: Default::default(),
+            product_id: String::new(),
+            version: String::new(),
+            color_profiles: ColorProfiles::new(),
+            symbols: Symbols::new(std::path::PathBuf::new()),
+            line_styles: Default::default(),
+            area_fills: Default::default(),
+            viewing_groups: ViewingGroups::new(),
+            viewing_group_layers: ViewingGroupLayers::new(),
+            display_modes: DisplayModes::new(),
+            display_planes: DisplayPlanes::default(),
+            foundation_mode: Vec::new(),
+            rules: PortrayalRules::new(std::path::PathBuf::new()),
+        }
+    }
     fn fc() -> FeatureCatalogue {
         let mut fc = FeatureCatalogue {
             source_path: Default::default(),
@@ -1031,7 +1056,7 @@ mod tests {
                 .with_cell_index(0)
                 .with_feature_id(1),
         );
-        let mut pc = crate::hatch_resource_tests::catalogue();
+        let mut pc = empty_catalogue();
         let plan = |pc: Option<(&ferrite_portrayal_catalog::PortrayalCatalogue, &str)>| {
             plan_interoperability_in(
                 &catalogue,
@@ -1086,7 +1111,7 @@ mod tests {
                 .with_feature_id(1),
         ));
         let original = vec![area, text];
-        let mut pc = crate::hatch_resource_tests::catalogue();
+        let mut pc = empty_catalogue();
         let mut day = ColorProfile::new("Day".into(), "Day".into());
         for (token, rgb) in [("DEPDW", (200, 220, 250)), ("CHBLK", (0, 0, 0))] {
             day.colors.insert(

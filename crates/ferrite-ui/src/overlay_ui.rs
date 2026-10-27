@@ -494,7 +494,11 @@ mod tests {
         for _ in 0..2 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| draw(ctx, &mut state));
         }
-        assert!(state.iter().all(|panel| panel.is_open()));
+        // The windows drawn (the route panel opens with its provider's button).
+        assert!(state
+            .iter()
+            .filter(|panel| panel.in_menu())
+            .all(|panel| panel.is_open()));
         let navwarn = state.get_mut::<NavwarnPanel>().unwrap().take_requests();
         assert!(navwarn.classify.is_none() && navwarn.select.is_none());
         assert!(!navwarn.sort_changed);

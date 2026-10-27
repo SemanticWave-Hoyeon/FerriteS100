@@ -13,7 +13,7 @@ use crate::platform::Platform;
 use ferrite_product_api::platform::RecordKind;
 use ferrite_product_api::{ProductAdapter, ProductId, SceneRole};
 use ferrite_s100_gml::product::GmlRules;
-use ferrite_s100_gml::Product;
+use ferrite_s100_gml::GmlIdentity;
 
 /// The GML (S-100 Part 10b) products, in registration order: their static
 /// rules, which also create their overlay modules.
@@ -29,9 +29,10 @@ pub fn gml_rules() -> Vec<&'static dyn GmlRules> {
     rules
 }
 
-/// The GML products registered in this build.
-pub fn gml_products() -> Vec<Product> {
-    gml_rules().iter().map(|r| r.product()).collect()
+/// How the GML products registered in this build name their datasets
+/// (reader, exchange-set validation and sniffing take these).
+pub fn gml_products() -> Vec<&'static GmlIdentity> {
+    gml_rules().iter().map(|r| r.identity()).collect()
 }
 
 /// The adapters of every product built into this engine, in registration
@@ -196,8 +197,9 @@ pub mod s101 {
             let data = config.platform.data.as_ref();
             let fc_path = config.catalogues.join("FC/S-101");
             let pc_path = config.catalogues.join("PC/S-101");
-            let fc = load_feature_catalogue_from(data, &fc_path)?;
-            let pc = load_portrayal_catalogue_from(data, &pc_path)?;
+            let layout = &ferrite_s101::layer::catalogue::LAYOUT;
+            let fc = load_feature_catalogue_from(data, &fc_path, layout)?;
+            let pc = load_portrayal_catalogue_from(data, &pc_path, layout)?;
             ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
             let fc_status = validate_fc(&fc, &fc.source_path);
             let pc_status = validate_pc(&pc, &pc.root_path);

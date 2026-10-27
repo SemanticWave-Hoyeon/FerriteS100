@@ -53,7 +53,7 @@ fn main() -> Result<()> {
         let data = portrayal.cell_data();
         let results = engine.process_cell(&data.read().unwrap(), parameters.clone())?;
         let mut context = RenderContext::new(Viewport::new(1200., 800.));
-        ferrite_s101::convert_lua_results_for_cell(
+        ferrite_part9a::convert_lua_results_for_cell(
             &results,
             &cell,
             &pc,
@@ -175,7 +175,7 @@ fn main() -> Result<()> {
                 };
                 let result = ferrite_lua::PortrayalResult::parse(&key.to_string(), &commands, "")?;
                 let mut fixture = RenderContext::new(Viewport::new(1200., 800.));
-                ferrite_s101::convert_lua_results_for_cell(
+                ferrite_part9a::convert_lua_results_for_cell(
                     &[result],
                     &cell,
                     &pc,

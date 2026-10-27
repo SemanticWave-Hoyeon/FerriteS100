@@ -14,7 +14,7 @@ use crate::platform::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ferrite_feature_catalog::FeatureCatalogue;
-use ferrite_portrayal_catalog::PortrayalCatalogue;
+use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
 use ferrite_product_api::open::{InstallContext, Loaded, OpenContext, OpenNotes, OpenStage};
 use ferrite_product_api::report::{
     DatasetId, DatasetSummary, InstallReport, IssueSeverity, ValidationIssue,
@@ -27,7 +27,7 @@ use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext, Viewport, Wor
 use ferrite_s100_gml::overlay::{self, OverlayCore};
 use ferrite_s100_gml::portrayal::{self, FeatureInstructions, PortrayalInput, XsltPortrayal};
 use ferrite_s100_gml::product::GmlOverlayProduct;
-use ferrite_s100_gml::{Dataset, Geometry, ObjectKind, Product, Severity, Value};
+use ferrite_s100_gml::{Dataset, Geometry, GmlIdentity, ObjectKind, Severity, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,12 +59,12 @@ pub fn decode_key(key: i64) -> Option<(u32, usize)> {
 
 /// The product (of those registered) of a GML file: namespace or
 /// productIdentifier in the first 64 KiB.
-pub fn sniff_product(path: &Path) -> Option<Product> {
+pub fn sniff_product(path: &Path) -> Option<ProductId> {
     sniff_product_in(&NativeDataSource, path)
 }
 
 /// [`sniff_product`] through a data source.
-pub fn sniff_product_in(data: &dyn DataSource, path: &Path) -> Option<Product> {
+pub fn sniff_product_in(data: &dyn DataSource, path: &Path) -> Option<ProductId> {
     if !overlay::sniffable_name(path) {
         return None;
     }
@@ -73,7 +73,7 @@ pub fn sniff_product_in(data: &dyn DataSource, path: &Path) -> Option<Product> {
 }
 
 /// [`sniff_product`] of a dataset already in memory.
-pub fn sniff_product_bytes(path: &Path, bytes: &[u8]) -> Option<Product> {
+pub fn sniff_product_bytes(path: &Path, bytes: &[u8]) -> Option<ProductId> {
     overlay::sniff(path, bytes, &crate::products::gml_products())
 }
 
@@ -306,9 +306,9 @@ fn marker(p: [f64; 2]) -> Vec<WorldPoint> {
     ]
 }
 
-/// The Part 9a conversion of drawing instructions to host instructions,
-/// shared with S-101 cell portrayal (`ferrite_s101`, linked with any GML
-/// product; without one no overlay dataset is ever opened).
+/// The product-neutral Part 9a conversion of drawing instructions to host
+/// instructions (`ferrite_part9a`, shared with S-101 cell portrayal) over the
+/// dataset's synthetic records.
 fn convert_part9a(
     results: &[ferrite_lua::PortrayalResult],
     cell: &ferrite_s100_core::S101Cell,
@@ -316,13 +316,7 @@ fn convert_part9a(
     context: &mut RenderContext,
     profile: &str,
 ) -> Result<()> {
-    #[cfg(any(feature = "s101", feature = "s124", feature = "s129"))]
-    return ferrite_s101::convert_lua_results_for_cell(results, cell, pc, context, 0, profile);
-    #[cfg(not(any(feature = "s101", feature = "s124", feature = "s129")))]
-    {
-        let _ = (results, cell, pc, context, profile);
-        anyhow::bail!("No GML product is built")
-    }
+    ferrite_part9a::convert_lua_results_for_cell(results, cell, pc, context, 0, profile)
 }
 
 /// Part 9a strings of one dataset to host instructions marked as overlays.
@@ -422,6 +416,9 @@ pub struct ProductCatalogues {
     /// with the product prefix, implicit viewing groups declared (so the
     /// errata correction can pass them; literal portrayal never emits them).
     pc: PortrayalCatalogue,
+    /// The catalogue as installed (palette and symbols of scenes without a
+    /// base chart).
+    bound: Arc<BoundPortrayalCatalogue>,
     /// Viewing groups the rules use but the catalogue does not declare.
     /// Instructions in them are not drawn unless the user enables
     /// [`GmlOverlays::correct_pc_errata`].
@@ -437,7 +434,7 @@ impl ProductCatalogues {
         product: &dyn GmlOverlayProduct,
         register_symbols: SymbolRegistrar,
     ) -> Result<Self> {
-        let id = product.product().identifier();
+        let id = product.product().as_str();
         let fc_dir = catalogues.join("FC").join(id);
         let fc_file = crate::dataset_discovery::feature_catalogue_file_in(data, &fc_dir)
             .with_context(|| format!("{id} feature catalogue in {}", fc_dir.display()))?;
@@ -521,6 +518,7 @@ impl ProductCatalogues {
             fc_source: (!data.local_paths()).then(|| Arc::from(fc_bytes)),
             xslt,
             pc,
+            bound: Arc::new(bound),
             implicit_groups,
             fc_status,
             pc_status,
@@ -612,10 +610,8 @@ impl GmlOverlays {
                     loaded.push(Some(c));
                 }
                 Err(error) => {
-                    let message = format!(
-                        "{} catalogues unavailable: {error:#}",
-                        product.product().identifier()
-                    );
+                    let message =
+                        format!("{} catalogues unavailable: {error:#}", product.product());
                     warn!("{message}");
                     errors.push(message);
                     loaded.push(None);
@@ -635,7 +631,7 @@ impl GmlOverlays {
         }
     }
 
-    fn index_of(&self, product: Product) -> Option<usize> {
+    fn index_of(&self, product: ProductId) -> Option<usize> {
         self.products.iter().position(|p| p.product() == product)
     }
 
@@ -671,7 +667,7 @@ impl GmlOverlays {
     }
 
     /// Catalogues of a registered product, None when not installed.
-    pub fn catalogues(&self, product: Product) -> Option<&ProductCatalogues> {
+    pub fn catalogues(&self, product: ProductId) -> Option<&ProductCatalogues> {
         self.catalogues[self.index_of(product)?].as_ref()
     }
 
@@ -763,7 +759,7 @@ impl GmlOverlays {
             .context("Not a GML dataset of a registered product")?;
         let catalogues = self
             .catalogues(product)
-            .with_context(|| format!("{} catalogues are not installed", product.identifier()))?;
+            .with_context(|| format!("{product} catalogues are not installed"))?;
         let limits = ferrite_s100_gml::ReadLimits::default();
         let meta = self
             .data
@@ -779,8 +775,10 @@ impl GmlOverlays {
             .data
             .read(bytes_path)
             .with_context(|| format!("Cannot read {}", bytes_path.display()))?;
-        let mut dataset = ferrite_s100_gml::read_bytes(&bytes, Some(&catalogues.fc), limits)
-            .with_context(|| bytes_path.display().to_string())?;
+        let products = crate::products::gml_products();
+        let mut dataset =
+            ferrite_s100_gml::read_bytes(&bytes, &products, Some(&catalogues.fc), limits)
+                .with_context(|| bytes_path.display().to_string())?;
         dataset.source = Some(path.to_path_buf());
         Ok((dataset, None))
     }
@@ -791,9 +789,10 @@ impl GmlOverlays {
             .context("Not a GML dataset of a registered product")?;
         let catalogues = self
             .catalogues(product)
-            .with_context(|| format!("{} catalogues are not installed", product.identifier()))?;
+            .with_context(|| format!("{product} catalogues are not installed"))?;
         let mut dataset = ferrite_s100_gml::read_bytes(
             bytes,
+            &crate::products::gml_products(),
             Some(&catalogues.fc),
             ferrite_s100_gml::ReadLimits::default(),
         )
@@ -811,12 +810,7 @@ impl GmlOverlays {
         {
             return Ok(Added::AlreadyOpen);
         }
-        let not_installed = || {
-            format!(
-                "{} catalogues are not installed",
-                dataset.product.identifier()
-            )
-        };
+        let not_installed = || format!("{} catalogues are not installed", dataset.product.as_str());
         let index = self.index_of(dataset.product).with_context(not_installed)?;
         let catalogues = self.catalogues[index]
             .as_ref()
@@ -843,7 +837,7 @@ impl GmlOverlays {
             .count();
         info!(
             "{} dataset {name} opened ({}): {} objects, {} validation errors, {} warnings",
-            dataset.product.identifier(),
+            dataset.product.as_str(),
             provenance.label(),
             dataset.objects.len(),
             errors,
@@ -861,7 +855,7 @@ impl GmlOverlays {
             let kind = if error { "errors" } else { "warnings" };
             warn!(
                 "{} {name}: {count} validation {kind} [{check}]",
-                dataset.product.identifier()
+                dataset.product.as_str()
             );
         }
         for issue in issues
@@ -869,10 +863,10 @@ impl GmlOverlays {
             .filter(|i| i.severity == Severity::Error)
             .take(50)
         {
-            warn!("{} {name}: {issue}", dataset.product.identifier());
+            warn!("{} {name}: {issue}", dataset.product.as_str());
         }
         for issue in issues.iter().filter(|i| i.severity == Severity::Warning) {
-            tracing::debug!("{} {name}: {issue}", dataset.product.identifier());
+            tracing::debug!("{} {name}: {issue}", dataset.product.as_str());
         }
         let received = self.products[index].received(&mut self.core, &dataset);
         self.core.datasets.push(OverlayDataset {
@@ -979,7 +973,7 @@ impl GmlOverlays {
     /// set aside and the product starts empty.
     pub fn attach_user_record(
         &mut self,
-        product: Product,
+        product: ProductId,
         record: Box<dyn UserRecord>,
         user: String,
     ) {
@@ -1093,7 +1087,7 @@ impl GmlOverlays {
                         for note in &p.notes {
                             notes.push(format!(
                                 "{} {}: {note}",
-                                product.identifier(),
+                                product.as_str(),
                                 entry.dataset.display_name()
                             ));
                         }
@@ -1102,7 +1096,7 @@ impl GmlOverlays {
                     Err(error) => {
                         warn!(
                             "{} portrayal of {} failed: {error:#}",
-                            product.identifier(),
+                            product.as_str(),
                             entry.dataset.display_name()
                         );
                         entry.portrayal = None;
@@ -1159,7 +1153,7 @@ impl GmlOverlays {
         let module = &self.products[index];
         let catalogues = self.catalogues[index].as_ref()?;
         let fc = catalogues.fc.as_ref();
-        let product = entry.product().identifier();
+        let product = entry.product();
         let mut attributes = vec![
             ("Dataset".to_owned(), entry.name()),
             (
@@ -1299,6 +1293,15 @@ impl ProductLayer for GmlOverlays {
     fn products(&self) -> Vec<ProductId> {
         self.products.iter().map(|p| p.id()).collect()
     }
+    /// The portrayal catalogue of the first registered product with
+    /// installed catalogues.
+    fn portrayal_catalogue(&self) -> Option<&ferrite_portrayal_catalog::BoundPortrayalCatalogue> {
+        self.catalogues
+            .iter()
+            .flatten()
+            .map(|c| c.bound.as_ref())
+            .next()
+    }
     fn is_empty(&self) -> bool {
         GmlOverlays::is_empty(self)
     }
@@ -1403,7 +1406,7 @@ impl ProductLayer for GmlOverlays {
 fn overlay_summary(overlay: &OverlayDataset) -> DatasetSummary {
     DatasetSummary {
         id: DatasetId::Overlay(overlay.id),
-        product: overlay.product().identifier().to_string(),
+        product: overlay.product().as_str().to_string(),
         name: overlay.name(),
         source: overlay.dataset.source.clone(),
         edition: overlay
@@ -1442,7 +1445,7 @@ fn overlay_issues(overlay: &OverlayDataset) -> Vec<ValidationIssue> {
 /// products by name and head, read (the authenticated snapshot when
 /// verified) on the worker and opened into the layer on install.
 struct GmlStage {
-    products: Vec<Product>,
+    products: Vec<&'static GmlIdentity>,
     /// The products' catalogues are installed.
     catalogues: bool,
     paths: Vec<PathBuf>,
@@ -1645,8 +1648,8 @@ mod tests {
             eprintln!("skipping: TestData not present");
             return;
         }
-        assert_eq!(sniff_product(&s124), Some(Product::S124));
-        assert_eq!(sniff_product(&s129), Some(Product::S129));
+        assert_eq!(sniff_product(&s124), Some(ferrite_s124::PRODUCT));
+        assert_eq!(sniff_product(&s129), Some(ferrite_s129::PRODUCT));
         assert_eq!(
             sniff_product(&root().join("Catalogues/FC/S-124/124_FC_2.0.0.xml")),
             None

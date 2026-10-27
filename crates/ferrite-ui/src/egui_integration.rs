@@ -217,19 +217,12 @@ pub struct AppUiState {
     pub plugin_toggle_requested: Option<String>,
     /// Active plugin UI data (plugin_id, json_data)
     pub plugin_ui_data: Vec<(String, String)>,
-    /// Parsed immutable native DTO; updated only with provider data publication.
-    native_route_ui: Option<std::sync::Arc<serde_json::Value>>,
-    route_panel_provider: Option<&'static str>,
     /// Plugin UI event queue (plugin_id, event_json)
     pub plugin_ui_events: Vec<(String, String)>,
     /// Previous chart area x offset (for detecting panel changes)
     prev_chart_x: f32,
     /// Pan offset adjustment needed due to panel changes (in pixels)
     pub pan_adjust_pixels: Option<f32>,
-    /// Route being edited (route_id, current_edit_text)
-    route_editing: Option<(u32, String)>,
-    /// Waypoint being edited (waypoint_id, current_edit_text)
-    waypoint_editing: Option<(u32, String)>,
     /// Debug overlay and profiling enabled (toolbar, F12, or --debug).
     pub debug_mode: bool,
     /// Debug stats: FPS
@@ -363,11 +356,10 @@ pub struct EguiIntegration {
 
 impl AppUiState {
     pub(crate) fn publish_plugin_ui_data(&mut self, data: Vec<(String, String)>) {
-        self.native_route_ui = data
-            .iter()
-            .find(|(id, _)| id == "native:s421-route")
-            .and_then(|(_, json)| serde_json::from_str(json).ok())
-            .map(std::sync::Arc::new);
+        #[cfg(feature = "s421")]
+        if let Some(route) = self.panels.get_mut::<crate::route_panel::RoutePanel>() {
+            route.publish(&data);
+        }
         self.plugin_ui_data = data;
     }
 
@@ -1205,7 +1197,7 @@ impl EguiIntegration {
             });
 
         // Route panel (left side) - shown when route plugin is active
-        Self::draw_route_panel(&self.ctx, ui_state);
+        Self::draw_leading_panels(&self.ctx, ui_state);
 
         crate::mcp_ui::draw(&self.ctx, &mut ui_state.s100_mcp);
         crate::llm_chat_ui::draw(&self.ctx, &mut ui_state.llm_chat, &ui_state.s100_mcp);
@@ -1924,515 +1916,21 @@ impl EguiIntegration {
             });
     }
 
-    /// Draw the Route panel (for route plugin)
-    fn draw_route_panel(ctx: &egui::Context, ui_state: &mut AppUiState) {
-        let theme = Theme::current(ctx);
-        // Exact provider identity only: a plugin whose ID merely contains
-        // "route" cannot claim the native route panel or receive its commands.
-        let provider = ["native:s421-route", "com.ferrite.route-planner"]
-            .into_iter()
-            .find(|id| {
-                ui_state
-                    .plugin_buttons
-                    .iter()
-                    .any(|b| b.plugin_id == *id && b.active)
-            });
-        let Some(provider) = provider else {
-            return;
-        };
-        if ui_state.route_panel_provider != Some(provider) {
-            ui_state.route_editing = None;
-            ui_state.waypoint_editing = None;
-            ui_state.route_panel_provider = Some(provider);
+    /// Draw the leading registered panels (the S-421 route panel of the
+    /// active route provider) and forward their requests.
+    fn draw_leading_panels(ctx: &egui::Context, ui_state: &mut AppUiState) {
+        #[cfg(feature = "s421")]
+        if let Some(route) = ui_state.panels.get_mut::<crate::route_panel::RoutePanel>() {
+            let buttons = &ui_state.plugin_buttons;
+            route.set_active_providers(|id| buttons.iter().any(|b| b.plugin_id == id && b.active));
         }
-        let route_data = if provider == "native:s421-route" {
-            ui_state.native_route_ui.clone()
-        } else {
-            ui_state
-                .plugin_ui_data
-                .iter()
-                .find(|(id, _)| id == provider)
-                .and_then(|(_, data)| serde_json::from_str(data).ok())
-                .map(std::sync::Arc::new)
-        };
-
-        let mut body = |ui: &mut egui::Ui| {
-            if let Some(route_ui) = &route_data {
-                {
-                    let editing = route_ui
-                        .get("editing")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let title = route_ui
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Route Plan");
-
-                    if provider != "native:s421-route" {
-                        // Header with editing indicator
-                        ui.vertical_centered(|ui| {
-                            ui.heading(egui::RichText::new(title).size(18.0).strong());
-                            if editing {
-                                ui.label(
-                                    egui::RichText::new("Click on chart to add waypoints")
-                                        .size(12.0)
-                                        .color(theme.success),
-                                );
-                            }
-                        });
-                        ui.separator();
-                    }
-                    if let Some(notice) = route_ui.get("notice").and_then(|v| v.as_str()) {
-                        ui.label(notice);
-                    }
-                    let display_available = route_ui
-                        .get("display_available")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    if display_available {
-                        // Rendering toggle at top of panel
-                        let rendering_enabled = route_ui
-                            .get("rendering_enabled")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        ui.horizontal(|ui| {
-                            ui.label("Route Display:");
-                            let btn_text = if rendering_enabled { "ON" } else { "OFF" };
-                            let btn_color = if rendering_enabled {
-                                theme.success
-                            } else {
-                                theme.error
-                            };
-                            if ui
-                                .add_enabled(
-                                    display_available,
-                                    egui::Button::new(
-                                        egui::RichText::new(btn_text).color(btn_color),
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                ui_state.plugin_ui_events.push((
-                                    provider.to_string(),
-                                    r#"{"type":"ToggleRendering"}"#.to_string(),
-                                ));
-                            }
-                        });
-                        ui.separator();
-                    }
-                    // Action buttons
-                    if let Some(actions) = route_ui.get("actions").and_then(|v| v.as_array()) {
-                        ui.horizontal_wrapped(|ui| {
-                            for action in actions {
-                                let id = action.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                let label =
-                                    action.get("label").and_then(|v| v.as_str()).unwrap_or("?");
-                                let enabled = action
-                                    .get("enabled")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-
-                                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                                    let event = match id {
-                                        "new" => r#"{"type":"New"}"#,
-                                        "finish" => r#"{"type":"Finish"}"#,
-                                        "clear" => r#"{"type":"Clear"}"#,
-                                        "export" => r#"{"type":"Export"}"#,
-                                        "import" => r#"{"type":"Import"}"#,
-                                        "copy" => r#"{"type":"CopyAsAuthored"}"#,
-                                        _ => continue,
-                                    };
-                                    ui_state
-                                        .plugin_ui_events
-                                        .push((provider.to_string(), event.to_string()));
-                                }
-                            }
-                        });
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    // Route list section
-                    if let Some(routes) = route_ui.get("routes").and_then(|v| v.as_array()) {
-                        if !routes.is_empty() {
-                            egui::CollapsingHeader::new(egui::RichText::new(format!("Routes ({})", routes.len())).strong())
-                                    .default_open(true)
-                                    .show(ui, |ui| {
-                                        let available_width = ui.available_width();
-                                        for (idx, route) in routes.iter().enumerate() {
-                                            let route_id = route.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                            let name = route.get("name").and_then(|v| v.as_str()).unwrap_or("Route");
-                                            let wp_count = route.get("waypoint_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                                            let dist = route.get("total_distance").and_then(|v| v.as_str()).unwrap_or("0 NM");
-                                            let is_active = route.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-
-                                            let bg_color = if is_active {
-                                                theme.selection
-                                            } else {
-                                                theme.raised
-                                            };
-
-                                            // Check if this route is being edited
-                                            let route_editable = route.get("editable").and_then(|v| v.as_bool()).unwrap_or(provider != "native:s421-route");
-                                            let is_editing = route_editable && ui_state.route_editing.as_ref().is_some_and(|(id, _)| *id == route_id);
-
-                                            // Track button clicks to prevent frame from consuming them
-                                            let mut button_clicked = false;
-
-                                            let frame_response = egui::Frame::new()
-                                                .fill(bg_color)
-                                                .corner_radius(4.0)
-                                                .inner_margin(egui::Margin::symmetric(8, 4))
-                                                .show(ui, |ui| {
-                                                    ui.set_min_width(available_width - 16.0);
-                                                    ui.horizontal(|ui| {
-                                                        // Route info (left side)
-                                                        ui.vertical(|ui| {
-                                                            if is_editing {
-                                                                // Inline text edit
-                                                                if let Some((_, ref mut edit_text)) = ui_state.route_editing {
-                                                                    let response = ui.add(
-                                                                        egui::TextEdit::singleline(edit_text)
-                                                                            .desired_width(available_width - 80.0)
-                                                                            .font(egui::TextStyle::Body)
-                                                                    );
-                                                                    // Auto-focus on the text field
-                                                                    response.request_focus();
-                                                                    // Confirm on Enter or focus lost
-                                                                    if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                                                        let new_name = edit_text.clone();
-                                                                        let event = serde_json::json!({"type":"RenameRoute", "id":route_id, "name":new_name}).to_string();
-                                                                        ui_state.plugin_ui_events.push((
-                                                                            provider.to_string(),
-                                                                            event
-                                                                        ));
-                                                                        ui_state.route_editing = None;
-                                                                    }
-                                                                    // Cancel on Escape
-                                                                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                                                        ui_state.route_editing = None;
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                ui.label(egui::RichText::new(name).strong());
-                                                            }
-                                                            ui.label(egui::RichText::new(format!("{} WP • {}", wp_count, dist))
-                                                                .size(11.0)
-                                                                .color(theme.muted));
-                                                        });
-
-                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                            // Delete route button - use sense to capture click properly
-                                                            let delete_btn = ui.add(egui::Button::new("X").small().sense(egui::Sense::click()));
-                                                            if delete_btn.on_hover_text("Delete route").clicked() {
-                                                                button_clicked = true;
-                                                                let event = format!(r#"{{"type":"DeleteRoute","id":{}}}"#, route_id);
-                                                                ui_state.plugin_ui_events.push((
-                                                                    provider.to_string(),
-                                                                    event
-                                                                ));
-                                                            }
-                                                            // Edit route name button
-                                                            if !is_editing {
-                                                                let edit_btn = ui.add_enabled(route_editable, egui::Button::new("E").small().sense(egui::Sense::click()));
-                                                                if edit_btn.on_hover_text("Rename route").clicked() {
-                                                                    button_clicked = true;
-                                                                    ui_state.route_editing = Some((route_id, name.to_string()));
-                                                                }
-                                                            }
-                                                        });
-                                                    });
-                                                });
-
-                                            // Make entire frame clickable for selection (except when editing or clicking buttons)
-                                            if !is_editing && !button_clicked && frame_response.response.clicked() && !is_active {
-                                                let event = format!(r#"{{"type":"SelectRoute","index":{}}}"#, idx);
-                                                ui_state.plugin_ui_events.push((
-                                                    provider.to_string(),
-                                                    event
-                                                ));
-                                            }
-                                            ui.add_space(2.0);
-                                        }
-                                    });
-                            ui.add_space(4.0);
-                        }
-                    }
-
-                    let content_editable = route_ui
-                        .get("content_editable")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(provider != "native:s421-route");
-                    let turn_radius_editable = route_ui
-                        .get("turn_radius_editable")
-                        .or_else(|| route_ui.get("content_editable"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let active_route_id = route_ui
-                        .get("routes")
-                        .and_then(|v| v.as_array())
-                        .and_then(|routes| {
-                            routes
-                                .iter()
-                                .find(|r| r.get("active").and_then(|v| v.as_bool()) == Some(true))
-                        })
-                        .and_then(|r| r.get("id"))
-                        .and_then(|v| v.as_u64())
-                        .and_then(|id| u32::try_from(id).ok());
-
-                    // Active route waypoints
-                    if let Some(_active_idx) =
-                        route_ui.get("active_route_index").and_then(|v| v.as_u64())
-                    {
-                        ui.separator();
-
-                        // Waypoint count and total distance for active route
-                        if let Some(count) = route_ui.get("waypoint_count").and_then(|v| v.as_u64())
-                        {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Waypoints:").strong());
-                                ui.label(format!("{}", count));
-                            });
-                        }
-                        if let Some(dist) = route_ui.get("total_distance").and_then(|v| v.as_str())
-                        {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Total:").strong());
-                                ui.label(dist);
-                            });
-                        }
-                        ui.add_space(8.0);
-
-                        // Waypoint list with delete and edit buttons
-                        if let Some(waypoints) =
-                            route_ui.get("waypoints").and_then(|v| v.as_array())
-                        {
-                            // Text, combo/editor controls, frame margins and spacing.
-                            // Only visible waypoint rows allocate/layout widgets.
-                            let row_height = (ui.text_style_height(&egui::TextStyle::Body) * 4.0
-                                + 52.0)
-                                .max(96.0);
-                            egui::ScrollArea::vertical().max_height(250.0).show_rows(ui, row_height, waypoints.len(), |ui, range| {
-                                    let available_width = ui.available_width();
-
-                                    for wp in &waypoints[range] {
-                                        let wp_id = wp.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                        let name = wp.get("name").and_then(|v| v.as_str()).unwrap_or("WP");
-                                        let pos = wp.get("position").and_then(|v| v.as_str()).unwrap_or("");
-                                        let leg = wp.get("leg_distance").and_then(|v| v.as_str());
-
-                                        // Check if this waypoint is being edited
-                                        let is_wp_editing = content_editable && ui_state.waypoint_editing.as_ref().is_some_and(|(id, _)| *id == wp_id);
-
-                                        egui::Frame::new()
-                                            .fill(theme.raised)
-                                            .corner_radius(4.0)
-                                            .inner_margin(egui::Margin::symmetric(8, 4))
-                                            .show(ui, |ui| {
-                                                ui.set_min_width((available_width - 16.0).max(0.0));
-                                                ui.set_min_height(row_height - 10.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.vertical(|ui| {
-                                                        if is_wp_editing {
-                                                            // Inline text edit for waypoint name
-                                                            if let Some((_, ref mut edit_text)) = ui_state.waypoint_editing {
-                                                                let response = ui.add(
-                                                                    egui::TextEdit::singleline(edit_text)
-                                                                        .desired_width(available_width - 80.0)
-                                                                        .font(egui::TextStyle::Body)
-                                                                );
-                                                                response.request_focus();
-
-                                                                // Confirm on Enter
-                                                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                                                    let event = serde_json::json!({"type":"RenameWaypoint", "id":wp_id, "name":edit_text}).to_string();
-                                                                    ui_state.plugin_ui_events.push((
-                                                                        provider.to_string(),
-                                                                        event
-                                                                    ));
-                                                                    ui_state.waypoint_editing = None;
-                                                                }
-                                                                // Cancel on Escape
-                                                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                                                    ui_state.waypoint_editing = None;
-                                                                }
-                                                            }
-                                                        } else {
-                                                            ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate());
-                                                        }
-                                                        ui.add(egui::Label::new(egui::RichText::new(pos).size(11.0).color(theme.muted)).truncate());
-                                                        if let Some(event) = crate::route_turn_radius_ui::show(ui, provider, active_route_id.unwrap_or(0), wp_id, wp.get("turn_radius_nm").and_then(|v| v.as_f64()), turn_radius_editable && active_route_id.is_some()) {
-                                                            ui_state.plugin_ui_events.push((provider.to_string(), event));
-                                                        }
-                                                        if let Some(d) = leg {
-                                                            ui.add(egui::Label::new(egui::RichText::new(format!("Leg: {}", d)).size(11.0).color(theme.accent)).truncate())
-                                                                .on_hover_text(format!("WGS84 · initial bearing: {} · final bearing: {}", wp.get("initial_bearing_deg").and_then(|v|v.as_f64()).map(|v|format!("{v:.1}°")).unwrap_or_else(||"Unavailable".into()), wp.get("final_bearing_deg").and_then(|v|v.as_f64()).map(|v|format!("{v:.1}°")).unwrap_or_else(||"Unavailable".into())));
-                                                            let geometry = wp.get("leg_geometry").and_then(|v|v.as_str());
-                                                            let editable = route_ui.get("leg_geometry_editable").and_then(|v|v.as_bool()).unwrap_or(false);
-                                                            let mut chosen = geometry.unwrap_or("").to_owned();
-                                                            ui.add_enabled_ui(editable, |ui| {
-                                                                egui::ComboBox::from_id_salt(("s421_leg_geometry", wp_id))
-                                                                    .selected_text(match chosen.as_str() { "Loxodrome" => "Rhumb line", "Orthodrome" => "Geodesic", _ => "Choose leg geometry" })
-                                                                    .show_ui(ui, |ui| {
-                                                                        ui.selectable_value(&mut chosen, "Loxodrome".into(), "Rhumb line");
-                                                                        ui.selectable_value(&mut chosen, "Orthodrome".into(), "Geodesic");
-                                                                    });
-                                                            });
-                                                            if Some(chosen.as_str()) != geometry && !chosen.is_empty() {
-                                                                let event = serde_json::json!({"type":"SetLegGeometry", "id":wp_id, "geometry":chosen}).to_string();
-                                                                ui_state.plugin_ui_events.push((provider.to_string(),event));
-                                                            }
-                                                        }
-                                                    });
-
-                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        // Delete button - use sense to capture click properly
-                                                        let delete_btn = ui.add_enabled(content_editable, egui::Button::new("X").small().sense(egui::Sense::click()));
-                                                        if delete_btn.on_hover_text("Delete waypoint").clicked() {
-                                                            let event = format!(r#"{{"type":"DeleteWaypoint","id":{}}}"#, wp_id);
-                                                            ui_state.plugin_ui_events.push((
-                                                                provider.to_string(),
-                                                                event
-                                                            ));
-                                                        }
-                                                        // Edit button
-                                                        if !is_wp_editing {
-                                                            let edit_btn = ui.add_enabled(content_editable, egui::Button::new("E").small().sense(egui::Sense::click()));
-                                                            if edit_btn.on_hover_text("Rename waypoint").clicked() {
-                                                                ui_state.waypoint_editing = Some((wp_id, name.to_string()));
-                                                            }
-                                                        }
-                                                    });
-                                                });
-                                            });
-                                        ui.add_space(2.0);
-                                    }
-                                });
-                        }
-                    } else if route_ui
-                        .get("routes")
-                        .and_then(|v| v.as_array())
-                        .is_some_and(|r| r.is_empty())
-                    {
-                        let message = if provider == "native:s421-route" {
-                            "No routes. Import an S-421 file."
-                        } else {
-                            "No routes. Click 'New' to create one."
-                        };
-                        ui.label(egui::RichText::new(message).size(12.0).color(theme.muted));
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    // S-421 Catalogue Settings
-                    egui::CollapsingHeader::new(egui::RichText::new("S-421 Catalogues").strong())
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            // FC Status
-                            ui.horizontal(|ui| {
-                                ui.label("FC:");
-                                if let Some(fc) = route_ui.get("fc_status") {
-                                    let loaded =
-                                        fc.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
-                                    let message = fc
-                                        .get("message")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("Unknown");
-                                    let color = if loaded { theme.success } else { theme.error };
-                                    ui.label(egui::RichText::new(message).color(color).size(11.0));
-                                } else {
-                                    ui.label(
-                                        egui::RichText::new("Not loaded")
-                                            .color(theme.muted)
-                                            .size(11.0),
-                                    );
-                                }
-                            });
-
-                            // PC Status
-                            ui.horizontal(|ui| {
-                                ui.label("PC:");
-                                if let Some(pc) = route_ui.get("pc_status") {
-                                    let loaded =
-                                        pc.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false);
-                                    let message = pc
-                                        .get("message")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("Unknown");
-                                    let color = if loaded { theme.success } else { theme.error };
-                                    ui.label(egui::RichText::new(message).color(color).size(11.0));
-                                } else {
-                                    ui.label(
-                                        egui::RichText::new("Not loaded")
-                                            .color(theme.muted)
-                                            .size(11.0),
-                                    );
-                                }
-                            });
-
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Catalogue path: ./Catalogues/*/S-421/")
-                                    .size(10.0)
-                                    .color(theme.muted),
-                            );
-                        });
-
-                    ui.add_space(4.0);
-
-                    // Instructions based on mode
-                    if editing {
-                        ui.label(egui::RichText::new("Editing Mode:").size(12.0).strong());
-                        ui.label(egui::RichText::new("• Left click: Add waypoint").size(11.0));
-                        ui.label(egui::RichText::new("• Right click: Remove last").size(11.0));
-                        ui.label(egui::RichText::new("• Click 'Finish' when done").size(11.0));
-                    } else if provider == "native:s421-route" {
-                        // The notice above describes this host's actual capabilities.
-                    } else if route_ui.get("active_route_index").is_some() {
-                        ui.label(
-                            egui::RichText::new("Click 'New' to add another route")
-                                .size(12.0)
-                                .color(theme.muted),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("Click 'New' to start a route")
-                                .size(12.0)
-                                .color(theme.muted),
-                        );
-                    }
-                }
-            } else {
-                ui.vertical_centered(|ui| {
-                    ui.heading(egui::RichText::new("Route Plan").size(18.0).strong());
-                });
-                ui.separator();
-                ui.label("Loading plugin...");
+        ui_state.panels.draw_leading(ctx);
+        #[cfg(feature = "s421")]
+        if let Some(route) = ui_state.panels.get_mut::<crate::route_panel::RoutePanel>() {
+            ui_state.plugin_ui_events.extend(route.take_events());
+            if let Some(provider) = route.take_toggle() {
+                ui_state.plugin_toggle_requested = Some(provider);
             }
-        };
-        if provider == "native:s421-route" {
-            let mut open = true;
-            egui::Window::new("S-421 Routes")
-                .id(egui::Id::new("native_s421_routes"))
-                .default_pos([280.0, 70.0])
-                .default_width(360.0)
-                .default_height(420.0)
-                .max_height((ctx.screen_rect().height() - 80.0).max(160.0))
-                .open(&mut open)
-                .vscroll(true)
-                .show(ctx, &mut body);
-            if !open {
-                ui_state.plugin_toggle_requested = Some(provider.into());
-            }
-        } else {
-            egui::SidePanel::left("route_panel")
-                .default_width(280.0)
-                .resizable(true)
-                .show(ctx, body);
         }
     }
 
@@ -3382,9 +2880,13 @@ mod dataset_panel_width_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "s421"))]
 mod native_route_ui_cache_tests {
     use super::*;
+    use crate::route_panel::RoutePanel;
+    fn native(state: &AppUiState) -> Option<std::sync::Arc<ferrite_s421::panel::RoutePanelData>> {
+        state.panels.get::<RoutePanel>().unwrap().native().cloned()
+    }
     #[test]
     fn native_dto_is_immutable_between_frames_and_replaced_on_publication() {
         let mut state = AppUiState::default();
@@ -3392,23 +2894,20 @@ mod native_route_ui_cache_tests {
             "native:s421-route".into(),
             r#"{"title":"First"}"#.into(),
         )]);
-        let first = state.native_route_ui.clone().unwrap();
-        let frame = state.native_route_ui.clone().unwrap();
+        let first = native(&state).unwrap();
+        let frame = native(&state).unwrap();
         assert!(std::sync::Arc::ptr_eq(&first, &frame));
         state.publish_plugin_ui_data(vec![(
             "native:s421-route".into(),
             r#"{"title":"Second"}"#.into(),
         )]);
-        assert!(!std::sync::Arc::ptr_eq(
-            &first,
-            state.native_route_ui.as_ref().unwrap()
-        ));
-        assert_eq!(first["title"], "First");
+        assert!(!std::sync::Arc::ptr_eq(&first, &native(&state).unwrap()));
+        assert_eq!(first.title, "First");
         state.publish_plugin_ui_data(vec![(
             "com.attacker.route".into(),
             r#"{"title":"Other"}"#.into(),
         )]);
-        assert!(state.native_route_ui.is_none());
+        assert!(native(&state).is_none());
     }
 }
 

@@ -6,7 +6,7 @@ use ferrite_s100_gml::product::{GmlOverlayProduct, GmlRules};
 use ferrite_s100_gml::validate::{
     file_name_follows, parse_date_time, upper_alnum, FcRule, Incoming, IssueSink, Validator,
 };
-use ferrite_s100_gml::{Dataset, Product, Severity};
+use ferrite_s100_gml::{Dataset, GmlIdentity, Severity};
 use std::collections::HashSet;
 
 /// S-124 9.6: datasets must not exceed 50 KB.
@@ -20,6 +20,14 @@ fn size_message(size: u64) -> String {
     format!("Dataset is {size} bytes; S-124 datasets must not exceed 50 KB")
 }
 
+/// How S-124 datasets name their product.
+pub static IDENTITY: GmlIdentity = GmlIdentity {
+    id: crate::PRODUCT,
+    identifiers: &["S-124", "S124"],
+    code: "124",
+    late_identification_check: "GML",
+};
+
 /// The S-124 rules (a `static` registered with the engine).
 pub struct S124Rules;
 
@@ -27,8 +35,8 @@ pub struct S124Rules;
 pub static S124: S124Rules = S124Rules;
 
 impl GmlRules for S124Rules {
-    fn product(&self) -> Product {
-        Product::S124
+    fn identity(&self) -> &'static GmlIdentity {
+        &IDENTITY
     }
 
     fn fc_rule_check(&self, rule: FcRule) -> (String, Severity) {
@@ -37,9 +45,7 @@ impl GmlRules for S124Rules {
 
     /// S-100 17-4.3 naming: `124`, producer, upper-case alphanumerics.
     fn file_name_ok(&self, name: &str) -> bool {
-        file_name_follows(Product::S124, name, |unique| {
-            unique.chars().all(upper_alnum)
-        })
+        file_name_follows(&IDENTITY, name, |unique| unique.chars().all(upper_alnum))
     }
 
     fn checked_by_product(&self, class: &str, role: &str, _target: &str) -> bool {

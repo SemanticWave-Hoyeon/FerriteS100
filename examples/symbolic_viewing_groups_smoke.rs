@@ -39,8 +39,15 @@ impl ApplicationHandler for App {
             .0;
         let mut converted = RenderContext::new(Viewport::new(100., 100.));
         let result=ferrite_lua::PortrayalResult::parse(&area_id.to_string(),"ViewingGroup:31011,accuracy;ColorFill:CHBLK;AugmentedPoint:GeographicCRS,0,0;PointInstruction:INFORM01;TextInstruction:X","").unwrap();
-        ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut converted, 0, "Day")
-            .unwrap();
+        ferrite_part9a::convert_lua_results_for_cell(
+            &[result],
+            &cell,
+            &pc,
+            &mut converted,
+            0,
+            "Day",
+        )
+        .unwrap();
         let point_id = *cell
             .features
             .iter()
@@ -52,7 +59,7 @@ impl ApplicationHandler for App {
             .unwrap()
             .0;
         let line=ferrite_lua::PortrayalResult::parse(&point_id.to_string(),"ViewingGroup:31011,accuracy;AugmentedRay:LocalCRS,90,LocalCRS,25;LineStyle:base,,1.28,CHBLK;LineInstruction:base","").unwrap();
-        ferrite_s101::convert_lua_results_for_cell(&[line], &cell, &pc, &mut converted, 0, "Day")
+        ferrite_part9a::convert_lua_results_for_cell(&[line], &cell, &pc, &mut converted, 0, "Day")
             .unwrap();
         assert!(converted
             .raw_instructions()
@@ -60,7 +67,7 @@ impl ApplicationHandler for App {
             .any(|i| matches!(i, DrawingInstruction::Line(_))));
         let before = converted.instruction_count();
         let bad=ferrite_lua::PortrayalResult::parse(&point_id.to_string(),"ViewingGroup:31011;PointInstruction:INFORM01;ViewingGroup:undeclared;PointInstruction:INFORM01","").unwrap();
-        assert!(ferrite_s101::convert_lua_results_for_cell(
+        assert!(ferrite_part9a::convert_lua_results_for_cell(
             &[bad],
             &cell,
             &pc,

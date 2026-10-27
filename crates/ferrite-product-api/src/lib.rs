@@ -138,6 +138,16 @@ pub trait ProductAdapter: Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
+/// Where a product's catalogues are installed, as the catalogue loaders
+/// name it when a catalogue folder is missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogueLayout {
+    /// The feature catalogue (`"<app>/Catalogues/FC/S-101/*Feature_Catalogue*.xml"`).
+    pub feature: &'static str,
+    /// The portrayal catalogue folder and its content.
+    pub portrayal: &'static str,
+}
+
 /// How a dataset entered the system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provenance {
@@ -145,8 +155,12 @@ pub enum Provenance {
     Authenticated,
     /// Signature verification switched off by the user.
     Unverified,
-    /// Converted from a non-S-100 source; never authoritative.
-    Imported(&'static str),
+    /// Converted from a non-S-100 source (format label) into a dataset of
+    /// `product`; never authoritative.
+    Imported {
+        format: &'static str,
+        product: ProductId,
+    },
 }
 
 impl Provenance {
@@ -154,8 +168,10 @@ impl Provenance {
         match self {
             Self::Authenticated => "signature verified".into(),
             Self::Unverified => "signature not verified".into(),
-            Self::Imported(format) => {
-                format!("imported from {format}; not an official S-124 dataset, not for navigation")
+            Self::Imported { format, product } => {
+                format!(
+                    "imported from {format}; not an official {product} dataset, not for navigation"
+                )
             }
         }
     }
@@ -396,6 +412,12 @@ pub trait ProductLayer: Any {
         _settings: &ferrite_render::host_settings::SettingsState,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+    /// The installed portrayal catalogue a renderer draws this layer's
+    /// scene with (palette, symbols): hosts take the first of the registered
+    /// layers (the base chart's when it is built).
+    fn portrayal_catalogue(&self) -> Option<&ferrite_portrayal_catalog::BoundPortrayalCatalogue> {
+        None
     }
     /// Numeric coverages of the visible datasets (S-98 Level 2 inputs of
     /// interoperability: S-102 depths).

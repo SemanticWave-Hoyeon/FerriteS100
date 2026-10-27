@@ -53,7 +53,7 @@ impl ApplicationHandler for App {
             origin.x + 1.,
             origin.y + 1.,
         ));
-        ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 0, "Day")
+        ferrite_part9a::convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 0, "Day")
             .unwrap();
         assert_eq!(context.instruction_count(), 3);
         // Isolate compositing from catalogue colour conversion, retaining adapter-produced alpha and widths.

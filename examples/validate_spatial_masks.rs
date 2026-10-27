@@ -22,7 +22,7 @@ fn main() -> Result<()> {
             for m in &f.masks {
                 masks.push(serde_json::json!({"feature":key,"rcnm":m.spatial_id.rcnm,"rcid":m.spatial_id.rcid,"mind":m.mask_type,"muin":m.update_instruction}));
             }
-            match ferrite_s101::resolve_feature_line_geometry(&cell, f, &[]) {
+            match ferrite_part9a::resolve_feature_line_geometry(&cell, f, &[]) {
                 Ok(lines) => {
                     leaf_curves += lines.len();
                     vertices += lines.iter().map(|l| l.points.len()).sum::<usize>();

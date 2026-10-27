@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     let command=format!("ViewingGroup:{vg};Id:parent;AugmentedPoint:GeographicCRS,-2,48;PointInstruction:ACHBRT07;Id:child;Parent:parent;PointInstruction:ACHBRT07;Parent;Id;PointInstruction:ACHBRT07");
     let result = ferrite_lua::PortrayalResult::parse("LOCAL-DEPENDENCY-TEST", &command, "")?;
     let mut context = RenderContext::new(Viewport::new(800., 600.));
-    ferrite_s101::convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 7, "Day")?;
+    ferrite_part9a::convert_lua_results_for_cell(&[result], &cell, &pc, &mut context, 7, "Day")?;
     let instructions = context.raw_instructions();
     assert_eq!(instructions.len(), 3);
     assert_eq!(

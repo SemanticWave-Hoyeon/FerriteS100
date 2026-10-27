@@ -25,9 +25,12 @@ s102-pure = ["ferrite-engine/s102-pure", "ferrite-gpu/s102-material", "dep:ferri
 s102-hdf5 = ["s102-pure", "ferrite-engine/s102-hdf5"]
 crypto-openssl = ["ferrite-engine/crypto-openssl"]
 crypto-rust = ["ferrite-engine/crypto-rust"]
-# Product modules (S-124, S-129 GML overlays; S-421 routes).
-# S-101 base chart (required: scenes are drawn with its portrayal catalogue).
-s101 = ["ferrite-engine/s101"]
+# Product modules (S-101 base chart; S-124, S-129 GML overlays; S-421
+# routes). Scenes are drawn with the first registered product's installed
+# portrayal catalogue (S-101's when built); the S-101 cell set-up (reference
+# scale, display-mode viewing groups, per-catalogue cell resources) only
+# with s101.
+s101 = ["ferrite-engine/s101", "dep:ferrite-s101"]
 s124 = ["ferrite-engine/s124"]
 s129 = ["ferrite-engine/s129"]
 s421 = ["ferrite-engine/s421"]
@@ -43,10 +46,11 @@ tracing-subscriber.workspace = true
 ferrite-engine.workspace = true
 ferrite-gpu.workspace = true
 ferrite-kernel.workspace = true
+ferrite-part9a.workspace = true
 ferrite-portrayal-catalog.workspace = true
 ferrite-product-api = { path = "../ferrite-product-api" }
 ferrite-render.workspace = true
-ferrite-s101.workspace = true
+ferrite-s101 = { workspace = true, optional = true }
 # The S-102 renderer extension's payload (raster tiles).
 ferrite-s102 = { workspace = true, optional = true }
 

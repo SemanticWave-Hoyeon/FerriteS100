@@ -9,7 +9,7 @@
 //! The exchange catalogue (CATALOG.XML, any S-100 XC edition) is read by
 //! local element names. Datasets referenced by the catalogue are read
 //! without a feature catalogue to compare their content with the metadata.
-use crate::model::{Attribute, Dataset, Issue, Product, Value};
+use crate::model::{identify, Attribute, Dataset, GmlIdentity, Issue, ProductId, Value};
 use crate::product::GmlRules;
 use crate::reader::{read_file, ReadLimits};
 use anyhow::{ensure, Context, Result};
@@ -217,7 +217,7 @@ pub struct ExchangeSetReport {
     /// The S100_ROOT folder that was validated.
     pub root: PathBuf,
     /// S-124 / S-129 content found in the exchange set.
-    pub products: Vec<Product>,
+    pub products: Vec<ProductId>,
     pub catalogue: Option<ExchangeCatalogue>,
     pub issues: Vec<Issue>,
 }
@@ -335,18 +335,25 @@ fn resolve(uri: &str) -> Option<String> {
 
 /// The product of a catalogue record: product specification, then the
 /// product folder, then the file name prefix (of the `known` products).
-fn product_of(identifier: Option<&str>, rel: Option<&str>, known: &[Product]) -> Option<Product> {
+fn product_of(
+    identifier: Option<&str>,
+    rel: Option<&str>,
+    known: &[&GmlIdentity],
+) -> Option<ProductId> {
     if let Some(p) = identifier {
-        return Product::from_identifier(p);
+        return identify(known, p);
     }
     let rel = rel?;
-    if let Some(p) = rel.split('/').next().and_then(Product::from_identifier) {
+    if let Some(p) = rel.split('/').next().and_then(|top| identify(known, top)) {
         if rel.contains('/') {
             return Some(p);
         }
     }
     let base = base_name(rel);
-    known.iter().copied().find(|p| base.starts_with(p.code()))
+    known
+        .iter()
+        .find(|p| base.starts_with(p.code))
+        .map(|p| p.id)
 }
 
 fn parse_int(v: Option<&str>) -> Option<i64> {
@@ -422,16 +429,16 @@ pub fn validate_exchange_set(
     on_system: Option<&HashSet<String>>,
     products: &[&dyn GmlRules],
 ) -> Result<ExchangeSetReport> {
-    let known: Vec<Product> = products.iter().map(|r| r.product()).collect();
-    let rules_of = |p: Product| -> &dyn GmlRules {
+    let known: Vec<&GmlIdentity> = products.iter().map(|r| r.identity()).collect();
+    let code_of = |p: &ProductId| known.iter().find(|k| k.id == *p).map(|k| k.code);
+    let rules_of = |p: ProductId| -> &dyn GmlRules {
         *products
             .iter()
             .find(|r| r.product() == p)
             .expect("registered product")
     };
-    let product_of = |identifier: Option<&str>, rel: Option<&str>| {
-        product_of(identifier, rel, &known).filter(|p| known.contains(p))
-    };
+    let product_of =
+        |identifier: Option<&str>, rel: Option<&str>| product_of(identifier, rel, &known);
     let root = exchange_root(folder);
     let inventory = Inventory::scan(&root)?;
     let mut report = ExchangeSetReport {
@@ -461,8 +468,8 @@ pub fn validate_exchange_set(
     }
 
     // Products in the exchange set.
-    let mut products: Vec<Product> = Vec::new();
-    let mut add = |p: Option<Product>| {
+    let mut products: Vec<ProductId> = Vec::new();
+    let mut add = |p: Option<ProductId>| {
         if let Some(p) = p {
             if !products.contains(&p) {
                 products.push(p);
@@ -479,14 +486,10 @@ pub fn validate_exchange_set(
     }
     for (rel, _) in &inventory.files {
         if rel.contains('/') {
-            add(rel
-                .split('/')
-                .next()
-                .and_then(Product::from_identifier)
-                .filter(|p| known.contains(p)));
+            add(rel.split('/').next().and_then(|top| identify(&known, top)));
         }
     }
-    products.sort_by_key(|p| p.code());
+    products.sort_by_key(code_of);
     report.products = products.clone();
     if products.is_empty() {
         return Ok(report);
@@ -574,7 +577,7 @@ pub fn validate_exchange_set(
                     object,
                     format!(
                         "Dataset file name does not follow the {} naming convention",
-                        product.identifier()
+                        product
                     ),
                 );
             }
@@ -633,9 +636,17 @@ pub fn validate_exchange_set(
                 bytes: MAX_DATASET_BYTES,
                 ..ReadLimits::default()
             };
-            match read_file(&root.join(actual), None, limits) {
+            match read_file(&root.join(actual), &known, None, limits) {
                 Ok(ds) => {
-                    check_dataset_content(rules_of(product), d, &name, &ds, object, &mut sink);
+                    check_dataset_content(
+                        rules_of(product),
+                        &known,
+                        d,
+                        &name,
+                        &ds,
+                        object,
+                        &mut sink,
+                    );
                     for reference in file_references(&ds) {
                         let target = resolve(&reference);
                         // A file URI, or a bare name resolved like `file::NAME`.
@@ -730,8 +741,7 @@ pub fn validate_exchange_set(
             let (Some(top), Some(folder)) = (parts.next(), parts.next()) else {
                 continue;
             };
-            let Some(product) = Product::from_identifier(top).filter(|p| products.contains(p))
-            else {
+            let Some(product) = identify(&known, top).filter(|p| products.contains(p)) else {
                 continue;
             };
             if listed.contains(&i) || base_name(rel).eq_ignore_ascii_case("CATALOG.XML") {
@@ -798,11 +808,8 @@ fn check_dataset_metadata(
     }
     let mut metadata = |message: String| sink.push(rules, ExchangeRule::Metadata, object, message);
     if let Some(p) = d.product_identifier.as_deref() {
-        if Product::from_identifier(p) != Some(product) {
-            metadata(format!(
-                "productIdentifier {p} is not {}",
-                product.identifier()
-            ));
+        if !rules.identity().names(p) {
+            metadata(format!("productIdentifier {p} is not {product}"));
         }
     }
     if let Some(f) = d.encoding_format.as_deref() {
@@ -860,6 +867,7 @@ fn check_dataset_metadata(
 /// S-158-129 check 18 (S-124/exchange/metadata): the record against the content.
 fn check_dataset_content(
     rules: &dyn GmlRules,
+    known: &[&GmlIdentity],
     d: &DatasetDiscovery,
     name: &str,
     ds: &Dataset,
@@ -871,13 +879,12 @@ fn check_dataset_content(
     if ds.product != product {
         metadata(format!(
             "The catalogue describes a {} dataset; the file is {}",
-            product.identifier(),
-            ds.product.identifier()
+            product, ds.product
         ));
     }
     let id = &ds.identification;
     if let (Some(m), Some(c)) = (d.product_identifier.as_deref(), id.product_identifier()) {
-        if Product::from_identifier(m) != Product::from_identifier(c) {
+        if identify(known, m) != identify(known, c) {
             metadata(format!(
                 "productIdentifier {m} differs from the dataset ({c})"
             ));
