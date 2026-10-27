@@ -1519,11 +1519,14 @@ dependencies = [
  "ferrite-kernel",
  "ferrite-lua",
  "ferrite-portrayal-catalog",
+ "ferrite-product-api",
  "ferrite-render",
  "ferrite-s100-core",
  "ferrite-s100-gml",
  "ferrite-s101",
  "ferrite-s102",
+ "ferrite-s124",
+ "ferrite-s129",
  "ferrite-s421",
  "ferrite-security",
  "ferrite-xslt",
@@ -1713,6 +1716,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-product-api"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ferrite-render",
+]
+
+[[package]]
 name = "ferrite-render"
 version = "2.0.0"
 dependencies = [
@@ -1761,6 +1773,8 @@ dependencies = [
  "ferrite-s100-gml",
  "ferrite-s101",
  "ferrite-s102",
+ "ferrite-s124",
+ "ferrite-s129",
  "ferrite-s421",
  "ferrite-security",
  "ferrite-ui",
@@ -1811,9 +1825,10 @@ dependencies = [
  "ferrite-feature-catalog",
  "ferrite-kernel",
  "ferrite-lua",
+ "ferrite-product-api",
  "ferrite-s100-core",
  "ferrite-xslt",
- "flate2",
+ "quick-xml 0.37.5",
  "roxmltree",
  "sha2",
  "tracing",
@@ -1860,6 +1875,38 @@ dependencies = [
  "serde",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "ferrite-s124"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ferrite-feature-catalog",
+ "ferrite-kernel",
+ "ferrite-lua",
+ "ferrite-product-api",
+ "ferrite-s100-gml",
+ "ferrite-xslt",
+ "flate2",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-s129"
+version = "2.0.0"
+dependencies = [
+ "chrono",
+ "ferrite-feature-catalog",
+ "ferrite-lua",
+ "ferrite-product-api",
+ "ferrite-s100-gml",
+ "tracing",
 ]
 
 [[package]]
@@ -1925,6 +1972,8 @@ dependencies = [
  "ferrite-gpu",
  "ferrite-portrayal-catalog",
  "ferrite-render",
+ "ferrite-s124",
+ "ferrite-s129",
  "ferrite-s421",
  "pollster",
  "serde_json",

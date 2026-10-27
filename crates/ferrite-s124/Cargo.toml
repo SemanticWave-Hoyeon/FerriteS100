@@ -1,0 +1,24 @@
+[package]
+name = "ferrite-s124"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "S-124 Navigational Warnings product module: warning lifecycle, imports (KML, GPX, shapefile), validation and exchange-set rules, per-user state and the warning list panel model"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+flate2 = "=1.1.8"
+roxmltree = "=0.20.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+ferrite-feature-catalog.workspace = true
+ferrite-kernel.workspace = true
+ferrite-product-api = { path = "../ferrite-product-api" }
+ferrite-s100-gml = { path = "../ferrite-s100-gml" }
+
+[dev-dependencies]
+ferrite-lua = { workspace = true, features = ["lua54"] }
+ferrite-xslt = { path = "../ferrite-xslt" }

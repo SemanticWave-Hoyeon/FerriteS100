@@ -254,7 +254,10 @@ crates/ferrite-ui/            egui panels, winit host and overlay compositing
 crates/ferrite-render/        Rendering instructions and geometry
 crates/ferrite-s101/          S-101 product adapter
 crates/ferrite-s102/          S-102 adapter (C and pure-Rust HDF5 readers)
-crates/ferrite-s100-gml/      S-124/S-129 GML reader, validation, lifecycle, XSLT portrayal input
+crates/ferrite-product-api/   Common product module interface (adapters, layers, panel models)
+crates/ferrite-s100-gml/      Shared GML infrastructure: reader, FC and exchange-set validation, XSLT portrayal input
+crates/ferrite-s124/          S-124 product module: lifecycle, imports, rules, per-user state, warning list model
+crates/ferrite-s129/          S-129 product module: S-158-129 rules, virtual portrayal features, plan panel model
 crates/ferrite-s421/          S-421 route adapter
 crates/ferrite-xslt/          XSLT 1.0 / XPath 1.0 processor for Part 9 portrayal
 crates/ferrite-lua/           S-100 Lua host and portrayal rules

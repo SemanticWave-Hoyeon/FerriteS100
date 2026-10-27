@@ -46,6 +46,7 @@ use crate::{dataset_signature_policy, s101_update_plan, CellHydrationSource, Cha
 use anyhow::{bail, ensure, Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
 use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
+use ferrite_product_api::{DatasetInput, Opened, PortrayalRequest, ProductLayer};
 use ferrite_render::host_settings::SettingsState;
 use ferrite_render::GeoBounds;
 use ferrite_s100_core::{DatasetIdentification, S101Cell};
@@ -583,7 +584,7 @@ impl ChartEngine {
             fc: Arc::clone(&self.state.fc),
             pc: Arc::clone(&self.state.pc),
             decoded: Arc::clone(&self.state.decoded_chart_cache),
-            overlay_products: self.overlays.s124.is_some() || self.overlays.s129.is_some(),
+            overlay_products: self.overlays.has_catalogues(),
             inventory: self.state.catalogue_inventory.clone(),
             loaded: self.loaded_datasets(),
             loaded_inputs: self
@@ -838,17 +839,18 @@ impl ChartEngine {
             report.datasets.push(self.cell_summary(index, cell));
         }
         for (path, bytes, provenance) in opened.overlays {
-            let added = self
-                .overlays
-                .read_bytes(&path, &bytes)
-                .and_then(|dataset| self.overlays.add(dataset, provenance));
+            let added = self.overlays.open(DatasetInput {
+                name: &path,
+                bytes: &bytes,
+                provenance,
+            });
             match added {
-                Ok(gml_overlay::Added::New) => {
-                    let overlay = self.overlays.datasets.last().expect("just added");
+                Ok(Opened::New(id)) => {
+                    let overlay = self.overlays.dataset(id).expect("just added");
                     report.datasets.push(overlay_summary(overlay));
                     report.issues.extend(overlay_issues(overlay));
                 }
-                Ok(gml_overlay::Added::AlreadyOpen) => {
+                Ok(Opened::AlreadyOpen) => {
                     report
                         .notices
                         .push(format!("Already open: {}", path.display()));
@@ -1095,12 +1097,13 @@ impl ChartEngine {
                 (scene.context, scene.coverage, registry, scene.ic_changed)
             }
         };
-        // S-124/S-129 overlays: cell-less, coverage-exempt instructions.
-        self.overlays.set_viewing_time(gml_overlay::viewing_time(
-            &self.state.render_context.settings,
-        ));
-        if let Some((_, list)) = self.overlays.instructions(&self.display.profile) {
-            context.append_converted(list.to_vec());
+        // GML overlays (S-124/S-129): cell-less, coverage-exempt instructions.
+        let request = PortrayalRequest {
+            profile: &self.display.profile,
+            viewing_time: gml_overlay::viewing_time(&self.state.render_context.settings),
+        };
+        if let Some(overlay) = self.overlays.portray(&request) {
+            context.append_converted(overlay.instructions.to_vec());
         }
         context.set_viewport(width as f32, height as f32);
         context.scaler = self.state.render_context.scaler.clone();

@@ -1,0 +1,16 @@
+[package]
+name = "ferrite-s129"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "S-129 Under Keel Clearance Management product module: S-158-129 validation and exchange-set rules, the virtual portrayal input features and the plan panel model"
+
+[dependencies]
+chrono.workspace = true
+tracing.workspace = true
+ferrite-product-api = { path = "../ferrite-product-api" }
+ferrite-s100-gml = { path = "../ferrite-s100-gml" }
+
+[dev-dependencies]
+ferrite-feature-catalog.workspace = true
+ferrite-lua = { workspace = true, features = ["lua54"] }

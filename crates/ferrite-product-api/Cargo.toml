@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-product-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Common interface of the S-100 product modules: product identity and detection, dataset layers (open, portray, coverage, describe), panel data models and platform services shared with the engine"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ferrite-render.workspace = true

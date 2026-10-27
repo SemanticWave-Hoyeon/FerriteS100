@@ -27,12 +27,12 @@
 //!   Mercator, read from the .prj) are unprojected; EPSG:4326 shapefiles are
 //!   read as is. Closed GPX tracks and routes (at least four points, first
 //!   equals last) become surfaces.
-use crate::model::*;
 use crate::navwarn::NAVWARN_TYPE_GENERAL;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Utc};
 use ferrite_feature_catalog::FeatureCatalogue;
 use ferrite_kernel::geodesy::Mercator;
+use ferrite_s100_gml::*;
 use roxmltree::Node;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

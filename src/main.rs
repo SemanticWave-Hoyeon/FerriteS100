@@ -1209,7 +1209,7 @@ impl ChartApp {
                 // S-124 11.1.1: classifications and indications per OS user.
                 let user = gml_overlay::os_user_name();
                 if let Some(record) = platform.user.navwarn_state(&user) {
-                    overlays.attach_user_record(record, user);
+                    overlays.attach_user_record(ferrite_s100_gml::Product::S124, record, user);
                 }
                 overlays
             },

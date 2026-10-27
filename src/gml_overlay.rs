@@ -3,7 +3,10 @@
 //! (S-98 Level 1 style).
 //!
 //! Datasets are S-100 Part 10b GML, portrayed with their own XSLT portrayal
-//! catalogues (`ferrite_s100_gml::portrayal`). The display list is converted
+//! catalogues (`ferrite_s100_gml::portrayal`). The products are modules
+//! (`ferrite-s124`, `ferrite-s129`) registered with the engine's overlay
+//! layer; this module is the viewer glue: the per-user state location, the
+//! product panels' rows and requests, selection and the data-layer tree. The display list is converted
 //! to the host's drawing instructions through the same Part 9a conversion the
 //! S-101 Lua portrayal uses, on a synthetic cell, and then marked as host
 //! overlay instructions: no source cell, exempt from ENC coverage and placed
@@ -18,16 +21,14 @@ use anyhow::Result;
 use chrono::Utc;
 use ferrite_gpu::CatalogueStatus;
 use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext};
-use ferrite_s100_gml::navwarn::{self, SortOrder, Status, UserClassification};
 use ferrite_s100_gml::{Product, Severity};
-use ferrite_ui::overlay_ui::{
-    ControlPointRow, NavwarnClassification, NavwarnPartRow, NavwarnRow, NavwarnSort, UkcPlanRow,
-};
+use ferrite_s124::S124Overlay;
+use ferrite_s129::S129Overlay;
+use ferrite_ui::overlay_ui::{NavwarnRow, UkcPlanRow};
 use std::path::{Path, PathBuf};
 
 pub(crate) use ferrite_engine::gml_overlay::{
-    cancel_reason, decode_key, discover, format_time, is_import_file, timing_label, viewing_time,
-    Added, GmlOverlays, Provenance,
+    decode_key, discover, format_time, is_import_file, viewing_time, Added, GmlOverlays, Provenance,
 };
 
 /// The overlay registry with the renderer's symbol sources registered for
@@ -103,17 +104,8 @@ pub(crate) fn default_user_state_path(user: &str) -> Option<PathBuf> {
     )
 }
 
-pub(crate) fn sort_order(sort: NavwarnSort) -> SortOrder {
-    match sort {
-        NavwarnSort::Received => SortOrder::Received,
-        NavwarnSort::IssueTime => SortOrder::IssueTime,
-        NavwarnSort::WarningType => SortOrder::WarningType,
-        NavwarnSort::ProducerSeries => SortOrder::ProducerSeries,
-        NavwarnSort::Classification => SortOrder::UserClassification,
-    }
-}
-
-/// Rows of the S-124 warning list and the S-129 plan list.
+/// Rows of the S-124 warning list and the S-129 plan list, from the
+/// registered product modules (empty when a product is not registered).
 pub(crate) trait OverlayRows {
     fn navwarn_rows(&mut self) -> (Vec<NavwarnRow>, Vec<String>, usize);
     fn ukc_rows(&self) -> Vec<UkcPlanRow>;
@@ -121,183 +113,17 @@ pub(crate) trait OverlayRows {
 
 impl OverlayRows for GmlOverlays {
     fn navwarn_rows(&mut self) -> (Vec<NavwarnRow>, Vec<String>, usize) {
-        self.evaluate(false);
-        let registry = self.registry().clone();
-        let mut rows = Vec::new();
-        let mut new_count = 0;
-        let clock = Utc::now();
-        for index in registry.sorted(self.sort, &self.user) {
-            let m = &registry.messages[index];
-            let Some(entry) = self
-                .registry_ids
-                .get(index)
-                .and_then(|id| self.dataset(*id))
-            else {
-                continue;
-            };
-            let class = self.user.classification_of(m);
-            let meets = class != UserClassification::Information;
-            let new = registry.is_new_at(index, &self.user, meets, clock);
-            new_count += new as usize;
-            rows.push(NavwarnRow {
-                dataset: entry.id,
-                caption: m.caption(),
-                status: match &m.status {
-                    Status::Cancelled(reason) => {
-                        format!("Cancelled ({})", cancel_reason(reason, &registry))
-                    }
-                    s => s.label().to_owned(),
-                },
-                cancelled: m.status.is_cancelled(),
-                imported: m.imported,
-                new,
-                portrayed: entry.visible
-                    && registry.dataset_portrayed(index, &self.user, &self.policy),
-                received: format_time(m.received),
-                issued: m
-                    .publication_time
-                    .map(format_time)
-                    .unwrap_or_else(|| "-".into()),
-                warning_type: m
-                    .warning_type
-                    .map(|t| {
-                        navwarn::warning_type_label(t)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("type {t}"))
-                    })
-                    .or_else(|| m.navwarn_type_general.clone())
-                    .unwrap_or_default(),
-                producer_series: m.series().map(|s| s.to_string()).unwrap_or_default(),
-                general_area: m
-                    .general_area
-                    .iter()
-                    .chain(&m.locality)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                classification: match class {
-                    UserClassification::OnChart => NavwarnClassification::OnChart,
-                    UserClassification::OffChart => NavwarnClassification::OffChart,
-                    UserClassification::Information => NavwarnClassification::Information,
-                },
-                parts: m
-                    .parts
-                    .iter()
-                    .map(|p| NavwarnPartRow {
-                        id: p.id.clone(),
-                        summary: p.abbreviated(120),
-                        timing: timing_label(p.timing),
-                        has_geometry: p.has_geometry,
-                    })
-                    .collect(),
-                source: format!(
-                    "{} · {}",
-                    entry
-                        .dataset
-                        .source
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default(),
-                    entry.provenance.label()
-                ),
-            });
+        match self.product_mut::<S124Overlay>() {
+            Some((s124, core)) => s124.navwarn_rows(core),
+            None => (Vec::new(), Vec::new(), 0),
         }
-        let mut missing = Vec::new();
-        for b in registry.missing_indications() {
-            let ids: Vec<String> = b
-                .missing
-                .iter()
-                .map(|m| {
-                    if m.imported_copy.is_some() {
-                        format!("{} (imported copy only)", m.id)
-                    } else {
-                        m.id.to_string()
-                    }
-                })
-                .collect();
-            missing.push(format!(
-                "In-force bulletin {} lists warnings not held: {}",
-                b.series,
-                ids.join(", ")
-            ));
-        }
-        (rows, missing, new_count)
     }
 
     fn ukc_rows(&self) -> Vec<UkcPlanRow> {
-        let mut out = Vec::new();
-        for entry in self
-            .datasets
-            .iter()
-            .filter(|d| d.product() == Product::S129)
-        {
-            let ds = &entry.dataset;
-            let plan = ds
-                .objects_of("UnderKeelClearancePlan")
-                .next()
-                .map(|(_, o)| o);
-            let v = |path: &[&str]| plan.and_then(|p| p.value(path)).unwrap_or("").to_owned();
-            let label = |code: &str| {
-                plan.and_then(|p| p.attribute(code))
-                    .and_then(|a| a.text())
-                    .filter(|t| !t.trim().is_empty())
-                    .map(|t| t.trim().to_owned())
-                    .unwrap_or_else(|| v(&[code]))
-            };
-            let window = |o: &ferrite_s100_gml::Object| match (
-                o.value(&["fixedTimeRange", "timeStart"]),
-                o.value(&["fixedTimeRange", "timeEnd"]),
-            ) {
-                (None, None) => String::new(),
-                (a, b) => format!("{} – {}", a.unwrap_or("…"), b.unwrap_or("…")),
-            };
-            let mut cps: Vec<(String, ControlPointRow)> = ds
-                .objects_of("UnderKeelClearanceControlPoint")
-                .map(|(_, o)| {
-                    let eta = o.value(&["expectedPassingTime"]).unwrap_or("").to_owned();
-                    (
-                        eta.clone(),
-                        ControlPointRow {
-                            name: o
-                                .value(&["featureName", "name"])
-                                .unwrap_or(&o.id)
-                                .to_owned(),
-                            eta,
-                            window: window(o),
-                            speed: o
-                                .value(&["expectedPassingSpeed"])
-                                .map(|s| format!("{s} kn"))
-                                .unwrap_or_default(),
-                            margin: o
-                                .value(&["distanceAboveUKCLimit"])
-                                .map(|s| format!("{s} m"))
-                                .unwrap_or_default(),
-                        },
-                    )
-                })
-                .collect();
-            cps.sort_by(|a, b| a.0.cmp(&b.0));
-            out.push(UkcPlanRow {
-                dataset: entry.id,
-                name: entry.name(),
-                vessel: v(&["vesselID"]),
-                draught: plan
-                    .and_then(|p| p.value(&["maximumDraught"]))
-                    .map(|d| format!("{d} m"))
-                    .unwrap_or_default(),
-                purpose: label("underKeelClearancePurpose"),
-                generation_time: v(&["generationTime"]),
-                validity: plan.map(window).unwrap_or_default(),
-                route: [v(&["sourceRouteName"]), v(&["sourceRouteVersion"])]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                control_points: cps.into_iter().map(|(_, r)| r).collect(),
-                issues: entry.issues.len(),
-            });
+        if self.product::<S129Overlay>().is_none() {
+            return Vec::new();
         }
-        out
+        ferrite_s129::panel::ukc_rows(self.core())
     }
 }
 
@@ -509,31 +335,32 @@ impl ChartApp {
             ui.show_information,
             ui.correct_pc_errata,
         );
-        let sort = sort_order(ui.sort);
+        let sort = ui.sort.into();
         let mut changed = false;
         if requests.options_changed {
             let g = &mut self.gml_overlays;
-            g.plain_boundaries = options.0;
-            g.apply_scale_minimum = options.1;
-            g.policy.show_before_fixed_date_range = options.2;
-            g.policy.show_information = options.3;
+            if let Some((s129, _)) = g.product_mut::<S129Overlay>() {
+                s129.plain_boundaries = options.0;
+                s129.apply_scale_minimum = options.1;
+            }
+            if let Some((s124, _)) = g.product_mut::<S124Overlay>() {
+                s124.policy.show_before_fixed_date_range = options.2;
+                s124.policy.show_information = options.3;
+            }
             g.set_correct_pc_errata(options.4);
             g.invalidate();
             changed = true;
         }
         if requests.sort_changed {
-            self.gml_overlays.sort = sort;
+            if let Some((s124, _)) = self.gml_overlays.product_mut::<S124Overlay>() {
+                s124.sort = sort;
+            }
             self.gml_overlays.ui_revision = 0;
         }
         if let Some((id, class)) = requests.classify {
-            self.gml_overlays.classify(
-                id,
-                match class {
-                    NavwarnClassification::OnChart => UserClassification::OnChart,
-                    NavwarnClassification::OffChart => UserClassification::OffChart,
-                    NavwarnClassification::Information => UserClassification::Information,
-                },
-            );
+            if let Some((s124, core)) = self.gml_overlays.product_mut::<S124Overlay>() {
+                s124.classify(core, id, class.into());
+            }
             changed = true;
         }
         if let Some((id, visible)) = visibility {
@@ -558,12 +385,7 @@ impl ChartApp {
     }
 
     fn select_overlay_message(&mut self, id: u32, part: Option<String>) {
-        let product = self.gml_overlays.dataset(id).map(|d| d.product());
-        let part = part.or_else(|| {
-            (product == Some(Product::S124))
-                .then(|| self.gml_overlays.first_part(id))
-                .flatten()
-        });
+        let part = part.or_else(|| self.gml_overlays.first_part(id));
         self.gml_overlays.mark_displayed(id);
         if let Some(part) = &part {
             if self.gml_overlays.list_selection.as_ref() != Some(&(id, part.clone())) {
@@ -590,6 +412,8 @@ impl ChartApp {
         let (messages, missing, new_count) = self.gml_overlays.navwarn_rows();
         let plans = self.gml_overlays.ukc_rows();
         let g = &self.gml_overlays;
+        let s124 = g.product::<S124Overlay>();
+        let s129 = g.product::<S129Overlay>();
         let lifecycle_time = match g.viewing_time {
             Some(t) => format!("Evaluated at viewing time {}", format_time(t)),
             None => format!("Evaluated at {} (system clock)", format_time(Utc::now())),
@@ -606,12 +430,16 @@ impl ChartApp {
             ui.missing = missing;
             ui.new_count = new_count;
             ui.plans = plans;
-            ui.plain_boundaries = g.plain_boundaries;
-            ui.apply_scale_minimum = g.apply_scale_minimum;
+            if let Some(s129) = s129 {
+                ui.plain_boundaries = s129.plain_boundaries;
+                ui.apply_scale_minimum = s129.apply_scale_minimum;
+            }
             ui.correct_pc_errata = g.correct_pc_errata();
-            ui.show_before_range = g.policy.show_before_fixed_date_range;
-            ui.show_information = g.policy.show_information;
-            ui.user_status = g.user_status();
+            if let Some(s124) = s124 {
+                ui.show_before_range = s124.policy.show_before_fixed_date_range;
+                ui.show_information = s124.policy.show_information;
+                ui.user_status = s124.user_status();
+            }
             ui.lifecycle_time = lifecycle_time;
             renderer.ui.ui_state.overlay_hidden = hidden;
         }
@@ -627,7 +455,8 @@ impl ChartApp {
         let g = &self.gml_overlays;
         let mut layers = Vec::new();
         let mut catalogues = Vec::new();
-        for product in [Product::S124, Product::S129] {
+        let products: Vec<Product> = g.products().map(|p| p.product()).collect();
+        for product in products {
             let id = product.identifier();
             let files: Vec<_> = g
                 .datasets
@@ -716,12 +545,69 @@ impl ChartApp {
 mod tests {
     use super::*;
     use chrono::DateTime;
-    use ferrite_engine::gml_overlay::{
-        exchange_set_reports, read_user_state, OVERLAY_VIEWING_GROUP,
-    };
-    use ferrite_s100_gml::navwarn::PartTiming;
+    use ferrite_engine::gml_overlay::{exchange_set_reports, OVERLAY_VIEWING_GROUP};
+    use ferrite_engine::platform::FileRecord;
     use ferrite_s100_gml::Dataset;
+    use ferrite_s124::navwarn::{
+        self, NavwarnRegistry, NavwarnUserState, PartTiming, PortrayalPolicy, Status,
+        UserClassification,
+    };
+    use ferrite_s124::user_state::{read_user_record, StoredUserState, RECORD_TEMPORARY_PREFIX};
+    use ferrite_ui::overlay_ui::NavwarnClassification;
     use std::collections::HashSet;
+
+    fn state_file(path: &Path) -> FileRecord {
+        FileRecord {
+            path: path.to_path_buf(),
+            temporary_prefix: RECORD_TEMPORARY_PREFIX,
+        }
+    }
+
+    fn read_user_state(path: &Path) -> anyhow::Result<Option<StoredUserState>> {
+        read_user_record(&state_file(path))
+    }
+
+    /// The registered S-124 and S-129 modules of the overlay layer.
+    trait Modules {
+        fn s124(&self) -> &S124Overlay;
+        fn s124_mut(&mut self) -> &mut S124Overlay;
+        fn s129_mut(&mut self) -> &mut S129Overlay;
+        fn user(&self) -> &NavwarnUserState {
+            &self.s124().user
+        }
+        fn policy_mut(&mut self) -> &mut PortrayalPolicy {
+            &mut self.s124_mut().policy
+        }
+        fn user_status(&self) -> String {
+            self.s124().user_status()
+        }
+        fn registry(&mut self) -> &NavwarnRegistry;
+        fn classify(&mut self, id: u32, class: UserClassification);
+        fn attach_user_store(&mut self, path: PathBuf, user: String);
+    }
+
+    impl Modules for GmlOverlays {
+        fn s124(&self) -> &S124Overlay {
+            self.product::<S124Overlay>().expect("S-124 module")
+        }
+        fn s124_mut(&mut self) -> &mut S124Overlay {
+            self.product_mut::<S124Overlay>().expect("S-124 module").0
+        }
+        fn s129_mut(&mut self) -> &mut S129Overlay {
+            self.product_mut::<S129Overlay>().expect("S-129 module").0
+        }
+        fn registry(&mut self) -> &NavwarnRegistry {
+            let (s124, core) = self.product_mut::<S124Overlay>().expect("S-124 module");
+            s124.registry(core)
+        }
+        fn classify(&mut self, id: u32, class: UserClassification) {
+            let (s124, core) = self.product_mut::<S124Overlay>().expect("S-124 module");
+            s124.classify(core, id, class);
+        }
+        fn attach_user_store(&mut self, path: PathBuf, user: String) {
+            self.attach_user_record(Product::S124, Box::new(state_file(&path)), user);
+        }
+    }
 
     fn root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -829,7 +715,7 @@ mod tests {
         assert_eq!(plans[0].control_points.len(), 15);
         assert!(!plans[0].vessel.is_empty());
         // Toggling scaleMinimum changes the S-129 output.
-        g.apply_scale_minimum = false;
+        g.s129_mut().apply_scale_minimum = false;
         g.invalidate();
         let (_, list2) = g.instructions("Night").unwrap();
         assert!(list2.len() >= list.len());
@@ -861,7 +747,7 @@ mod tests {
              <S124:geometry><S100:pointProperty><S100:Point gml:id=\"TPG\"><gml:pos>50.70 -1.10</gml:pos>\
              </S100:Point></S100:pointProperty></S124:geometry></S124:TextPlacement></S124:members>",
         );
-        let fc = g.s124.as_ref().unwrap().fc.clone();
+        let fc = g.catalogues(Product::S124).unwrap().fc.clone();
         let dataset =
             ferrite_s100_gml::read_bytes(text.as_bytes(), Some(&fc), Default::default()).unwrap();
         assert!(matches!(
@@ -934,7 +820,11 @@ mod tests {
              <S124:geometry><S100:pointProperty><S100:Point gml:id=\"G1\"><gml:pos>50.0 -1.0</gml:pos></S100:Point></S100:pointProperty></S124:geometry>\
              </S124:NavwarnPart></S124:members></S124:Dataset>"
         );
-        let fc = g.s124.as_ref().expect("S-124 catalogues").fc.clone();
+        let fc = g
+            .catalogues(Product::S124)
+            .expect("S-124 catalogues")
+            .fc
+            .clone();
         ferrite_s100_gml::read_bytes(xml.as_bytes(), Some(&fc), Default::default()).unwrap()
     }
 
@@ -984,11 +874,11 @@ mod tests {
         let mut g = start(&path);
         assert!(g.user_status().contains("restored"), "{}", g.user_status());
         assert_eq!(
-            g.user.classification.get(&message_key),
+            g.user().classification.get(&message_key),
             Some(&UserClassification::OffChart)
         );
-        assert!(g.user.displayed.contains(&key_a));
-        assert!(g.user.received.contains_key(&key_b));
+        assert!(g.user().displayed.contains(&key_a));
+        assert!(g.user().received.contains_key(&key_b));
         assert!(matches!(
             g.add(a.clone(), Provenance::Unverified).unwrap(),
             Added::New
@@ -1003,15 +893,15 @@ mod tests {
         g.classify(id, UserClassification::OnChart);
         drop(g);
         let mut g = start(&path);
-        assert!(!g.user.classification.contains_key(&message_key));
-        assert_eq!(g.user.classification.len(), 1); // b stays Information
-                                                    // The "Correct known PC errata" option is off by default and saved.
+        assert!(!g.user().classification.contains_key(&message_key));
+        assert_eq!(g.user().classification.len(), 1); // b stays Information
+                                                      // The "Correct known PC errata" option is off by default and saved.
         assert!(!g.correct_pc_errata());
         g.set_correct_pc_errata(true);
         drop(g);
         let mut g = start(&path);
         assert!(g.correct_pc_errata());
-        assert_eq!(g.user.classification.len(), 1);
+        assert_eq!(g.user().classification.len(), 1);
         g.set_correct_pc_errata(false);
         drop(g);
         assert!(!start(&path).correct_pc_errata());
@@ -1019,12 +909,12 @@ mod tests {
         // Another OS user has a separate file.
         let bob = dir.path().join("navwarn").join("bob.json");
         let g = start(&bob);
-        assert!(g.user.classification.is_empty() && g.user.received.is_empty());
+        assert!(g.user().classification.is_empty() && g.user().received.is_empty());
 
         // Corrupt file: empty state, file set aside, saving works again.
         std::fs::write(&path, b"{not json").unwrap();
         let mut g = start(&path);
-        assert!(g.user.classification.is_empty());
+        assert!(g.user().classification.is_empty());
         assert!(
             g.user_status().contains("unreadable"),
             "{}",
@@ -1110,7 +1000,7 @@ mod tests {
         assert_eq!(status, Status::Active);
         assert_eq!(timing, PartTiming::InRange);
         // In range: portrayed even with the strict policy.
-        g.policy.show_before_fixed_date_range = false;
+        g.policy_mut().show_before_fixed_date_range = false;
         g.invalidate();
         let (_, list) = g.instructions("Day").unwrap();
         assert!(!list.is_empty());

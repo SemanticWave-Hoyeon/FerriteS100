@@ -42,8 +42,8 @@
 //!   it is not shown (the warning itself stays listed until cancelled).
 //!   Month-day truncated dates (`--MM-DD`) recur yearly. A range that cannot
 //!   be read is treated as covering `now` so information is not lost.
-use crate::model::{Dataset, Object, ObjectKind, Value};
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use ferrite_s100_gml::{Dataset, Object, ObjectKind, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -85,7 +85,7 @@ pub struct MessageId {
 }
 
 impl MessageId {
-    pub fn from_attributes(attrs: &[crate::model::Attribute]) -> Option<Self> {
+    pub fn from_attributes(attrs: &[ferrite_s100_gml::Attribute]) -> Option<Self> {
         let get = |code: &str| {
             attrs
                 .iter()

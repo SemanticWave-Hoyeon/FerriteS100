@@ -270,3 +270,94 @@ python3 tools/pixel_regression.py --skip-build    # 이전 빌드 재사용
 - 셀 포트레이얼 캐시는 각 실행 파일 옆 `cache` 폴더를 쓰며, 위치마다 캐시를 비운 실행과 캐시를
   채운 뒤의 재실행을 모두 비교한다.
 - 비교기는 같은 화면이면 동일, Day와 Night는 다르게 판정되는지를 매번 자체 점검한다.
+
+## 7. 제품 모듈화
+
+### 현재 구조와 문제
+
+크레이트 분리(1~6단계)는 계층(엔진·GPU·UI·애플리케이션)을 나눴지만 제품 코드는 계층마다 흩어져 있다.
+
+- S-101: `ferrite-s101`(셀 읽기·Lua 변환) 외에 엔진의 `s101_*` 모듈(업데이트 계획, 생명주기, 교환 세트 검사), `EngineState`의 셀·카탈로그 필드, `chart_engine.rs`의 열기·준비 분기.
+- S-102: `ferrite-s102`, 엔진 `s102_*`(장면, 수심 정책, 입력 포착, 저널 허용, 시험 워커)와 `EngineState`의 `s102_*` 필드, `ferrite-gpu` 래스터 경로, `src/main.rs` 분기(약 230곳).
+- S-421: `ferrite-s421`, 엔진 `s421_dataset_input`, `ferrite-gpu`의 `native_route_*`, `ferrite-ui` 경로 패널, `src/native_s421.rs`.
+- S-124/S-129: 두 제품이 `ferrite-s100-gml` 한 크레이트에 섞여 있고, 생명주기·사용자 상태·포트레이얼 옵션은 엔진 `gml_overlay.rs`와 `src/gml_overlay.rs`에 `Product::S124`/`S129` 분기로 들어 있었다.
+
+제품 하나를 추가하거나 빼려면 여러 크레이트를 함께 고쳐야 하고 제품 단위로 빌드할 수 없다.
+
+### 목표 구조
+
+```
+ferrite-product-api   공통 인터페이스: ProductAdapter, ProductLayer, 데이터 모델,
+                      제품이 쓰는 플랫폼 서비스(Clock, UserRecord). egui·wgpu 비의존
+ferrite-s100-gml      GML 공통 기반: Part 10b 판독기, FC 검증, 교환 세트 검증,
+                      Part 9 XSLT 입력·변환, 오버레이 계층 상태, GML 제품 인터페이스
+ferrite-s101 / -s102 / -s124 / -s129 / -s421
+                      제품별 크레이트. 제품 고유 코드를 모두 가진다
+ferrite-engine        제품 비의존: 등록된 어댑터, 데이터셋 저장, 장면 합성, 커버리지,
+                      캐시, 플랫폼 서비스. 제품 크레이트는 기능 플래그 뒤에서 등록
+ferrite-ui            등록된 제품의 패널 데이터 모델을 그린다
+```
+
+의존 방향: `제품 크레이트 → ferrite-product-api (+ 공통 기반)`, `engine → 제품 크레이트`, `ui → 제품 크레이트(패널 모델)`. 제품 크레이트는 엔진·UI에 의존하지 않는다.
+
+### 인터페이스 (`ferrite-product-api`)
+
+| 항목 | 내용 |
+|---|---|
+| `ProductAdapter` | 제품 하나. `info()`(`ProductId`, 이름, 인코딩, 장면 역할 `SceneRole`), `sniff(name, head)`(파일 이름과 앞 64 KiB로 데이터셋·가져오기 형식 판별), `import_extensions()`·`imports_archives()`, `panels()`(`PanelDescriptor`), `as_any()`/`as_any_mut()`(제품을 아는 호스트가 제품 고유 기능에 접근) |
+| `ProductLayer` | 같은 인코딩·포트레이얼 경로를 쓰는 제품들의 데이터셋 저장소. `open(DatasetInput)`(이름, 바이트(검증 시 인증 스냅숏), `Provenance`), `remove`, `set_visible`, `portray(PortrayalRequest)` → `SceneContribution`(리비전, `DrawingInstruction`, `RendererExtension`), `coverage`, `describe(key)` → `FeaturePick`, `highlight(key)` |
+| `RendererExtension` | 렌더러가 아는 종류 이름과 페이로드. S-102 래스터 타일, S-421 경로 오버레이를 그리기 명령 밖의 데이터로 넘기는 자리 |
+| 패널 데이터 모델 | 제품 크레이트가 행·옵션 타입을 정의하고(`ferrite_s124::panel`, `ferrite_s129::panel`), UI 크레이트는 그 타입만 그린다. API 크레이트는 egui에 의존하지 않는다 |
+| `platform::{Clock, UserRecord}` | 제품이 직접 쓰는 플랫폼 서비스. `ferrite_engine::platform`이 다시 내보내고 구현한다 |
+
+GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한다.
+
+- `GmlRules`(정적 값, 예: `ferrite_s124::S124`): FC 규칙의 검사 식별자·심각도(`FcRule`), 파일 이름 규칙, 제품 규칙(`product_checks`), 교환 세트 규칙(`ExchangeRule`, 필수 메타데이터, 목적, 크기, 지원 파일), 가져오기 확장자, 오버레이 모듈 생성.
+- `GmlOverlayProduct: ProductAdapter`(엔진이 소유하는 상태): 선언되지 않은 보기 그룹, 카탈로그 적재 후 처리, 포트레이얼 입력 옵션(가상 피처), XSLT 문맥 매개변수와 변환 옵션(`PortrayalSettings`), 가져오기, 수신 시각, 생명주기 평가, 피처 억제, 피킹 행·관련 정보·강조, 목록 선택, 오류 정정 옵션, 사용자별 상태. 모든 훅에 중립 기본값이 있다.
+
+다섯 제품에 대응시키면 다음과 같다(2~5단계에서 구현).
+
+| 요소 | S-101 | S-102 | S-124 / S-129 | S-421 |
+|---|---|---|---|---|
+| `sniff` | ISO 8211 `.000`/`.00n` | HDF5, productSpecification | GML 네임스페이스·productIdentifier | GML S-421 네임스페이스 |
+| `open` | 교환 세트 계획, 업데이트 체인, 서명 정책 | 순수 Rust 또는 C HDF5 판독 | 판독·FC 검증·제품 규칙 | 경로 판독 |
+| `portray` | Lua 규칙·셀 캐시 → `DrawingInstruction` | PC 규칙 → `RendererExtension`(래스터 타일) | XSLT → `DrawingInstruction`(셀 없음, 커버리지 예외) | `RendererExtension`(경로 오버레이) |
+| `coverage` | M_COVR | 격자 범위 | 객체 범위 | 경로 범위 |
+| `describe` | 피처 속성·FC 이름 | 격자 값 | FC 속성, 경고 상태 | 웨이포인트·구간 |
+| 패널 | 카탈로그·셀 | 수심 옵션 | 경고 목록 / 계획 | 경로 편집 |
+
+### 기능 플래그
+
+`ferrite-engine`의 `s124`, `s129`(기본 켜짐)가 제품 크레이트를 등록한다(`ferrite_engine::products`, 엔진에서 제품을 이름으로 부르는 유일한 곳). 끄면 그 제품의 데이터셋은 탐색·판별·열기 대상이 아니고 카탈로그도 적재하지 않는다. `ferrite-cli`·`ferrite-capi`·`ferrite-wasm`은 같은 이름의 기능을 기본으로 켜서 넘기고, 뷰어는 엔진 의존에 두 기능을 명시한다. `tools/build_wasm.py --no-s102`도 두 기능을 유지한다.
+
+### 단계
+
+각 단계의 완료 조건은 기존 검사 전체(`cargo fmt --check`, `cargo clippy -- -D warnings`, 작업 공간·wasm·기능 끈 엔진 빌드, 테스트 이름 보존, 픽셀 회귀 동일)다.
+
+| 단계 | 내용 |
+|---|---|
+| 1 | **완료.** `ferrite-product-api` 정의. S-124·S-129를 `ferrite-s124`·`ferrite-s129`로 분리하고 엔진 오버레이 경로가 등록된 어댑터를 거치게 함(아래). |
+| 2 | S-102: 엔진 `s102_*` 모듈과 `EngineState`의 `s102_*` 필드를 `ferrite-s102`(제품 계층)로 옮기고 래스터 타일을 `RendererExtension`으로 넘긴다. `main.rs`의 S-102 분기를 계층 호출로 바꾼다. |
+| 3 | S-421: `s421_dataset_input`, `src/native_s421.rs`의 제품 로직, `ferrite-gpu` `native_route_*`의 데이터 모델을 `ferrite-s421`로 모으고 경로 오버레이를 확장으로 넘긴다. 경로 패널은 제품 패널 모델을 그린다. |
+| 4 | S-101: 엔진 `s101_*`(업데이트 계획, 생명주기, 교환 세트 검사, 카탈로그 선택)와 셀 포트레이얼의 제품 고유 부분을 `ferrite-s101` 제품 계층으로 옮긴다. |
+| 5 | 엔진·UI 정리: `ChartEngine`이 `Vec<Box<dyn ProductLayer>>`로 계층을 합성하고, UI는 등록된 패널을 그리며, UI·애플리케이션·CLI·C ABI·웹에 제품별 기능 플래그를 둔다. `ferrite_s100_gml::Product` 열거형을 `ProductId` 등록으로 바꾼다. |
+
+### 1단계 결과
+
+- 새 크레이트: `ferrite-product-api`, `ferrite-s124`, `ferrite-s129`.
+- 옮긴 파일(`git mv`): `ferrite-s100-gml/src/{navwarn,import}.rs` → `ferrite-s124/src/`, `ferrite-s100-gml/tests/{navwarn_lifecycle,import_shom_ping}.rs` → `ferrite-s124/tests/`.
+- `ferrite-s100-gml`에 남은 것: 판독기, 제품 비의존 FC 검증(`Validator`, `FcRule`, `IssueSink`, `file_name_follows`), 교환 세트 검증 절차(`ExchangeRule`), XSLT 입력·변환(가상 피처 훅 `InputOptions::virtual_features`, 오류 정정 메커니즘 `ConvertOptions`), 오버레이 계층 상태(`overlay::{OverlayCore, OverlayDataset}`, 판별 `sniff_head`), GML 제품 인터페이스(`product`).
+- `ferrite-s124`: 생명주기(`navwarn`), 가져오기(`import`), 규칙(`rules`: S-124 검증 4·8.1·9.3·9.6, 교환 세트 9.5~9.8·12), 오버레이 모듈(`overlay::S124Overlay`: 평가, 분류, 표시 표시, 억제, 강조, 피킹 행), 사용자 상태 기록(`user_state`, 형식 버전 1과 위치 그대로), 경고 목록 모델(`panel`).
+- `ferrite-s129`: S-158-129 규칙(`rules`), 가상 피처(`virtual_features`: `PlannedRoute`, 정보 상자), 오버레이 모듈(`S129Overlay`: PlainBoundaries, scaleMinimum, 오류 정정), 계획 패널 모델(`panel`).
+- 엔진: `gml_overlay::GmlOverlays`는 등록된 모듈·카탈로그·데이터셋(`OverlayCore`, `Deref`)을 가진 제품 비의존 호스트이고 `ProductLayer`를 구현한다. `ChartEngine`의 오버레이 열기·포트레이얼은 `ProductLayer::open`/`portray`를 거친다. 제품을 아는 호스트는 `product::<T>()`/`product_mut::<T>()`를 쓴다.
+- 앱·UI: `src/gml_overlay.rs`는 등록된 모듈로 행을 만들고 요청을 넘긴다. `ferrite-ui::overlay_ui`는 제품 크레이트의 패널 타입을 다시 내보내 그린다.
+- 동작: 검증 문제, 포트레이얼 출력, UI, NAVWARN 상태 파일 형식·위치는 그대로다. 로그 한 줄("Correct known PC errata: on (...)")의 나열 순서가 등록 순서(S-124, S-129)로 바뀌었다.
+
+### 2~5단계 참고
+
+- `ferrite_s100_gml::Product` 열거형(판독기 제품 판별, `namespaced_symbol`, 교환 세트의 제품 판별)과 판독기의 S-129 검사 식별자(`S-158-129/15`)가 아직 공통 기반에 있다. 5단계에서 `ProductId` 등록으로 바꾼다.
+- `Provenance::label`의 가져오기 문구가 S-124를 말한다. 가져오기 제품이 늘면 제품이 문구를 준다.
+- `platform::UserStore::navwarn_state`는 S-124 이름이다. 제품별 기록(`product_state(product, user)`)으로 일반화하되 저장 키(`navwarn/<user>`, `FerriteS100/navwarn/<user>.json`)는 유지한다.
+- `ferrite-ui::overlay_ui::State`는 S-124·S-129 필드를 고정으로 가진다. 5단계 패널 등록에서 제품별 패널 상태로 나누고 UI 기능 플래그를 둔다.
+- `ChartEngine`의 열기 작업(작업 스레드)은 정적 등록(`products::gml_rules`)으로 판별한다. 다른 제품도 정적 규칙과 상태 모듈을 나누면 같은 방식으로 작업 스레드에서 판별할 수 있다.
+- S-102·S-421 계층은 `RendererExtension`의 페이로드 타입을 렌더러 쪽(`ferrite-gpu`)과 함께 정해야 한다. 페이로드는 `Arc<dyn Any + Send + Sync>`라 제품 크레이트가 GPU에 의존하지 않는다.

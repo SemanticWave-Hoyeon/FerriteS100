@@ -60,7 +60,10 @@ fn opens_and_prepares_a_scene_entirely_from_memory() {
     let mut engine =
         ChartEngine::new(EngineConfig::new(platform, mem("/in-memory/Catalogues"))).unwrap();
     assert!(
-        engine.overlays().s124.is_some(),
+        engine
+            .overlays()
+            .catalogues(ferrite_s100_gml::Product::S124)
+            .is_some(),
         "{:?}",
         engine.catalogue_errors()
     );

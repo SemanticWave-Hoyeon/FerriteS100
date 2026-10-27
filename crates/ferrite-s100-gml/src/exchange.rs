@@ -1,14 +1,17 @@
-//! S-100 Part 17 exchange-set validation for S-124 and S-129.
+//! S-100 Part 17 exchange-set validation for GML products.
 //!
 //! Evaluates the exchange-set level checks the single-dataset validator
-//! cannot: S-158-129 checks 11, 17, 18, 19 and 20 (all warnings) and the
-//! S-124 exchange-set rules of clauses 9.5-9.8 and 12 (`S-124/exchange/*`).
+//! cannot: references, discovery metadata, purposes, sizes and
+//! cancellations. The registered products' [`GmlRules`] map each rule
+//! ([`ExchangeRule`]) to their check identifier and severity and supply the
+//! product's metadata, purpose, size and support-file rules (S-158-129
+//! checks 11, 17-20 for S-129; S-124 clauses 9.5-9.8 and 12).
 //! The exchange catalogue (CATALOG.XML, any S-100 XC edition) is read by
 //! local element names. Datasets referenced by the catalogue are read
 //! without a feature catalogue to compare their content with the metadata.
-use crate::model::{Attribute, Dataset, Issue, Product, Severity, Value};
+use crate::model::{Attribute, Dataset, Issue, Product, Value};
+use crate::product::GmlRules;
 use crate::reader::{read_file, ReadLimits};
-use crate::validate::{file_name_ok, S124_MAX_BYTES, S129_MAX_BYTES};
 use anyhow::{ensure, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -168,9 +171,10 @@ pub fn parse_catalogue(bytes: &[u8]) -> Result<ExchangeCatalogue> {
     Ok(out)
 }
 
-/// Exchange-set rules, mapped per product to a check identifier.
+/// Exchange-set rules, mapped per product ([`GmlRules::exchange_check`]) to
+/// a check identifier and severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rule {
+pub enum ExchangeRule {
     /// CATALOG.XML missing or unreadable.
     Catalogue,
     /// CATALOG.XML misnamed, or another file named CATALOG.XML.
@@ -197,102 +201,8 @@ enum Rule {
     CancelWithFile,
 }
 
-impl Rule {
-    fn check(self, product: Product) -> (String, Severity) {
-        match product {
-            Product::S129 => {
-                let id = match self {
-                    Self::CatalogueName | Self::FileName => "S-158-129/11",
-                    Self::Reference => "S-158-129/17",
-                    Self::Metadata
-                    | Self::MetadataMissing
-                    | Self::UnlistedDataset
-                    | Self::Purpose => "S-158-129/18",
-                    Self::CancelUnknown => "S-158-129/19",
-                    Self::CancelWithFile => "S-158-129/20",
-                    Self::Catalogue => "S-129/exchange/catalogue",
-                    Self::Signature => "S-129/exchange/signature",
-                    Self::UnlistedCatalogue | Self::UnlistedSupport | Self::SupportFile => {
-                        "S-129/exchange/unlisted"
-                    }
-                    Self::Size => "S-129/exchange/size",
-                };
-                (id.to_string(), Severity::Warning)
-            }
-            Product::S124 => {
-                let name = match self {
-                    Self::Catalogue | Self::CatalogueName => "catalogue",
-                    Self::Signature => "signature",
-                    Self::FileName => "file-name",
-                    Self::Reference => "reference",
-                    Self::Metadata | Self::MetadataMissing => "metadata",
-                    Self::UnlistedDataset => "dataset-metadata",
-                    Self::UnlistedCatalogue => "catalogue-metadata",
-                    Self::UnlistedSupport | Self::SupportFile => "support-file",
-                    Self::Purpose => "purpose",
-                    Self::Size => "size",
-                    Self::CancelUnknown => "cancellation-unknown",
-                    Self::CancelWithFile => "cancellation-file",
-                };
-                let severity = match self {
-                    Self::MetadataMissing | Self::CancelUnknown => Severity::Warning,
-                    _ => Severity::Error,
-                };
-                (format!("S-124/exchange/{name}"), severity)
-            }
-        }
-    }
-}
-
-/// Mandatory dataset discovery metadata (S-124 12.2.2, S-129 19.4).
-fn mandatory(product: Product) -> &'static [&'static str] {
-    const COMMON: [&str; 7] = [
-        "compressionFlag",
-        "dataProtection",
-        "digitalSignatureReference",
-        "digitalSignatureValue",
-        "copyright",
-        "notForNavigation",
-        "issueDate",
-    ];
-    const S124: [&str; 11] = [
-        COMMON[0],
-        COMMON[1],
-        COMMON[2],
-        COMMON[3],
-        COMMON[4],
-        COMMON[5],
-        COMMON[6],
-        "boundingBox",
-        "productSpecification",
-        "producingAgency",
-        "encodingFormat",
-    ];
-    const S129: [&str; 16] = [
-        COMMON[0],
-        COMMON[1],
-        COMMON[2],
-        COMMON[3],
-        COMMON[4],
-        COMMON[5],
-        COMMON[6],
-        "purpose",
-        "specificUsage",
-        "editionNumber",
-        "issueTime",
-        "temporalExtent",
-        "productSpecification",
-        "producingAgency",
-        "encodingFormat",
-        "dataCoverage",
-    ];
-    match product {
-        Product::S124 => &S124,
-        Product::S129 => &S129,
-    }
-}
-
-const PURPOSES: [&str; 6] = [
+/// Every S-100 dataset discovery purpose.
+pub const PURPOSES: [&str; 6] = [
     "newDataset",
     "newEdition",
     "update",
@@ -317,8 +227,14 @@ struct Sink<'a> {
 }
 
 impl Sink<'_> {
-    fn push(&mut self, product: Product, rule: Rule, object: Option<&str>, message: String) {
-        let (check, severity) = rule.check(product);
+    fn push(
+        &mut self,
+        product: &dyn GmlRules,
+        rule: ExchangeRule,
+        object: Option<&str>,
+        message: String,
+    ) {
+        let (check, severity) = product.exchange_check(rule);
         self.issues.push(Issue {
             severity,
             check,
@@ -418,8 +334,8 @@ fn resolve(uri: &str) -> Option<String> {
 }
 
 /// The product of a catalogue record: product specification, then the
-/// product folder, then the file name prefix.
-fn product_of(identifier: Option<&str>, rel: Option<&str>) -> Option<Product> {
+/// product folder, then the file name prefix (of the `known` products).
+fn product_of(identifier: Option<&str>, rel: Option<&str>, known: &[Product]) -> Option<Product> {
     if let Some(p) = identifier {
         return Product::from_identifier(p);
     }
@@ -430,9 +346,7 @@ fn product_of(identifier: Option<&str>, rel: Option<&str>) -> Option<Product> {
         }
     }
     let base = base_name(rel);
-    [Product::S124, Product::S129]
-        .into_iter()
-        .find(|p| base.starts_with(p.code()))
+    known.iter().copied().find(|p| base.starts_with(p.code()))
 }
 
 fn parse_int(v: Option<&str>) -> Option<i64> {
@@ -495,17 +409,29 @@ pub fn exchange_root(folder: &Path) -> PathBuf {
     }
 }
 
-/// Validates the S-124 / S-129 content of an exchange set.
+/// Validates the content of an exchange set that belongs to the `products`
+/// (the registered GML products; content of other products is ignored).
 ///
 /// `folder` is the S100_ROOT folder (or its parent). `on_system` holds the
 /// file names (any case) of the datasets currently loaded and not cancelled;
-/// check 19 (cancellation of an unknown dataset) needs it and is skipped
-/// when it is None. Returns an empty report when the folder holds no S-124
-/// or S-129 content.
+/// the check of cancellations of unknown datasets needs it and is skipped
+/// when it is None. Returns an empty report when the folder holds no content
+/// of the products.
 pub fn validate_exchange_set(
     folder: &Path,
     on_system: Option<&HashSet<String>>,
+    products: &[&dyn GmlRules],
 ) -> Result<ExchangeSetReport> {
+    let known: Vec<Product> = products.iter().map(|r| r.product()).collect();
+    let rules_of = |p: Product| -> &dyn GmlRules {
+        *products
+            .iter()
+            .find(|r| r.product() == p)
+            .expect("registered product")
+    };
+    let product_of = |identifier: Option<&str>, rel: Option<&str>| {
+        product_of(identifier, rel, &known).filter(|p| known.contains(p))
+    };
     let root = exchange_root(folder);
     let inventory = Inventory::scan(&root)?;
     let mut report = ExchangeSetReport {
@@ -553,7 +479,11 @@ pub fn validate_exchange_set(
     }
     for (rel, _) in &inventory.files {
         if rel.contains('/') {
-            add(rel.split('/').next().and_then(Product::from_identifier));
+            add(rel
+                .split('/')
+                .next()
+                .and_then(Product::from_identifier)
+                .filter(|p| known.contains(p)));
         }
     }
     products.sort_by_key(|p| p.code());
@@ -565,27 +495,27 @@ pub fn validate_exchange_set(
     let mut sink = Sink {
         issues: &mut report.issues,
     };
-    let all = |sink: &mut Sink, rule: Rule, object: Option<&str>, message: &str| {
+    let all = |sink: &mut Sink, rule: ExchangeRule, object: Option<&str>, message: &str| {
         for p in &products {
-            sink.push(*p, rule, object, message.to_string());
+            sink.push(rules_of(*p), rule, object, message.to_string());
         }
     };
     match (root_catalogue, &catalogue_error) {
         (None, _) => all(
             &mut sink,
-            Rule::Catalogue,
+            ExchangeRule::Catalogue,
             None,
             "The exchange set has no exchange catalogue (CATALOG.XML)",
         ),
         (Some(_), Some(e)) => all(
             &mut sink,
-            Rule::Catalogue,
+            ExchangeRule::Catalogue,
             Some("CATALOG.XML"),
             &format!("The exchange catalogue cannot be read: {e}"),
         ),
         (Some(i), None) if inventory.files[i].0 != "CATALOG.XML" => all(
             &mut sink,
-            Rule::CatalogueName,
+            ExchangeRule::CatalogueName,
             Some(&inventory.files[i].0),
             "The exchange catalogue must be named CATALOG.XML",
         ),
@@ -595,7 +525,7 @@ pub fn validate_exchange_set(
         if rel.contains('/') && base_name(rel).eq_ignore_ascii_case("CATALOG.XML") {
             all(
                 &mut sink,
-                Rule::CatalogueName,
+                ExchangeRule::CatalogueName,
                 Some(rel),
                 "No file other than the exchange catalogue may be named CATALOG.XML",
             );
@@ -608,7 +538,7 @@ pub fn validate_exchange_set(
     {
         all(
             &mut sink,
-            Rule::Signature,
+            ExchangeRule::Signature,
             None,
             "The exchange catalogue signature (CATALOG.SIGN) is missing",
         );
@@ -628,8 +558,8 @@ pub fn validate_exchange_set(
             };
             let Some(rel) = rel else {
                 sink.push(
-                    product,
-                    Rule::Reference,
+                    rules_of(product),
+                    ExchangeRule::Reference,
                     None,
                     format!("Dataset fileName '{}' is not a valid file URI", d.file_name),
                 );
@@ -637,10 +567,10 @@ pub fn validate_exchange_set(
             };
             let name = base_name(&rel).to_string();
             let object = Some(name.as_str());
-            if !file_name_ok(product, &name) {
+            if !rules_of(product).file_name_ok(&name) {
                 sink.push(
-                    product,
-                    Rule::FileName,
+                    rules_of(product),
+                    ExchangeRule::FileName,
                     object,
                     format!(
                         "Dataset file name does not follow the {} naming convention",
@@ -655,8 +585,8 @@ pub fn validate_exchange_set(
             if d.is_cancellation() {
                 if found.is_some() {
                     sink.push(
-                        product,
-                        Rule::CancelWithFile,
+                        rules_of(product),
+                        ExchangeRule::CancelWithFile,
                         object,
                         "Cancellations cannot contain data: the exchange set holds the dataset file"
                             .into(),
@@ -665,16 +595,16 @@ pub fn validate_exchange_set(
                 let key = name.to_ascii_uppercase();
                 if !cancelled.insert(key.clone()) {
                     sink.push(
-                        product,
-                        Rule::CancelUnknown,
+                        rules_of(product),
+                        ExchangeRule::CancelUnknown,
                         object,
                         "The dataset is cancelled more than once".into(),
                     );
                 } else if let Some(system) = on_system {
                     if !system.iter().any(|s| s.eq_ignore_ascii_case(&key)) {
                         sink.push(
-                            product,
-                            Rule::CancelUnknown,
+                            rules_of(product),
+                            ExchangeRule::CancelUnknown,
                             object,
                             "Terminated dataset is not present on the system".into(),
                         );
@@ -682,11 +612,11 @@ pub fn validate_exchange_set(
                 }
                 continue;
             }
-            check_dataset_metadata(product, d, object, &mut sink);
+            check_dataset_metadata(rules_of(product), d, object, &mut sink);
             let Some(i) = found else {
                 sink.push(
-                    product,
-                    Rule::Reference,
+                    rules_of(product),
+                    ExchangeRule::Reference,
                     object,
                     format!(
                         "{rel} is described in the catalogue but not present in the exchange set"
@@ -695,24 +625,9 @@ pub fn validate_exchange_set(
                 continue;
             };
             let (actual, size) = &inventory.files[i];
-            let limit = match product {
-                Product::S124 => S124_MAX_BYTES,
-                Product::S129 => S129_MAX_BYTES,
-            };
-            if *size > limit {
-                sink.push(
-                    product,
-                    Rule::Size,
-                    object,
-                    match product {
-                        Product::S124 => {
-                            format!("Dataset is {size} bytes; S-124 datasets must not exceed 50 KB")
-                        }
-                        Product::S129 => {
-                            format!("Dataset is {size} bytes; the recommended maximum is 20 MB")
-                        }
-                    },
-                );
+            let rules = rules_of(product);
+            if *size > rules.max_dataset_bytes() {
+                sink.push(rules, ExchangeRule::Size, object, rules.size_message(*size));
             }
             let limits = ReadLimits {
                 bytes: MAX_DATASET_BYTES,
@@ -720,7 +635,7 @@ pub fn validate_exchange_set(
             };
             match read_file(&root.join(actual), None, limits) {
                 Ok(ds) => {
-                    check_dataset_content(product, d, &name, &ds, object, &mut sink);
+                    check_dataset_content(rules_of(product), d, &name, &ds, object, &mut sink);
                     for reference in file_references(&ds) {
                         let target = resolve(&reference);
                         // A file URI, or a bare name resolved like `file::NAME`.
@@ -732,8 +647,8 @@ pub fn validate_exchange_set(
                         });
                         if !present {
                             sink.push(
-                                product,
-                                Rule::Reference,
+                                rules_of(product),
+                                ExchangeRule::Reference,
                                 object,
                                 format!(
                                     "File '{reference}' referenced in the dataset is not present in the exchange set"
@@ -743,8 +658,8 @@ pub fn validate_exchange_set(
                     }
                 }
                 Err(e) => sink.push(
-                    product,
-                    Rule::Metadata,
+                    rules_of(product),
+                    ExchangeRule::Metadata,
                     object,
                     format!("The dataset cannot be read: {e:#}"),
                 ),
@@ -762,14 +677,14 @@ pub fn validate_exchange_set(
                     listed.insert(i);
                 }
                 Some((r, None)) if !cancelled => sink.push(
-                    product,
-                    Rule::Reference,
+                    rules_of(product),
+                    ExchangeRule::Reference,
                     Some(base_name(r)),
                     format!("Catalogue {r} is described in the exchange catalogue but not present"),
                 ),
                 None => sink.push(
-                    product,
-                    Rule::Reference,
+                    rules_of(product),
+                    ExchangeRule::Reference,
                     None,
                     format!(
                         "Catalogue fileName '{}' is not a valid file URI",
@@ -787,24 +702,17 @@ pub fn validate_exchange_set(
             };
             let Some(rel) = rel else { continue };
             let object = Some(base_name(&rel));
-            if product == Product::S124 && s.resource_purpose.as_deref() != Some("languagePack") {
-                sink.push(
-                    product,
-                    Rule::SupportFile,
-                    object,
-                    format!(
-                        "S-124 exchange sets may only include language packs as support files (resourcePurpose {})",
-                        s.resource_purpose.as_deref().unwrap_or("missing")
-                    ),
-                );
+            let rules = rules_of(product);
+            if let Some(message) = rules.support_file_issue(s.resource_purpose.as_deref()) {
+                sink.push(rules, ExchangeRule::SupportFile, object, message);
             }
             match inventory.find(&rel) {
                 Some(i) => {
                     listed.insert(i);
                 }
                 None if s.revision_status.as_deref() != Some("deletion") => sink.push(
-                    product,
-                    Rule::Reference,
+                    rules_of(product),
+                    ExchangeRule::Reference,
                     object,
                     format!(
                         "Support file {rel} is described in the exchange catalogue but not present"
@@ -832,14 +740,20 @@ pub fn validate_exchange_set(
             let is_dataset = folder.eq_ignore_ascii_case("DATASET_FILES")
                 || base_name(rel).to_ascii_lowercase().ends_with(".gml");
             let (rule, what) = if is_dataset {
-                (Rule::UnlistedDataset, "dataset discovery metadata")
+                (ExchangeRule::UnlistedDataset, "dataset discovery metadata")
             } else if folder.eq_ignore_ascii_case("CATALOGUES") {
-                (Rule::UnlistedCatalogue, "catalogue discovery metadata")
+                (
+                    ExchangeRule::UnlistedCatalogue,
+                    "catalogue discovery metadata",
+                )
             } else {
-                (Rule::UnlistedSupport, "support file discovery metadata")
+                (
+                    ExchangeRule::UnlistedSupport,
+                    "support file discovery metadata",
+                )
             };
             sink.push(
-                product,
+                rules_of(product),
                 rule,
                 Some(base_name(rel)),
                 format!("{rel} has no {what} in the exchange catalogue"),
@@ -851,34 +765,29 @@ pub fn validate_exchange_set(
 
 /// Content-table rules of one (non-cancellation) dataset record.
 fn check_dataset_metadata(
-    product: Product,
+    rules: &dyn GmlRules,
     d: &DatasetDiscovery,
     object: Option<&str>,
     sink: &mut Sink,
 ) {
-    for name in mandatory(product) {
+    let product = rules.product();
+    for name in rules.mandatory_metadata() {
         if !d.fields.contains(*name) {
             sink.push(
-                product,
-                Rule::MetadataMissing,
+                rules,
+                ExchangeRule::MetadataMissing,
                 object,
                 format!("Mandatory discovery metadata {name} is missing"),
             );
         }
     }
     if let Some(purpose) = d.purpose.as_deref() {
-        let allowed: &[&str] = match product {
-            Product::S124 => &["newDataset", "cancellation"],
-            Product::S129 => &PURPOSES,
-        };
-        let numeric = matches!(
-            (product, purpose),
-            (Product::S124, "1" | "5") | (Product::S129, "1" | "2" | "3" | "4" | "5" | "6")
-        );
+        let allowed = rules.purposes();
+        let numeric = rules.numeric_purpose_ok(purpose);
         if !allowed.contains(&purpose) && !numeric {
             sink.push(
-                product,
-                Rule::Purpose,
+                rules,
+                ExchangeRule::Purpose,
                 object,
                 format!(
                     "purpose '{purpose}' is not permitted (allowed: {})",
@@ -887,7 +796,7 @@ fn check_dataset_metadata(
             );
         }
     }
-    let mut metadata = |message: String| sink.push(product, Rule::Metadata, object, message);
+    let mut metadata = |message: String| sink.push(rules, ExchangeRule::Metadata, object, message);
     if let Some(p) = d.product_identifier.as_deref() {
         if Product::from_identifier(p) != Some(product) {
             metadata(format!(
@@ -901,8 +810,8 @@ fn check_dataset_metadata(
             metadata(format!("encodingFormat must be GML, not {f}"));
         }
     }
-    if product == Product::S124 && d.data_protection == Some(true) {
-        metadata("dataProtection must be false for S-124".into());
+    if let Some(message) = rules.data_protection_issue(d.data_protection) {
+        metadata(message);
     }
     let edition = parse_int(d.edition_number.as_deref());
     let update = parse_int(d.update_number.as_deref());
@@ -950,14 +859,15 @@ fn check_dataset_metadata(
 
 /// S-158-129 check 18 (S-124/exchange/metadata): the record against the content.
 fn check_dataset_content(
-    product: Product,
+    rules: &dyn GmlRules,
     d: &DatasetDiscovery,
     name: &str,
     ds: &Dataset,
     object: Option<&str>,
     sink: &mut Sink,
 ) {
-    let mut metadata = |message: String| sink.push(product, Rule::Metadata, object, message);
+    let product = rules.product();
+    let mut metadata = |message: String| sink.push(rules, ExchangeRule::Metadata, object, message);
     if ds.product != product {
         metadata(format!(
             "The catalogue describes a {} dataset; the file is {}",

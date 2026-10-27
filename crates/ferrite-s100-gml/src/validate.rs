@@ -1,12 +1,15 @@
 //! Feature catalogue and product rule validation of Part 10b datasets.
 //!
-//! Generic checks are driven by the feature catalogue. For S-129 every check
-//! is a warning (S-158-129 A.1.3) and carries its S-158-129 number where one
-//! applies; other checks use `FC/<rule>`, `S-124/<rule>` or `S-129/<rule>`.
-//! Association names are not encoded in Part 10b, so S-158-129 checks 4, 6
-//! and 9 infer the association from (source class, role, target class);
-//! exchange-set checks (11, 17-20) are in [`crate::exchange`].
+//! Generic checks are driven by the feature catalogue; the product's
+//! [`GmlRules`] map each generic rule ([`FcRule`]) to a check identifier and
+//! severity, add the product rules and decide the file naming convention
+//! (the product crates: S-124 `FC/<rule>` and `S-124/<rule>`, S-129 every
+//! check a warning with its S-158-129 number where one applies).
+//! Association names are not encoded in Part 10b, so association checks
+//! infer the association from (source class, role, target class);
+//! exchange-set checks are in [`crate::exchange`].
 use crate::model::*;
+use crate::product::GmlRules;
 use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use ferrite_feature_catalog::{
@@ -15,25 +18,21 @@ use ferrite_feature_catalog::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// S-124 9.6: datasets must not exceed 50 KB.
-pub const S124_MAX_BYTES: u64 = 50 * 1024;
-/// S-129 18.2.2: recommended maximum dataset size.
-pub const S129_MAX_BYTES: u64 = 20 * 1024 * 1024;
-
 /// Validates with the byte size taken from the dataset's source file, if any.
 /// Returns validation issues only; reader issues stay in `dataset.issues`.
-pub fn validate(dataset: &Dataset, fc: &FeatureCatalogue) -> Vec<Issue> {
+pub fn validate(dataset: &Dataset, fc: &FeatureCatalogue, rules: &dyn GmlRules) -> Vec<Issue> {
     let size = dataset
         .source
         .as_deref()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    Validator::new(fc).validate(dataset, size)
+    Validator::new(fc).validate(dataset, size, rules)
 }
 
-/// Generic FC rules, mapped per product to a check identifier and severity.
+/// Generic FC rules, mapped per product ([`GmlRules::fc_rule_check`]) to a
+/// check identifier and severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rule {
+pub enum FcRule {
     MandatoryMissing,
     MandatoryNil,
     Zeros,
@@ -58,8 +57,9 @@ enum Rule {
     Product,
 }
 
-impl Rule {
-    fn name(self) -> &'static str {
+impl FcRule {
+    /// The rule name of `FC/<name>` check identifiers.
+    pub fn name(self) -> &'static str {
         match self {
             Self::MandatoryMissing => "mandatory-missing",
             Self::MandatoryNil => "mandatory-nil",
@@ -84,30 +84,8 @@ impl Rule {
             Self::Product => "product",
         }
     }
-    fn s158_129(self) -> Option<u32> {
-        Some(match self {
-            Self::MandatoryMissing => 1,
-            Self::MandatoryNil => 2,
-            Self::Zeros => 3,
-            Self::RoleNotPermitted => 5,
-            Self::RoleUnknown => 7,
-            Self::WrongTarget => 8,
-            Self::WrongAssociation => 4,
-            Self::UnknownAssociation => 6,
-            Self::RoleOnWrongAssociation => 9,
-            Self::ValueFormat | Self::Enumeration => 10,
-            Self::UnknownClass => 12,
-            Self::UnknownAttribute => 13,
-            Self::AttributeNotPermitted => 14,
-            Self::Order => 15,
-            Self::TooMany => 16,
-            Self::OptionalEmpty => 21,
-            Self::FileName => 22,
-            Self::DateTimeFormat => 26,
-            Self::Primitive | Self::AssociationMultiplicity | Self::Product => return None,
-        })
-    }
-    fn severity(self) -> Severity {
+    /// Severity of a violation where the product does not override it.
+    pub fn severity(self) -> Severity {
         match self {
             Self::Zeros | Self::Order | Self::OptionalEmpty => Severity::Warning,
             _ => Severity::Error,
@@ -115,14 +93,20 @@ impl Rule {
     }
 }
 
+/// An association binding of a class: role, association (if named),
+/// target class and multiplicity.
 #[derive(Debug, Clone)]
-struct AssociationBinding {
-    role: String,
-    association: Option<String>,
-    target: String,
-    lower: u32,
-    upper: Option<u32>,
+pub struct AssociationBinding {
+    pub role: String,
+    pub association: Option<String>,
+    pub target: String,
+    pub lower: u32,
+    pub upper: Option<u32>,
 }
+
+/// For each object of a dataset, the (source object, reference index) pairs
+/// that resolve to it.
+pub type Incoming = [Vec<(usize, usize)>];
 
 /// Catalogue content the feature catalogue model does not carry (roles,
 /// association bindings, permitted values, raw value types and primitives),
@@ -286,18 +270,14 @@ pub struct Validator<'a> {
 }
 
 /// Issue sink for one dataset.
-struct Sink {
-    product: Product,
+pub struct IssueSink<'r> {
+    rules: &'r dyn GmlRules,
     issues: Vec<Issue>,
 }
 
-impl Sink {
-    fn rule(&mut self, rule: Rule, object: Option<&str>, message: String) {
-        let (check, severity) = match (self.product, rule.s158_129()) {
-            (Product::S129, Some(n)) => (format!("S-158-129/{n}"), Severity::Warning),
-            (Product::S129, None) => (format!("FC/{}", rule.name()), Severity::Warning),
-            (Product::S124, _) => (format!("FC/{}", rule.name()), rule.severity()),
-        };
+impl IssueSink<'_> {
+    fn rule(&mut self, rule: FcRule, object: Option<&str>, message: String) {
+        let (check, severity) = self.rules.fc_rule_check(rule);
         self.issues.push(Issue {
             severity,
             check,
@@ -305,7 +285,14 @@ impl Sink {
             message,
         });
     }
-    fn product(&mut self, check: &str, severity: Severity, object: Option<&str>, message: String) {
+    /// A product rule finding with its own check identifier.
+    pub fn product(
+        &mut self,
+        check: &str,
+        severity: Severity,
+        object: Option<&str>,
+        message: String,
+    ) {
         self.issues.push(Issue {
             severity,
             check: check.to_string(),
@@ -336,10 +323,16 @@ impl<'a> Validator<'a> {
         Self { fc, extra }
     }
 
-    /// Validates a dataset; `byte_size` enables the dataset size checks.
-    pub fn validate(&self, dataset: &Dataset, byte_size: Option<u64>) -> Vec<Issue> {
-        let mut sink = Sink {
-            product: dataset.product,
+    /// Validates a dataset with its product's rules; `byte_size` enables
+    /// the dataset size checks.
+    pub fn validate(
+        &self,
+        dataset: &Dataset,
+        byte_size: Option<u64>,
+        rules: &dyn GmlRules,
+    ) -> Vec<Issue> {
+        let mut sink = IssueSink {
+            rules,
             issues: Vec::new(),
         };
         self.dataset_checks(dataset, byte_size, &mut sink);
@@ -347,11 +340,16 @@ impl<'a> Validator<'a> {
         for (i, object) in dataset.objects.iter().enumerate() {
             self.object_checks(dataset, i, object, &incoming, &mut sink);
         }
-        match dataset.product {
-            Product::S124 => s124_checks(dataset, byte_size, &mut sink),
-            Product::S129 => self.s129_checks(dataset, &incoming, &mut sink),
-        }
+        rules.product_checks(self, dataset, byte_size, &incoming, &mut sink);
         sink.issues
+    }
+
+    /// Roles of an association, as declared in the catalogue source.
+    pub fn association_roles(&self, association: &str) -> Option<&[String]> {
+        self.extra
+            .association_roles
+            .get(association)
+            .map(Vec::as_slice)
     }
 
     /// The class and its supertypes, most derived first.
@@ -399,7 +397,7 @@ impl<'a> Validator<'a> {
     }
 
     /// Association bindings of the class (catalogue model first, then source).
-    fn association_bindings(&self, code: &str) -> Vec<AssociationBinding> {
+    pub fn association_bindings(&self, code: &str) -> Vec<AssociationBinding> {
         let mut out = Vec::new();
         for owner in self.lineage(code) {
             let mut model = Vec::new();
@@ -484,12 +482,12 @@ impl<'a> Validator<'a> {
         Vec::new()
     }
 
-    fn dataset_checks(&self, ds: &Dataset, byte_size: Option<u64>, sink: &mut Sink) {
+    fn dataset_checks(&self, ds: &Dataset, byte_size: Option<u64>, sink: &mut IssueSink) {
         let id = &ds.identification;
         let fc_product = self.fc.product_id.trim();
         if !fc_product.is_empty() && fc_product != ds.product.identifier() {
             sink.rule(
-                Rule::Product,
+                FcRule::Product,
                 None,
                 format!(
                     "Dataset is {} but the feature catalogue is {fc_product}",
@@ -500,7 +498,7 @@ impl<'a> Validator<'a> {
         match id.product_identifier() {
             Some(p) if Product::from_identifier(p) == Some(ds.product) => {}
             other => sink.rule(
-                Rule::Product,
+                FcRule::Product,
                 None,
                 format!(
                     "productIdentifier {other:?} is not {}",
@@ -534,9 +532,9 @@ impl<'a> Validator<'a> {
             }
         }
         for name in names {
-            if !file_name_ok(ds.product, &name) {
+            if !sink.rules.file_name_ok(&name) {
                 sink.rule(
-                    Rule::FileName,
+                    FcRule::FileName,
                     None,
                     format!("Dataset file name '{name}' does not follow the naming convention"),
                 );
@@ -552,16 +550,8 @@ impl<'a> Validator<'a> {
                 );
             }
         }
-        if let (Product::S129, Some(size)) = (ds.product, byte_size) {
-            if size > S129_MAX_BYTES {
-                sink.product(
-                    "S-129/size",
-                    Severity::Warning,
-                    None,
-                    format!("Dataset is {size} bytes; the recommended maximum is 20 MB"),
-                );
-            }
-        }
+        let rules = sink.rules;
+        rules.dataset_checks(ds, byte_size, sink);
     }
 
     fn object_checks(
@@ -569,8 +559,8 @@ impl<'a> Validator<'a> {
         ds: &Dataset,
         index: usize,
         o: &Object,
-        incoming: &[Vec<(usize, usize)>],
-        sink: &mut Sink,
+        incoming: &Incoming,
+        sink: &mut IssueSink,
     ) {
         let id = Some(o.id.as_str());
         let feature = self.fc.feature_types.get(&o.code);
@@ -580,7 +570,7 @@ impl<'a> Validator<'a> {
             (_, Some(i)) => i.is_abstract,
             _ => {
                 sink.rule(
-                    Rule::UnknownClass,
+                    FcRule::UnknownClass,
                     id,
                     format!("{} is not a feature or information type", o.code),
                 );
@@ -588,14 +578,14 @@ impl<'a> Validator<'a> {
             }
         };
         if is_abstract {
-            sink.rule(Rule::UnknownClass, id, format!("{} is abstract", o.code));
+            sink.rule(FcRule::UnknownClass, id, format!("{} is abstract", o.code));
         }
         self.attributes(&o.code, &o.attributes, &o.code, id, sink);
 
         // Geometry primitives.
         if feature.is_none() && !o.geometry.is_empty() {
             sink.rule(
-                Rule::Primitive,
+                FcRule::Primitive,
                 id,
                 format!("Information type {} has geometry", o.code),
             );
@@ -610,7 +600,7 @@ impl<'a> Validator<'a> {
                 };
                 if !permitted.is_empty() && !permitted.iter().any(|p| p == name) {
                     sink.rule(
-                        Rule::Primitive,
+                        FcRule::Primitive,
                         id,
                         format!(
                             "{} geometry is not permitted on {} ({})",
@@ -628,7 +618,7 @@ impl<'a> Validator<'a> {
         for r in &o.references {
             if !self.extra.roles.is_empty() && !self.extra.roles.contains(&r.role) {
                 sink.rule(
-                    Rule::RoleUnknown,
+                    FcRule::RoleUnknown,
                     id,
                     format!("Role '{}' is not defined in the feature catalogue", r.role),
                 );
@@ -642,18 +632,13 @@ impl<'a> Validator<'a> {
 
         // Association multiplicity, counting either encoded direction.
         for b in &bindings {
-            if (ds.product, o.code.as_str(), b.role.as_str())
-                == (Product::S129, "UnderKeelClearancePlan", "theComponent")
-                && b.target == "UnderKeelClearanceControlPoint"
-                || (ds.product, o.code.as_str(), b.role.as_str())
-                    == (Product::S124, "NavwarnPart", "header")
-            {
-                continue; // Reported by the product checks (S-158-129/27, S-124/header).
+            if sink.rules.checked_by_product(&o.code, &b.role, &b.target) {
+                continue; // Reported by the product checks.
             }
             let n = self.associated(ds, index, o, b, incoming).len() as u32;
             if n < b.lower || b.upper.is_some_and(|u| n > u) {
                 sink.rule(
-                    Rule::AssociationMultiplicity,
+                    FcRule::AssociationMultiplicity,
                     id,
                     format!(
                         "{n} {} association(s) via role '{}', expected {}..{}",
@@ -683,7 +668,7 @@ impl<'a> Validator<'a> {
         role: &str,
         target: Option<&str>,
         bindings: &[AssociationBinding],
-    ) -> Option<(Rule, String)> {
+    ) -> Option<(FcRule, String)> {
         let candidates: Vec<_> = bindings.iter().filter(|b| b.role == role).collect();
         match target {
             Some(t) if candidates.iter().any(|b| self.is_a(t, &b.target)) => return None,
@@ -701,13 +686,13 @@ impl<'a> Validator<'a> {
         with_role.sort_unstable();
         if evaluable && with_role.is_empty() {
             return Some((
-                Rule::UnknownAssociation,
+                FcRule::UnknownAssociation,
                 format!("Role '{role}' belongs to no association in the feature catalogue"),
             ));
         }
         let not_permitted = || {
             (
-                Rule::RoleNotPermitted,
+                FcRule::RoleNotPermitted,
                 format!("Role '{role}' is not permitted on {source}"),
             )
         };
@@ -717,7 +702,7 @@ impl<'a> Validator<'a> {
         let wrong_target = || {
             let expected: Vec<_> = candidates.iter().map(|b| b.target.as_str()).collect();
             (
-                Rule::WrongTarget,
+                FcRule::WrongTarget,
                 format!(
                     "Role '{role}' targets {target}, expected {}",
                     expected.join(" or ")
@@ -740,7 +725,7 @@ impl<'a> Validator<'a> {
                 .any(|(_, roles)| roles.iter().any(|r| r == role))
             {
                 return Some((
-                    Rule::RoleNotPermitted,
+                    FcRule::RoleNotPermitted,
                     format!(
                         "Role '{role}' is not permitted on {source} in association {names} with {target}"
                     ),
@@ -754,14 +739,14 @@ impl<'a> Validator<'a> {
             let implied = with_role.join(" or ");
             return Some(if own {
                 (
-                    Rule::RoleOnWrongAssociation,
+                    FcRule::RoleOnWrongAssociation,
                     format!(
                         "Role '{role}' of association {implied} is used on association {names} between {source} and {target}, which does not include it"
                     ),
                 )
             } else {
                 (
-                    Rule::WrongAssociation,
+                    FcRule::WrongAssociation,
                     format!(
                         "Role '{role}' implies association {implied}, but {source} and {target} are associated by {names}"
                     ),
@@ -782,7 +767,7 @@ impl<'a> Validator<'a> {
             not_permitted()
         } else {
             (
-                Rule::UnknownAssociation,
+                FcRule::UnknownAssociation,
                 format!(
                     "No association in the feature catalogue links {source} to {target} through role '{role}'"
                 ),
@@ -822,13 +807,13 @@ impl<'a> Validator<'a> {
     }
 
     /// Distinct objects associated through binding `b`, outgoing or inverse.
-    fn associated(
+    pub fn associated(
         &self,
         ds: &Dataset,
         index: usize,
         o: &Object,
         b: &AssociationBinding,
-        incoming: &[Vec<(usize, usize)>],
+        incoming: &Incoming,
     ) -> HashSet<usize> {
         let mut out: HashSet<usize> = o
             .references
@@ -868,7 +853,7 @@ impl<'a> Validator<'a> {
         attrs: &[Attribute],
         context: &str,
         id: Option<&str>,
-        sink: &mut Sink,
+        sink: &mut IssueSink,
     ) {
         let bindings = self.attribute_bindings(owner);
         let position = |code: &str| bindings.iter().position(|(_, b)| b.attribute_code == code);
@@ -881,7 +866,7 @@ impl<'a> Validator<'a> {
             let complex = self.fc.complex_attributes.get(&a.code);
             if simple.is_none() && complex.is_none() {
                 sink.rule(
-                    Rule::UnknownAttribute,
+                    FcRule::UnknownAttribute,
                     id,
                     format!("{path}: attribute code is not in the feature catalogue"),
                 );
@@ -889,7 +874,7 @@ impl<'a> Validator<'a> {
             }
             let Some(p) = position(&a.code) else {
                 sink.rule(
-                    Rule::AttributeNotPermitted,
+                    FcRule::AttributeNotPermitted,
                     id,
                     format!("{path}: not permitted on {owner}"),
                 );
@@ -902,7 +887,7 @@ impl<'a> Validator<'a> {
                 .or_default() += 1;
             let (decl, binding) = bindings[p];
             let mandatory = binding.multiplicity.lower > 0;
-            let empty = |rule_if_mandatory: Rule, what: &str, sink: &mut Sink| {
+            let empty = |rule_if_mandatory: FcRule, what: &str, sink: &mut IssueSink| {
                 if mandatory {
                     sink.rule(
                         rule_if_mandatory,
@@ -911,7 +896,7 @@ impl<'a> Validator<'a> {
                     );
                 } else {
                     sink.rule(
-                        Rule::OptionalEmpty,
+                        FcRule::OptionalEmpty,
                         id,
                         format!("{path}: optional attribute {what}"),
                     );
@@ -922,19 +907,19 @@ impl<'a> Validator<'a> {
                     if mandatory && reason.is_some() {
                         // Mandatory and unknown, with nilReason: S-158-129/2 is a reminder.
                         sink.rule(
-                            Rule::MandatoryNil,
+                            FcRule::MandatoryNil,
                             id,
                             format!("{path}: mandatory attribute value is unknown"),
                         );
                     } else if mandatory {
                         sink.rule(
-                            Rule::MandatoryNil,
+                            FcRule::MandatoryNil,
                             id,
                             format!("{path}: mandatory attribute is nil without nilReason"),
                         );
                     } else {
                         sink.rule(
-                            Rule::OptionalEmpty,
+                            FcRule::OptionalEmpty,
                             id,
                             format!("{path}: optional attribute value is unknown"),
                         );
@@ -943,7 +928,7 @@ impl<'a> Validator<'a> {
                 (Value::Simple { text, code }, Some(sa), _) => {
                     let value = code.as_deref().unwrap_or(text).trim();
                     if value.is_empty() {
-                        empty(Rule::MandatoryNil, "has no value", sink);
+                        empty(FcRule::MandatoryNil, "has no value", sink);
                     } else {
                         let permitted = self.permitted_values(decl, binding);
                         self.simple_value(sa, a, value, &permitted, &path, id, sink);
@@ -958,14 +943,14 @@ impl<'a> Validator<'a> {
                         let v = children[0].text().unwrap_or("");
                         if !truncated_date_ok(&children[0].code, v) {
                             sink.rule(
-                                Rule::ValueFormat,
+                                FcRule::ValueFormat,
                                 id,
                                 format!("{path}: '{v}' is not a valid {}", children[0].code),
                             );
                         }
                     } else {
                         sink.rule(
-                            Rule::ValueFormat,
+                            FcRule::ValueFormat,
                             id,
                             format!("{path}: simple attribute has element content"),
                         );
@@ -973,10 +958,10 @@ impl<'a> Validator<'a> {
                 }
                 (Value::Simple { text, .. }, None, Some(_)) => {
                     if text.trim().is_empty() {
-                        empty(Rule::MandatoryNil, "is empty", sink);
+                        empty(FcRule::MandatoryNil, "is empty", sink);
                     } else {
                         sink.rule(
-                            Rule::ValueFormat,
+                            FcRule::ValueFormat,
                             id,
                             format!("{path}: complex attribute has text content"),
                         );
@@ -984,7 +969,7 @@ impl<'a> Validator<'a> {
                 }
                 (Value::Complex(children), None, Some(_)) => {
                     if children.is_empty() {
-                        empty(Rule::MandatoryNil, "is empty", sink);
+                        empty(FcRule::MandatoryNil, "is empty", sink);
                     }
                     self.attributes(&a.code, children, &path, id, sink);
                 }
@@ -993,7 +978,7 @@ impl<'a> Validator<'a> {
         }
         if misordered {
             sink.rule(
-                Rule::Order,
+                FcRule::Order,
                 id,
                 format!("{context}: attributes are not in feature catalogue order"),
             );
@@ -1003,7 +988,7 @@ impl<'a> Validator<'a> {
             let m = &b.multiplicity;
             if n == 0 && m.lower > 0 {
                 sink.rule(
-                    Rule::MandatoryMissing,
+                    FcRule::MandatoryMissing,
                     id,
                     format!(
                         "{context}.{}: mandatory attribute is missing",
@@ -1012,7 +997,7 @@ impl<'a> Validator<'a> {
                 );
             } else if n < m.lower {
                 sink.rule(
-                    Rule::MandatoryMissing,
+                    FcRule::MandatoryMissing,
                     id,
                     format!(
                         "{context}.{}: {n} instance(s), at least {} required",
@@ -1022,7 +1007,7 @@ impl<'a> Validator<'a> {
             }
             if m.upper.is_some_and(|u| n > u) {
                 sink.rule(
-                    Rule::TooMany,
+                    FcRule::TooMany,
                     id,
                     format!(
                         "{context}.{}: {n} instances, at most {} permitted",
@@ -1052,14 +1037,14 @@ impl<'a> Validator<'a> {
         permitted: &[u32],
         path: &str,
         id: Option<&str>,
-        sink: &mut Sink,
+        sink: &mut IssueSink,
     ) {
-        let bad = |sink: &mut Sink, rule: Rule, kind: &str| {
+        let bad = |sink: &mut IssueSink, rule: FcRule, kind: &str| {
             sink.rule(rule, id, format!("{path}: '{value}' is not a valid {kind}"));
         };
         if self.is_truncated_date(sa) {
             if !truncated_date_ok("", value) {
-                bad(sink, Rule::ValueFormat, "truncated date");
+                bad(sink, FcRule::ValueFormat, "truncated date");
             }
             return;
         }
@@ -1074,12 +1059,12 @@ impl<'a> Validator<'a> {
                 };
                 match listed {
                     None => sink.rule(
-                        Rule::Enumeration,
+                        FcRule::Enumeration,
                         id,
                         format!("{path}: '{value}' is not a listed value of {}", sa.code),
                     ),
                     Some(l) if !permitted.is_empty() && !permitted.contains(&l.code) => sink.rule(
-                        Rule::Enumeration,
+                        FcRule::Enumeration,
                         id,
                         format!(
                             "{path}: value {} ({}) is not permitted here",
@@ -1106,18 +1091,18 @@ impl<'a> Validator<'a> {
                 }
             }
             AttributeValueType::Integer => match integer_padded(value) {
-                None => bad(sink, Rule::ValueFormat, "integer"),
+                None => bad(sink, FcRule::ValueFormat, "integer"),
                 Some(true) => sink.rule(
-                    Rule::Zeros,
+                    FcRule::Zeros,
                     id,
                     format!("{path}: '{value}' has non-significant zeros"),
                 ),
                 Some(false) => {}
             },
             AttributeValueType::Real => match real_padded(value) {
-                None => bad(sink, Rule::ValueFormat, "real"),
+                None => bad(sink, FcRule::ValueFormat, "real"),
                 Some(true) => sink.rule(
-                    Rule::Zeros,
+                    FcRule::Zeros,
                     id,
                     format!("{path}: '{value}' has non-significant zeros"),
                 ),
@@ -1125,26 +1110,26 @@ impl<'a> Validator<'a> {
             },
             AttributeValueType::Boolean => {
                 if !matches!(value, "true" | "false" | "1" | "0") {
-                    bad(sink, Rule::ValueFormat, "boolean");
+                    bad(sink, FcRule::ValueFormat, "boolean");
                 }
             }
             AttributeValueType::Date => {
                 if !date_ok(strip_zone(value)) {
-                    bad(sink, Rule::ValueFormat, "date (YYYY-MM-DD)");
+                    bad(sink, FcRule::ValueFormat, "date (YYYY-MM-DD)");
                 }
             }
             AttributeValueType::DateTime => {
                 if parse_date_time(value).is_none() {
                     bad(
                         sink,
-                        Rule::DateTimeFormat,
+                        FcRule::DateTimeFormat,
                         "dateTime (YYYY-MM-DDThh:mm:ss[Z|±hh:mm])",
                     );
                 }
             }
             AttributeValueType::Time => {
                 if !time_ok(value) {
-                    bad(sink, Rule::ValueFormat, "time (hh:mm:ss[Z|±hh:mm])");
+                    bad(sink, FcRule::ValueFormat, "time (hh:mm:ss[Z|±hh:mm])");
                 }
             }
             AttributeValueType::Urn => {
@@ -1153,83 +1138,15 @@ impl<'a> Validator<'a> {
                     .is_some_and(|p| p.eq_ignore_ascii_case("urn:"))
                     && value[4..].contains(':');
                 if !urn || value.contains(char::is_whitespace) {
-                    bad(sink, Rule::ValueFormat, "URN");
+                    bad(sink, FcRule::ValueFormat, "URN");
                 }
             }
             AttributeValueType::Uri | AttributeValueType::Url
                 if value.contains(char::is_whitespace) =>
             {
-                bad(sink, Rule::ValueFormat, "URI");
+                bad(sink, FcRule::ValueFormat, "URI");
             }
             _ => {}
-        }
-    }
-
-    fn s129_checks(&self, ds: &Dataset, incoming: &[Vec<(usize, usize)>], sink: &mut Sink) {
-        for o in &ds.objects {
-            let id = Some(o.id.as_str());
-            for r in o.attributes_named("fixedTimeRange") {
-                let value = |name: &str| {
-                    r.children()
-                        .iter()
-                        .find(|c| c.code == name)
-                        .and_then(|c| c.text())
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                };
-                match (value("timeStart"), value("timeEnd")) {
-                    (Some(s), Some(e)) => {
-                        if let (Some(s), Some(e)) = (parse_date_time(s), parse_date_time(e)) {
-                            if s > e {
-                                sink.product(
-                                    "S-158-129/23",
-                                    Severity::Warning,
-                                    id,
-                                    "fixedTimeRange: timeStart is later than timeEnd".into(),
-                                );
-                            }
-                        }
-                    }
-                    (Some(_), None) => sink.product(
-                        "S-158-129/24",
-                        Severity::Warning,
-                        id,
-                        "fixedTimeRange: timeStart without timeEnd".into(),
-                    ),
-                    (None, Some(_)) => sink.product(
-                        "S-158-129/25",
-                        Severity::Warning,
-                        id,
-                        "fixedTimeRange: timeEnd without timeStart".into(),
-                    ),
-                    (None, None) => {}
-                }
-            }
-        }
-        let binding = AssociationBinding {
-            role: "theComponent".into(),
-            association: Some("UnderKeelClearanceControlPointComposition".into()),
-            target: "UnderKeelClearanceControlPoint".into(),
-            lower: 1,
-            upper: None,
-        };
-        let mut binding = binding;
-        if let Some(b) = self
-            .association_bindings("UnderKeelClearancePlan")
-            .into_iter()
-            .find(|b| b.target == "UnderKeelClearanceControlPoint")
-        {
-            binding = b;
-        }
-        for (i, plan) in ds.objects_of("UnderKeelClearancePlan") {
-            if self.associated(ds, i, plan, &binding, incoming).is_empty() {
-                sink.product(
-                    "S-158-129/27",
-                    Severity::Warning,
-                    Some(&plan.id),
-                    "An UnderKeelClearancePlan must consist of at least 1 UnderKeelClearanceControlPoint association".into(),
-                );
-            }
         }
     }
 }
@@ -1247,233 +1164,10 @@ fn incoming(ds: &Dataset) -> Vec<Vec<(usize, usize)>> {
     out
 }
 
-fn s124_checks(ds: &Dataset, byte_size: Option<u64>, sink: &mut Sink) {
-    let err = Severity::Error;
-    if let Some(size) = byte_size {
-        if size > S124_MAX_BYTES {
-            sink.product(
-                "S-124/size",
-                err,
-                None,
-                format!("Dataset is {size} bytes; S-124 datasets must not exceed 50 KB"),
-            );
-        }
-    }
-    let preambles: Vec<_> = ds.objects_of("NavwarnPreamble").map(|(i, _)| i).collect();
-    if preambles.len() != 1 {
-        sink.product(
-            "S-124/preamble",
-            err,
-            None,
-            format!(
-                "Dataset has {} NavwarnPreamble instances; exactly one is required",
-                preambles.len()
-            ),
-        );
-    }
-    let parts: Vec<_> = ds.objects_of("NavwarnPart").collect();
-    for (_, part) in &parts {
-        let headers: HashSet<usize> = part
-            .references
-            .iter()
-            .filter(|r| r.role == "header")
-            .filter_map(|r| r.target)
-            .filter(|t| ds.objects[*t].code == "NavwarnPreamble")
-            .collect();
-        if headers.len() != 1
-            || part
-                .references
-                .iter()
-                .filter(|r| r.role == "header")
-                .count()
-                != 1
-        {
-            sink.product(
-                "S-124/header",
-                err,
-                Some(&part.id),
-                "NavwarnPart must have exactly one header reference to the NavwarnPreamble".into(),
-            );
-        }
-        for wi in part.attributes_named("warningInformation") {
-            let has = |c: &str| wi.children().iter().any(|a| a.code == c);
-            if !has("information") && !has("navwarnTypeDetails") {
-                sink.product(
-                    "S-124/warning-information",
-                    err,
-                    Some(&part.id),
-                    "warningInformation must contain information or navwarnTypeDetails".into(),
-                );
-            }
-            let mut languages = HashSet::new();
-            for info in wi.children().iter().filter(|a| a.code == "information") {
-                let lang = info
-                    .children()
-                    .iter()
-                    .find(|c| c.code == "language")
-                    .and_then(|c| c.text());
-                if !languages.insert(lang.unwrap_or("").trim().to_string()) {
-                    sink.product(
-                        "S-124/warning-information",
-                        err,
-                        Some(&part.id),
-                        format!(
-                            "warningInformation has more than one information in language {lang:?}"
-                        ),
-                    );
-                }
-            }
-        }
-        for range in part.attributes_named("fixedDateRange") {
-            let has = |c: &str| range.children().iter().any(|a| a.code == c);
-            for (time, date) in [("timeOfDayStart", "dateStart"), ("timeOfDayEnd", "dateEnd")] {
-                if has(time) && !has(date) {
-                    sink.product(
-                        "S-124/fixed-date-range",
-                        err,
-                        Some(&part.id),
-                        format!("fixedDateRange: {time} requires {date}"),
-                    );
-                }
-            }
-        }
-    }
-    for &p in &preambles {
-        let pre = &ds.objects[p];
-        // Associated with at least one References or NavwarnPart (either direction).
-        let linked = pre
-            .references
-            .iter()
-            .filter_map(|r| r.target)
-            .chain(ds.objects.iter().enumerate().filter_map(|(j, o)| {
-                o.references
-                    .iter()
-                    .any(|r| r.target == Some(p))
-                    .then_some(j)
-            }))
-            .any(|t| matches!(ds.objects[t].code.as_str(), "References" | "NavwarnPart"));
-        if !linked {
-            sink.product(
-                "S-124/preamble-content",
-                err,
-                Some(&pre.id),
-                "NavwarnPreamble must be associated with at least one References or NavwarnPart"
-                    .into(),
-            );
-        }
-        if let (Some(c), Some(p)) = (
-            pre.value(&["cancellationDate"]),
-            pre.value(&["publicationTime"]),
-        ) {
-            if let (Some(c), Some(p)) = (parse_date_time(c), parse_date_time(p)) {
-                if c <= p {
-                    sink.product(
-                        "S-124/cancellation-date",
-                        Severity::Warning,
-                        Some(&pre.id),
-                        "cancellationDate is not later than publicationTime".into(),
-                    );
-                }
-            }
-        }
-    }
-
-    // References content (S-124 4.x constraints, 8.1.2, 8.1.4, 9.3).
-    let references: Vec<_> = ds.objects_of("References").collect();
-    let mut in_force = Vec::new();
-    let mut cancellations = 0;
-    for (i, r) in &references {
-        let id = Some(r.id.as_str());
-        let no_message = r
-            .value(&["noMessageOnHand"])
-            .map(|v| matches!(v.trim(), "true" | "1"));
-        let category = r.value(&["referenceCategory"]).map(str::trim);
-        let series = r.attributes_named("messageSeriesIdentifier").count();
-        match no_message {
-            Some(true) if series > 0 => sink.product(
-                "S-124/references",
-                err,
-                id,
-                "messageSeriesIdentifier is prohibited when noMessageOnHand is true".into(),
-            ),
-            Some(false) if series == 0 => sink.product(
-                "S-124/references",
-                err,
-                id,
-                "messageSeriesIdentifier is mandatory when noMessageOnHand is false".into(),
-            ),
-            _ => {}
-        }
-        if no_message == Some(true) && category != Some("3") {
-            sink.product(
-                "S-124/references",
-                Severity::Warning,
-                id,
-                "noMessageOnHand=true is only meaningful in an in-force bulletin (referenceCategory 3)".into(),
-            );
-        }
-        match category {
-            Some("3") => in_force.push((*i, no_message == Some(true))),
-            Some("1") => cancellations += 1,
-            _ => {}
-        }
-    }
-    if !in_force.is_empty() {
-        if in_force.len() > 1 {
-            sink.product(
-                "S-124/in-force-bulletin",
-                err,
-                None,
-                format!("In-force bulletin has {} References with referenceCategory 3; exactly one is required", in_force.len()),
-            );
-        }
-        for o in &ds.objects {
-            if matches!(o.code.as_str(), "NavwarnAreaAffected" | "TextPlacement")
-                || !o.geometry.is_empty()
-            {
-                sink.product(
-                    "S-124/in-force-bulletin",
-                    err,
-                    Some(&o.id),
-                    format!("In-force bulletin must not contain geometry, NavwarnAreaAffected or TextPlacement ({})", o.code),
-                );
-            }
-        }
-        if let Some((keep, _)) = in_force.iter().find(|(_, nmoh)| *nmoh) {
-            for (j, o) in ds.objects.iter().enumerate() {
-                if j != *keep && o.code != "NavwarnPreamble" {
-                    sink.product(
-                        "S-124/in-force-bulletin",
-                        err,
-                        Some(&o.id),
-                        format!("In-force bulletin with noMessageOnHand=true permits no other content ({})", o.code),
-                    );
-                }
-            }
-        }
-    } else if parts.is_empty() && cancellations > 1 {
-        sink.product(
-            "S-124/cancellation",
-            Severity::Warning,
-            None,
-            format!("Cancellation dataset should contain only one References instance, found {cancellations}"),
-        );
-    }
-    for code in ["NavwarnAreaAffected", "TextPlacement"] {
-        for (_, o) in ds.objects_of(code) {
-            if o.geometry.is_empty() {
-                sink.product(
-                    "S-124/geometry",
-                    err,
-                    Some(&o.id),
-                    format!("{code} must have geometry"),
-                );
-            }
-        }
-    }
-}
-
-pub(crate) fn file_name_ok(product: Product, name: &str) -> bool {
+/// The S-100 dataset file naming convention `<product code><producer
+/// (4 upper-case alphanumerics)><unique part>.GML`; `unique_ok` decides the
+/// product's rule for the unique part.
+pub fn file_name_follows(product: Product, name: &str, unique_ok: impl Fn(&str) -> bool) -> bool {
     let Some((stem, ext)) = name.rsplit_once('.') else {
         return false;
     };
@@ -1484,15 +1178,12 @@ pub(crate) fn file_name_ok(product: Product, name: &str) -> bool {
         return false;
     };
     let (producer, unique) = rest.split_at(rest.len().min(4));
-    let upper_alnum = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit();
-    producer.len() == 4
-        && producer.chars().all(upper_alnum)
-        && match product {
-            Product::S129 => {
-                unique.len() <= 8 && unique.chars().all(|c| upper_alnum(c) || c == '_')
-            }
-            Product::S124 => unique.chars().all(upper_alnum),
-        }
+    producer.len() == 4 && producer.chars().all(upper_alnum) && unique_ok(unique)
+}
+
+/// An upper-case ASCII letter or a digit.
+pub fn upper_alnum(c: char) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit()
 }
 
 /// Some(padded) for a valid integer, None if malformed.
@@ -1568,7 +1259,7 @@ fn time_ok(v: &str) -> bool {
 }
 
 /// Parses an xs:dateTime (extended format); values without a zone are taken as UTC.
-fn parse_date_time(v: &str) -> Option<NaiveDateTime> {
+pub fn parse_date_time(v: &str) -> Option<NaiveDateTime> {
     let (date, time) = v.trim().split_once('T')?;
     if !date_ok(date) || !time_ok(time) {
         return None;
@@ -1610,21 +1301,7 @@ fn truncated_date_ok(kind: &str, v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::tests::{
-        fc, fc as fc_of, read, workspace_file, S124_DIR, S124_FC, S129_130, S129_200, S129_FC,
-    };
-    use crate::reader::{read_bytes, ReadLimits};
-
-    fn count(issues: &[Issue], check: &str) -> usize {
-        issues.iter().filter(|i| i.check == check).count()
-    }
-    fn checks(issues: &[Issue]) -> std::collections::BTreeMap<&str, usize> {
-        let mut m = std::collections::BTreeMap::new();
-        for i in issues {
-            *m.entry(i.check.as_str()).or_default() += 1;
-        }
-        m
-    }
+    use crate::reader::tests::{fc, S124_FC, S129_FC};
 
     #[test]
     fn number_and_time_formats() {
@@ -1660,20 +1337,10 @@ mod tests {
             assert!(!truncated_date_ok("", v), "{v}");
         }
         assert!(truncated_date_ok("gYear", "2024") && !truncated_date_ok("gYear", "2024-01-01"));
-        assert!(!truncated_date_ok("", "é-----") && !file_name_ok(Product::S124, "124é.GML"));
-    }
-
-    #[test]
-    fn file_names() {
-        assert!(file_name_ok(Product::S129, "12900MCTDS130TS.gml"));
-        assert!(file_name_ok(Product::S129, "129ABCD.GML"));
-        assert!(file_name_ok(Product::S129, "129ABCD_1234567.GML"));
-        assert!(!file_name_ok(Product::S129, "129ABCD123456789.GML"));
-        assert!(!file_name_ok(Product::S129, "129abcd.GML"));
-        assert!(!file_name_ok(Product::S129, "129ABCD.xml"));
-        assert!(!file_name_ok(Product::S129, "124ABCD.GML"));
-        assert!(file_name_ok(Product::S124, "124GB00S1Y2026N36.GML"));
-        assert!(!file_name_ok(Product::S124, "124GB0.GML"));
+        assert!(
+            !truncated_date_ok("", "é-----")
+                && !file_name_follows(Product::S124, "124é.GML", |_| true)
+        );
     }
 
     #[test]
@@ -1714,371 +1381,5 @@ mod tests {
             ("UnderKeelClearanceControlPoint", 1, None)
         );
         assert_eq!(v.primitives("UnderKeelClearancePlan"), ["nogeometry"]);
-    }
-
-    #[test]
-    fn s124_ukho_datasets() {
-        let Some(fc) = fc(S124_FC) else { return };
-        let v = Validator::new(&fc);
-        let mut all = Vec::new();
-        for name in [
-            "124GB00S1Y2026N36.GML",
-            "124GB00S2Y2026N43.GML",
-            "124GB00S2Y2026N44.GML",
-            "124GB00S2Y2026N45.GML",
-            "124GB00S2Y2026N46.GML",
-        ] {
-            let Some(ds) = read(&format!("{S124_DIR}/{name}"), &fc) else {
-                return;
-            };
-            let issues = validate(&ds, &fc);
-            assert_eq!(
-                issues,
-                v.validate(
-                    &ds,
-                    std::fs::metadata(ds.source.as_ref().unwrap())
-                        .ok()
-                        .map(|m| m.len())
-                )
-            );
-            let per_file = checks(&issues);
-            // Every file uses countryName (FC: nationality), so nationality is
-            // also reported missing only if mandatory (it is optional).
-            assert!(
-                count(&issues, "FC/unknown-attribute") >= 1,
-                "{name}: {per_file:?}"
-            );
-            assert!(
-                !per_file.contains_key("S-124/header"),
-                "{name}: {per_file:?}"
-            );
-            assert!(!per_file.contains_key("S-124/preamble"), "{name}");
-            assert!(!per_file.contains_key("S-124/preamble-content"), "{name}");
-            assert!(!per_file.contains_key("S-124/size"), "{name}");
-            assert!(!per_file.contains_key("FC/file-name"), "{name}");
-            assert!(
-                !per_file.contains_key("FC/association-multiplicity"),
-                "{name}: {issues:#?}"
-            );
-            all.extend(issues);
-        }
-        let totals = checks(&all);
-        // countryName in all 5 files; featureName/Name in N43, N44, N45.
-        assert_eq!(totals.get("FC/unknown-attribute"), Some(&8), "{totals:?}");
-        let names: Vec<_> = all
-            .iter()
-            .filter(|i| i.check == "FC/unknown-attribute")
-            .map(|i| i.message.split(':').next().unwrap())
-            .collect();
-        assert_eq!(
-            names.iter().filter(|n| n.ends_with(".countryName")).count(),
-            5
-        );
-        assert_eq!(
-            names
-                .iter()
-                .filter(|n| **n == "NavwarnPart.featureName.Name")
-                .count(),
-            3
-        );
-        // ... which leaves featureName without its mandatory name.
-        assert_eq!(totals.get("FC/mandatory-missing"), Some(&3), "{totals:?}");
-        assert!(all
-            .iter()
-            .filter(|i| i.check == "FC/mandatory-missing")
-            .all(|i| i.message.starts_with("NavwarnPart.featureName.name")));
-        assert_eq!(totals.len(), 2, "{totals:?}");
-        assert!(all.iter().all(|i| i.severity == Severity::Error));
-    }
-
-    #[test]
-    fn s129_iho_datasets() {
-        let Some(fc) = fc(S129_FC) else { return };
-        let Some(a) = read(S129_130, &fc) else { return };
-        let Some(b) = read(S129_200, &fc) else { return };
-        for (ds, empty_ranges) in [(&a, 7), (&b, 0)] {
-            let issues = validate(ds, &fc);
-            assert!(issues.iter().all(|i| i.severity == Severity::Warning));
-            let c = checks(&issues);
-            // The test datasets encode no associations at all.
-            assert_eq!(c.get("S-158-129/27"), Some(&1), "{c:?}");
-            // Every area and control point lacks its theCollection link to the plan.
-            assert_eq!(
-                c.get("FC/association-multiplicity"),
-                Some(&(1 + 87 + 200 + 15)),
-                "{c:?}"
-            );
-            // 130TS has seven empty <fixedTimeRange/> elements.
-            assert_eq!(
-                c.get("S-158-129/21").copied().unwrap_or(0),
-                empty_ranges,
-                "{c:?}"
-            );
-            for n in [1, 2, 3, 5, 7, 8, 12, 13, 14, 15, 16, 22, 23, 24, 25, 26] {
-                assert_eq!(count(&issues, &format!("S-158-129/{n}")), 0, "{n}: {c:?}");
-            }
-            assert_eq!(issues.len(), 1 + 303 + empty_ranges, "{c:?}");
-        }
-    }
-
-    fn s129(members: &str) -> Dataset {
-        let xml = format!(
-            r#"<Dataset xmlns="http://www.iho.int/S129/2.0" xmlns:S100="http://www.iho.int/s100gml/5.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" gml:id="DS">
-<S100:DatasetIdentificationInformation><S100:productIdentifier>S-129</S100:productIdentifier><S100:productEdition>2.0.0</S100:productEdition><S100:datasetFileIdentifier>129ABCD01.GML</S100:datasetFileIdentifier></S100:DatasetIdentificationInformation>
-<members>{members}</members></Dataset>"#
-        );
-        read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap()
-    }
-
-    #[test]
-    fn s129_synthetic_violations() {
-        let Some(fc) = fc(S129_FC) else { return };
-        let ds = s129(
-            r##"<UnderKeelClearancePlan gml:id="PLAN">
-  <generationTime>2024-04-15 23:11</generationTime>
-  <fixedTimeRange><timeStart>2024-04-18T01:00:00Z</timeStart><timeEnd>2024-04-17T01:00:00Z</timeEnd></fixedTimeRange>
-  <vesselID>1</vesselID><vesselID>2</vesselID>
-  <maximumDraught>012.20</maximumDraught>
-  <underKeelClearancePurpose code="9">Bogus</underKeelClearancePurpose>
-  <scaleMinimum>1</scaleMinimum>
-  <madeUp>1</madeUp>
-  <theComponent xlink:href="#CP"/>
-</UnderKeelClearancePlan>
-<UnderKeelClearanceControlPoint gml:id="CP">
-  <featureName><language>eng</language><nameUsage code="3"/></featureName>
-  <expectedPassingSpeed xsi:nil="true" nilReason="unknown"/>
-  <fixedTimeRange><timeEnd>2024-04-17T01:00:00Z</timeEnd></fixedTimeRange>
-  <theCollection xlink:href="#PLAN"/><theNothing xlink:href="#PLAN"/><theComponent xlink:href="#PLAN"/>
-</UnderKeelClearanceControlPoint>
-<UnderKeelClearanceControlPoint gml:id="CP2"><fixedTimeRange><timeStart>2024-04-17T01:00:00Z</timeStart></fixedTimeRange><theCollection xlink:href="#CP"/></UnderKeelClearanceControlPoint>
-<Bogus gml:id="X"/>"##,
-        );
-        let issues = Validator::new(&fc).validate(&ds, None);
-        let c = checks(&issues);
-        let expect = [
-            ("S-158-129/1", 1),  // featureName.name missing
-            ("S-158-129/3", 1),  // 012.20
-            ("S-158-129/5", 1),  // theComponent on a control point
-            ("S-158-129/7", 1),  // theNothing
-            ("S-158-129/8", 1),  // CP2 theCollection -> control point
-            ("S-158-129/10", 2), // enumeration codes 9 and 3
-            ("S-158-129/12", 1), // Bogus
-            ("S-158-129/13", 1), // madeUp
-            ("S-158-129/14", 1), // scaleMinimum on the plan
-            ("S-158-129/15", 1), // generationTime before fixedTimeRange
-            ("S-158-129/16", 1), // two vesselID
-            ("S-158-129/21", 1), // nil expectedPassingSpeed
-            ("S-158-129/23", 1),
-            ("S-158-129/24", 1),
-            ("S-158-129/25", 1),
-            ("S-158-129/26", 1),
-            ("FC/association-multiplicity", 1), // CP2 lacks a plan
-        ];
-        for (check, n) in expect {
-            assert_eq!(
-                c.get(check).copied().unwrap_or(0),
-                n,
-                "{check}: {issues:#?}"
-            );
-        }
-        assert_eq!(
-            issues.len(),
-            expect.iter().map(|e| e.1).sum::<usize>(),
-            "{c:?}"
-        );
-        // The plan's control point arrives through the inverse theCollection role.
-        assert_eq!(count(&issues, "S-158-129/27"), 0);
-    }
-
-    /// The S-129 catalogue with an orphan role and a second association
-    /// (ControlPointMonitoring: theMonitor/theMonitored, bound on control
-    /// points towards plan areas), so that checks 4, 6 and 9 are reachable.
-    pub(crate) fn patched_s129_fc(tag: &str) -> Option<FeatureCatalogue> {
-        let text = std::fs::read_to_string(workspace_file(S129_FC)?).unwrap();
-        let role = |code: &str| {
-            format!("<S100FC:S100_FC_Role><S100FC:name>{code}</S100FC:name><S100FC:definition>Test role.</S100FC:definition><S100FC:code>{code}</S100FC:code></S100FC:S100_FC_Role>")
-        };
-        let mut patched = text.replacen(
-            "</S100FC:S100_FC_Roles>",
-            &format!(
-                "{}{}{}</S100FC:S100_FC_Roles>",
-                role("theMonitor"),
-                role("theMonitored"),
-                role("theOrphan")
-            ),
-            1,
-        );
-        patched = patched.replacen(
-            "</S100FC:S100_FC_FeatureAssociations>",
-            r#"<S100FC:S100_FC_FeatureAssociation isAbstract="false"><S100FC:name>Monitoring</S100FC:name><S100FC:definition>Test association.</S100FC:definition><S100FC:code>ControlPointMonitoring</S100FC:code><S100FC:role ref="theMonitor"/><S100FC:role ref="theMonitored"/></S100FC:S100_FC_FeatureAssociation></S100FC:S100_FC_FeatureAssociations>"#,
-            1,
-        );
-        // The last binding in the catalogue is the control point's plan link.
-        let at =
-            patched.rfind("</S100FC:featureBinding>").unwrap() + "</S100FC:featureBinding>".len();
-        assert!(patched[..at]
-            .trim_end_matches("</S100FC:featureBinding>")
-            .trim_end()
-            .ends_with("<S100FC:featureType ref=\"UnderKeelClearancePlan\"/>"));
-        patched.insert_str(
-            at,
-            r#"<S100FC:featureBinding roleType="association"><S100FC:multiplicity><S100Base:lower>0</S100Base:lower><S100Base:upper xsi:nil="true" infinite="true"/></S100FC:multiplicity><S100FC:association ref="ControlPointMonitoring"/><S100FC:role ref="theMonitored"/><S100FC:featureType ref="UnderKeelClearancePlanArea"/></S100FC:featureBinding>"#,
-        );
-        let dir = std::env::temp_dir().join(format!("ferrite-gml-fc-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("129_FC_patched.xml");
-        std::fs::write(&path, patched).unwrap();
-        Some(FeatureCatalogue::load(&path).unwrap())
-    }
-
-    #[test]
-    fn s129_association_inference() {
-        let Some(fc) = patched_s129_fc("assoc") else {
-            return;
-        };
-        let v = Validator::new(&fc);
-        assert_eq!(v.extra.association_roles["ControlPointMonitoring"].len(), 2);
-        let ds = s129(
-            r##"<UnderKeelClearancePlan gml:id="PLAN">
-  <theComponent xlink:href="#CP"/>
-  <theOrphan xlink:href="#CP"/>
-  <theMonitored xlink:href="#CP"/>
-</UnderKeelClearancePlan>
-<UnderKeelClearanceControlPoint gml:id="CP">
-  <theCollection xlink:href="#PLAN"/>
-  <theMonitored xlink:href="#PLAN"/>
-  <theComponent xlink:href="#PLAN"/>
-</UnderKeelClearanceControlPoint>"##,
-        );
-        let issues: Vec<_> = v
-            .validate(&ds, None)
-            .into_iter()
-            .filter(|i| {
-                ["/4", "/5", "/6", "/7", "/8", "/9"]
-                    .iter()
-                    .any(|n| i.check == format!("S-158-129{n}"))
-            })
-            .collect();
-        let found: Vec<_> = issues
-            .iter()
-            .map(|i| (i.check.as_str(), i.object.as_deref().unwrap_or("")))
-            .collect();
-        assert_eq!(
-            found,
-            [
-                ("S-158-129/6", "PLAN"), // theOrphan: in no association
-                ("S-158-129/4", "PLAN"), // theMonitored: plan is not monitored
-                ("S-158-129/9", "CP"),   // CP's monitoring role on the composition
-                ("S-158-129/5", "CP"),   // composition role, wrong end
-            ],
-            "{issues:#?}"
-        );
-        assert!(issues.iter().all(|i| i.severity == Severity::Warning));
-        // The released S-129 catalogue: both roles belong to every association,
-        // so a known role can only be the wrong end (5) or target (8).
-        let Some(plain) = fc_of(S129_FC) else { return };
-        let issues = Validator::new(&plain).validate(&ds, None);
-        let c = checks(&issues);
-        assert_eq!(c.get("S-158-129/7"), Some(&3), "{c:?}");
-        assert_eq!(c.get("S-158-129/5"), Some(&1), "{c:?}");
-        for n in [4, 6, 9] {
-            assert_eq!(count(&issues, &format!("S-158-129/{n}")), 0, "{c:?}");
-        }
-    }
-
-    #[test]
-    fn s124_association_inference() {
-        let Some(fc) = fc_of(S124_FC) else { return };
-        let ds = s124(&format!(
-            r##"{PREAMBLE}</S124:NavwarnPreamble>
-<S124:References gml:id="R"><S124:referenceCategory code="1"/><S124:theWarning xlink:href="#PRE"/><S124:affects xlink:href="#P"/></S124:References>
-<S124:NavwarnPart gml:id="P"><S124:header xlink:href="#PRE"/><S124:affects xlink:href="#A"/><S124:theWarning xlink:href="#A"/><S124:header xlink:href="#A"/><S124:impacts xlink:href="#A"/></S124:NavwarnPart>
-<S124:NavwarnAreaAffected gml:id="A"><S124:impacts xlink:href="#P"/></S124:NavwarnAreaAffected>"##
-        ));
-        let issues = Validator::new(&fc).validate(&ds, None);
-        let found: Vec<_> = issues
-            .iter()
-            .filter(|i| {
-                i.check.starts_with("FC/association-") && i.check != "FC/association-multiplicity"
-                    || i.check.starts_with("FC/role-")
-            })
-            .map(|i| (i.check.as_str(), i.object.as_deref().unwrap_or("")))
-            .collect();
-        assert_eq!(
-            found,
-            [
-                ("FC/association-unknown", "R"), // affects: References - NavwarnPart
-                ("FC/association-wrong", "P"),   // theWarning on Part - AreaAffected
-                ("FC/role-association", "P"),    // header (Part's own) on areaAffected
-                ("FC/role-not-permitted", "P"),  // impacts: the area's end
-            ],
-            "{issues:#?}"
-        );
-        assert!(issues
-            .iter()
-            .filter(|i| i.check.starts_with("FC/association-u")
-                || i.check.starts_with("FC/association-w")
-                || i.check == "FC/role-association")
-            .all(|i| i.severity == Severity::Error));
-    }
-
-    fn s124(members: &str) -> Dataset {
-        let xml = format!(
-            r#"<S124:Dataset xmlns:S124="http://www.iho.int/S124/gml/2.0" xmlns:S100="http://www.iho.int/s100gml/5.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:xlink="http://www.w3.org/1999/xlink" gml:id="DS">
-<S100:DatasetIdentificationInformation><S100:productIdentifier>S-124</S100:productIdentifier><S100:productEdition>2.0.0</S100:productEdition><S100:datasetFileIdentifier>124GB00IFB1.GML</S100:datasetFileIdentifier></S100:DatasetIdentificationInformation>
-<S124:members>{members}</S124:members></S124:Dataset>"#
-        );
-        read_bytes(xml.as_bytes(), None, ReadLimits::default()).unwrap()
-    }
-    const PREAMBLE: &str = r#"<S124:NavwarnPreamble gml:id="PRE"><S124:generalArea><S124:locationName><S124:language>eng</S124:language><S124:text>WIGHT</S124:text></S124:locationName></S124:generalArea><S124:messageSeriesIdentifier><S124:agencyResponsibleForProduction>UKHO</S124:agencyResponsibleForProduction><S124:nameOfSeries>WZ</S124:nameOfSeries><S124:warningNumber>1</S124:warningNumber><S124:warningType code="2"/><S124:year>2026</S124:year></S124:messageSeriesIdentifier><S124:cancellationDate>2026-01-01T00:00:00Z</S124:cancellationDate><S124:intService>true</S124:intService><S124:navwarnTypeGeneral code="8"/><S124:publicationTime>2026-02-13T08:42:41Z</S124:publicationTime>"#;
-
-    #[test]
-    fn s124_in_force_bulletin_rules() {
-        let Some(fc) = fc(S124_FC) else { return };
-        let v = Validator::new(&fc);
-        // No message on hand: only the preamble and one References.
-        let ok = s124(&format!(
-            r##"{PREAMBLE}<S124:theReferences xlink:href="#R"/></S124:NavwarnPreamble>
-<S124:References gml:id="R"><S124:noMessageOnHand>true</S124:noMessageOnHand><S124:referenceCategory code="3"/></S124:References>"##
-        ));
-        let issues = v.validate(&ok, Some(1000));
-        assert_eq!(
-            checks(&issues).into_iter().collect::<Vec<_>>(),
-            [("S-124/cancellation-date", 1)],
-            "{issues:#?}"
-        );
-
-        let bad = s124(&format!(
-            r##"{PREAMBLE}</S124:NavwarnPreamble>
-<S124:References gml:id="R"><S124:messageSeriesIdentifier><S124:agencyResponsibleForProduction>UKHO</S124:agencyResponsibleForProduction><S124:nameOfSeries>WZ</S124:nameOfSeries><S124:warningNumber>1</S124:warningNumber><S124:warningType code="2"/><S124:year>2026</S124:year></S124:messageSeriesIdentifier><S124:noMessageOnHand>true</S124:noMessageOnHand><S124:referenceCategory code="3"/><S124:theWarning xlink:href="#PRE"/></S124:References>
-<S124:NavwarnPart gml:id="P"><S124:fixedDateRange><S124:timeOfDayStart>08:00:00</S124:timeOfDayStart></S124:fixedDateRange><S124:warningInformation/><S124:header xlink:href="#PRE"/><S124:header xlink:href="#PRE"/><S124:geometry><S100:pointProperty><S100:Point gml:id="G"><gml:pos>50 -1</gml:pos></S100:Point></S100:pointProperty></S124:geometry></S124:NavwarnPart>
-<S124:NavwarnAreaAffected gml:id="A"><S124:impacts xlink:href="#P"/></S124:NavwarnAreaAffected>"##
-        ));
-        let issues = v.validate(&bad, Some(60_000));
-        let c = checks(&issues);
-        assert_eq!(c.get("S-124/size"), Some(&1));
-        assert_eq!(c.get("S-124/references"), Some(&1), "{issues:#?}");
-        assert_eq!(c.get("S-124/header"), Some(&1));
-        assert_eq!(c.get("S-124/warning-information"), Some(&1));
-        assert_eq!(c.get("S-124/fixed-date-range"), Some(&1));
-        assert_eq!(c.get("S-124/geometry"), Some(&1));
-        // P has geometry, A is an area; with noMessageOnHand both are extra content.
-        assert_eq!(c.get("S-124/in-force-bulletin"), Some(&4), "{issues:#?}");
-        // warningInformation is mandatory and present but empty.
-        assert_eq!(c.get("FC/mandatory-nil"), Some(&1), "{issues:#?}");
-    }
-
-    #[test]
-    fn s124_preamble_rules() {
-        let Some(fc) = fc(S124_FC) else { return };
-        let ds = s124(&format!(
-            "{PREAMBLE}</S124:NavwarnPreamble>{}",
-            PREAMBLE.replace("\"PRE\"", "\"PRE2\"") + "</S124:NavwarnPreamble>"
-        ));
-        let issues = Validator::new(&fc).validate(&ds, None);
-        let c = checks(&issues);
-        assert_eq!(c.get("S-124/preamble"), Some(&1));
-        assert_eq!(c.get("S-124/preamble-content"), Some(&2), "{issues:#?}");
-        assert!(workspace_file(S124_FC).is_some());
     }
 }

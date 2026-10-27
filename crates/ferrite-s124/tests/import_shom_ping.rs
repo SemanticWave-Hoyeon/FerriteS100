@@ -1,7 +1,7 @@
 use chrono::{TimeZone, Utc};
-use ferrite_s100_gml::import::*;
-use ferrite_s100_gml::navwarn::{evaluate, NavwarnInput, Status};
 use ferrite_s100_gml::{Geometry, Product, Value};
+use ferrite_s124::import::*;
+use ferrite_s124::navwarn::{evaluate, NavwarnInput, Status};
 use std::path::{Path, PathBuf};
 
 fn data(rel: &str) -> PathBuf {

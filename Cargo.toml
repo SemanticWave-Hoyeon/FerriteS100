@@ -22,6 +22,9 @@ members = [
     "crates/ferrite-mcp",
     "crates/ferrite-xslt",
     "crates/ferrite-s100-gml",
+    "crates/ferrite-product-api",
+    "crates/ferrite-s124",
+    "crates/ferrite-s129",
     "crates/ferrite-engine",
     "crates/ferrite-cli",
     "crates/ferrite-capi",
@@ -132,7 +135,7 @@ lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferri
 lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-gpu/lua55", "ferrite-ui/lua55", "ferrite-engine/lua55"]
 
 [dependencies]
-ferrite-engine = { workspace = true, features = ["parallel", "s102-hdf5", "crypto-openssl"] }
+ferrite-engine = { workspace = true, features = ["parallel", "s102-hdf5", "crypto-openssl", "s124", "s129"] }
 quick-xml.workspace = true
 roxmltree = "=0.20.0"
 chrono.workspace = true
@@ -147,6 +150,8 @@ ferrite-security = { workspace = true, features = ["crypto-openssl"] }
 ferrite-feature-catalog.workspace = true
 ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
 ferrite-s100-gml = { path = "crates/ferrite-s100-gml" }
+ferrite-s124 = { path = "crates/ferrite-s124" }
+ferrite-s129 = { path = "crates/ferrite-s129" }
 ferrite-render = { workspace = true, features = ["parallel"] }
 ferrite-gpu = { workspace = true, features = ["s102-portrayal"] }
 ferrite-ui = { workspace = true, features = ["s102-portrayal"] }

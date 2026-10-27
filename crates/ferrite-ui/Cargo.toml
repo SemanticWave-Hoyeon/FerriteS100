@@ -13,6 +13,8 @@ lua55 = ["ferrite-gpu/lua55"]
 ferrite-gpu.workspace = true
 ferrite-render = { workspace = true, features = ["parallel"] }
 ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
+ferrite-s124 = { path = "../ferrite-s124" }
+ferrite-s129 = { path = "../ferrite-s129" }
 ferrite-s421 = { path = "../ferrite-s421" }
 tracing.workspace = true
 serde_json.workspace = true

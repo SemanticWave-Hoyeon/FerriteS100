@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
-use ferrite_s100_gml::navwarn::*;
 use ferrite_s100_gml::{read_bytes, read_file, Dataset, ReadLimits};
+use ferrite_s124::navwarn::*;
 use std::path::Path;
 
 fn t(s: &str) -> DateTime<Utc> {

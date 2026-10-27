@@ -5,8 +5,9 @@
 //! 1. [`input_xml`] builds the Part 9 Appendix 9-A portrayal input
 //!    (`Dataset/{InformationTypes, Points, MultiPoints, Curves,
 //!    CompositeCurves, Surfaces, Features}`) from a [`Dataset`], adding the
-//!    virtual input features the S-129 portrayal catalogue expects
-//!    (`PlannedRoute`, `UnderKeelClearanceControlPointInformationBox`).
+//!    virtual input features a product's portrayal catalogue expects
+//!    ([`InputOptions::virtual_features`], for example the S-129
+//!    `PlannedRoute` and information boxes).
 //! 2. [`XsltPortrayal::transform`] runs the catalogue's top level XSLT rule
 //!    with its context parameters (catalogue defaults, overridable).
 //! 3. [`display_list_instructions`] converts the resulting Part 9 display list
@@ -53,12 +54,6 @@ use std::rc::Rc;
 
 /// Namespace prefix of the S-100 presentation (display list) schemas.
 pub const S100_PRESENTATION: &str = "http://www.iho.int/S100Presentation";
-
-/// Feature code of the S-129 virtual route feature.
-pub const PLANNED_ROUTE: &str = "PlannedRoute";
-/// Feature code of the S-129 virtual information box feature.
-pub const INFORMATION_BOX: &str = "UnderKeelClearanceControlPointInformationBox";
-const CONTROL_POINT: &str = "UnderKeelClearanceControlPoint";
 
 // Record names of the synthetic cell (ISO 8211 RCNM values used by S-101).
 const RCNM_POINT: u8 = 110;
@@ -123,16 +118,50 @@ pub struct InputOptions {
     /// Include curve and ring coordinates (Appendix 9-A-5 allows omitting
     /// them; point and multipoint coordinates are always included).
     pub curve_coordinates: bool,
-    /// Add the S-129 virtual features (`PlannedRoute`, information boxes).
-    pub s129_virtual_features: bool,
+    /// The product's virtual input features (S-129: `PlannedRoute` and the
+    /// information boxes); None adds none.
+    pub virtual_features: Option<VirtualFeatures>,
 }
 impl Default for InputOptions {
     fn default() -> Self {
         Self {
             curve_coordinates: true,
-            s129_virtual_features: true,
+            virtual_features: None,
         }
     }
+}
+
+/// Adds a product's virtual input features: the dataset, its input features
+/// and spatials so far, and a sink for conformance notes (feature `@id`,
+/// message). The returned features are appended in order.
+pub type VirtualFeatures = fn(
+    &Dataset,
+    &[InputFeature],
+    &[InputSpatial],
+    &mut dyn FnMut(Option<&str>, String),
+) -> Vec<VirtualFeature>;
+
+/// Geometry of a virtual input feature.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VirtualGeometry {
+    /// An existing spatial of the input (index into its spatials).
+    Spatial(usize),
+    /// A new curve through these positions.
+    Curve(Vec<Coord>),
+}
+
+/// A feature of the portrayal input that is not in the dataset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VirtualFeature {
+    /// The input `@id` (conventionally `~<code>[.<dataset feature id>]`).
+    pub id: String,
+    pub code: String,
+    /// Part 9 primitive of the feature.
+    pub primitive: &'static str,
+    pub geometry: VirtualGeometry,
+    pub scale_minimum: Option<u32>,
+    /// Simple child elements (thematic attributes) written into the input.
+    pub children: Vec<(&'static str, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,80 +315,30 @@ pub fn input_xml(
         });
     }
 
-    // S-129 virtual features.
+    // Product virtual features.
     let mut virtual_children: HashMap<usize, Vec<(&'static str, String)>> = HashMap::new();
-    if dataset.product == Product::S129 && options.s129_virtual_features {
-        let mut points: Vec<(usize, Option<chrono::DateTime<chrono::FixedOffset>>)> = Vec::new();
-        for (fi, feature) in features.iter().enumerate() {
-            if feature.code != CONTROL_POINT {
-                continue;
-            }
-            let object = &dataset.objects[feature.object.expect("dataset feature")];
-            let time = object
-                .value(&["expectedPassingTime"])
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t.trim()).ok());
-            if !matches!(object.geometry.first(), Some(Geometry::Point(_))) {
-                notes.add(Some(&object.id), "Control point without point geometry is left out of the planned route and information boxes");
-                continue;
-            }
-            points.push((fi, time));
-        }
-        // The route visits the control points in passing order (S-129: the
-        // route is "defined by a set of geographical control points with time
-        // windows"); expectedPassingTime orders them. Without a time for every
-        // point the dataset order is kept.
-        if points.iter().all(|(_, t)| t.is_some()) {
-            points.sort_by_key(|(_, t)| *t);
-        } else if !points.is_empty() {
-            notes.add(None, "Not every control point has a valid expectedPassingTime; the planned route follows dataset order");
-        }
-        let mut info_boxes = Vec::new();
-        for (fi, _) in &points {
-            let feature = &features[*fi];
-            let object = &dataset.objects[feature.object.expect("dataset feature")];
-            let mut children = Vec::new();
-            if let Some(name) = display_name(object) {
-                children.push(("name", name));
-            }
-            if let Some(eta) = object.value(&["expectedPassingTime"]) {
-                children.push(("ETA", eta.trim().to_owned()));
-            }
-            if let Some(open) = object.value(&["fixedTimeRange", "timeStart"]) {
-                children.push(("TimeWindowOpen", open.trim().to_owned()));
-            }
-            if let Some(close) = object.value(&["fixedTimeRange", "timeEnd"]) {
-                children.push(("TimeWindowClose", close.trim().to_owned()));
-            }
-            let info_box = InputFeature {
-                id: format!("~{INFORMATION_BOX}.{}", feature.id),
-                code: INFORMATION_BOX.into(),
-                object: None,
-                primitive: "Point",
-                spatials: vec![feature.spatials[0]],
-                scale_minimum: feature.scale_minimum,
+    if let Some(add_virtual) = options.virtual_features {
+        let extra = add_virtual(dataset, &features, &spatials, &mut |feature, message| {
+            notes.add(feature, message)
+        });
+        for v in extra {
+            let spatial = match v.geometry {
+                VirtualGeometry::Spatial(index) => index,
+                VirtualGeometry::Curve(coords) => {
+                    new_spatial(&mut spatials, SpatialKind::Curve, coords)
+                }
             };
-            info_boxes.push((info_box, children));
-        }
-        let route: Vec<Coord> = points
-            .iter()
-            .map(|(fi, _)| spatials[features[*fi].spatials[0]].coords[0])
-            .collect();
-        if route.len() >= 2 {
-            let curve = new_spatial(&mut spatials, SpatialKind::Curve, route);
+            if !v.children.is_empty() {
+                virtual_children.insert(features.len(), v.children);
+            }
             features.push(InputFeature {
-                id: format!("~{PLANNED_ROUTE}"),
-                code: PLANNED_ROUTE.into(),
+                id: v.id,
+                code: v.code,
                 object: None,
-                primitive: "Curve",
-                spatials: vec![curve],
-                scale_minimum: None,
+                primitive: v.primitive,
+                spatials: vec![spatial],
+                scale_minimum: v.scale_minimum,
             });
-        } else if !points.is_empty() {
-            notes.add(None, "Fewer than two control points; no planned route");
-        }
-        for (info_box, children) in info_boxes {
-            virtual_children.insert(features.len(), children);
-            features.push(info_box);
         }
     }
 
@@ -512,24 +491,6 @@ fn scale_minimum(object: &Object, notes: &mut Notes) -> Option<u32> {
             None
         }
     }
-}
-
-/// featureName/name with nameUsage 1 (default display), else the first.
-fn display_name(object: &Object) -> Option<String> {
-    let names: Vec<&Attribute> = object.attributes_named("featureName").collect();
-    let pick = names
-        .iter()
-        .find(|n| {
-            n.children()
-                .iter()
-                .any(|c| c.code == "nameUsage" && c.simple_value().map(str::trim) == Some("1"))
-        })
-        .or(names.first())?;
-    pick.children()
-        .iter()
-        .find(|c| c.code == "name")
-        .and_then(|c| c.text())
-        .map(|t| t.trim().to_owned())
 }
 
 fn write_attributes(builder: &mut Builder, attributes: &[Attribute]) {

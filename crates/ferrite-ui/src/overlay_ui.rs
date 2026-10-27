@@ -1,116 +1,14 @@
 //! Windows for overlay products shown over the ENC: the S-124 navigational
 //! warning list (S-124 2.0.0 clause 11.1.1) and the S-129 under keel clearance
-//! plan panel. The host owns the datasets and their evaluation; this module
-//! only draws the rows it is given and records requests, which the host
-//! consumes on the next frame.
+//! plan panel. The product modules define the panels' data models
+//! (`ferrite_s124::panel`, `ferrite_s129::panel`) and the host publishes them
+//! from the registered products; this module only draws the rows it is given
+//! and records requests, which the host consumes on the next frame.
 use crate::ui_chrome::Theme;
 
-/// User relevance classification (S-124 11.1.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NavwarnClassification {
-    #[default]
-    OnChart,
-    OffChart,
-    Information,
-}
-
-impl NavwarnClassification {
-    pub const ALL: [Self; 3] = [Self::OnChart, Self::OffChart, Self::Information];
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::OnChart => "On chart",
-            Self::OffChart => "Off chart",
-            Self::Information => "Information",
-        }
-    }
-}
-
-/// Listing order (S-124 11.1.1 b).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NavwarnSort {
-    #[default]
-    Received,
-    IssueTime,
-    WarningType,
-    ProducerSeries,
-    Classification,
-}
-
-impl NavwarnSort {
-    pub const ALL: [Self; 5] = [
-        Self::Received,
-        Self::IssueTime,
-        Self::WarningType,
-        Self::ProducerSeries,
-        Self::Classification,
-    ];
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Received => "Received",
-            Self::IssueTime => "Issue time",
-            Self::WarningType => "Warning type",
-            Self::ProducerSeries => "Producer / series",
-            Self::Classification => "Classification",
-        }
-    }
-}
-
-/// One NavwarnPart of a listed message.
-#[derive(Debug, Clone, Default)]
-pub struct NavwarnPartRow {
-    pub id: String,
-    /// Abbreviated warningInformation (11.1.1 g).
-    pub summary: String,
-    pub timing: String,
-    pub has_geometry: bool,
-}
-
-/// One listed S-124 dataset (message, bulletin or cancellation).
-#[derive(Debug, Clone, Default)]
-pub struct NavwarnRow {
-    /// Host dataset identity.
-    pub dataset: u32,
-    pub caption: String,
-    pub status: String,
-    pub cancelled: bool,
-    pub imported: bool,
-    /// New-message indication (11.1.1 c).
-    pub new: bool,
-    pub portrayed: bool,
-    pub received: String,
-    pub issued: String,
-    pub warning_type: String,
-    pub producer_series: String,
-    pub general_area: String,
-    pub classification: NavwarnClassification,
-    pub parts: Vec<NavwarnPartRow>,
-    pub source: String,
-}
-
-/// A control point of an S-129 plan.
-#[derive(Debug, Clone, Default)]
-pub struct ControlPointRow {
-    pub name: String,
-    pub eta: String,
-    pub window: String,
-    pub speed: String,
-    pub margin: String,
-}
-
-/// One loaded S-129 dataset.
-#[derive(Debug, Clone, Default)]
-pub struct UkcPlanRow {
-    pub dataset: u32,
-    pub name: String,
-    pub vessel: String,
-    pub draught: String,
-    pub purpose: String,
-    pub generation_time: String,
-    pub validity: String,
-    pub route: String,
-    pub control_points: Vec<ControlPointRow>,
-    pub issues: usize,
-}
+// The panels' data models belong to the product modules.
+pub use ferrite_s124::panel::{NavwarnClassification, NavwarnPartRow, NavwarnRow, NavwarnSort};
+pub use ferrite_s129::panel::{ControlPointRow, UkcPlanRow};
 
 #[derive(Debug, Clone, Default)]
 pub struct State {

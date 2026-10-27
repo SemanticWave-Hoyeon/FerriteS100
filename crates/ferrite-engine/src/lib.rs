@@ -24,6 +24,13 @@
 //! [`PortrayalSource::Precomputed`]) and `s102-hdf5` (S-102 with the HDF5 C
 //! library for local paths). `s102-pure` serves S-102 with the pure-Rust HDF5
 //! reader alone (wasm); with neither, S-102 inputs are reported as unsupported.
+//!
+//! Product modularization (`docs/ENGINE_DESIGN.md`, "제품 모듈화") moves each
+//! product into its own crate behind the common interface of
+//! `ferrite-product-api`. The GML products S-124 (`ferrite-s124`) and S-129
+//! (`ferrite-s129`) are registered in [`products`] behind the features `s124`
+//! and `s129` (on by default); the overlay layer ([`gml_overlay`]) is
+//! product-agnostic.
 
 pub mod catalogue;
 pub mod cell_source_identity;
@@ -42,6 +49,7 @@ pub mod platform;
 pub mod portrayal;
 pub mod portrayal_cache;
 pub mod primary_viewing_layers;
+pub mod products;
 pub mod s101_catalogue_selection;
 pub mod s101_lifecycle_metadata;
 pub mod s101_update_plan;
