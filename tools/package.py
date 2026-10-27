@@ -113,9 +113,14 @@ def main():
         return status
     executable = BINARY + (".exe" if os.name == "nt" else "")
     binary = build / profile / executable
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
+    # Empty the folder rather than removing it: a Finder window open on it
+    # recreates .DS_Store while the tree is deleted, which fails rmtree.
+    out.mkdir(parents=True, exist_ok=True)
+    for entry in out.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
     if platform.system() == "Darwin":
         result = mac_bundle(root, binary, out)
     else:
