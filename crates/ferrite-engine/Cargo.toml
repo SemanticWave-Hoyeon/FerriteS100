@@ -14,7 +14,7 @@ parallel = ["ferrite-kernel/parallel", "ferrite-render/parallel", "ferrite-s101/
 # mlua S-101 portrayal (needs lua54 or lua55, which select the interpreter).
 # Off: S-101 cells are portrayed from precomputed per-cell instruction
 # payloads in the cache store (`PortrayalSource::Precomputed`).
-lua-native = ["ferrite-lua/native", "ferrite-s102?/lua-native"]
+lua-native = ["ferrite-lua/native", "ferrite-s101/lua-native", "ferrite-s102?/lua-native"]
 lua54 = ["lua-native", "ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102?/lua54"]
 lua55 = ["lua-native", "ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102?/lua55"]
 # S-102 bathymetry with the pure-Rust HDF5 reader only (no C library;
@@ -39,7 +39,7 @@ s129 = ["dep:ferrite-s129"]
 # route store of ChartEngine.
 s421 = ["dep:ferrite-s421"]
 # Test-only helpers used by the application's own tests.
-test-support = []
+test-support = ["ferrite-s101/test-support"]
 
 [dependencies]
 anyhow.workspace = true

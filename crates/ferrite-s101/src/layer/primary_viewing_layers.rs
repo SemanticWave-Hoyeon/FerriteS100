@@ -33,16 +33,13 @@ impl<'a> PrimaryLayerPolicy<'a> {
             return Ok(HashSet::new());
         }
         // Strict existing leaf validation still checks IDs and every referenced group.
-        ferrite_s101::viewing_groups_for_layers(pc, self.ids.iter().map(String::as_str))
+        crate::viewing_groups_for_layers(pc, self.ids.iter().map(String::as_str))
     }
 }
 
 /// Explicit startup/Apply capture. Validate first; mutate only the private candidate.
 pub fn capture_primary(pc: &BoundPortrayalCatalogue, candidate: &mut SettingsState) -> Result<()> {
-    ferrite_s101::viewing_groups_for_layers(
-        pc,
-        candidate.viewing_layers.iter().map(String::as_str),
-    )?;
+    crate::viewing_groups_for_layers(pc, candidate.viewing_layers.iter().map(String::as_str))?;
     candidate.viewing_layer_owner = Some(*pc.source_digest());
     Ok(())
 }
@@ -118,8 +115,7 @@ mod tests {
         assert_eq!(resolve(&a, &s).unwrap(), HashSet::from([26]));
         assert!(resolve(&b, &s).unwrap().is_empty());
         let mut actual =
-            ferrite_s101::viewing_groups_for_preset(&b, ferrite_s101::DisplayPreset::Standard)
-                .unwrap();
+            crate::viewing_groups_for_preset(&b, crate::DisplayPreset::Standard).unwrap();
         let original = actual.clone();
         actual.extend(resolve(&b, &s).unwrap());
         assert_eq!(actual, original);
@@ -170,8 +166,7 @@ mod tests {
         let mut s = selected(&a);
         s.viewing_layers.clear();
         let mut groups =
-            ferrite_s101::viewing_groups_for_preset(&a, ferrite_s101::DisplayPreset::Standard)
-                .unwrap();
+            crate::viewing_groups_for_preset(&a, crate::DisplayPreset::Standard).unwrap();
         groups.extend(resolve(&a, &s).unwrap());
         assert!(groups.contains(&1));
         assert!(groups.contains(&2));

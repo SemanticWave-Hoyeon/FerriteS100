@@ -47,8 +47,10 @@ fn cell_bytes(root: &Path) -> Option<Vec<(PathBuf, Arc<[u8]>)>> {
 fn scene_payload(engine: &mut ChartEngine) -> anyhow::Result<Vec<u8>> {
     let scene = engine.prepare(&View::fit(800, 600))?;
     Ok(
-        ferrite_engine::portrayal_cache::encode_cache_payload(scene.context.raw_instructions())
-            .unwrap(),
+        ferrite_s101::layer::portrayal_cache::encode_cache_payload(
+            scene.context.raw_instructions(),
+        )
+        .unwrap(),
     )
 }
 

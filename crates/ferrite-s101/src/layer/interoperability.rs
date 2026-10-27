@@ -173,7 +173,7 @@ pub fn compose_vectors(
     let mut instructions = context.raw_instructions().to_vec();
     let mut changed = 0;
     for (index, cell) in cells.iter().enumerate() {
-        let plan = ferrite_s101::plan_interoperability_in(
+        let plan = crate::plan_interoperability_in(
             &ic.catalogue,
             level2.selection,
             cell,
@@ -211,7 +211,7 @@ pub fn compose_vectors_for_cells(
     let catalogues: Vec<&ferrite_feature_catalog::FeatureCatalogue> =
         fcs.iter().map(|fc| &***fc).collect();
     let mut instructions = context.raw_instructions().to_vec();
-    let plan = ferrite_s101::plan_interoperability_for_cells_in(
+    let plan = crate::plan_interoperability_for_cells_in(
         &ic.catalogue,
         level2.selection,
         cells,

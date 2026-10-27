@@ -387,7 +387,7 @@ impl WebEngineCore {
     /// built and chosen, or `auto` lacks a payload of an opened cell (then
     /// the preparation falls back to Lua for every cell).
     pub fn lua_needed(&mut self) -> bool {
-        if !LUA_AVAILABLE || self.engine.state().cells.is_empty() {
+        if !LUA_AVAILABLE || self.engine.state().s101.cells.is_empty() {
             return false;
         }
         match self.portrayal {
@@ -424,7 +424,7 @@ impl WebEngineCore {
         payload_sha256: Option<&[u8]>,
     ) -> Result<()> {
         let verified = payload_sha256.is_some_and(|digest| {
-            ferrite_engine::portrayal_cache::stored_digest(bytes) == Some(digest)
+            ferrite_s101::layer::portrayal_cache::stored_digest(bytes) == Some(digest)
         });
         if name.starts_with(".ferrite_pre_") {
             return self.load_precomputed_checked(name, bytes, verified);
@@ -636,7 +636,7 @@ impl WebEngineCore {
             Err(error) => return Err(error),
         };
         self.used_source =
-            (!self.engine.state().cells.is_empty()).then(|| self.engine.portrayal_source());
+            (!self.engine.state().s101.cells.is_empty()).then(|| self.engine.portrayal_source());
         Arc::try_unwrap(scene).map_err(|_| anyhow::anyhow!("Prepared scene is shared"))
     }
 
@@ -665,9 +665,9 @@ impl WebEngineCore {
             "palette": self.engine.display().profile,
             "portrayal": self.used_source.map(source_name),
             "reprojected": reprojected,
-            "resident_cells": self.engine.state().resident_cells.as_ref()
+            "resident_cells": self.engine.state().s101.resident_cells.as_ref()
                 .map(|r| r.iter().filter(|r| **r).count()),
-            "cells": self.engine.state().cells.len(),
+            "cells": self.engine.state().s101.cells.len(),
             "bathymetry_files": self.engine.state().bathymetry_extents().len(),
             // Cache entries read by this preparation (per-cell portrayal
             // caches and precomputed payloads): hits skip Lua.
@@ -698,16 +698,17 @@ impl WebEngineCore {
         use ferrite_lua::{CellData, PortrayalEngine, TypeCatalogue};
         use std::fmt::Write as _;
         let state = self.engine.state();
-        let context = ferrite_engine::portrayal::validated_lua_context(
-            &state.pc,
+        let context = ferrite_s101::layer::portrayal::validated_lua_context(
+            &state.s101.pc,
             Some(&self.engine.display().settings),
         )?;
-        let mut engine = PortrayalEngine::new_with_sources(state.pc.sources())?;
-        engine
-            .set_shared_type_catalogue(Arc::new(TypeCatalogue::from_feature_catalogue(&state.fc)));
+        let mut engine = PortrayalEngine::new_with_sources(state.s101.pc.sources())?;
+        engine.set_shared_type_catalogue(Arc::new(TypeCatalogue::from_feature_catalogue(
+            &state.s101.fc,
+        )));
         engine.initialize()?;
         let mut out = String::new();
-        for (index, cell) in state.cells.iter().enumerate() {
+        for (index, cell) in state.s101.cells.iter().enumerate() {
             let (_, emitted) = engine
                 .process_owned_cell_recording(CellData::from_cell(cell), context.clone())
                 .with_context(|| format!("Portrayal of {} failed", cell.dsid.dataset_name))?;
@@ -848,7 +849,9 @@ mod tests {
     /// missing digest leaves the check to the engine.
     #[test]
     fn host_digest_marks_matching_entries_checked() {
-        use ferrite_engine::portrayal_cache::{encode_cache_payload, stored_digest, wrap_cache};
+        use ferrite_s101::layer::portrayal_cache::{
+            encode_cache_payload, stored_digest, wrap_cache,
+        };
         let root = repository();
         let mut core = WebEngineCore::new(catalogue_files(&root), Arc::new(SystemClock)).unwrap();
         let file = wrap_cache(&encode_cache_payload(&[]).unwrap());

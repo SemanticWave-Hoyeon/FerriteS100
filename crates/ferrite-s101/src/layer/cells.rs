@@ -215,7 +215,7 @@ mod updated_chart_bounds_tests {
 #[cfg(test)]
 mod manual_catalogue_normalization_tests {
     use super::*;
-    use crate::{dataset_signature_policy, s101_update_plan};
+    use crate::layer::{signatures as dataset_signature_policy, update_plan as s101_update_plan};
     fn cell() -> S101Cell {
         S101Cell {
             file_path: PathBuf::from("original.000"),

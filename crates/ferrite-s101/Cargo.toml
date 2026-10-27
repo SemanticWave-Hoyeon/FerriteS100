@@ -11,8 +11,14 @@ crypto-openssl = ["ferrite-interoperability/crypto-openssl"]
 crypto-rust = ["ferrite-interoperability/crypto-rust"]
 # Parallel coverage projection (rayon); off: sequential, identical results.
 parallel = ["ferrite-kernel/parallel", "ferrite-render/parallel"]
-lua54 = ["ferrite-lua/lua54"]
-lua55 = ["ferrite-lua/lua55"]
+# mlua cell portrayal of the product layer (selected by lua54/lua55). Off:
+# cells are portrayed from precomputed per-cell instruction payloads
+# (`layer::PortrayalSource::Precomputed`).
+lua-native = ["ferrite-lua/native"]
+lua54 = ["lua-native", "ferrite-lua/lua54"]
+lua55 = ["lua-native", "ferrite-lua/lua55"]
+# Path-based update planning helpers used by the application's own tests.
+test-support = []
 
 [dependencies]
 rustc-hash.workspace = true
@@ -31,5 +37,19 @@ ferrite-interoperability.workspace = true
 ferrite-iso8211.workspace = true
 chrono.workspace = true
 
-[dev-dependencies]
+# Product layer (`layer`): update planning, lifecycle metadata, exchange-set
+# checks, catalogue selection, publication, caches and cell portrayal.
+ferrite-product-api = { path = "../ferrite-product-api" }
+ferrite-security.workspace = true
+bincode.workspace = true
+roxmltree = "=0.20.0"
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+# Test-only actual ECDSA fixture; already used by ferrite-security.
+openssl = { version = "0.10", features = ["vendored"] }
+base64 = "=0.22.1"
+tempfile = "3"

@@ -1727,6 +1727,7 @@ dependencies = [
  "ferrite-kernel",
  "ferrite-portrayal-catalog",
  "ferrite-render",
+ "walkdir",
 ]
 
 [[package]]
@@ -1844,6 +1845,8 @@ name = "ferrite-s101"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bincode",
  "chrono",
  "ferrite-feature-catalog",
  "ferrite-interoperability",
@@ -1851,11 +1854,19 @@ dependencies = [
  "ferrite-kernel",
  "ferrite-lua",
  "ferrite-portrayal-catalog",
+ "ferrite-product-api",
  "ferrite-render",
  "ferrite-s100-core",
+ "ferrite-security",
+ "openssl",
+ "roxmltree",
  "rustc-hash 2.1.1",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -2010,6 +2021,7 @@ dependencies = [
  "ferrite-gpu",
  "ferrite-lua",
  "ferrite-render",
+ "ferrite-s101",
  "js-sys",
  "serde_json",
  "tracing",

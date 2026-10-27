@@ -147,6 +147,7 @@ pub fn inspection_json(engine: &ChartEngine, report: &OpenReport) -> Value {
 pub fn palettes(engine: &ChartEngine) -> Vec<String> {
     let mut names: Vec<_> = engine
         .state()
+        .s101
         .pc
         .color_profiles
         .profiles
@@ -262,7 +263,7 @@ impl SceneEmitter {
         let state = engine.state();
         let display = engine.display();
         let profile = display.profile.as_str();
-        let pc = &state.pc;
+        let pc = &state.s101.pc;
         let key = (*pc.source_digest(), profile.to_string());
         let color_profile = pc
             .color_profiles
@@ -285,6 +286,7 @@ impl SceneEmitter {
             renderer.background_color = ferrite_s101::lookup_pc_color(pc, "DEPDW", profile);
             // Producer reference scales; zero denotes unknown (as the viewer).
             let reference_scale = state
+                .s101
                 .cells
                 .iter()
                 .filter_map(|cell| {
@@ -306,32 +308,35 @@ impl SceneEmitter {
                 ));
             }
             let visible = state.viewing_groups(&display.settings)?;
-            let resources =
-                if state.requires_cell_resources(&scene.catalogue_registry, &state.fc, pc)? {
-                    // Cells of other catalogue editions draw with their own owners.
-                    let bindings = state
-                        .cell_resource_bindings(&scene.catalogue_registry, &display.settings)?
-                        .into_iter()
-                        .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
-                            cell_index: binding.cell_index,
-                            catalogue: binding.catalogue,
-                            shallow_pattern: binding.shallow_pattern,
-                        })
-                        .collect::<Vec<_>>();
-                    let mut resources =
-                        ferrite_gpu::CellPortrayalResources::prepare(&bindings, profile, 4096)?;
-                    for index in 0..state.cells.len() {
-                        let groups = state.cell_viewing_groups(
-                            &scene.catalogue_registry,
-                            index,
-                            &display.settings,
-                        )?;
-                        resources.capture_viewing_groups_for_cell(index, Some(groups))?;
-                    }
-                    Some(resources)
-                } else {
-                    None
-                };
+            let resources = if state.s101.requires_cell_resources(
+                &scene.catalogue_registry,
+                &state.s101.fc,
+                pc,
+            )? {
+                // Cells of other catalogue editions draw with their own owners.
+                let bindings = state
+                    .cell_resource_bindings(&scene.catalogue_registry, &display.settings)?
+                    .into_iter()
+                    .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
+                        cell_index: binding.cell_index,
+                        catalogue: binding.catalogue,
+                        shallow_pattern: binding.shallow_pattern,
+                    })
+                    .collect::<Vec<_>>();
+                let mut resources =
+                    ferrite_gpu::CellPortrayalResources::prepare(&bindings, profile, 4096)?;
+                for index in 0..state.s101.cells.len() {
+                    let groups = state.cell_viewing_groups(
+                        &scene.catalogue_registry,
+                        index,
+                        &display.settings,
+                    )?;
+                    resources.capture_viewing_groups_for_cell(index, Some(groups))?;
+                }
+                Some(resources)
+            } else {
+                None
+            };
             timings.setup_ms = ms(started);
             let prefill = ferrite_kernel::time::Instant::now();
             if resources.is_none() {
@@ -426,7 +431,7 @@ impl SceneEmitter {
         let suppress = engine.display().settings.interoperability_enabled
             && state.ic.as_ref().is_some_and(|ic| {
                 let mut displayed = Vec::new();
-                if !state.cells.is_empty() {
+                if !state.s101.cells.is_empty() {
                     displayed.push("S-101");
                 }
                 if !state.bathymetry_extents().is_empty() {

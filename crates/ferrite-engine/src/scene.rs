@@ -1,14 +1,15 @@
 //! The renderer-agnostic product of a portrayal: the prepared scene a host
 //! renderer attaches its GPU resources to, and the description of the
 //! per-cell portrayal resources it needs.
-use crate::s101_catalogue_selection::DatasetCatalogueRegistry;
 use crate::state::EngineState;
-use crate::{portrayal::validated_lua_context, primary_viewing_layers};
 use anyhow::{Context, Result};
 use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
 use ferrite_render::host_settings::{DisplayMode, SettingsState};
 use ferrite_render::RenderContext;
 use ferrite_s101::coverage_projection::GeographicCoverageInventory;
+use ferrite_s101::layer::catalogue_selection::DatasetCatalogueRegistry;
+use ferrite_s101::layer::S101Layer;
+use ferrite_s101::layer::{portrayal::validated_lua_context, primary_viewing_layers};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -54,12 +55,13 @@ impl EngineState {
         registry: &DatasetCatalogueRegistry,
         settings: &SettingsState,
     ) -> Result<Vec<CellResourceBinding>> {
-        self.cells
+        self.s101
+            .cells
             .iter()
             .enumerate()
             .map(|(cell_index, cell)| {
                 let owner = registry
-                    .owner_for(&EngineState::catalogue_dataset_key(&cell.dsid)?)
+                    .owner_for(&S101Layer::catalogue_dataset_key(&cell.dsid)?)
                     .context("Missing cell PC resource owner")?;
                 validated_lua_context(owner.pc(), Some(settings))?;
                 Ok(CellResourceBinding {
@@ -80,8 +82,8 @@ impl EngineState {
             DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
             DisplayMode::All => ferrite_s101::DisplayPreset::Other,
         };
-        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.pc, preset)?;
-        groups.extend(primary_viewing_layers::resolve(&self.pc, settings)?);
+        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.s101.pc, preset)?;
+        groups.extend(primary_viewing_layers::resolve(&self.s101.pc, settings)?);
         Ok(groups)
     }
 
@@ -93,14 +95,14 @@ impl EngineState {
         index: usize,
         settings: &SettingsState,
     ) -> Result<HashSet<u32>> {
-        let cell = self.cells.get(index).context("Missing cell")?;
+        let cell = self.s101.cells.get(index).context("Missing cell")?;
         let preset = match settings.display_mode {
             DisplayMode::Base => ferrite_s101::DisplayPreset::Base,
             DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
             DisplayMode::All => ferrite_s101::DisplayPreset::Other,
         };
         let owner = registry
-            .owner_for(&EngineState::catalogue_dataset_key(&cell.dsid)?)
+            .owner_for(&S101Layer::catalogue_dataset_key(&cell.dsid)?)
             .context("Missing cell viewing-group owner")?;
         let mut groups = ferrite_s101::viewing_groups_for_preset(owner.pc(), preset)?;
         groups.extend(primary_viewing_layers::resolve(owner.pc(), settings)?);

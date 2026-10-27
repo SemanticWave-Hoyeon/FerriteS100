@@ -1,5 +1,5 @@
 //! Exact representation correspondence, not a general geographic equivalence oracle.
-use crate::s101_xc_coverage::{XcDataCoverage, XcScale};
+use crate::layer::xc_coverage::{XcDataCoverage, XcScale};
 use anyhow::{ensure, Context, Result};
 use ferrite_s100_core::{OrientedCurve, S101Cell, SegmentType};
 use std::collections::{BTreeMap, BTreeSet};
@@ -310,7 +310,7 @@ pub fn compare(bytes: &[u8], rows: &[XcDataCoverage], cell: &S101Cell) -> Result
     }
     total = 0;
     let mut actual = BTreeMap::new();
-    for (key, s) in ferrite_s101::coverage_scale::cell_scales(cell)? {
+    for (key, s) in crate::coverage_scale::cell_scales(cell)? {
         let feature = &cell.features[&key];
         if feature.primitive_type != ferrite_s100_core::SpatialPrimitiveType::Surface
             || feature.spatial_associations.len() != 1

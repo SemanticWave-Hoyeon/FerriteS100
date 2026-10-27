@@ -1,6 +1,7 @@
 //! S-101 product adapter: official Lua output to product-neutral display instructions.
 //! No window, application settings, file dialogs, or GPU dependency belongs here.
 pub mod cancellation;
+pub mod layer;
 
 use ferrite_portrayal_catalog::PortrayalCatalogue;
 use ferrite_render::{

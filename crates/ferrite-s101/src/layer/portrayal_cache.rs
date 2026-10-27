@@ -1,7 +1,7 @@
 //! Per-cell portrayal instruction cache format: magic, schema version and a
 //! SHA-256 corruption check around a bincode instruction payload.
-use crate::platform::CacheStore;
-use crate::secure_instruction_cache;
+use ferrite_product_api::platform as secure_instruction_cache;
+use ferrite_product_api::platform::CacheStore;
 use ferrite_render::DrawingInstruction;
 use sha2::{Digest, Sha256};
 
@@ -58,7 +58,7 @@ pub fn read_and_deserialize_cache(
 /// The payload SHA-256 stored in a cache file (`[8..40]` after the magic
 /// and schema version), None when `data` is no cache file. A host that
 /// hashed the payload (`data[40..]`) itself can compare it with this and
-/// store the entry as checked ([`crate::platform::MemoryCacheStore::write_verified`]).
+/// store the entry as checked ([`ferrite_product_api::platform::MemoryCacheStore::write_verified`]).
 pub fn stored_digest(data: &[u8]) -> Option<&[u8]> {
     (data.len() >= 40 && &data[..4] == CACHE_MAGIC).then(|| &data[8..40])
 }
@@ -213,71 +213,6 @@ mod instruction_cache_schema_tests {
         assert!(verify_and_deserialize_cache(&wrap_cache(&payload))
             .unwrap_err()
             .contains("deserialization failed"));
-    }
-
-    /// An in-memory store remembers a passed SHA-256 check per write: the
-    /// next read of the same bytes skips it, a rewrite checks again, and a
-    /// corrupted entry is still rejected. Host-checked entries
-    /// (`write_verified`) start checked; stores without memory (the default
-    /// `read_entry`) check every read.
-    #[test]
-    fn memory_store_remembers_integrity_checks_per_write() {
-        use crate::platform::{CacheStore, MemoryCacheStore, NoCacheStore};
-        use ferrite_render::PointInstruction;
-        use std::path::Path;
-        let instructions = vec![DrawingInstruction::Point(PointInstruction::new(
-            "S".into(),
-            WorldPoint::new(1., 2.),
-        ))];
-        let file = wrap_cache(&encode_cache_payload(&instructions).unwrap());
-        assert_eq!(stored_digest(&file), Some(&Sha256::digest(&file[40..])[..]));
-        assert_eq!(stored_digest(b"FRC"), None);
-        let store = MemoryCacheStore::default();
-        let path = Path::new("/memory-cache/portrayal-v1/.ferrite_cell_x.bin");
-        store.write(path, &file).unwrap();
-        assert!(!store.read_entry(path).unwrap().verified);
-        assert_eq!(
-            read_and_deserialize_cache(&store, path)
-                .unwrap()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(store.read_entry(path).unwrap().verified);
-        assert_eq!(
-            read_and_deserialize_cache(&store, path)
-                .unwrap()
-                .unwrap()
-                .len(),
-            1
-        );
-        // A rewrite (here corrupted) is checked again and rejected.
-        let mut corrupted = file.clone();
-        *corrupted.last_mut().unwrap() ^= 1;
-        store.write(path, &corrupted).unwrap();
-        assert!(!store.read_entry(path).unwrap().verified);
-        assert!(read_and_deserialize_cache(&store, path)
-            .unwrap()
-            .unwrap_err()
-            .contains("SHA-256"));
-        assert!(!store.read_entry(path).unwrap().verified);
-        // A check recorded for an earlier write does not carry over.
-        let stale = store.read_entry(path).unwrap().version.unwrap();
-        store.write(path, &file).unwrap();
-        store.mark_verified(path, stale);
-        assert!(!store.read_entry(path).unwrap().verified);
-        // Entries the host checked start verified; magic and schema
-        // version are still checked.
-        store.write_verified(path, &file).unwrap();
-        assert!(store.read_entry(path).unwrap().verified);
-        let mut old_schema = file.clone();
-        old_schema[4] ^= 1;
-        store.write_verified(path, &old_schema).unwrap();
-        assert!(read_and_deserialize_cache(&store, path)
-            .unwrap()
-            .unwrap_err()
-            .contains("schema"));
-        assert!(read_and_deserialize_cache(&NoCacheStore, path).is_err());
     }
 
     /// Large cells are written as segments decoded in parallel; the result

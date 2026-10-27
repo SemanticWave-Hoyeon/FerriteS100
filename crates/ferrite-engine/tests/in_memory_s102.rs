@@ -174,7 +174,7 @@ fn prepare_with_lua_then_precomputed(mut engine: ChartEngine, cache: Arc<MemoryC
         );
     }
     let mut precomputed = new_engine(memory, cache);
-    precomputed.set_portrayal_source(ferrite_engine::portrayal::PortrayalSource::Precomputed);
+    precomputed.set_portrayal_source(ferrite_engine::PortrayalSource::Precomputed);
     precomputed
         .open_blocking(DatasetSource::Folder(mem("/mem/data")))
         .unwrap();
@@ -186,7 +186,7 @@ fn prepare_with_lua_then_precomputed(mut engine: ChartEngine, cache: Arc<MemoryC
     catalogues(&mut memory, &["FC/S-101", "PC/S-101", "PC/S-102"]);
     memory.insert(mem("/mem/data/a.H5"), std::fs::read(shom(1)).unwrap());
     let mut cold = new_engine(memory, Arc::new(MemoryCacheStore::default()));
-    cold.set_portrayal_source(ferrite_engine::portrayal::PortrayalSource::Precomputed);
+    cold.set_portrayal_source(ferrite_engine::PortrayalSource::Precomputed);
     cold.open_blocking(DatasetSource::Folder(mem("/mem/data")))
         .unwrap();
     let error = cold.prepare(&View::fit(800, 600)).err().unwrap();

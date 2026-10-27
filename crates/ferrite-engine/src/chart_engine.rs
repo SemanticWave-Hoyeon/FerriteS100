@@ -28,25 +28,23 @@
 //! platform user store's cancellation history. Opening runs as a background
 //! job on the platform executor; its result is installed on the owner
 //! thread, like the viewer's publication.
-use crate::catalogue::{
-    load_feature_catalogue_from, load_portrayal_catalogue_from, validate_fc, validate_pc,
-};
-use crate::chart_cells::chart_data_bounds;
-use crate::chart_publication::{
-    CancellationHistory, CancellationRecord, HistoryStore, ValidatedRemoval,
-};
+use crate::catalogue::{load_feature_catalogue_from, load_portrayal_catalogue_from};
 use crate::gml_overlay::{self, GmlOverlays, Provenance, SymbolRegistrar};
 use crate::pick::{find_features_at, FeatureReport, GeometryPicker, PickCandidate, PickSurface};
 use crate::platform::{parallel_map, EntryKind, Platform};
-use crate::portrayal::{AreaTriangulator, PortrayalChangeRequest, PortrayalSource};
 #[cfg(feature = "s421")]
 use crate::products::s421::{CapturedRouteInput, S421Layer, S421};
+use ferrite_s101::layer::cells::chart_data_bounds;
+use ferrite_s101::layer::portrayal::{AreaTriangulator, PortrayalChangeRequest, PortrayalSource};
+use ferrite_s101::layer::publication::{
+    CancellationHistory, CancellationRecord, HistoryStore, ValidatedRemoval,
+};
 /// Without the S-421 product no route is captured.
 #[cfg(not(feature = "s421"))]
 type CapturedRouteInput = std::convert::Infallible;
 use crate::scene::{prepare_flat_coverage, PreparedScene};
 use crate::state::{EngineState, ViewportPixels};
-use crate::{dataset_signature_policy, s101_update_plan, CellHydrationSource, ChartLoadResult};
+use crate::{dataset_signature_policy, CellHydrationSource, ChartLoadResult};
 use anyhow::{bail, ensure, Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
 use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
@@ -54,6 +52,9 @@ use ferrite_product_api::{DatasetInput, Opened, PortrayalRequest, ProductLayer};
 use ferrite_render::host_settings::SettingsState;
 use ferrite_render::GeoBounds;
 use ferrite_s100_core::{DatasetIdentification, S101Cell};
+use ferrite_s101::layer::catalogue::{validate_fc, validate_pc};
+use ferrite_s101::layer::update_plan as s101_update_plan;
+use ferrite_s101::layer::{Inserted, S101Layer};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -480,7 +481,7 @@ impl ChartEngine {
     /// (`FERRITE_RESIDENCY_THRESHOLD` or 1,500,000; 0 always activates it).
     /// Applies from the next [`Self::prepare`].
     pub fn set_residency_threshold(&mut self, threshold: Option<usize>) {
-        self.state.residency_threshold_override = threshold;
+        self.state.s101.residency_threshold_override = threshold;
     }
 
     /// The chart state (cells, catalogues, coverage).
@@ -523,16 +524,16 @@ impl ChartEngine {
     /// Where S-101 cell instructions come from (default: Lua when the
     /// `lua-native` feature is built, otherwise precomputed payloads).
     pub fn portrayal_source(&self) -> PortrayalSource {
-        self.state.portrayal_source
+        self.state.s101.portrayal_source
     }
     pub fn set_portrayal_source(&mut self, source: PortrayalSource) {
-        self.state.portrayal_source = source;
+        self.state.s101.portrayal_source = source;
     }
     /// Export: also write a precomputed payload of every cell the following
     /// preparations portray with Lua to the platform cache store, for hosts
     /// without Lua ([`PortrayalSource::Precomputed`]).
     pub fn set_precomputed_export(&mut self, export: bool) {
-        self.state.precomputed_export = export;
+        self.state.s101.precomputed_export = export;
     }
 
     /// Geographic extent of `camera` in `viewport` over the loaded data, and
@@ -600,14 +601,15 @@ impl ChartEngine {
             source,
             signatures: self.signatures,
             trust_anchors: Arc::clone(&self.trust_anchors),
-            fc: Arc::clone(&self.state.fc),
-            pc: Arc::clone(&self.state.pc),
-            decoded: Arc::clone(&self.state.decoded_chart_cache),
+            fc: Arc::clone(&self.state.s101.fc),
+            pc: Arc::clone(&self.state.s101.pc),
+            decoded: Arc::clone(&self.state.s101.decoded_chart_cache),
             overlay_products: self.overlays.has_catalogues(),
-            inventory: self.state.catalogue_inventory.clone(),
-            loaded: self.loaded_datasets(),
+            inventory: self.state.s101.catalogue_inventory.clone(),
+            loaded: self.state.s101.loaded_datasets(),
             loaded_inputs: self
                 .state
+                .s101
                 .loaded_chain_paths
                 .iter()
                 .flatten()
@@ -626,22 +628,6 @@ impl ChartEngine {
             worker.done.notify_all();
         }));
         OpenJob { shared }
-    }
-
-    /// The loaded logical datasets explicit cancellations are planned against.
-    fn loaded_datasets(&self) -> s101_update_plan::LoadedDatasets {
-        let mut loaded = BTreeMap::new();
-        for (index, cell) in self.state.cells.iter().enumerate() {
-            let (Ok(key), Some(identity)) = (
-                s101_update_plan::dataset_key(&cell.dsid),
-                self.state.loaded_source_identities.get(index),
-            ) else {
-                continue;
-            };
-            let metadata = self.state.loaded_discovery.get(&key).cloned().flatten();
-            loaded.insert(key, (cell.dsid.clone(), identity, metadata));
-        }
-        loaded
     }
 
     /// Validate the job's cancellations against the current cells and a
@@ -683,7 +669,7 @@ impl ChartEngine {
                 "Same dataset cannot be loaded and cancelled in one batch: {}",
                 path.display()
             );
-            let index = self.state.cells.iter().position(|cell| {
+            let index = self.state.s101.cells.iter().position(|cell| {
                 s101_update_plan::dataset_key(&cell.dsid).is_ok_and(|key| &key == removal.key())
             });
             if removal.removes_content() {
@@ -692,8 +678,8 @@ impl ChartEngine {
                 })?;
                 ensure!(
                     removal.targets(
-                        &self.state.cells[index].dsid,
-                        self.state.loaded_source_identities.get(index)
+                        &self.state.s101.cells[index].dsid,
+                        self.state.s101.loaded_source_identities.get(index)
                     ),
                     "Cancellation target changed after validation: {}",
                     path.display()
@@ -719,13 +705,8 @@ impl ChartEngine {
         store.persist(records.clone())?;
         targets.sort_unstable();
         for index in targets.into_iter().rev() {
-            let cell = self.state.cells.remove(index);
-            self.state.loaded_source_identities.remove(index);
-            self.state.loaded_chain_paths.remove(index);
+            let cell = self.state.s101.remove_dataset(index);
             self.provenance.remove(index);
-            if let Ok(key) = s101_update_plan::dataset_key(&cell.dsid) {
-                self.state.loaded_discovery.remove(&key);
-            }
             report.notices.push(format!(
                 "Cancelled S-101 dataset {} (edition {}, update {})",
                 cell.dsid.dataset_name, cell.dsid.edition_number, cell.dsid.update_number
@@ -754,8 +735,8 @@ impl ChartEngine {
         ensure!(
             opened.catalogues
                 == (
-                    *self.state.fc.source_digest(),
-                    *self.state.pc.source_digest()
+                    *self.state.s101.fc.source_digest(),
+                    *self.state.s101.pc.source_digest()
                 ),
             "Bound catalogues changed while loading; reopen the datasets"
         );
@@ -785,80 +766,26 @@ impl ChartEngine {
             match route {}
         }
         let mut added = 0usize;
-        let mut loaded: HashSet<[u8; 32]> = (0..self.state.cells.len())
-            .filter_map(|i| self.state.cell_identity_sha(i))
-            .collect();
-        let mut keys: BTreeMap<(String, String), usize> = BTreeMap::new();
-        for (index, cell) in self.state.cells.iter().enumerate() {
-            if let Ok(key) = s101_update_plan::dataset_key(&cell.dsid) {
-                keys.insert(key, index);
-            }
-        }
+        let mut batch = self.state.s101.begin_batch();
         for (result, provenance) in opened.cells {
-            let ChartLoadResult {
-                metadata,
-                input_paths,
-                cell,
-                source_identity,
-                hydration,
-                ..
-            } = result;
-            if !loaded.insert(*source_identity.sha256()) {
-                report
-                    .notices
-                    .push(format!("Already open: {}", cell.file_path.display()));
-                continue;
+            match self.state.s101.insert_loaded(&mut batch, result)? {
+                Inserted::AlreadyOpen(path) => {
+                    report
+                        .notices
+                        .push(format!("Already open: {}", path.display()));
+                }
+                Inserted::Added { replaced } => {
+                    if let Some(index) = replaced {
+                        self.provenance.remove(index);
+                    }
+                    self.provenance.push(provenance);
+                    added += 1;
+                }
             }
-            let key = s101_update_plan::dataset_key(&cell.dsid)?;
-            if let Some(&index) = keys.get(&key) {
-                let loaded = &self.state.cells[index].dsid;
-                ensure!(
-                    (cell.dsid.edition_number, cell.dsid.update_number)
-                        >= (loaded.edition_number, loaded.update_number),
-                    "{} would downgrade a loaded edition/update",
-                    cell.file_path.display()
-                );
-                // A newer edition/update replaces the loaded dataset.
-                self.state.cells.remove(index);
-                self.state.loaded_source_identities.remove(index);
-                self.state.loaded_chain_paths.remove(index);
-                self.provenance.remove(index);
-                keys = self
-                    .state
-                    .cells
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| Some((s101_update_plan::dataset_key(&c.dsid).ok()?, i)))
-                    .collect();
-            }
-            if let Some(source) = hydration {
-                self.state.cell_hydration.insert(
-                    *source_identity.sha256(),
-                    crate::CellHydration {
-                        source,
-                        released: None,
-                        verify: None,
-                    },
-                );
-            }
-            self.state.loaded_discovery.insert(key.clone(), metadata);
-            self.state.loaded_chain_paths.push(input_paths);
-            self.state.loaded_source_identities.push(source_identity);
-            keys.insert(key, self.state.cells.len());
-            self.state.cells.push(cell);
-            self.provenance.push(provenance);
-            added += 1;
         }
-        self.state.prune_cell_hydration();
-        if !self.state.cells.is_empty() {
-            self.state.catalogue_registry =
-                self.state
-                    .prepare_catalogue_registry(&self.state.fc, &self.state.pc, true)?;
-        } else {
-            self.state.catalogue_registry = Default::default();
-        }
-        let first_new = self.state.cells.len() - added;
-        for (index, cell) in self.state.cells.iter().enumerate().skip(first_new) {
+        self.state.s101.finish_batch()?;
+        let first_new = self.state.s101.cells.len() - added;
+        for (index, cell) in self.state.s101.cells.iter().enumerate().skip(first_new) {
             report.datasets.push(self.cell_summary(index, cell));
         }
         for (path, bytes, provenance) in opened.overlays {
@@ -893,10 +820,10 @@ impl ChartEngine {
 
     fn data_bounds(&self) -> GeoBounds {
         let bathymetry = self.state.bathymetry_extents();
-        if !self.state.cells.is_empty() || !bathymetry.is_empty() {
+        if !self.state.s101.cells.is_empty() || !bathymetry.is_empty() {
             // The viewer's all-data view: the data extent (S-101 cells and
             // S-102 rasters) with a margin.
-            let mut bounds = chart_data_bounds(&self.state.cells, bathymetry);
+            let mut bounds = chart_data_bounds(&self.state.s101.cells, bathymetry);
             bounds.expand_by_percent(0.1);
             return bounds;
         }
@@ -912,7 +839,7 @@ impl ChartEngine {
             name: cell.dsid.dataset_name.clone(),
             source: Some(cell.file_path.clone()),
             edition: format!("{}.{}", cell.dsid.edition_number, cell.dsid.update_number),
-            features: self.state.cell_feature_count(index),
+            features: self.state.s101.cell_feature_count(index),
             provenance: self.provenance.get(index).cloned().unwrap_or_default(),
         }
     }
@@ -921,6 +848,7 @@ impl ChartEngine {
     pub fn datasets(&self) -> Vec<DatasetSummary> {
         let mut out: Vec<_> = self
             .state
+            .s101
             .cells
             .iter()
             .enumerate()
@@ -935,7 +863,7 @@ impl ChartEngine {
         let mut counts = BTreeMap::new();
         match id {
             DatasetId::Cell(index) => {
-                if let Some(cell) = self.state.cells.get(index) {
+                if let Some(cell) = self.state.s101.cells.get(index) {
                     for feature in cell.features.values() {
                         let code = feature.feature_code.clone().unwrap_or_else(|| "?".into());
                         *counts.entry(code).or_default() += 1;
@@ -971,11 +899,11 @@ impl ChartEngine {
     pub fn exchange_set_checks(&self) -> (Vec<ValidationIssue>, Vec<String>) {
         let mut issues = Vec::new();
         let mut notices = Vec::new();
-        for cell in &self.state.cells {
+        for cell in &self.state.s101.cells {
             let subject = cell.file_path.display().to_string();
             let metadata = s101_update_plan::dataset_key(&cell.dsid)
                 .ok()
-                .and_then(|key| self.state.loaded_discovery.get(&key))
+                .and_then(|key| self.state.s101.loaded_discovery.get(&key))
                 .and_then(Option::as_ref);
             let Some(metadata) = metadata else {
                 notices.push(format!(
@@ -1021,6 +949,7 @@ impl ChartEngine {
     pub fn set_display(&mut self, display: DisplayOptions) -> Result<()> {
         ensure!(
             self.state
+                .s101
                 .pc
                 .color_profiles
                 .profiles
@@ -1028,7 +957,10 @@ impl ChartEngine {
             "Portrayal catalogue has no colour profile {}",
             display.profile
         );
-        crate::portrayal::validated_lua_context(&self.state.pc, Some(&display.settings))?;
+        ferrite_s101::layer::portrayal::validated_lua_context(
+            &self.state.s101.pc,
+            Some(&display.settings),
+        )?;
         self.display = display;
         Ok(())
     }
@@ -1063,8 +995,11 @@ impl ChartEngine {
             .scaler
             .set_pixel_ratio(scale_factor);
 
-        let (fc, pc) = (Arc::clone(&self.state.fc), Arc::clone(&self.state.pc));
-        let (mut context, coverage, registry, ic_changed) = if self.state.cells.is_empty() {
+        let (fc, pc) = (
+            Arc::clone(&self.state.s101.fc),
+            Arc::clone(&self.state.s101.pc),
+        );
+        let (mut context, coverage, registry, ic_changed) = if self.state.s101.cells.is_empty() {
             let mut context = self.state.render_context.empty_for_rebuild();
             context.set_bounds(self.state.bounds);
             (
@@ -1076,8 +1011,12 @@ impl ChartEngine {
                 0,
             )
         } else {
-            let registry = self.state.prepare_catalogue_registry(&fc, &pc, true)?;
-            if self.state.requires_cell_resources(&registry, &fc, &pc)? {
+            let registry = self.state.s101.prepare_catalogue_registry(&fc, &pc, true)?;
+            if self
+                .state
+                .s101
+                .requires_cell_resources(&registry, &fc, &pc)?
+            {
                 // Cells owned by other installed catalogues: per-owner portrayal.
                 let coverage = self
                     .state
@@ -1141,8 +1080,8 @@ impl ChartEngine {
             crate::s102_host::prepare(&self.state, &self.display.profile, &settings, &self.s102)?
                 .into_iter()
                 .collect();
-        self.state.catalogue_registry = registry.clone();
-        self.state.coverage_inventory = Some(Arc::clone(&coverage));
+        self.state.s101.catalogue_registry = registry.clone();
+        self.state.s101.coverage_inventory = Some(Arc::clone(&coverage));
         self.state.ic_assigned_vectors = ic_changed;
         Ok(Arc::new(PreparedScene {
             context,
@@ -1157,41 +1096,37 @@ impl ChartEngine {
     /// Cache-store entries a [`Self::prepare`] with the current display reads
     /// for the opened S-101 cells when they are portrayed with Lua: the
     /// per-cell instruction caches
-    /// ([`EngineState::cell_instruction_cache_paths`]); empty without cells
+    /// ([`S101Layer::cell_instruction_cache_paths`]); empty without cells
     /// or without a cache. A host whose persistent store is asynchronous
     /// (the web's IndexedDB) loads these entries into the platform cache
     /// store before preparing, and saves the entries the preparation wrote.
     pub fn cell_cache_entries(&mut self) -> Vec<PathBuf> {
         // The key covers the colour profile `prepare` selects first.
-        let previous = std::mem::replace(
-            &mut self.state.current_profile_name,
-            self.display.profile.clone(),
-        );
         let paths = self
             .state
-            .cell_instruction_cache_paths(Some(&self.display.settings));
-        self.state.current_profile_name = previous;
+            .s101
+            .cell_instruction_cache_paths(Some(&self.display.settings), &self.display.profile);
         paths.into_iter().flatten().flatten().collect()
     }
 
     /// Cache-store entries of precomputed payloads
-    /// ([`crate::portrayal::PrecomputedCells`]) for the opened S-101 cells
+    /// ([`ferrite_s101::layer::portrayal::PrecomputedCells`]) for the opened S-101 cells
     /// with the current display, i.e. what a [`Self::prepare`] with
     /// [`PortrayalSource::Precomputed`] reads; empty without cells or cache
     /// store. A host keeping payloads in an asynchronous store loads these
     /// before preparing.
     pub fn precomputed_cell_entries(&self) -> Vec<PathBuf> {
         let common =
-            EngineState::precomputed_common(Some(&self.display.settings), &self.display.profile);
-        let identities = self.state.cell_identities();
-        let cells = crate::portrayal::PrecomputedCells {
+            S101Layer::precomputed_common(Some(&self.display.settings), &self.display.profile);
+        let identities = self.state.s101.cell_identities();
+        let cells = ferrite_s101::layer::portrayal::PrecomputedCells {
             store: self.state.platform.cache.as_ref(),
             common,
             identities: &identities,
             export: false,
         };
-        (0..self.state.cells.len())
-            .filter_map(|index| cells.key(&self.state.fc, &self.state.pc, index))
+        (0..self.state.s101.cells.len())
+            .filter_map(|index| cells.key(&self.state.s101.fc, &self.state.s101.pc, index))
             .collect()
     }
 
@@ -1209,7 +1144,7 @@ impl ChartEngine {
     /// coverage of the new view. `scene` must be the scene this engine
     /// prepared last, with the datasets and display unchanged since. Returns
     /// false (`scene` unchanged) when the view needs other cells resident
-    /// (large chart sets, `EngineState::residency_for_view`); then
+    /// (large chart sets, `S101Layer::residency_for_view`); then
     /// [`Self::prepare`] portrays the new resident set. Otherwise the result
     /// equals what [`Self::prepare`] would build for `view`.
     pub fn reproject(&mut self, scene: &mut PreparedScene, view: &View) -> Result<bool> {
@@ -1231,11 +1166,14 @@ impl ChartEngine {
         context.set_viewport(width as f32, height as f32);
         context.zoom_to_fit(fit);
         context.scaler.set_pixel_ratio(scale_factor);
-        if !self.state.cells.is_empty()
-            && self
-                .state
-                .residency_for_view(&scene.coverage, true, Some(view.viewport))
-                != self.state.resident_cells
+        if !self.state.s101.cells.is_empty()
+            && self.state.s101.residency_for_view(
+                &scene.coverage,
+                &self.state.render_context,
+                self.state.bounds,
+                true,
+                Some(view.viewport),
+            ) != self.state.s101.resident_cells
         {
             return Ok(false);
         }
@@ -1301,7 +1239,12 @@ impl ChartEngine {
             });
         }
         let index = id.cell_index? as usize;
-        self.state.cells.get(index)?.features.get(&id.feature_id)?;
+        self.state
+            .s101
+            .cells
+            .get(index)?
+            .features
+            .get(&id.feature_id)?;
         Some(
             self.state
                 .describe_feature(id.cell_index, id.feature_id, ""),
@@ -1354,7 +1297,7 @@ struct OpenTask {
     trust_anchors: Arc<Vec<(String, Vec<u8>)>>,
     fc: Arc<BoundFeatureCatalogue>,
     pc: Arc<BoundPortrayalCatalogue>,
-    decoded: crate::decoded_chart_cache::SharedDecodedChartCache,
+    decoded: ferrite_s101::layer::decoded_cache::SharedDecodedChartCache,
     overlay_products: bool,
     /// Installed S-101 catalogue inventory (empty: none).
     inventory: PathBuf,
@@ -1593,16 +1536,7 @@ impl OpenTask {
         fc: &BoundFeatureCatalogue,
         pc: &BoundPortrayalCatalogue,
     ) -> Result<()> {
-        ferrite_s101::validate_dataset_catalogues(&cell.dsid, fc, &pc.product_id, &pc.version)
-            .with_context(|| format!("Incompatible S-101 dataset {}", cell.file_path.display()))?;
-        ferrite_s101::validate_spatial_scale_properties(&cell.dsid, cell.features.values())
-            .with_context(|| {
-                format!(
-                    "Nonconformant S-101 spatial scales {}",
-                    cell.file_path.display()
-                )
-            })?;
-        Ok(())
+        S101Layer::admit_with(cell, fc, pc)
     }
 
     /// An S-421 route among the inputs (the S-421 adapter recognises the
@@ -1758,7 +1692,7 @@ impl OpenTask {
             let (mut cell, source_identity) = plan.load_with_decoded_cache(&self.decoded)?;
             // Datasets of other catalogue editions: their installed owner.
             let owner = owners.as_ref().and_then(|(registry, codes)| {
-                let key = EngineState::catalogue_dataset_key(&plan.base.id).ok()?;
+                let key = S101Layer::catalogue_dataset_key(&plan.base.id).ok()?;
                 let owner = registry.owner_for(&key)?;
                 Some((owner, codes.get(owner.fc().source_digest())?))
             });
@@ -1811,10 +1745,10 @@ impl OpenTask {
         plans: &[s101_update_plan::Plan],
         notices: &mut Vec<String>,
     ) -> Option<(
-        crate::s101_catalogue_selection::DatasetCatalogueRegistry,
+        ferrite_s101::layer::catalogue_selection::DatasetCatalogueRegistry,
         BTreeMap<[u8; 32], Arc<Vec<String>>>,
     )> {
-        use crate::s101_catalogue_selection::{
+        use ferrite_s101::layer::catalogue_selection::{
             DatasetCatalogueOwner, DatasetCatalogueRegistry, DatasetCatalogueRequest,
         };
         if self.inventory.as_os_str().is_empty()
@@ -1835,7 +1769,7 @@ impl OpenTask {
                 .iter()
                 .map(|plan| {
                     Ok(DatasetCatalogueRequest {
-                        dataset_key: EngineState::catalogue_dataset_key(&plan.base.id)?,
+                        dataset_key: S101Layer::catalogue_dataset_key(&plan.base.id)?,
                         source_identity: plan.captured_source_identity_sha(),
                         identification: plan.base.id.clone(),
                     })
@@ -1861,7 +1795,7 @@ impl OpenTask {
         };
         let mut codes = BTreeMap::new();
         for plan in plans {
-            let Some(owner) = EngineState::catalogue_dataset_key(&plan.base.id)
+            let Some(owner) = S101Layer::catalogue_dataset_key(&plan.base.id)
                 .ok()
                 .and_then(|key| registry.owner_for(&key))
             else {

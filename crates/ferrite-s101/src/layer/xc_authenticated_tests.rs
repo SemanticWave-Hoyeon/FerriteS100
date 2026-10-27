@@ -154,7 +154,7 @@ fn authenticated_xc_capture_uses_verified_original_and_survives_live_catalogue_c
     assert_eq!(first.data_coverage.len(), 1);
     assert!(matches!(
         first.data_coverage[0].minimum,
-        crate::s101_xc_coverage::XcScale::Positive {
+        crate::layer::xc_coverage::XcScale::Positive {
             denominator: 45000,
             ..
         }
@@ -295,10 +295,10 @@ fn guarded_public_original_authenticated_xc_positive() -> Result<()> {
         ensure!(
             matches!(
                 row.optimum,
-                crate::s101_xc_coverage::XcScale::Positive { .. }
+                crate::layer::xc_coverage::XcScale::Positive { .. }
             ) && matches!(
                 row.maximum,
-                crate::s101_xc_coverage::XcScale::Positive { .. }
+                crate::layer::xc_coverage::XcScale::Positive { .. }
             ),
             "Original optimum/maximum not numeric positive"
         );

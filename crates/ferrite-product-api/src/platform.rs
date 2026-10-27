@@ -2,10 +2,15 @@
 //! (`ferrite_engine::platform`) provides the implementations: the system
 //! clock, files in the application data folder or records in memory, the
 //! data source datasets and catalogues are read through (local files or
-//! memory) and the disposable cache store.
+//! memory) and the disposable cache store. The local file system
+//! ([`NativeDataSource`]), files in memory ([`MemoryDataSource`]) and the
+//! sequential [`Executor`] are defined here so product layers and their
+//! tests can use them without the engine; [`Services`] bundles the shared
+//! handles a product layer keeps.
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -98,9 +103,325 @@ pub trait DataSource: Send + Sync {
     }
 }
 
+/// Whether `path` names a dataset file with `extension` (any case), not an
+/// AppleDouble metadata companion (`._name`).
+pub fn is_dataset_file(path: &Path, extension: &str) -> bool {
+    !path
+        .file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"._"))
+        && path
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+
+/// The local file system: `std::fs` and `walkdir`, exactly as the viewer
+/// always read its inputs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeDataSource;
+
+fn entry_kind(kind: std::fs::FileType) -> EntryKind {
+    if kind.is_symlink() {
+        EntryKind::Symlink
+    } else if kind.is_dir() {
+        EntryKind::Dir
+    } else if kind.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
+    }
+}
+
+impl DataSource for NativeDataSource {
+    fn kind(&self, path: &Path) -> io::Result<EntryKind> {
+        Ok(entry_kind(std::fs::symlink_metadata(path)?.file_type()))
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+    fn len(&self, path: &Path) -> io::Result<u64> {
+        Ok(std::fs::metadata(path)?.len())
+    }
+    fn modified(&self, path: &Path) -> Option<SystemTime> {
+        std::fs::metadata(path).ok()?.modified().ok()
+    }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<SourceEntry>> {
+        std::fs::read_dir(path)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok(SourceEntry {
+                    path: entry.path(),
+                    kind: entry_kind(entry.file_type()?),
+                })
+            })
+            .collect()
+    }
+    fn walk<'a>(&'a self, root: &Path) -> Box<dyn Iterator<Item = io::Result<SourceEntry>> + 'a> {
+        Box::new(
+            walkdir::WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .map(|entry| {
+                    // Keep walkdir's message (it names the path).
+                    let entry = entry.map_err(|error| {
+                        let kind = error
+                            .io_error()
+                            .map_or(io::ErrorKind::Other, io::Error::kind);
+                        io::Error::new(kind, error)
+                    })?;
+                    let kind = entry_kind(entry.file_type());
+                    Ok(SourceEntry {
+                        path: entry.into_path(),
+                        kind,
+                    })
+                }),
+        )
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+    fn read_limited(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        path.canonicalize()
+    }
+    fn local_paths(&self) -> bool {
+        true
+    }
+    /// The native snapshot: symlink root rejected, bounded parallel reads.
+    fn portrayal_sources(
+        &self,
+        root: &Path,
+    ) -> ferrite_portrayal_catalog::Result<Arc<ferrite_portrayal_catalog::CatalogueSources>> {
+        ferrite_portrayal_catalog::CatalogueSources::capture(root)
+    }
+}
+
+/// Files held in memory, keyed by their (absolute or relative) paths.
+/// Directories are implied by the files they hold.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryDataSource {
+    files: BTreeMap<PathBuf, Arc<[u8]>>,
+}
+
+/// Lexically normalized path (`.` removed, `..` applied); None when `..`
+/// would leave the root.
+fn normalize(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
+/// A platform-absolute in-memory key for a root-relative virtual path such
+/// as `/xs/CATALOG.XML`. In-memory paths that act as dataset, catalogue or
+/// authorization keys must be absolute ([`Path::is_absolute`]); `/x` is
+/// absolute on Unix-style platforms (WebAssembly included) and is returned
+/// unchanged there, while on Windows it has no drive, so it is placed on the
+/// virtual drive `C:` (`C:/xs/CATALOG.XML`; forward slashes are separators
+/// there). Other paths (already absolute, or relative) are unchanged.
+pub fn memory_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if cfg!(windows) && path.has_root() && !path.is_absolute() {
+        let mut keyed = std::ffi::OsString::from("C:");
+        keyed.push(path.as_os_str());
+        return PathBuf::from(keyed);
+    }
+    path.to_path_buf()
+}
+
+fn not_found(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{} is not in the memory source", path.display()),
+    )
+}
+
+impl MemoryDataSource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Add (or replace) a file.
+    pub fn insert(&mut self, path: impl Into<PathBuf>, bytes: impl Into<Arc<[u8]>>) {
+        let path = path.into();
+        let path = normalize(&path).unwrap_or(path);
+        self.files.insert(path, bytes.into());
+    }
+    /// Builder form of [`MemoryDataSource::insert`].
+    pub fn with(mut self, path: impl Into<PathBuf>, bytes: impl Into<Arc<[u8]>>) -> Self {
+        self.insert(path, bytes);
+        self
+    }
+    /// Copy every regular file under `from` of another source (e.g. a test
+    /// fixture folder read once from disk) into memory under `to`.
+    pub fn copy_tree(
+        &mut self,
+        source: &dyn DataSource,
+        from: &Path,
+        to: &Path,
+    ) -> io::Result<usize> {
+        let mut count = 0;
+        for entry in source.walk(from) {
+            let entry = entry?;
+            if entry.kind == EntryKind::File {
+                let bytes = source.read(&entry.path)?;
+                let relative = entry.path.strip_prefix(from).map_err(io::Error::other)?;
+                self.insert(to.join(relative), bytes);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+    fn file(&self, path: &Path) -> Option<&Arc<[u8]>> {
+        self.files.get(&normalize(path)?)
+    }
+    fn has_dir(&self, path: &Path) -> bool {
+        let Some(path) = normalize(path) else {
+            return false;
+        };
+        self.files
+            .range(path.clone()..)
+            .next()
+            .is_some_and(|(p, _)| p != &path && p.starts_with(&path))
+            || (path.as_os_str().is_empty() && !self.files.is_empty())
+    }
+    fn entries_under(&self, root: &Path) -> Vec<SourceEntry> {
+        let mut dirs = BTreeSet::new();
+        let mut files = Vec::new();
+        for path in self
+            .files
+            .keys()
+            .filter(|p| p.starts_with(root) && *p != root)
+        {
+            files.push(path.clone());
+            let mut parent = path.parent();
+            while let Some(dir) = parent.filter(|d| d.starts_with(root) && *d != root) {
+                dirs.insert(dir.to_path_buf());
+                parent = dir.parent();
+            }
+        }
+        let mut entries: Vec<SourceEntry> = dirs
+            .into_iter()
+            .map(|path| SourceEntry {
+                path,
+                kind: EntryKind::Dir,
+            })
+            .chain(files.into_iter().map(|path| SourceEntry {
+                path,
+                kind: EntryKind::File,
+            }))
+            .collect();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        entries
+    }
+}
+
+impl DataSource for MemoryDataSource {
+    fn kind(&self, path: &Path) -> io::Result<EntryKind> {
+        if self.file(path).is_some() {
+            Ok(EntryKind::File)
+        } else if self.has_dir(path) {
+            Ok(EntryKind::Dir)
+        } else {
+            Err(not_found(path))
+        }
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        self.file(path).is_some()
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        self.has_dir(path)
+    }
+    fn len(&self, path: &Path) -> io::Result<u64> {
+        self.file(path)
+            .map(|b| b.len() as u64)
+            .ok_or_else(|| not_found(path))
+    }
+    fn modified(&self, _path: &Path) -> Option<SystemTime> {
+        None
+    }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<SourceEntry>> {
+        if !self.has_dir(path) {
+            return Err(not_found(path));
+        }
+        let root = normalize(path).ok_or_else(|| not_found(path))?;
+        Ok(self
+            .entries_under(&root)
+            .into_iter()
+            .filter(|e| e.path.parent() == Some(root.as_path()))
+            .collect())
+    }
+    fn walk<'a>(&'a self, root: &Path) -> Box<dyn Iterator<Item = io::Result<SourceEntry>> + 'a> {
+        let Some(normal) = normalize(root) else {
+            return Box::new(std::iter::once(Err(not_found(root))));
+        };
+        let first = match self.kind(&normal) {
+            Ok(kind) => SourceEntry {
+                path: normal.clone(),
+                kind,
+            },
+            Err(error) => return Box::new(std::iter::once(Err(error))),
+        };
+        let rest = if first.kind == EntryKind::Dir {
+            self.entries_under(&normal)
+        } else {
+            Vec::new()
+        };
+        Box::new(std::iter::once(Ok(first)).chain(rest.into_iter().map(Ok)))
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.file(path)
+            .map(|b| b.to_vec())
+            .ok_or_else(|| not_found(path))
+    }
+    fn read_limited(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+        let bytes = self.file(path).ok_or_else(|| not_found(path))?;
+        let end = usize::try_from(limit.saturating_add(1))
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        Ok(bytes[..end].to_vec())
+    }
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        let normal = normalize(path).ok_or_else(|| not_found(path))?;
+        self.kind(&normal)?;
+        Ok(normal)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Cache store
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Largest cache entry (bytes) a store reads or a portrayal cache encodes.
+pub const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// Most drawing instructions one portrayal cache entry holds.
+pub const MAX_INSTRUCTIONS: u64 = 100_000;
 
 /// The disposable portrayal cell cache. Entries are named by paths under
 /// [`CacheStore::root`]; the payload hash (not the store) detects corruption.
@@ -119,7 +440,7 @@ pub trait CacheStore: Send + Sync {
     fn prune(&self);
     /// [`Self::read`], also telling whether these exact bytes already passed
     /// the portrayal cache integrity check (SHA-256,
-    /// `ferrite_engine::portrayal_cache::verify_and_deserialize_cache`). Only a
+    /// `ferrite_s101::layer::portrayal_cache::verify_and_deserialize_cache`). Only a
     /// store whose entries cannot change except through [`Self::write`] may
     /// remember that (in-memory stores); the default never does, so every
     /// read is checked again.
@@ -186,3 +507,82 @@ pub trait UserRecord: Send + Sync {
 
 /// Guard of [`UserRecord::lock`] (an OS file lock for native records).
 pub type RecordLock = Box<dyn std::any::Any + Send>;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Executor
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Where parallel and background work runs.
+pub trait Executor: Send + Sync {
+    /// Run `job(i)` for every `i < count`, possibly concurrently; returns
+    /// once all finished. A panicking job propagates its panic.
+    fn for_each_index(&self, count: usize, job: &(dyn Fn(usize) + Sync));
+    /// Start a background job. A sequential executor runs it before returning.
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>);
+    /// How many jobs may run at once.
+    fn parallelism(&self) -> usize;
+}
+
+/// Everything on the calling thread, in order (hosts without threads).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SequentialExecutor;
+impl Executor for SequentialExecutor {
+    fn for_each_index(&self, count: usize, job: &(dyn Fn(usize) + Sync)) {
+        for index in 0..count {
+            job(index);
+        }
+    }
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        job()
+    }
+    fn parallelism(&self) -> usize {
+        1
+    }
+}
+
+/// `f` over `items` on the executor; results in item order.
+pub fn parallel_map<T: Sync, R: Send>(
+    executor: &dyn Executor,
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    executor.for_each_index(items.len(), &|index| {
+        let result = f(&items[index]);
+        if let Ok(mut slot) = slots[index].lock() {
+            *slot = Some(result);
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .ok()
+                .flatten()
+                .expect("executor ran every job")
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Layer services
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The platform services a product layer reads inputs, keeps derived data
+/// and runs parallel work through: handles shared with the host's platform,
+/// taken when the layer is created.
+#[derive(Clone)]
+pub struct Services {
+    pub data: Arc<dyn DataSource>,
+    pub cache: Arc<dyn CacheStore>,
+    pub executor: Arc<dyn Executor>,
+}
+
+impl std::fmt::Debug for Services {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Services")
+            .field("local_paths", &self.data.local_paths())
+            .field("parallelism", &self.executor.parallelism())
+            .finish_non_exhaustive()
+    }
+}

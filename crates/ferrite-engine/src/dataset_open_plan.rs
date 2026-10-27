@@ -219,7 +219,7 @@ pub fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
             on_system,
         );
     }
-    if crate::s101_update_plan::is_chart_file(path) {
+    if ferrite_s101::layer::update_plan::is_chart_file(path) {
         // Existing load_charts expands siblings and verifies the original inputs.
         return Ok(Plan {
             charts: vec![path.to_path_buf()],

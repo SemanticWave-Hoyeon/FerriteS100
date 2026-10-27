@@ -1,17 +1,18 @@
 //! S-101 cell portrayal through the catalogue's Lua rules, with per-cell
 //! instruction caches.
-use crate::platform::{CacheStore, DataSource, Executor};
-use crate::portrayal_cache::{encode_cache_payload, read_and_deserialize_cache, wrap_cache};
-use crate::{primary_viewing_layers, secure_instruction_cache};
+#[cfg(feature = "lua-native")]
+use crate::convert_lua_results_for_cell;
+use crate::layer::portrayal_cache::{encode_cache_payload, read_and_deserialize_cache, wrap_cache};
+use crate::layer::primary_viewing_layers;
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
 use ferrite_lua::ContextParameters as LuaContextParameters;
 use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
+use ferrite_product_api::platform as secure_instruction_cache;
+use ferrite_product_api::platform::{CacheStore, DataSource, Executor};
 use ferrite_render::host_settings::SettingsState;
 use ferrite_render::{DrawingInstruction, RenderContext};
 use ferrite_s100_core::S101Cell;
-#[cfg(feature = "lua-native")]
-use ferrite_s101::convert_lua_results_for_cell;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "lua-native")]
 use std::sync::Arc;
@@ -74,8 +75,8 @@ pub fn validated_lua_context(
         pc_context_params.len()
     );
 
-    ferrite_s101::synchronize_legacy_context(pc, &mut context);
-    let (_, diagnostics) = ferrite_s101::validate_portrayal_context(pc, &context)
+    crate::synchronize_legacy_context(pc, &mut context);
+    let (_, diagnostics) = crate::validate_portrayal_context(pc, &context)
         .context("PC portrayal input validation failed")?;
     for diagnostic in diagnostics {
         warn!("{diagnostic}");
@@ -368,29 +369,30 @@ fn precomputed_portrayal_for_cells<'a>(
          exported by a native build",
     )?;
     let cells: Vec<(usize, &S101Cell)> = cells.into_iter().collect();
-    let decoded = crate::platform::parallel_map(run.executor, &cells, |&(cell_index, cell)| {
-        let missing = || {
-            format!(
-                "No precomputed portrayal for S-101 cell {} ({}); without the \
+    let decoded =
+        ferrite_product_api::platform::parallel_map(run.executor, &cells, |&(cell_index, cell)| {
+            let missing = || {
+                format!(
+                    "No precomputed portrayal for S-101 cell {} ({}); without the \
                  lua-native feature, payloads exported by a native build \
                  (`ferrite precompute`) for the same catalogues and settings \
                  must be in the cache store",
-                cell.dsid.dataset_name,
-                cell.file_path.display()
-            )
-        };
-        let key = precomputed.key(fc, pc, cell_index).with_context(missing)?;
-        let mut instructions = read_and_deserialize_cache(precomputed.store, &key)
-            .with_context(|| format!("{} [{}]", missing(), key.display()))?
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "Precomputed portrayal of {} rejected: {error}",
+                    cell.dsid.dataset_name,
                     cell.file_path.display()
                 )
-            })?;
-        renumber_stored(&mut instructions, cell_index);
-        Ok::<_, anyhow::Error>(instructions)
-    });
+            };
+            let key = precomputed.key(fc, pc, cell_index).with_context(missing)?;
+            let mut instructions = read_and_deserialize_cache(precomputed.store, &key)
+                .with_context(|| format!("{} [{}]", missing(), key.display()))?
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Precomputed portrayal of {} rejected: {error}",
+                        cell.file_path.display()
+                    )
+                })?;
+            renumber_stored(&mut instructions, cell_index);
+            Ok::<_, anyhow::Error>(instructions)
+        });
     for instructions in decoded {
         render_context.append_converted(instructions?);
     }

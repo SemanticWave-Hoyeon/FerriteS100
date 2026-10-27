@@ -18,14 +18,15 @@
 //! * [`ProductLayer`]: a store of opened datasets of one or more products
 //!   that share an encoding and a portrayal pipeline (the S-100 Part 10b GML
 //!   overlay layer serves S-124 and S-129, `ferrite_s102::layer` S-102
-//!   grids, `ferrite_s421::layer` S-421 routes; S-101 cells follow in a
-//!   later step). It opens datasets from bytes
+//!   grids, `ferrite_s421::layer` S-421 routes, `ferrite_s101::layer`
+//!   S-101 cells). It opens datasets from bytes
 //!   ([`DatasetInput`]), portrays them into drawing instructions and
 //!   renderer extensions ([`SceneContribution`]), reports coverage and
 //!   describes and highlights picked features ([`FeaturePick`]).
 //!
-//! Platform services the product modules need themselves (the clock and
-//! per-user records) are defined in [`platform`]; the engine's `Platform`
+//! Platform services the product modules need themselves (the clock,
+//! per-user records, data sources, the cache store and the executor) are
+//! defined in [`platform`]; the engine's `Platform`
 //! implements them. [`route_overlay`] is the renderer extension a route
 //! product (S-421) portrays into and renderers draw.
 use std::any::Any;

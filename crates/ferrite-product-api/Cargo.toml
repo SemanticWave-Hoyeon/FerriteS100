@@ -16,3 +16,5 @@ chrono.workspace = true
 ferrite-kernel.workspace = true
 ferrite-portrayal-catalog.workspace = true
 ferrite-render.workspace = true
+# NativeDataSource (platform): directory walks of the local file system.
+walkdir.workspace = true

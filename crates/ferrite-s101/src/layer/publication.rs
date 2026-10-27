@@ -1,8 +1,10 @@
 //! App cell publication transaction. Product parsing stays in its adapter;
 //! replacement moves owned cells and retains only replaced cells for rollback.
-use crate::platform::{RecordLock, UserRecord};
-use crate::{cell_source_identity::LoadedSourceIdentities, s101_update_plan, ChartLoadResult};
+use crate::layer::{
+    load::ChartLoadResult, source_identity::LoadedSourceIdentities, update_plan as s101_update_plan,
+};
 use anyhow::{ensure, Result};
+use ferrite_product_api::platform::{RecordLock, UserRecord};
 use ferrite_s100_core::{CellSourceIdentity, S101Cell};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -32,8 +34,8 @@ pub struct CancellationRecord {
 }
 impl ValidatedRemoval {
     pub fn validate(
-        cancellation: &ferrite_s101::cancellation::Cancellation,
-        metadata: &ferrite_s101::cancellation::CancellationMetadata,
+        cancellation: &crate::cancellation::Cancellation,
+        metadata: &crate::cancellation::CancellationMetadata,
         purpose: ferrite_security::DatasetPurpose,
         loaded: &ferrite_s100_core::DatasetIdentification,
         source_identity: CellSourceIdentity,
@@ -61,8 +63,8 @@ impl ValidatedRemoval {
 }
 impl ValidatedRemoval {
     pub fn announcement(
-        cancellation: &ferrite_s101::cancellation::Cancellation,
-        metadata: &ferrite_s101::cancellation::CancellationMetadata,
+        cancellation: &crate::cancellation::Cancellation,
+        metadata: &crate::cancellation::CancellationMetadata,
         purpose: ferrite_security::DatasetPurpose,
     ) -> Result<Self> {
         ensure!(
@@ -118,6 +120,10 @@ pub struct CancellationHistory {
     by_dataset: BTreeMap<(String, String), CancellationRecord>,
 }
 impl CancellationHistory {
+    /// The tombstone recorded for a dataset key.
+    pub fn get(&self, key: &(String, String)) -> Option<&CancellationRecord> {
+        self.by_dataset.get(key)
+    }
     pub fn record(&mut self, records: Vec<CancellationRecord>) {
         for record in records {
             match self.by_dataset.entry(record.key.clone()) {
@@ -175,7 +181,7 @@ impl CancellationHistory {
     pub fn read(path: &std::path::Path) -> Result<Self> {
         Self::read_record(&HistoryFile::new(path.to_owned()))
     }
-    /// The history in a user record ([`crate::platform::UserStore::cancellation_history`]);
+    /// The history in a user record ([`ferrite_product_api::platform::UserStore::cancellation_history`]);
     /// a record never written is the empty history.
     pub fn read_record(record: &dyn UserRecord) -> Result<Self> {
         let Some(bytes) = record.read(MAX_HISTORY_BYTES)? else {
@@ -210,7 +216,7 @@ impl CancellationHistory {
                 "Invalid cancelled dataset stem"
             );
             ensure!(
-                crate::s101_update_plan::is_chart_file(std::path::Path::new(&name)),
+                crate::layer::update_plan::is_chart_file(std::path::Path::new(&name)),
                 "Invalid cancellation history filename"
             );
             ensure!(
@@ -355,7 +361,7 @@ impl HistoryStore {
     pub fn begin(path: &std::path::Path) -> Result<Self> {
         Self::begin_record(Box::new(HistoryFile::new(path.to_owned())))
     }
-    /// Any history record ([`crate::platform::UserStore::cancellation_history`]).
+    /// Any history record ([`ferrite_product_api::platform::UserStore::cancellation_history`]).
     pub fn begin_record(record: Box<dyn UserRecord>) -> Result<Self> {
         let lock = record.lock()?;
         let history = CancellationHistory::read_record(record.as_ref())?;
@@ -735,13 +741,12 @@ pub mod tests {
         }
     }
     fn announcement(name: &str) -> ValidatedRemoval {
-        let cancellation = ferrite_s101::cancellation::Cancellation::parse(
+        let cancellation = crate::cancellation::Cancellation::parse(
             &physical_cancellation_fixture("2", "0", &format!("{name}.003")),
         )
         .unwrap();
         let metadata =
-            ferrite_s101::cancellation::CancellationMetadata::new(4, Some(3), "2024-10-17")
-                .unwrap();
+            crate::cancellation::CancellationMetadata::new(4, Some(3), "2024-10-17").unwrap();
         ValidatedRemoval::announcement(
             &cancellation,
             &metadata,
@@ -1003,13 +1008,12 @@ pub mod tests {
         loaded.product_edition = "2.0".into();
         loaded.edition_number = 4;
         loaded.update_number = 2;
-        let cancellation = ferrite_s101::cancellation::Cancellation::parse(
+        let cancellation = crate::cancellation::Cancellation::parse(
             &physical_cancellation_fixture("2", "0", "101AA00TEST.003"),
         )
         .unwrap();
         let metadata =
-            ferrite_s101::cancellation::CancellationMetadata::new(4, Some(3), "2024-10-17")
-                .unwrap();
+            crate::cancellation::CancellationMetadata::new(4, Some(3), "2024-10-17").unwrap();
         let previous = chrono::NaiveDate::from_ymd_opt(2024, 10, 16).unwrap();
         let identity = ids.get(0).unwrap();
         let removal = ValidatedRemoval::validate(
@@ -1158,45 +1162,6 @@ pub mod tests {
         );
         drop(reopened);
         std::fs::remove_dir_all(folder).unwrap();
-    }
-    #[test]
-    fn history_store_in_a_memory_user_store_round_trips_and_refuses_corruption() {
-        use crate::platform::{MemoryUserStore, UserStore, MEMORY_HISTORY_KEY};
-        let user = MemoryUserStore::default();
-        let record = CancellationRecord {
-            key: ("INT.IHO.S-101.2.0".into(), "101AA00TEST".into()),
-            cancelled_edition: 4,
-            cancellation_update: 3,
-            issue_date: chrono::NaiveDate::from_ymd_opt(2024, 10, 17).unwrap(),
-        };
-        let mut store = HistoryStore::begin_record(user.cancellation_history().unwrap()).unwrap();
-        assert!(store.history.is_empty());
-        store.persist(vec![record.clone()]).unwrap();
-        drop(store);
-        let reopened =
-            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
-                .unwrap();
-        assert_eq!(reopened.by_dataset.get(&record.key), Some(&record));
-        // Same document bytes as the native file.
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("history.json");
-        HistoryStore::begin(&path)
-            .unwrap()
-            .persist(vec![record.clone()])
-            .unwrap();
-        assert_eq!(
-            user.get(MEMORY_HISTORY_KEY).unwrap(),
-            std::fs::read(&path).unwrap()
-        );
-        user.cancellation_history()
-            .unwrap()
-            .write(b"truncated")
-            .unwrap();
-        assert!(
-            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
-                .is_err()
-        );
-        assert!(HistoryStore::begin_record(user.cancellation_history().unwrap()).is_err());
     }
     #[test]
     fn persistent_history_survives_reopen_and_refuses_corrupt_or_duplicate_records() {

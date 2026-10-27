@@ -7,8 +7,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_INSTRUCTIONS: u64 = 100_000;
+/// Entry limits of the portrayal cache, defined with the cache-store interface.
+pub use ferrite_product_api::platform::{MAX_CACHE_BYTES, MAX_INSTRUCTIONS};
 /// Whole cache directory budget; the least recently used files go first.
 pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 static NONCE: AtomicU64 = AtomicU64::new(0);

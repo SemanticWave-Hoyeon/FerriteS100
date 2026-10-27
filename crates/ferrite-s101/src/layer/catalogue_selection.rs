@@ -1,11 +1,11 @@
 //! Version-specific S-101 catalogue selection. Does not confer authentication.
 //! S98 20.1/20.2 and Appendix B: absence/incompatibility is an error, not a
 //! warning permission to process Edition 1 with Edition 2 catalogues.
-use crate::platform::{DataSource, EntryKind, NativeDataSource};
 use anyhow::{ensure, Context, Result};
 use ferrite_feature_catalog::{BoundFeatureCatalogue, FeatureCatalogue};
 use ferrite_kernel::SpecificationVersion;
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
+use ferrite_product_api::platform::{DataSource, EntryKind, NativeDataSource};
 use ferrite_s100_core::DatasetIdentification;
 use std::path::{Path, PathBuf};
 
@@ -155,9 +155,9 @@ fn resolve_pair_with_policy(
     } else {
         true
     };
-    let current_compatible = ferrite_s101::validate_catalogue_pair(current_fc, current_pc).is_ok()
+    let current_compatible = crate::validate_catalogue_pair(current_fc, current_pc).is_ok()
         && incoming.iter().chain(loaded).all(|d| {
-            ferrite_s101::validate_dataset_catalogues(
+            crate::validate_dataset_catalogues(
                 d,
                 current_fc,
                 &current_pc.product_id,
@@ -252,9 +252,9 @@ fn resolve_pair_with_policy(
         )? {
             continue;
         }
-        ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
+        crate::validate_catalogue_pair(&fc, &pc)?;
         for d in incoming.iter().chain(loaded) {
-            ferrite_s101::validate_dataset_catalogues(d, &fc, &pc.product_id, &pc.version)?;
+            crate::validate_dataset_catalogues(d, &fc, &pc.product_id, &pc.version)?;
         }
         let notice=format!("Using installed S-101 FC {} / PC {} for dataset version {}.{}.{}. Signature verification policy is unchanged.",fc.version,pc.version,target.edition,target.revision,target.clarification);
         let exact = exact_revision_pair(target, &fc, &pc)?;
@@ -288,7 +288,7 @@ impl DatasetCatalogueOwner {
         fc: std::sync::Arc<BoundFeatureCatalogue>,
         pc: std::sync::Arc<BoundPortrayalCatalogue>,
     ) -> Result<Self> {
-        ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
+        crate::validate_catalogue_pair(&fc, &pc)?;
         Ok(Self { fc, pc })
     }
     pub fn fc(&self) -> &std::sync::Arc<BoundFeatureCatalogue> {
@@ -301,13 +301,8 @@ impl DatasetCatalogueOwner {
         (*self.fc.source_digest(), *self.pc.source_digest())
     }
     fn accepts(&self, d: &DatasetIdentification) -> bool {
-        ferrite_s101::validate_dataset_catalogues(
-            d,
-            &self.fc,
-            &self.pc.product_id,
-            &self.pc.version,
-        )
-        .is_ok()
+        crate::validate_dataset_catalogues(d, &self.fc, &self.pc.product_id, &self.pc.version)
+            .is_ok()
     }
 }
 /// Caller supplies the captured parsed input identity, never a later live-path hash.
@@ -481,7 +476,7 @@ impl DatasetCatalogueRegistry {
                 }
             };
             for request in unresolved {
-                ferrite_s101::validate_dataset_catalogues(
+                crate::validate_dataset_catalogues(
                     &request.identification,
                     &owner.fc,
                     &owner.pc.product_id,
@@ -733,12 +728,12 @@ mod tests {
         let (fc, pc) = f.pair("current", "1.0.2", "1.0.2");
         f.pair("inventory/2.2.0", "2.2.0", "2.2.0");
         f.pair("inventory/2.0.1", "2.0.1", "2.0.1");
-        let mut memory = crate::platform::MemoryDataSource::new();
+        let mut memory = ferrite_product_api::platform::MemoryDataSource::new();
         memory
             .copy_tree(
                 &NativeDataSource,
                 &f.root.join("inventory"),
-                &crate::platform::memory_path("/mem/inventory"),
+                &ferrite_product_api::platform::memory_path("/mem/inventory"),
             )
             .unwrap();
         // The folder is gone: only the memory copy can be selected from.
@@ -753,7 +748,7 @@ mod tests {
             &[],
             &fc,
             &pc,
-            &crate::platform::memory_path("/mem/inventory"),
+            &ferrite_product_api::platform::memory_path("/mem/inventory"),
         )
         .unwrap()
         else {
@@ -763,7 +758,7 @@ mod tests {
         assert_eq!(installed_pc.version, "2.0.1");
         assert_eq!(
             installed_fc.source_path,
-            crate::platform::memory_path("/mem/inventory/2.0.1/FC/FC.xml")
+            ferrite_product_api::platform::memory_path("/mem/inventory/2.0.1/FC/FC.xml")
         );
         let fallback = std::sync::Arc::new(
             DatasetCatalogueOwner::new(std::sync::Arc::new(fc), std::sync::Arc::new(pc)).unwrap(),
@@ -773,7 +768,7 @@ mod tests {
                 &memory,
                 &[request("SHOM", "2.0", 2)],
                 fallback.clone(),
-                &crate::platform::memory_path("/mem/inventory"),
+                &ferrite_product_api::platform::memory_path("/mem/inventory"),
             )
             .unwrap();
         assert_eq!(staged.owner_for("SHOM").unwrap().fc().version, "2.0.1");
@@ -782,7 +777,7 @@ mod tests {
                 &memory,
                 &[request("SHOM", "2.0", 2)],
                 fallback,
-                &crate::platform::memory_path("/mem/absent"),
+                &ferrite_product_api::platform::memory_path("/mem/absent"),
             )
             .is_err());
     }

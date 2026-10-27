@@ -1,5 +1,5 @@
 //! Product2 XC numeric checks; never pair regional polygons by ordinal or bbox.
-use crate::s101_xc_coverage::{XcDataCoverage, XcScale};
+use crate::layer::xc_coverage::{XcDataCoverage, XcScale};
 use anyhow::{ensure, Context, Result};
 use ferrite_kernel::{scale_policy::SCALE_BAND_OPTIMUM_DENOMINATORS, SpecificationVersion};
 use ferrite_security::DatasetPurpose;
@@ -175,7 +175,7 @@ pub fn compare_effective(
     ) {
         return Ok(profile);
     }
-    let features = ferrite_s101::coverage_scale::cell_scales(cell)?;
+    let features = crate::coverage_scale::cell_scales(cell)?;
     ensure!(
         !features.is_empty(),
         "Effective S1012 cell has no DataCoverage"

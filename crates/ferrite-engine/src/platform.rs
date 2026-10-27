@@ -9,9 +9,9 @@
 //!
 //! Paths stay the identity of inputs everywhere (cell source paths, cache
 //! keys, catalogue roots): a memory source simply uses them as keys.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -37,304 +37,15 @@ impl ferrite_xslt::ModuleSource for SourceModules<'_> {
     }
 }
 
-/// The local file system: `std::fs` and `walkdir`, exactly as the viewer
-/// always read its inputs.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NativeDataSource;
-
-fn entry_kind(kind: std::fs::FileType) -> EntryKind {
-    if kind.is_symlink() {
-        EntryKind::Symlink
-    } else if kind.is_dir() {
-        EntryKind::Dir
-    } else if kind.is_file() {
-        EntryKind::File
-    } else {
-        EntryKind::Other
-    }
-}
-
-impl DataSource for NativeDataSource {
-    fn kind(&self, path: &Path) -> io::Result<EntryKind> {
-        Ok(entry_kind(std::fs::symlink_metadata(path)?.file_type()))
-    }
-    fn is_file(&self, path: &Path) -> bool {
-        path.is_file()
-    }
-    fn is_dir(&self, path: &Path) -> bool {
-        path.is_dir()
-    }
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
-    }
-    fn len(&self, path: &Path) -> io::Result<u64> {
-        Ok(std::fs::metadata(path)?.len())
-    }
-    fn modified(&self, path: &Path) -> Option<SystemTime> {
-        std::fs::metadata(path).ok()?.modified().ok()
-    }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<SourceEntry>> {
-        std::fs::read_dir(path)?
-            .map(|entry| {
-                let entry = entry?;
-                Ok(SourceEntry {
-                    path: entry.path(),
-                    kind: entry_kind(entry.file_type()?),
-                })
-            })
-            .collect()
-    }
-    fn walk<'a>(&'a self, root: &Path) -> Box<dyn Iterator<Item = io::Result<SourceEntry>> + 'a> {
-        Box::new(
-            walkdir::WalkDir::new(root)
-                .follow_links(false)
-                .into_iter()
-                .map(|entry| {
-                    // Keep walkdir's message (it names the path).
-                    let entry = entry.map_err(|error| {
-                        let kind = error
-                            .io_error()
-                            .map_or(io::ErrorKind::Other, io::Error::kind);
-                        io::Error::new(kind, error)
-                    })?;
-                    let kind = entry_kind(entry.file_type());
-                    Ok(SourceEntry {
-                        path: entry.into_path(),
-                        kind,
-                    })
-                }),
-        )
-    }
-    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
-    }
-    fn read_limited(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)?
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
-    }
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        path.canonicalize()
-    }
-    fn local_paths(&self) -> bool {
-        true
-    }
-    /// The native snapshot: symlink root rejected, bounded parallel reads.
-    fn portrayal_sources(
-        &self,
-        root: &Path,
-    ) -> ferrite_portrayal_catalog::Result<Arc<ferrite_portrayal_catalog::CatalogueSources>> {
-        ferrite_portrayal_catalog::CatalogueSources::capture(root)
-    }
-}
-
-/// Files held in memory, keyed by their (absolute or relative) paths.
-/// Directories are implied by the files they hold.
-#[derive(Clone, Debug, Default)]
-pub struct MemoryDataSource {
-    files: BTreeMap<PathBuf, Arc<[u8]>>,
-}
-
-/// Lexically normalized path (`.` removed, `..` applied); None when `..`
-/// would leave the root.
-fn normalize(path: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    Some(out)
-}
-
-/// A platform-absolute in-memory key for a root-relative virtual path such
-/// as `/xs/CATALOG.XML`. In-memory paths that act as dataset, catalogue or
-/// authorization keys must be absolute ([`Path::is_absolute`]); `/x` is
-/// absolute on Unix-style platforms (WebAssembly included) and is returned
-/// unchanged there, while on Windows it has no drive, so it is placed on the
-/// virtual drive `C:` (`C:/xs/CATALOG.XML`; forward slashes are separators
-/// there). Other paths (already absolute, or relative) are unchanged.
-pub fn memory_path(path: impl AsRef<Path>) -> PathBuf {
-    let path = path.as_ref();
-    if cfg!(windows) && path.has_root() && !path.is_absolute() {
-        let mut keyed = std::ffi::OsString::from("C:");
-        keyed.push(path.as_os_str());
-        return PathBuf::from(keyed);
-    }
-    path.to_path_buf()
-}
+/// The local file system and files in memory, defined with the product
+/// interface (product modules read through them).
+pub use ferrite_product_api::platform::{memory_path, MemoryDataSource, NativeDataSource};
 
 fn not_found(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
         format!("{} is not in the memory source", path.display()),
     )
-}
-
-impl MemoryDataSource {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    /// Add (or replace) a file.
-    pub fn insert(&mut self, path: impl Into<PathBuf>, bytes: impl Into<Arc<[u8]>>) {
-        let path = path.into();
-        let path = normalize(&path).unwrap_or(path);
-        self.files.insert(path, bytes.into());
-    }
-    /// Builder form of [`MemoryDataSource::insert`].
-    pub fn with(mut self, path: impl Into<PathBuf>, bytes: impl Into<Arc<[u8]>>) -> Self {
-        self.insert(path, bytes);
-        self
-    }
-    /// Copy every regular file under `from` of another source (e.g. a test
-    /// fixture folder read once from disk) into memory under `to`.
-    pub fn copy_tree(
-        &mut self,
-        source: &dyn DataSource,
-        from: &Path,
-        to: &Path,
-    ) -> io::Result<usize> {
-        let mut count = 0;
-        for entry in source.walk(from) {
-            let entry = entry?;
-            if entry.kind == EntryKind::File {
-                let bytes = source.read(&entry.path)?;
-                let relative = entry.path.strip_prefix(from).map_err(io::Error::other)?;
-                self.insert(to.join(relative), bytes);
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-    pub fn len(&self) -> usize {
-        self.files.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
-    }
-    fn file(&self, path: &Path) -> Option<&Arc<[u8]>> {
-        self.files.get(&normalize(path)?)
-    }
-    fn has_dir(&self, path: &Path) -> bool {
-        let Some(path) = normalize(path) else {
-            return false;
-        };
-        self.files
-            .range(path.clone()..)
-            .next()
-            .is_some_and(|(p, _)| p != &path && p.starts_with(&path))
-            || (path.as_os_str().is_empty() && !self.files.is_empty())
-    }
-    fn entries_under(&self, root: &Path) -> Vec<SourceEntry> {
-        let mut dirs = BTreeSet::new();
-        let mut files = Vec::new();
-        for path in self
-            .files
-            .keys()
-            .filter(|p| p.starts_with(root) && *p != root)
-        {
-            files.push(path.clone());
-            let mut parent = path.parent();
-            while let Some(dir) = parent.filter(|d| d.starts_with(root) && *d != root) {
-                dirs.insert(dir.to_path_buf());
-                parent = dir.parent();
-            }
-        }
-        let mut entries: Vec<SourceEntry> = dirs
-            .into_iter()
-            .map(|path| SourceEntry {
-                path,
-                kind: EntryKind::Dir,
-            })
-            .chain(files.into_iter().map(|path| SourceEntry {
-                path,
-                kind: EntryKind::File,
-            }))
-            .collect();
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
-        entries
-    }
-}
-
-impl DataSource for MemoryDataSource {
-    fn kind(&self, path: &Path) -> io::Result<EntryKind> {
-        if self.file(path).is_some() {
-            Ok(EntryKind::File)
-        } else if self.has_dir(path) {
-            Ok(EntryKind::Dir)
-        } else {
-            Err(not_found(path))
-        }
-    }
-    fn is_file(&self, path: &Path) -> bool {
-        self.file(path).is_some()
-    }
-    fn is_dir(&self, path: &Path) -> bool {
-        self.has_dir(path)
-    }
-    fn len(&self, path: &Path) -> io::Result<u64> {
-        self.file(path)
-            .map(|b| b.len() as u64)
-            .ok_or_else(|| not_found(path))
-    }
-    fn modified(&self, _path: &Path) -> Option<SystemTime> {
-        None
-    }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<SourceEntry>> {
-        if !self.has_dir(path) {
-            return Err(not_found(path));
-        }
-        let root = normalize(path).ok_or_else(|| not_found(path))?;
-        Ok(self
-            .entries_under(&root)
-            .into_iter()
-            .filter(|e| e.path.parent() == Some(root.as_path()))
-            .collect())
-    }
-    fn walk<'a>(&'a self, root: &Path) -> Box<dyn Iterator<Item = io::Result<SourceEntry>> + 'a> {
-        let Some(normal) = normalize(root) else {
-            return Box::new(std::iter::once(Err(not_found(root))));
-        };
-        let first = match self.kind(&normal) {
-            Ok(kind) => SourceEntry {
-                path: normal.clone(),
-                kind,
-            },
-            Err(error) => return Box::new(std::iter::once(Err(error))),
-        };
-        let rest = if first.kind == EntryKind::Dir {
-            self.entries_under(&normal)
-        } else {
-            Vec::new()
-        };
-        Box::new(std::iter::once(Ok(first)).chain(rest.into_iter().map(Ok)))
-    }
-    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        self.file(path)
-            .map(|b| b.to_vec())
-            .ok_or_else(|| not_found(path))
-    }
-    fn read_limited(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
-        let bytes = self.file(path).ok_or_else(|| not_found(path))?;
-        let end = usize::try_from(limit.saturating_add(1))
-            .unwrap_or(usize::MAX)
-            .min(bytes.len());
-        Ok(bytes[..end].to_vec())
-    }
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        let normal = normalize(path).ok_or_else(|| not_found(path))?;
-        self.kind(&normal)?;
-        Ok(normal)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -372,7 +83,7 @@ impl CacheStore for NativeCacheStore {
 }
 
 /// Entries in a host-chosen directory, e.g. precomputed portrayal payloads
-/// shipped with an application ([`crate::portrayal::PrecomputedCells`]):
+/// shipped with an application ([`ferrite_s101::layer::portrayal::PrecomputedCells`]):
 /// regular files only (links are rejected), atomic replacement, the native
 /// per-entry byte budget, no pruning. Payload hashes detect corruption; the
 /// directory is not access-checked like the private native cache.
@@ -622,7 +333,7 @@ pub trait UserStore: Send + Sync {
     /// The S-124 user state record of an OS user (None: not persisted).
     fn navwarn_state(&self, user: &str) -> Option<Box<dyn UserRecord>>;
     /// The transactional S-101 cancellation history record
-    /// ([`crate::chart_publication::HistoryStore`]). None: cancellations are
+    /// ([`ferrite_s101::layer::publication::HistoryStore`]). None: cancellations are
     /// not supported by this host.
     fn cancellation_history(&self) -> Option<Box<dyn UserRecord>>;
     /// Native location of the cancellation history file, for hosts that
@@ -741,9 +452,9 @@ impl UserStore for NativeUserStore {
         })
     }
     fn cancellation_history(&self) -> Option<Box<dyn UserRecord>> {
-        Some(Box::new(crate::chart_publication::HistoryFile::new(
-            self.history_path.clone(),
-        )))
+        Some(Box::new(
+            ferrite_s101::layer::publication::HistoryFile::new(self.history_path.clone()),
+        ))
     }
     fn cancellation_history_path(&self) -> Option<PathBuf> {
         Some(self.history_path.clone())
@@ -893,16 +604,9 @@ impl Clock for FixedClock {
 // Executor
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Where parallel and background work runs.
-pub trait Executor: Send + Sync {
-    /// Run `job(i)` for every `i < count`, possibly concurrently; returns
-    /// once all finished. A panicking job propagates its panic.
-    fn for_each_index(&self, count: usize, job: &(dyn Fn(usize) + Sync));
-    /// Start a background job. A sequential executor runs it before returning.
-    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>);
-    /// How many jobs may run at once.
-    fn parallelism(&self) -> usize;
-}
+/// Executor interface and the sequential executor, defined with the product
+/// interface (product modules run parallel work on it).
+pub use ferrite_product_api::platform::{parallel_map, Executor, SequentialExecutor};
 
 /// Native threads: up to the available parallelism (or one thread per job
 /// when fewer), background jobs on their own thread (`parallel` feature).
@@ -938,23 +642,6 @@ impl Executor for ThreadExecutor {
     }
 }
 
-/// Everything on the calling thread, in order (hosts without threads).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SequentialExecutor;
-impl Executor for SequentialExecutor {
-    fn for_each_index(&self, count: usize, job: &(dyn Fn(usize) + Sync)) {
-        for index in 0..count {
-            job(index);
-        }
-    }
-    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        job()
-    }
-    fn parallelism(&self) -> usize {
-        1
-    }
-}
-
 /// The executor of [`Platform::native`]: threads with the `parallel`
 /// feature, otherwise sequential.
 pub fn default_executor() -> Arc<dyn Executor> {
@@ -966,30 +653,6 @@ pub fn default_executor() -> Arc<dyn Executor> {
     {
         Arc::new(SequentialExecutor)
     }
-}
-
-/// `f` over `items` on the executor; results in item order.
-pub fn parallel_map<T: Sync, R: Send>(
-    executor: &dyn Executor,
-    items: &[T],
-    f: impl Fn(&T) -> R + Sync,
-) -> Vec<R> {
-    let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
-    executor.for_each_index(items.len(), &|index| {
-        let result = f(&items[index]);
-        if let Ok(mut slot) = slots[index].lock() {
-            *slot = Some(result);
-        }
-    });
-    slots
-        .into_iter()
-        .map(|slot| {
-            slot.into_inner()
-                .ok()
-                .flatten()
-                .expect("executor ran every job")
-        })
-        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1049,6 +712,17 @@ impl Platform {
     pub fn with_cache(mut self, cache: Arc<dyn CacheStore>) -> Self {
         self.cache = cache;
         self
+    }
+}
+
+impl Platform {
+    /// The handles a product layer keeps ([`ferrite_product_api::platform::Services`]).
+    pub fn services(&self) -> ferrite_product_api::platform::Services {
+        ferrite_product_api::platform::Services {
+            data: Arc::clone(&self.data),
+            cache: Arc::clone(&self.cache),
+            executor: Arc::clone(&self.executor),
+        }
     }
 }
 
@@ -1170,5 +844,118 @@ mod tests {
         let clock = FixedClock(at);
         assert_eq!(clock.unix_seconds(), 1_700_000_000);
         assert_eq!(clock.utc().timestamp(), 1_700_000_000);
+    }
+
+    // The S-101 portrayal cache and cancellation history through the
+    // engine's memory stores.
+    /// An in-memory store remembers a passed SHA-256 check per write: the
+    /// next read of the same bytes skips it, a rewrite checks again, and a
+    /// corrupted entry is still rejected. Host-checked entries
+    /// (`write_verified`) start checked; stores without memory (the default
+    /// `read_entry`) check every read.
+    #[test]
+    fn memory_store_remembers_integrity_checks_per_write() {
+        use ferrite_render::PointInstruction;
+        use ferrite_render::{DrawingInstruction, WorldPoint};
+        use ferrite_s101::layer::portrayal_cache::{
+            encode_cache_payload, read_and_deserialize_cache, stored_digest, wrap_cache,
+        };
+        use sha2::{Digest, Sha256};
+        use std::path::Path;
+        let instructions = vec![DrawingInstruction::Point(PointInstruction::new(
+            "S".into(),
+            WorldPoint::new(1., 2.),
+        ))];
+        let file = wrap_cache(&encode_cache_payload(&instructions).unwrap());
+        assert_eq!(stored_digest(&file), Some(&Sha256::digest(&file[40..])[..]));
+        assert_eq!(stored_digest(b"FRC"), None);
+        let store = MemoryCacheStore::default();
+        let path = Path::new("/memory-cache/portrayal-v1/.ferrite_cell_x.bin");
+        store.write(path, &file).unwrap();
+        assert!(!store.read_entry(path).unwrap().verified);
+        assert_eq!(
+            read_and_deserialize_cache(&store, path)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.read_entry(path).unwrap().verified);
+        assert_eq!(
+            read_and_deserialize_cache(&store, path)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        // A rewrite (here corrupted) is checked again and rejected.
+        let mut corrupted = file.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        store.write(path, &corrupted).unwrap();
+        assert!(!store.read_entry(path).unwrap().verified);
+        assert!(read_and_deserialize_cache(&store, path)
+            .unwrap()
+            .unwrap_err()
+            .contains("SHA-256"));
+        assert!(!store.read_entry(path).unwrap().verified);
+        // A check recorded for an earlier write does not carry over.
+        let stale = store.read_entry(path).unwrap().version.unwrap();
+        store.write(path, &file).unwrap();
+        store.mark_verified(path, stale);
+        assert!(!store.read_entry(path).unwrap().verified);
+        // Entries the host checked start verified; magic and schema
+        // version are still checked.
+        store.write_verified(path, &file).unwrap();
+        assert!(store.read_entry(path).unwrap().verified);
+        let mut old_schema = file.clone();
+        old_schema[4] ^= 1;
+        store.write_verified(path, &old_schema).unwrap();
+        assert!(read_and_deserialize_cache(&store, path)
+            .unwrap()
+            .unwrap_err()
+            .contains("schema"));
+        assert!(read_and_deserialize_cache(&NoCacheStore, path).is_err());
+    }
+
+    #[test]
+    fn history_store_in_a_memory_user_store_round_trips_and_refuses_corruption() {
+        use ferrite_s101::layer::publication::{
+            CancellationHistory, CancellationRecord, HistoryStore,
+        };
+        let user = MemoryUserStore::default();
+        let record = CancellationRecord {
+            key: ("INT.IHO.S-101.2.0".into(), "101AA00TEST".into()),
+            cancelled_edition: 4,
+            cancellation_update: 3,
+            issue_date: chrono::NaiveDate::from_ymd_opt(2024, 10, 17).unwrap(),
+        };
+        let mut store = HistoryStore::begin_record(user.cancellation_history().unwrap()).unwrap();
+        assert!(store.history.is_empty());
+        store.persist(vec![record.clone()]).unwrap();
+        drop(store);
+        let reopened =
+            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
+                .unwrap();
+        assert_eq!(reopened.get(&record.key), Some(&record));
+        // Same document bytes as the native file.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("history.json");
+        HistoryStore::begin(&path)
+            .unwrap()
+            .persist(vec![record.clone()])
+            .unwrap();
+        assert_eq!(
+            user.get(MEMORY_HISTORY_KEY).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        user.cancellation_history()
+            .unwrap()
+            .write(b"truncated")
+            .unwrap();
+        assert!(
+            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
+                .is_err()
+        );
+        assert!(HistoryStore::begin_record(user.cancellation_history().unwrap()).is_err());
     }
 }

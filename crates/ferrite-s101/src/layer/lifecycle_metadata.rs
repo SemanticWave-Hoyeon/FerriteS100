@@ -1,9 +1,9 @@
 //! Owned metadata evidence for S-101 lifecycle decisions. OFF reads producer
 //! metadata without any authenticity claim; it never constructs signed wrappers.
-use crate::platform::DataSource;
-use crate::s101_xc_coverage::{self, XcDataCoverage};
+use crate::layer::xc_coverage::{self as s101_xc_coverage, XcDataCoverage};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::NaiveDate;
+use ferrite_product_api::platform::DataSource;
 use ferrite_security::{AuthorizedDatasets, DatasetDiscoveryAuthorization, DatasetPurpose};
 use roxmltree::{Document, Node, ParsingOptions};
 use sha2::{Digest, Sha256, Sha384};
@@ -61,7 +61,7 @@ pub struct MetadataEvidence {
     pub update: Option<u32>,
     pub issue_date: NaiveDate,
     pub data_coverage: Vec<XcDataCoverage>,
-    product_specification: Option<crate::s101_xc_consistency::XcProduct>,
+    product_specification: Option<crate::layer::xc_consistency::XcProduct>,
     coverage_catalogue: Option<CapturedCoverageCatalogue>,
     original_canonical_key: PathBuf,
     raw_resource_sha256: [u8; 32],
@@ -151,7 +151,7 @@ impl MetadataEvidence {
         Ok(())
     }
     pub fn validate_xc_profile(&self, id: &ferrite_s100_core::DatasetIdentification) -> Result<()> {
-        crate::s101_xc_consistency::validate_profile(
+        crate::layer::xc_consistency::validate_profile(
             self.product_specification.as_ref(),
             self.purpose,
             &self.data_coverage,
@@ -162,8 +162,8 @@ impl MetadataEvidence {
     pub fn validate_effective_xc_scales(
         &self,
         cell: &ferrite_s100_core::S101Cell,
-    ) -> Result<crate::s101_xc_consistency::ScaleConsistency> {
-        crate::s101_xc_consistency::compare_effective(
+    ) -> Result<crate::layer::xc_consistency::ScaleConsistency> {
+        crate::layer::xc_consistency::compare_effective(
             self.product_specification.as_ref(),
             self.purpose,
             &self.data_coverage,
@@ -173,20 +173,20 @@ impl MetadataEvidence {
     pub fn validate_xc_regions(
         &self,
         cell: &ferrite_s100_core::S101Cell,
-    ) -> Result<crate::s101_xc_region::RegionStatus> {
+    ) -> Result<crate::layer::xc_region::RegionStatus> {
         let numeric = self.validate_effective_xc_scales(cell)?;
         if matches!(
             numeric,
-            crate::s101_xc_consistency::ScaleConsistency::LegacyNotApplied
-                | crate::s101_xc_consistency::ScaleConsistency::CancellationRequiresRetainedOriginal
-                | crate::s101_xc_consistency::ScaleConsistency::NullInterpretationRequired
+            crate::layer::xc_consistency::ScaleConsistency::LegacyNotApplied
+                | crate::layer::xc_consistency::ScaleConsistency::CancellationRequiresRetainedOriginal
+                | crate::layer::xc_consistency::ScaleConsistency::NullInterpretationRequired
         ) {
-            return Ok(crate::s101_xc_region::RegionStatus::Unverified);
+            return Ok(crate::layer::xc_region::RegionStatus::Unverified);
         }
         let Some(capture) = &self.coverage_catalogue else {
-            return Ok(crate::s101_xc_region::RegionStatus::Unverified);
+            return Ok(crate::layer::xc_region::RegionStatus::Unverified);
         };
-        crate::s101_xc_region::compare(capture.bytes(), &self.data_coverage, cell)
+        crate::layer::xc_region::compare(capture.bytes(), &self.data_coverage, cell)
     }
     pub fn is_authenticated(&self) -> bool {
         matches!(self.provenance, Provenance::AuthenticatedCatalogue)
@@ -344,7 +344,7 @@ fn capture_authenticated_rows(
     resource_uri: &str,
 ) -> Result<(
     Vec<XcDataCoverage>,
-    Option<crate::s101_xc_consistency::XcProduct>,
+    Option<crate::layer::xc_consistency::XcProduct>,
 )> {
     let xml = std::str::from_utf8(bytes)?;
     let document = Document::parse_with_options(
@@ -369,7 +369,7 @@ fn capture_authenticated_rows(
     );
     Ok((
         s101_xc_coverage::capture(entry)?,
-        crate::s101_xc_consistency::capture_product(entry)?,
+        crate::layer::xc_consistency::capture_product(entry)?,
     ))
 }
 
@@ -393,7 +393,7 @@ struct UnverifiedEntry {
     rows: std::result::Result<
         (
             Vec<XcDataCoverage>,
-            Option<crate::s101_xc_consistency::XcProduct>,
+            Option<crate::layer::xc_consistency::XcProduct>,
         ),
         String,
     >,
@@ -461,7 +461,7 @@ fn parse_unverified(
                     .and_then(|coverage| {
                         Ok((
                             coverage,
-                            crate::s101_xc_consistency::capture_product(entry)?,
+                            crate::layer::xc_consistency::capture_product(entry)?,
                         ))
                     })
                     .map_err(message),
@@ -496,7 +496,7 @@ pub fn capture_cached(
     cache: &mut CaptureCache,
 ) -> Result<Option<MetadataEvidence>> {
     capture_cached_in(
-        &crate::platform::NativeDataSource,
+        &ferrite_product_api::platform::NativeDataSource,
         original,
         RetainedInput::File(retained_data),
         retained_fingerprint,
@@ -643,7 +643,7 @@ pub fn capture_cached_in(
                     Some(bytes) => Arc::clone(bytes),
                     None => {
                         let bytes =
-                            crate::s101_xc_capture_pool::retain_unverified(&xml_path, &bytes)?;
+                            crate::layer::xc_capture_pool::retain_unverified(&xml_path, &bytes)?;
                         *slot = Some(Arc::clone(&bytes));
                         bytes
                     }
@@ -716,7 +716,7 @@ mod tests {
             "<xc:S100_DatasetDiscoveryMetadata><xc:fileName>file:/101AA00TEST.000</xc:fileName><xc:purpose>cancellation</xc:purpose><xc:editionNumber>4</xc:editionNumber><xc:updateNumber>3</xc:updateNumber><xc:issueDate>2026-10-07</xc:issueDate></xc:S100_DatasetDiscoveryMetadata>".into()
         }
         fn authorization(&self) -> AuthorizedDatasets {
-            crate::dataset_signature_policy::unchecked_datasets(&[self.original.clone()]).unwrap()
+            crate::layer::signatures::unchecked_datasets(&[self.original.clone()]).unwrap()
         }
     }
     impl Drop for Fixture {
@@ -773,11 +773,9 @@ mod tests {
             .replace("cancellation", "newDataset")
             .replace("<xc:updateNumber>3</xc:updateNumber>", "");
         f.xml(&(f.entry() + &other));
-        let authorization = crate::dataset_signature_policy::unchecked_datasets(&[
-            f.original.clone(),
-            second.clone(),
-        ])
-        .unwrap();
+        let authorization =
+            crate::layer::signatures::unchecked_datasets(&[f.original.clone(), second.clone()])
+                .unwrap();
         let summary = |e: &MetadataEvidence| {
             (
                 e.purpose,
@@ -992,5 +990,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "s101_xc_authenticated_tests.rs"]
+#[path = "xc_authenticated_tests.rs"]
 mod authenticated_xc_tests;

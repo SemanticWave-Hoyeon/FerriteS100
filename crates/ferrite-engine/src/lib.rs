@@ -36,42 +36,30 @@
 //! prepared scene. S-421 is the product layer `ferrite_s421::layer` behind
 //! the feature `s421` (on by default): route discovery and capture
 //! ([`dataset_open_plan`], [`ChartEngine`]) and the route store of
-//! [`ChartEngine`] go through it ([`products`]).
+//! [`ChartEngine`] go through it ([`products`]). S-101 is the product layer
+//! `ferrite_s101::layer` (update planning, lifecycle and exchange-set
+//! checks, catalogue selection, publication, caches and cell portrayal),
+//! held as [`EngineState::s101`]; the engine composes interoperability and
+//! the published scene around it. The stage descriptions above name the
+//! modules where they were before the move.
 
 pub mod catalogue;
-pub mod cell_source_identity;
-pub mod chart_cells;
 pub mod chart_engine;
-pub mod chart_publication;
 pub mod dataset_discovery;
 pub mod dataset_open_plan;
 pub mod dataset_pick_fields;
 pub mod dataset_signature_policy;
-pub mod decoded_chart_cache;
 pub mod gml_overlay;
-pub mod interoperability;
 pub mod pick;
 pub mod platform;
-pub mod portrayal;
-pub mod portrayal_cache;
-pub mod primary_viewing_layers;
 pub mod products;
-pub mod s101_catalogue_selection;
-pub mod s101_lifecycle_metadata;
-pub mod s101_update_plan;
-pub mod s101_xc_capture_pool;
-pub mod s101_xc_consistency;
-pub mod s101_xc_coverage;
-pub mod s101_xc_region;
 pub mod s102_host;
 pub mod scene;
 pub mod secure_instruction_cache;
 
-mod chart_load;
 mod state;
 pub use chart_engine::{
     Camera, ChartEngine, DatasetSource, EngineConfig, SignaturePolicy, View, Zoom,
 };
-pub use chart_load::{CellHydrationSource, ChartLoadResult};
-pub use portrayal::PortrayalSource;
+pub use ferrite_s101::layer::{CellHydrationSource, ChartLoadResult, PortrayalSource};
 pub use state::{CellHydration, CellScene, ChangeCellScene, EngineState, ViewportPixels};

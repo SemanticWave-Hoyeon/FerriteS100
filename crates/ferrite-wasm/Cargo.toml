@@ -37,6 +37,8 @@ ferrite-engine = { workspace = true, features = ["crypto-rust"] }
 ferrite-gpu.workspace = true
 ferrite-lua = { workspace = true, optional = true }
 ferrite-render.workspace = true
+# S-101 product layer: precomputed cell payload coding, the Lua context check.
+ferrite-s101.workspace = true
 tracing.workspace = true
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

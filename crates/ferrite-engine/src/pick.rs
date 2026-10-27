@@ -317,7 +317,8 @@ impl EngineState {
         fallback_type: &str,
     ) -> FeatureReport {
         let feature = cell_index.and_then(|cell_idx| {
-            self.cells
+            self.s101
+                .cells
                 .get(cell_idx as usize)
                 .and_then(|cell| cell.features.get(&feature_id))
         });
@@ -326,7 +327,7 @@ impl EngineState {
             .unwrap_or(fallback_type)
             .to_string();
         let source_fc = cell_index
-            .and_then(|index| self.catalogue_owner_for_cell(index as usize))
+            .and_then(|index| self.s101.catalogue_owner_for_cell(index as usize))
             .map(|owner| {
                 let fc: &ferrite_feature_catalog::FeatureCatalogue = owner.fc();
                 fc
@@ -346,7 +347,7 @@ impl EngineState {
                 .map(|f| format!("{:?}", f.primitive_type))
                 .unwrap_or_else(|| "Unknown".into()),
             source: cell_index
-                .and_then(|i| self.cells.get(i as usize))
+                .and_then(|i| self.s101.cells.get(i as usize))
                 .map(|c| c.file_path.display().to_string()),
             attributes: fields.attributes,
             definition,

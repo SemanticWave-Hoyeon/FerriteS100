@@ -97,18 +97,19 @@ mod flat_eventloop_diagnostics;
 mod flat_service_trajectory;
 mod gml_overlay;
 
-use ferrite_engine::catalogue::{
-    load_feature_catalogue, load_portrayal_catalogue, validate_fc, validate_pc,
-};
-use ferrite_engine::chart_cells::{chart_data_bounds, CatalogueNormalization};
-use ferrite_engine::portrayal::{validated_lua_context, PortrayalChangeRequest};
+use ferrite_engine::catalogue::{load_feature_catalogue, load_portrayal_catalogue};
 use ferrite_engine::scene::PreparedScene;
-use ferrite_engine::{
-    chart_publication, dataset_discovery, dataset_open_plan, dataset_signature_policy,
-    primary_viewing_layers, s101_catalogue_selection, s101_update_plan,
-};
+use ferrite_engine::{dataset_discovery, dataset_open_plan, dataset_signature_policy};
 use ferrite_engine::{
     CellHydration, CellHydrationSource, CellScene, ChangeCellScene, ChartLoadResult, EngineState,
+};
+use ferrite_s101::layer::catalogue::{validate_fc, validate_pc};
+use ferrite_s101::layer::cells::{chart_data_bounds, CatalogueNormalization};
+use ferrite_s101::layer::portrayal::{validated_lua_context, PortrayalChangeRequest};
+use ferrite_s101::layer::S101Layer;
+use ferrite_s101::layer::{
+    catalogue_selection as s101_catalogue_selection, primary_viewing_layers,
+    publication as chart_publication, update_plan as s101_update_plan,
 };
 use ferrite_s102::layer::{
     depth_policy as s102_depth_policy, input_capture as s102_input_capture,
@@ -1350,6 +1351,7 @@ impl ChartApp {
     #[allow(dead_code)]
     fn get_current_profile(&self) -> Option<&ferrite_portrayal_catalog::ColorProfile> {
         self.engine
+            .s101
             .pc
             .color_profiles
             .profiles
@@ -1369,7 +1371,7 @@ impl ChartApp {
             .as_mut()
             .unwrap()
             .set_settings(self.applied_settings.clone());
-        primary_viewing_layers::capture_primary(&self.engine.pc, &mut candidate)?;
+        primary_viewing_layers::capture_primary(&self.engine.s101.pc, &mut candidate)?;
         let request = PortrayalChangeRequest {
             profile: self.engine.current_profile_name.clone(),
             settings: candidate,
@@ -1418,7 +1420,7 @@ impl ChartApp {
     fn update_raster_suppression(&mut self) {
         let suppress = self.active_ic().is_some_and(|ic| {
             let mut displayed = Vec::new();
-            if !self.engine.cells.is_empty() {
+            if !self.engine.s101.cells.is_empty() {
                 displayed.push("S-101");
             }
             if !self.engine.s102.bathymetry.is_empty() {
@@ -1457,7 +1459,7 @@ impl ChartApp {
         // The MSVS is the committed scene's display scale; during an affine
         // preview keep the last answer rather than flicker.
         let msvs = self.engine.render_context.scaler.display_scale;
-        let larger_scale = match self.engine.coverage_inventory.as_ref() {
+        let larger_scale = match self.engine.s101.coverage_inventory.as_ref() {
             Some(inventory) if exact && msvs.is_finite() && msvs > 0. => {
                 inventory.larger_scale_at(position, msvs)
             }
@@ -1508,7 +1510,7 @@ impl ChartApp {
                     && !c.suppressed.is_empty()
             })
         });
-        if suppresses && !self.engine.cells.is_empty() {
+        if suppresses && !self.engine.s101.cells.is_empty() {
             self.queue_portrayal_change(PortrayalChangeRequest {
                 profile: self.engine.current_profile_name.clone(),
                 settings: self.applied_settings.clone(),
@@ -1576,6 +1578,7 @@ impl ChartApp {
     #[allow(dead_code)]
     fn get_available_profiles(&self) -> Vec<&str> {
         self.engine
+            .s101
             .pc
             .color_profiles
             .profiles
@@ -1599,7 +1602,7 @@ impl ChartApp {
             DisplayMode::All => ferrite_s101::DisplayPreset::Other,
         };
         // Every catalogue installation validates these mappings before commit.
-        let mut visible = ferrite_s101::viewing_groups_for_preset(&self.engine.pc, preset)
+        let mut visible = ferrite_s101::viewing_groups_for_preset(&self.engine.s101.pc, preset)
             .expect("Installed S-101 display modes were prevalidated");
         let settings = self
             .renderer
@@ -1607,7 +1610,7 @@ impl ChartApp {
             .map(|r| r.settings())
             .unwrap_or(&self.applied_settings);
         visible.extend(
-            primary_viewing_layers::resolve(&self.engine.pc, settings)
+            primary_viewing_layers::resolve(&self.engine.s101.pc, settings)
                 .expect("Selected S-101 layers were prevalidated"),
         );
         visible.insert(21010); // Existing plugin overlay group.
@@ -1780,7 +1783,7 @@ impl ChartApp {
     }
     fn load_bathymetry_transaction(&mut self, paths: &[PathBuf]) -> Result<()> {
         // Chart bounds read every cell's geometry.
-        self.engine.hydrate_all_cells()?;
+        self.engine.s101.hydrate_all_cells()?;
         self.ensure_navigation_scene()?;
         self.engine.s102.recheck_journal_admission()?;
         if paths.is_empty() {
@@ -2014,7 +2017,7 @@ impl ChartApp {
             incoming_bounds.push(input.bounds.context("No coverage tiles")?);
         }
         let mut next_bounds = chart_data_bounds(
-            &self.engine.cells,
+            &self.engine.s101.cells,
             self.engine
                 .s102
                 .bathymetry_bounds
@@ -2155,7 +2158,7 @@ impl ChartApp {
         if let Some(renderer) = &mut self.renderer {
             renderer.ui.ui_state.bathymetry_count = self.engine.s102.bathymetry.len();
             renderer.ui.ui_state.chart_count =
-                self.engine.cells.len() + self.engine.s102.bathymetry.len();
+                self.engine.s101.cells.len() + self.engine.s102.bathymetry.len();
             renderer.update_selection(&self.engine.render_context.scaler);
         }
         if self.auto_screenshot.is_some() {
@@ -2251,11 +2254,14 @@ impl ChartApp {
     ) -> Result<PreparedPortrayalChange> {
         self.poll_scene_build(true);
         self.ensure_navigation_scene()?;
-        let fc = Arc::clone(&self.engine.fc);
-        let pc = Arc::clone(&self.engine.pc);
+        let fc = Arc::clone(&self.engine.s101.fc);
+        let pc = Arc::clone(&self.engine.s101.pc);
         let symbols = self.symbol_cache.fork_empty();
         if self.cell_resources.is_some() {
-            let registry = self.engine.prepare_catalogue_registry(&fc, &pc, true)?;
+            let registry = self
+                .engine
+                .s101
+                .prepare_catalogue_registry(&fc, &pc, true)?;
             return self.prepare_portrayal_change_with_registry(
                 request,
                 &fc,
@@ -2284,14 +2290,14 @@ impl ChartApp {
         pc: Arc<BoundPortrayalCatalogue>,
     ) -> Result<()> {
         // Every cell is re-normalized with the new feature catalogue.
-        self.engine.hydrate_all_cells()?;
+        self.engine.s101.hydrate_all_cells()?;
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
             self.loading_state.is_none(),
             "Wait for dataset loading to finish before changing catalogues"
         );
         ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
-        for cell in &self.engine.cells {
+        for cell in &self.engine.s101.cells {
             ferrite_s101::validate_dataset_catalogues(
                 &cell.dsid,
                 &fc,
@@ -2309,12 +2315,13 @@ impl ChartApp {
         );
         let original: Vec<_> = self
             .engine
+            .s101
             .cells
             .iter()
             .map(CatalogueNormalization::capture)
             .collect();
         let codes = Arc::new(fc.feature_type_codes());
-        for cell in &mut self.engine.cells {
+        for cell in &mut self.engine.s101.cells {
             cell.normalize_feature_codes(&codes);
         }
         let prepared = self.prepare_portrayal_change_for_catalogues(
@@ -2332,25 +2339,25 @@ impl ChartApp {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                for (cell, original) in self.engine.cells.iter_mut().zip(original) {
+                for (cell, original) in self.engine.s101.cells.iter_mut().zip(original) {
                     original.restore(cell);
                 }
                 return Err(error);
             }
         };
         // Staging validated the capsule. Only infallible owner moves follow.
-        for hydration in self.engine.cell_hydration.values_mut() {
+        for hydration in self.engine.s101.cell_hydration.values_mut() {
             hydration.source.codes.push(Arc::clone(&codes));
         }
-        self.engine.fc = fc;
-        self.engine.pc = pc;
-        self.engine.fc_status = fc_status;
-        self.engine.pc_status = pc_status;
+        self.engine.s101.fc = fc;
+        self.engine.s101.pc = pc;
+        self.engine.s101.fc_status = fc_status;
+        self.engine.s101.pc_status = pc_status;
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui.ui_state.fc_status = self.engine.fc_status.clone();
-            renderer.ui.ui_state.pc_status = self.engine.pc_status.clone();
+            renderer.ui.ui_state.fc_status = self.engine.s101.fc_status.clone();
+            renderer.ui.ui_state.pc_status = self.engine.s101.pc_status.clone();
             renderer.ui.ui_state.optional_viewing_layers =
-                ferrite_s101::optional_viewing_layers(&self.engine.pc);
+                ferrite_s101::optional_viewing_layers(&self.engine.s101.pc);
             renderer.ui.ui_state.notice = None;
         }
         self.install_portrayal_change(prepared);
@@ -2394,7 +2401,7 @@ impl ChartApp {
         } = preparation_inputs;
         if matches!(raster_preparation, RasterPreparation::CallerStagedRaster) {
             anyhow::ensure!(
-                Arc::ptr_eq(fc, &self.engine.fc) && Arc::ptr_eq(pc, &self.engine.pc),
+                Arc::ptr_eq(fc, &self.engine.s101.fc) && Arc::ptr_eq(pc, &self.engine.s101.pc),
                 "Caller-staged raster requires the current primary catalogues"
             );
             anyhow::ensure!(
@@ -2419,15 +2426,19 @@ impl ChartApp {
                 "Caller-staged raster cannot bypass pending display settings"
             );
         }
-        if pc.source_digest() != self.engine.pc.source_digest() {
+        if pc.source_digest() != self.engine.s101.pc.source_digest() {
             request.settings = primary_viewing_layers::for_new_primary(pc, &request.settings);
         }
         let catalogue_registry = match registry {
-            Some(registry) => self.engine.reconcile_catalogue_registry(registry, fc, pc)?,
-            None => self.engine.prepare_catalogue_registry(fc, pc, false)?,
+            Some(registry) => self
+                .engine
+                .s101
+                .reconcile_catalogue_registry(registry, fc, pc)?,
+            None => self.engine.s101.prepare_catalogue_registry(fc, pc, false)?,
         };
         let owned = self
             .engine
+            .s101
             .requires_cell_resources(&catalogue_registry, fc, pc)?;
         let mut cell_resources = if owned {
             Some(self.prepare_cell_resources(&catalogue_registry, &request)?)
@@ -2493,7 +2504,7 @@ impl ChartApp {
             Some(inventory) => inventory,
             None => Arc::new(
                 ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(
-                    &self.engine.cells,
+                    &self.engine.s101.cells,
                 )?,
             ),
         };
@@ -2638,7 +2649,7 @@ impl ChartApp {
         groups.extend(primary_viewing_layers::resolve(pc, &request.settings)?);
         groups.insert(21010);
         if let Some(resources) = &mut cell_resources {
-            for (index, _) in self.engine.cells.iter().enumerate() {
+            for (index, _) in self.engine.s101.cells.iter().enumerate() {
                 let mut subset = next.empty_for_rebuild();
                 subset.set_instructions_from_cache(
                     next.raw_instructions()
@@ -2671,7 +2682,7 @@ impl ChartApp {
                     .cloned()
                     .collect(),
             );
-            if overlays.instruction_count() > 0 && !self.engine.cells.is_empty() {
+            if overlays.instruction_count() > 0 && !self.engine.s101.cells.is_empty() {
                 let resolved = resources.resolve_overlay_mut()?;
                 preflight_candidate_symbols(
                     &overlays,
@@ -2964,7 +2975,7 @@ impl ChartApp {
     /// Explicit audit only: request interpretation, not complete GPU permission proof.
     fn optional_layer_policy_audit(&self) -> Result<serde_json::Value> {
         anyhow::ensure!(
-            self.engine.cells.len() <= 4096,
+            self.engine.s101.cells.len() <= 4096,
             "Optional layer audit cell budget exceeded"
         );
         let digest = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -2978,11 +2989,12 @@ impl ChartApp {
             ids.sort_unstable();
             ids
         };
-        let mut cells = Vec::with_capacity(self.engine.cells.len());
-        for (index, cell) in self.engine.cells.iter().enumerate() {
-            let dataset_key = EngineState::catalogue_dataset_key(&cell.dsid)?;
+        let mut cells = Vec::with_capacity(self.engine.s101.cells.len());
+        for (index, cell) in self.engine.s101.cells.iter().enumerate() {
+            let dataset_key = S101Layer::catalogue_dataset_key(&cell.dsid)?;
             let owner = self
                 .engine
+                .s101
                 .catalogue_registry
                 .owner_for(&dataset_key)
                 .context("Optional layer audit missing actual dataset catalogue owner")?;
@@ -3006,10 +3018,10 @@ impl ChartApp {
         }
         Ok(serde_json::json!({
             "scope":"primary-PC-bound optional intent and per-cell resolved CPU policy; not all GPU permissions",
-            "primary_pc_source_digest":digest(self.engine.pc.source_digest()),
+            "primary_pc_source_digest":digest(self.engine.s101.pc.source_digest()),
             "applied_owner":self.applied_settings.viewing_layer_owner.as_ref().map(digest),
             "lexical_ids":self.applied_settings.viewing_layers.iter().collect::<Vec<_>>(),
-            "primary_product":self.engine.pc.product_id,"primary_version":self.engine.pc.version,
+            "primary_product":self.engine.s101.pc.product_id,"primary_version":self.engine.s101.pc.version,
             "display_mode":format!("{:?}",self.applied_settings.display_mode),"cells":cells
         }))
     }
@@ -3056,9 +3068,9 @@ impl ChartApp {
                 "render_stats": format!("{:?}",renderer.statistics()),
                 "area_triangulation_reuse": renderer.area_triangulation_reuse_statistics(),
                 "overscale_program_reuse": renderer.overscale_program_statistics(),
-                "flat_coverage_binding_cache": self.engine.coverage_inventory.as_ref().map(|i|i.flat_binding_cache_statistics()),
-                "flat_source_northing_cache": self.engine.coverage_inventory.as_ref().map(|i|i.flat_northing_cache_statistics()),
-                "source_cells": self.engine.cells.iter().map(|c| &c.file_path).collect::<Vec<_>>(),
+                "flat_coverage_binding_cache": self.engine.s101.coverage_inventory.as_ref().map(|i|i.flat_binding_cache_statistics()),
+                "flat_source_northing_cache": self.engine.s101.coverage_inventory.as_ref().map(|i|i.flat_northing_cache_statistics()),
+                "source_cells": self.engine.s101.cells.iter().map(|c| &c.file_path).collect::<Vec<_>>(),
                 "native_physical_input_verified": false,
                 "debug_statistics": {"cpu_percent": renderer.ui.ui_state.debug_cpu_usage,
                     "resident_mib": renderer.ui.ui_state.debug_memory_mb,
@@ -3239,20 +3251,21 @@ impl ChartApp {
         use ferrite_ui::{
             DatasetCatalogueLayer, DatasetLayerEntry, DatasetLayerId, DatasetProductLayer,
         };
-        let mut files = Vec::with_capacity(self.engine.cells.len());
-        let mut catalogue_bindings = Vec::with_capacity(self.engine.cells.len());
-        for (index, cell) in self.engine.cells.iter().enumerate() {
+        let mut files = Vec::with_capacity(self.engine.s101.cells.len());
+        let mut catalogue_bindings = Vec::with_capacity(self.engine.s101.cells.len());
+        for (index, cell) in self.engine.s101.cells.iter().enumerate() {
             let Ok((product, name)) = s101_update_plan::dataset_key(&cell.dsid) else {
                 continue;
             };
             let source = self
                 .engine
+                .s101
                 .loaded_chain_paths
                 .get(index)
                 .and_then(|paths| paths.first())
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            if let Some(owner) = self.engine.catalogue_owner_for_cell(index) {
+            if let Some(owner) = self.engine.s101.catalogue_owner_for_cell(index) {
                 if let Ok(cell_index) = u32::try_from(index) {
                     catalogue_bindings.push(ferrite_ui::DatasetCatalogueBinding {
                         cell_index: Some(cell_index),
@@ -3274,7 +3287,7 @@ impl ChartApp {
                     "Edition {} · update {} · {} features",
                     cell.dsid.edition_number,
                     cell.dsid.update_number,
-                    self.engine.cell_feature_count(index)
+                    self.engine.s101.cell_feature_count(index)
                 ),
             });
         }
@@ -3327,8 +3340,8 @@ impl ChartApp {
             renderer.ui.ui_state.catalogue_layers = vec![
                 DatasetCatalogueLayer {
                     product: "S-101".into(),
-                    fc: self.engine.fc_status.clone(),
-                    pc: self.engine.pc_status.clone(),
+                    fc: self.engine.s101.fc_status.clone(),
+                    pc: self.engine.s101.pc_status.clone(),
                 },
                 DatasetCatalogueLayer {
                     product: "S-102".into(),
@@ -3341,13 +3354,13 @@ impl ChartApp {
                     product: "S-101".into(),
                     fc: format!(
                         "FC {} · {}",
-                        self.engine.fc.version,
-                        self.engine.fc.source_path.display()
+                        self.engine.s101.fc.version,
+                        self.engine.s101.fc.source_path.display()
                     ),
                     pc: format!(
                         "PC {} · {}",
-                        self.engine.pc.version,
-                        self.engine.pc.root_path.display()
+                        self.engine.s101.pc.version,
+                        self.engine.s101.pc.root_path.display()
                     ),
                     files,
                 },
@@ -3415,7 +3428,7 @@ impl ChartApp {
     }
 
     fn unload_dataset(&mut self, id: ferrite_ui::DatasetLayerId) -> Result<()> {
-        self.engine.hydrate_all_cells()?;
+        self.engine.s101.hydrate_all_cells()?;
         anyhow::ensure!(
             self.loading_state.is_none()
                 && self.dataset_open_discovery.is_none()
@@ -3474,6 +3487,7 @@ impl ChartApp {
                 let key = (product, name);
                 let index = self
                     .engine
+                    .s101
                     .cells
                     .iter()
                     .position(|cell| {
@@ -3481,23 +3495,20 @@ impl ChartApp {
                     })
                     .context("Dataset is no longer loaded")?;
                 anyhow::ensure!(
-                    self.engine.cells.len() == self.engine.loaded_source_identities.len()
-                        && self.engine.cells.len() == self.engine.loaded_chain_paths.len(),
+                    self.engine.s101.cells.len() == self.engine.s101.loaded_source_identities.len()
+                        && self.engine.s101.cells.len()
+                            == self.engine.s101.loaded_chain_paths.len(),
                     "Loaded S-101 ownership is not aligned"
                 );
-                let cell = self.engine.cells.remove(index);
-                let identity = self.engine.loaded_source_identities.remove(index);
-                let paths = self.engine.loaded_chain_paths.remove(index);
+                let taken = self.engine.s101.take_cell(index);
                 let staged = self
                     .prepare_portrayal_change(request)
                     .and_then(|prepared| self.commit_portrayal_change(prepared));
                 if let Err(error) = staged {
-                    self.engine.cells.insert(index, cell);
-                    self.engine.loaded_source_identities.insert(index, identity);
-                    self.engine.loaded_chain_paths.insert(index, paths);
+                    self.engine.s101.restore_cell(index, taken);
                     return Err(error);
                 }
-                self.engine.loaded_discovery.remove(&key);
+                self.engine.s101.loaded_discovery.remove(&key);
             }
             ferrite_ui::DatasetLayerId::S421 { .. }
             | ferrite_ui::DatasetLayerId::Overlay { .. } => {
@@ -3542,22 +3553,24 @@ impl ChartApp {
         self.select_feature(None);
         self.pending_hit_test = None;
         self.chart_loaded =
-            !self.engine.cells.is_empty() || !self.engine.s102.bathymetry.is_empty();
+            !self.engine.s101.cells.is_empty() || !self.engine.s102.bathymetry.is_empty();
         if let Some(renderer) = &mut self.renderer {
             renderer.ui.ui_state.selection_candidates.clear();
             renderer.ui.ui_state.selection_requested = None;
             renderer.ui.ui_state.chart_count =
-                self.engine.cells.len() + self.engine.s102.bathymetry.len();
+                self.engine.s101.cells.len() + self.engine.s102.bathymetry.len();
             renderer.ui.ui_state.bathymetry_count = self.engine.s102.bathymetry.len();
             renderer.ui.ui_state.security_status = "Retained datasets keep their original verification results; dataset manually unloaded".into();
             renderer.ui.ui_state.feature_count = self
                 .engine
+                .s101
                 .cells
                 .iter()
                 .map(|cell| cell.features.len())
                 .sum();
             renderer.ui.ui_state.loaded_chart = self
                 .engine
+                .s101
                 .cells
                 .first()
                 .map(|cell| cell.dsid.dataset_name.clone());
@@ -3750,7 +3763,7 @@ impl ChartApp {
         {
             session.notices[0].clone()
         } else {
-            session.summary(self.engine.cells.len())
+            session.summary(self.engine.s101.cells.len())
         };
         if ferrite_ui::background_test::enabled() {
             if let Some(path) = std::env::var_os("FERRITE_OPEN_FOLDER_AUDIT_OUTPUT") {
@@ -3761,7 +3774,7 @@ impl ChartApp {
                         "rasters_existing": session.raster_existing,
                         "rasters_failed": session.raster_failed,
                         "coverages": self.engine.s102.bathymetry.len(),
-                        "chart_count": self.engine.cells.len(),
+                        "chart_count": self.engine.s101.cells.len(),
                         "notices": session.notices,
                         "summary": summary,
                         "paths": self.engine.s102.bathymetry.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
@@ -3810,9 +3823,10 @@ impl ChartApp {
 
         let checkpoint = self.load_checkpoint();
         let prepared = (|| -> Result<_> {
-            ferrite_s101::validate_catalogue_pair(&self.engine.fc, &self.engine.pc)?;
+            ferrite_s101::validate_catalogue_pair(&self.engine.s101.fc, &self.engine.s101.pc)?;
             let loaded_inputs: Vec<_> = self
                 .engine
+                .s101
                 .loaded_chain_paths
                 .iter()
                 .flatten()
@@ -3823,11 +3837,18 @@ impl ChartApp {
             // Retain all authenticated private inputs through background parsing.
             let authorization = self.authenticate_paths(&candidates)?;
             let mut loaded = std::collections::BTreeMap::new();
-            for (index, cell) in self.engine.cells.iter().enumerate() {
+            for (index, cell) in self.engine.s101.cells.iter().enumerate() {
                 let key = s101_update_plan::dataset_key(&cell.dsid)?;
-                let metadata = self.engine.loaded_discovery.get(&key).cloned().flatten();
+                let metadata = self
+                    .engine
+                    .s101
+                    .loaded_discovery
+                    .get(&key)
+                    .cloned()
+                    .flatten();
                 let identity = self
                     .engine
+                    .s101
                     .loaded_source_identities
                     .get(index)
                     .context("Missing loaded cell identity")?;
@@ -3839,7 +3860,7 @@ impl ChartApp {
                 );
             }
             let history = chart_publication::CancellationHistory::read(
-                &self.engine.cancellation_history_path,
+                &self.engine.s101.cancellation_history_path,
             )?;
             let (plans, cancellations, discovery_notices) = if selected.is_empty() {
                 let (plans, notices) = s101_update_plan::authorized_folder_plans(
@@ -3862,7 +3883,7 @@ impl ChartApp {
             let editions = plans
                 .iter()
                 .map(|p| &p.base.id)
-                .chain(self.engine.cells.iter().map(|c| &c.dsid))
+                .chain(self.engine.s101.cells.iter().map(|c| &c.dsid))
                 .map(|id| {
                     id.product_edition
                         .parse::<ferrite_kernel::SpecificationVersion>()
@@ -3873,28 +3894,28 @@ impl ChartApp {
             let candidate_registry = if mixed {
                 use s101_catalogue_selection::{DatasetCatalogueOwner, DatasetCatalogueRequest};
                 let fallback = Arc::new(DatasetCatalogueOwner::new(
-                    Arc::clone(&self.engine.fc),
-                    Arc::clone(&self.engine.pc),
+                    Arc::clone(&self.engine.s101.fc),
+                    Arc::clone(&self.engine.s101.pc),
                 )?);
-                let retained = self.engine.prepare_catalogue_registry(
-                    &self.engine.fc,
-                    &self.engine.pc,
+                let retained = self.engine.s101.prepare_catalogue_registry(
+                    &self.engine.s101.fc,
+                    &self.engine.s101.pc,
                     true,
                 )?;
                 let requests = plans
                     .iter()
                     .map(|plan| {
                         Ok(DatasetCatalogueRequest {
-                            dataset_key: EngineState::catalogue_dataset_key(&plan.base.id)?,
+                            dataset_key: S101Layer::catalogue_dataset_key(&plan.base.id)?,
                             source_identity: plan.captured_source_identity_sha(),
                             identification: plan.base.id.clone(),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let staged =
-                    retained.stage(&requests, fallback, &self.engine.catalogue_inventory)?;
+                    retained.stage(&requests, fallback, &self.engine.s101.catalogue_inventory)?;
                 for plan in &plans {
-                    let key = EngineState::catalogue_dataset_key(&plan.base.id)?;
+                    let key = S101Layer::catalogue_dataset_key(&plan.base.id)?;
                     let owner = staged
                         .owner_for(&key)
                         .context("Missing planned dataset catalogue owner")?;
@@ -3929,13 +3950,19 @@ impl ChartApp {
                     .flat_map(|p| std::iter::once(&p.base).chain(&p.updates))
                     .map(|p| p.id.clone())
                     .collect();
-                let retained: Vec<_> = self.engine.cells.iter().map(|c| c.dsid.clone()).collect();
+                let retained: Vec<_> = self
+                    .engine
+                    .s101
+                    .cells
+                    .iter()
+                    .map(|c| c.dsid.clone())
+                    .collect();
                 match s101_catalogue_selection::resolve_pair_exact_first(
                     &incoming,
                     &retained,
-                    &self.engine.fc,
-                    &self.engine.pc,
-                    &self.engine.catalogue_inventory,
+                    &self.engine.s101.fc,
+                    &self.engine.s101.pc,
+                    &self.engine.s101.catalogue_inventory,
                 )? {
                     s101_catalogue_selection::Selection::KeepCurrent => None,
                     s101_catalogue_selection::Selection::UseInstalled { fc, pc, notice } => {
@@ -4007,23 +4034,23 @@ impl ChartApp {
             candidate_catalogues
                 .as_ref()
                 .map(|p| &p.fc)
-                .unwrap_or(&self.engine.fc),
+                .unwrap_or(&self.engine.s101.fc),
         );
         let pc = candidate_catalogues
             .as_ref()
             .map(|p| &p.pc)
-            .unwrap_or(&self.engine.pc);
+            .unwrap_or(&self.engine.s101.pc);
         let pc_product = pc.product_id.clone();
         let pc_version = pc.version.clone();
 
         let worker_registry = candidate_registry.clone();
         // Raw parser memo survives chart unload; it never retains resolved catalogue owners.
         if std::env::var_os("FERRITE_NO_CACHE").is_some() {
-            if let Ok(mut cache) = self.engine.decoded_chart_cache.lock() {
+            if let Ok(mut cache) = self.engine.s101.decoded_chart_cache.lock() {
                 cache.clear();
             }
         }
-        let decoded_chart_cache = Arc::clone(&self.engine.decoded_chart_cache);
+        let decoded_chart_cache = Arc::clone(&self.engine.s101.decoded_chart_cache);
 
         // Spawn background thread for loading
         std::thread::spawn(move || {
@@ -4037,7 +4064,7 @@ impl ChartApp {
                 let plan: &crate::s101_update_plan::Plan = plan;
                 let path = plan.base.original.clone();
                 (|| -> Result<_> {
-                    let key = EngineState::catalogue_dataset_key(&plan.base.id)?;
+                    let key = S101Layer::catalogue_dataset_key(&plan.base.id)?;
                     let owner = worker_registry
                         .as_ref()
                         .map(|registry| {
@@ -4327,6 +4354,7 @@ impl ChartApp {
                 || state.checkpoint.catalogue_identity != self.bound_catalogue_identity()
                 || !self
                     .engine
+                    .s101
                     .catalogue_registry
                     .matches_checkpoint(&state.checkpoint.registry_checkpoint)
                 || state.checkpoint.catalogue_routes != self.catalogue_routes()
@@ -4364,19 +4392,21 @@ impl ChartApp {
             frames_since_loaded: self.frames_since_loaded,
             signature_mode: self.signature_verification_enabled(),
             catalogue_identity: self.bound_catalogue_identity(),
-            registry_checkpoint: self.engine.catalogue_registry.checkpoint(),
+            registry_checkpoint: self.engine.s101.catalogue_registry.checkpoint(),
             catalogue_routes: self.catalogue_routes(),
         }
     }
     fn catalogue_routes(&self) -> Vec<(Option<String>, Option<[u8; 32]>)> {
         self.engine
+            .s101
             .cells
             .iter()
             .enumerate()
             .map(|(index, cell)| {
                 (
-                    EngineState::catalogue_dataset_key(&cell.dsid).ok(),
+                    S101Layer::catalogue_dataset_key(&cell.dsid).ok(),
                     self.engine
+                        .s101
                         .loaded_source_identities
                         .get(index)
                         .map(|identity| *identity.sha256()),
@@ -4386,8 +4416,8 @@ impl ChartApp {
     }
     fn bound_catalogue_identity(&self) -> ([u8; 32], [u8; 32]) {
         (
-            *self.engine.fc.source_digest(),
-            *self.engine.pc.source_digest(),
+            *self.engine.s101.fc.source_digest(),
+            *self.engine.s101.pc.source_digest(),
         )
     }
     fn restore_load_checkpoint(&mut self, checkpoint: LoadCheckpoint) {
@@ -4436,7 +4466,7 @@ impl ChartApp {
         candidate_registry: Option<s101_catalogue_selection::DatasetCatalogueRegistry>,
     ) {
         // Publication merges, bounds and validation read every loaded cell.
-        if let Err(error) = self.engine.hydrate_all_cells() {
+        if let Err(error) = self.engine.s101.hydrate_all_cells() {
             self.load_error(error);
             return;
         }
@@ -4454,15 +4484,16 @@ impl ChartApp {
             }
         }
         let cancelled_count = removals.len();
-        let mut history =
-            match chart_publication::HistoryStore::begin(&self.engine.cancellation_history_path) {
-                Ok(history) => history,
-                Err(error) => {
-                    self.restore_load_checkpoint(checkpoint);
-                    self.load_error(error);
-                    return;
-                }
-            };
+        let mut history = match chart_publication::HistoryStore::begin(
+            &self.engine.s101.cancellation_history_path,
+        ) {
+            Ok(history) => history,
+            Err(error) => {
+                self.restore_load_checkpoint(checkpoint);
+                self.load_error(error);
+                return;
+            }
+        };
         for removal in &removals {
             if let Err(error) = history.history.validate_cancellation(removal.record()) {
                 self.restore_load_checkpoint(checkpoint);
@@ -4472,7 +4503,7 @@ impl ChartApp {
         }
         let announcement_only =
             incoming.is_empty() && removals.iter().all(|r| !r.removes_content());
-        let mut next_metadata = self.engine.loaded_discovery.clone();
+        let mut next_metadata = self.engine.s101.loaded_discovery.clone();
         for removal in &removals {
             next_metadata.remove(removal.key());
         }
@@ -4497,7 +4528,7 @@ impl ChartApp {
         }
         for result in &incoming {
             if let Some(source) = &result.hydration {
-                self.engine.cell_hydration.insert(
+                self.engine.s101.cell_hydration.insert(
                     *result.source_identity.sha256(),
                     CellHydration {
                         source: source.clone(),
@@ -4508,9 +4539,9 @@ impl ChartApp {
             }
         }
         let transaction = match chart_publication::CellPublication::stage_changes(
-            &mut self.engine.cells,
-            &mut self.engine.loaded_source_identities,
-            &mut self.engine.loaded_chain_paths,
+            &mut self.engine.s101.cells,
+            &mut self.engine.s101.loaded_source_identities,
+            &mut self.engine.s101.loaded_chain_paths,
             incoming,
             removals,
         ) {
@@ -4524,16 +4555,16 @@ impl ChartApp {
         if announcement_only {
             if let Err(error) = history.persist(transaction.cancellations()) {
                 transaction.rollback(
-                    &mut self.engine.cells,
-                    &mut self.engine.loaded_source_identities,
-                    &mut self.engine.loaded_chain_paths,
+                    &mut self.engine.s101.cells,
+                    &mut self.engine.s101.loaded_source_identities,
+                    &mut self.engine.s101.loaded_chain_paths,
                 );
                 self.restore_load_checkpoint(checkpoint);
                 self.load_error(error);
                 return;
             }
             drop(transaction.commit());
-            self.engine.loaded_discovery = next_metadata;
+            self.engine.s101.loaded_discovery = next_metadata;
             // A notice about an absent cell must not replace the retained
             // chart's authentication results or status.
             self.restore_load_checkpoint(checkpoint);
@@ -4546,9 +4577,9 @@ impl ChartApp {
             return;
         }
         let previous_bounds = self.engine.bounds;
-        if !self.engine.cells.is_empty() || !self.engine.s102.bathymetry.is_empty() {
+        if !self.engine.s101.cells.is_empty() || !self.engine.s102.bathymetry.is_empty() {
             self.engine.bounds = chart_data_bounds(
-                &self.engine.cells,
+                &self.engine.s101.cells,
                 self.engine.s102.bathymetry_bounds.values().copied(),
             );
             self.engine.bounds.expand_by_percent(0.1);
@@ -4556,8 +4587,8 @@ impl ChartApp {
         // All candidate FC/PC/VM/cache/material state stays private. The old live
         // pair and renderer resources still own the retained display on failure.
         let staged = if let Some(registry) = candidate_registry {
-            let fc = Arc::clone(&self.engine.fc);
-            let pc = Arc::clone(&self.engine.pc);
+            let fc = Arc::clone(&self.engine.s101.fc);
+            let pc = Arc::clone(&self.engine.s101.pc);
             let request = PortrayalChangeRequest {
                 profile: self.engine.current_profile_name.clone(),
                 settings: self.applied_settings.clone(),
@@ -4607,9 +4638,9 @@ impl ChartApp {
             Ok(prepared) => prepared,
             Err(error) => {
                 transaction.rollback(
-                    &mut self.engine.cells,
-                    &mut self.engine.loaded_source_identities,
-                    &mut self.engine.loaded_chain_paths,
+                    &mut self.engine.s101.cells,
+                    &mut self.engine.s101.loaded_source_identities,
+                    &mut self.engine.s101.loaded_chain_paths,
                 );
                 self.engine.bounds = previous_bounds;
                 self.restore_load_checkpoint(checkpoint);
@@ -4630,9 +4661,9 @@ impl ChartApp {
         };
         if let Err(error) = persist_result {
             transaction.rollback(
-                &mut self.engine.cells,
-                &mut self.engine.loaded_source_identities,
-                &mut self.engine.loaded_chain_paths,
+                &mut self.engine.s101.cells,
+                &mut self.engine.s101.loaded_source_identities,
+                &mut self.engine.s101.loaded_chain_paths,
             );
             self.engine.bounds = previous_bounds;
             self.restore_load_checkpoint(checkpoint);
@@ -4660,24 +4691,24 @@ impl ChartApp {
             PreparedLoadPortrayal::Current(portrayal) => self.publish_instructions(*portrayal),
             PreparedLoadPortrayal::Catalogue { owner, change } => {
                 let owner = *owner;
-                self.engine.fc = owner.fc;
-                self.engine.pc = owner.pc;
-                self.engine.fc_status = owner.fc_status;
-                self.engine.pc_status = owner.pc_status;
+                self.engine.s101.fc = owner.fc;
+                self.engine.s101.pc = owner.pc;
+                self.engine.s101.fc_status = owner.fc_status;
+                self.engine.s101.pc_status = owner.pc_status;
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.ui.ui_state.fc_status = self.engine.fc_status.clone();
-                    renderer.ui.ui_state.pc_status = self.engine.pc_status.clone();
+                    renderer.ui.ui_state.fc_status = self.engine.s101.fc_status.clone();
+                    renderer.ui.ui_state.pc_status = self.engine.s101.pc_status.clone();
                     renderer.ui.ui_state.optional_viewing_layers =
-                        ferrite_s101::optional_viewing_layers(&self.engine.pc);
+                        ferrite_s101::optional_viewing_layers(&self.engine.s101.pc);
                     renderer.ui.ui_state.notice = Some(owner.notice);
                 }
                 self.install_portrayal_change(*change);
             }
         }
         drop(transaction.commit());
-        self.engine.loaded_discovery = next_metadata;
+        self.engine.s101.loaded_discovery = next_metadata;
         self.chart_loaded =
-            !self.engine.cells.is_empty() || !self.engine.s102.bathymetry.is_empty();
+            !self.engine.s101.cells.is_empty() || !self.engine.s102.bathymetry.is_empty();
 
         if let Some(renderer) = &mut self.renderer {
             renderer.ui.ui_state.selected_feature = None;
@@ -4693,8 +4724,9 @@ impl ChartApp {
             renderer.ui.ui_state.loading_progress = None;
 
             if self.chart_loaded {
-                let chart_info = if self.engine.cells.len() == 1 {
+                let chart_info = if self.engine.s101.cells.len() == 1 {
                     self.engine
+                        .s101
                         .cells
                         .first()
                         .and_then(|c| {
@@ -4704,25 +4736,27 @@ impl ChartApp {
                         })
                         .unwrap_or_else(|| "Chart".to_string())
                 } else {
-                    format!("{} charts loaded", self.engine.cells.len())
+                    format!("{} charts loaded", self.engine.s101.cells.len())
                 };
                 renderer.ui.ui_state.loaded_chart = Some(chart_info);
 
                 let total_count: usize = self
                     .engine
+                    .s101
                     .cells
                     .iter()
                     .map(|c| c.statistics().features)
                     .sum();
                 renderer.ui.ui_state.feature_count = total_count;
                 renderer.ui.ui_state.chart_count =
-                    self.engine.cells.len() + self.engine.s102.bathymetry.len();
+                    self.engine.s101.cells.len() + self.engine.s102.bathymetry.len();
 
                 // The reference comes from producer DataCoverage attributes.
                 // A legacy dataset without optimumDisplayScale has no current
                 // reference; zero denotes unknown, never an invented filename scale.
                 let reference_scale = self
                     .engine
+                    .s101
                     .cells
                     .iter()
                     .filter_map(
@@ -4741,8 +4775,8 @@ impl ChartApp {
                 renderer.set_compilation_scale(reference_scale.unwrap_or(0));
 
                 // Compute per-cell bounding boxes for world map masking
-                let mut chart_boxes = Vec::with_capacity(self.engine.cells.len());
-                for cell in &self.engine.cells {
+                let mut chart_boxes = Vec::with_capacity(self.engine.s101.cells.len());
+                for cell in &self.engine.s101.cells {
                     let mut cmin_x = f64::MAX;
                     let mut cmin_y = f64::MAX;
                     let mut cmax_x = f64::MIN;
@@ -4801,8 +4835,9 @@ impl ChartApp {
 
         info!(
             "Loading complete: {} charts, {} features",
-            self.engine.cells.len(),
+            self.engine.s101.cells.len(),
             self.engine
+                .s101
                 .cells
                 .iter()
                 .map(|c| c.statistics().features)
@@ -4824,7 +4859,7 @@ impl ChartApp {
     /// Log detailed interior ring debug info for all loaded cells
     fn log_interior_ring_debug(&self) {
         info!("=== INTERIOR RING DEBUG ===");
-        for (ci, cell) in self.engine.cells.iter().enumerate() {
+        for (ci, cell) in self.engine.s101.cells.iter().enumerate() {
             let mut surfaces_with_holes = 0;
             let mut total_interior_rings = 0;
             let mut unclosed_rings = 0;
@@ -4955,10 +4990,7 @@ impl ChartApp {
 
         self.engine.verified_count = 0;
         self.engine.unsigned_count = 0;
-        self.engine.cells.clear();
-        self.engine.loaded_source_identities.clear();
-        self.engine.loaded_chain_paths.clear();
-        self.engine.loaded_discovery.clear();
+        self.engine.s101.clear_cells();
         self.engine.s102.clear_coverages();
         self.pending_portrayal_change = None;
         self.engine.bounds = GeoBounds::new(-180.0, -90.0, 180.0, 90.0);
@@ -4986,7 +5018,7 @@ impl ChartApp {
             self.engine.render_context.settings = display_settings;
         }
         self.engine.base_instruction_count = 0;
-        self.engine.coverage_inventory = None;
+        self.engine.s101.coverage_inventory = None;
 
         if let Some(_renderer) = &mut self.renderer {}
 
@@ -5028,15 +5060,18 @@ impl ChartApp {
         raster_preparation: RasterPreparation,
     ) -> Result<PreparedPortrayal> {
         self.ensure_navigation_scene()?;
-        let registry =
-            self.engine
-                .prepare_catalogue_registry(&self.engine.fc, &self.engine.pc, true)?;
-        if self
-            .engine
-            .requires_cell_resources(&registry, &self.engine.fc, &self.engine.pc)?
-        {
-            let fc = Arc::clone(&self.engine.fc);
-            let pc = Arc::clone(&self.engine.pc);
+        let registry = self.engine.s101.prepare_catalogue_registry(
+            &self.engine.s101.fc,
+            &self.engine.s101.pc,
+            true,
+        )?;
+        if self.engine.s101.requires_cell_resources(
+            &registry,
+            &self.engine.s101.fc,
+            &self.engine.s101.pc,
+        )? {
+            let fc = Arc::clone(&self.engine.s101.fc);
+            let pc = Arc::clone(&self.engine.s101.pc);
             let request = PortrayalChangeRequest {
                 profile: self.engine.current_profile_name.clone(),
                 settings: self.applied_settings.clone(),
@@ -5097,9 +5132,11 @@ impl ChartApp {
                 "Injected failure after Lua/IC/flat coverage preparation, before publication"
             );
         }
-        let catalogue_registry =
-            self.engine
-                .prepare_catalogue_registry(&self.engine.fc, &self.engine.pc, true)?;
+        let catalogue_registry = self.engine.s101.prepare_catalogue_registry(
+            &self.engine.s101.fc,
+            &self.engine.s101.pc,
+            true,
+        )?;
         info!(
             "Post-Lua preparation: {:.1} ms",
             after_lua.elapsed().as_secs_f64() * 1e3
@@ -5135,7 +5172,7 @@ impl ChartApp {
             .collect::<Vec<_>>();
         let mut resources =
             ferrite_gpu::CellPortrayalResources::prepare(&bindings, &request.profile, 4096)?;
-        for index in 0..self.engine.cells.len() {
+        for index in 0..self.engine.s101.cells.len() {
             let groups = self
                 .engine
                 .cell_viewing_groups(registry, index, &request.settings)?;
@@ -5209,12 +5246,12 @@ impl ChartApp {
         if ferrite_render::area_triangulation_reuse_enabled() {
             next.inherit_static_area_geometry_from(&self.engine.render_context);
         }
-        self.engine.catalogue_registry = catalogue_registry;
+        self.engine.s101.catalogue_registry = catalogue_registry;
         self.cell_resources = cell_resources;
         self.engine.render_context = next;
-        self.engine.coverage_inventory = Some(coverage);
+        self.engine.s101.coverage_inventory = Some(coverage);
         self.engine.ic_assigned_vectors = ic_changed;
-        self.engine.cell_release_pending = true;
+        self.engine.s101.cell_release_pending = true;
         self.engine.base_instruction_count = self.engine.render_context.instruction_count();
         if let Some(renderer) = &self.renderer {
             self.applied_settings = renderer.settings().clone();
@@ -5229,6 +5266,7 @@ impl ChartApp {
     ) {
         let color_profile = self
             .engine
+            .s101
             .pc
             .color_profiles
             .profiles
@@ -5511,7 +5549,7 @@ impl ChartApp {
         );
         anyhow::ensure!(!output.exists(), "Native dataset audit output must be new");
         std::fs::create_dir_all(output)?;
-        self.engine.cancellation_history_path = output.join("history.json");
+        self.engine.s101.cancellation_history_path = output.join("history.json");
         let input = PathBuf::from(std::env::var("FERRITE_NATIVE_DATASET_INPUT")?);
         let folder = input.is_dir();
         let expected: usize = std::env::var("FERRITE_NATIVE_DATASET_EXPECTED")?.parse()?;
@@ -5651,7 +5689,7 @@ impl ChartApp {
         self.ensure_navigation_scene()?;
         anyhow::ensure!(!output.exists(), "Audit output must be new");
         fs::create_dir_all(output)?;
-        self.engine.cancellation_history_path = output.join("history.json");
+        self.engine.s101.cancellation_history_path = output.join("history.json");
         let input = PathBuf::from(std::env::var("FERRITE_DATASET_UI_INPUT")?);
         let folder = std::env::var("FERRITE_DATASET_UI_KIND").is_ok_and(|s| s == "folder");
         // Match the ordinary UI's first painted frame before accepting an open
@@ -5803,20 +5841,20 @@ impl ChartApp {
             }
             anyhow::ensure!(
                 !self.chart_loaded
-                    && self.engine.cells.is_empty()
+                    && self.engine.s101.cells.is_empty()
                     && self.engine.s102.bathymetry.is_empty(),
                 "Last dataset retained"
             );
             self.capture_catalogue_audit(&output.join("unloaded-all"))?;
         }
         anyhow::ensure!(
-            !self.engine.cancellation_history_path.exists(),
+            !self.engine.s101.cancellation_history_path.exists(),
             "Manual unload created cancellation history"
         );
         fs::write(
             output.join("result.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"tree_count":tree_count,"opening_notice":opening_notice,"failed_unload":format!("{failure:#}"),"failure_binding_exact":true,"tree_before":old_tree,"remaining_cells":self.engine.cells.len(),"remaining_raster_instances":self.engine.s102.bathymetry.len(),"history_written":false,"visible":self.window.as_ref().unwrap().is_visible(),"focused":self.window.as_ref().unwrap().has_focus()}),
+                &serde_json::json!({"tree_count":tree_count,"opening_notice":opening_notice,"failed_unload":format!("{failure:#}"),"failure_binding_exact":true,"tree_before":old_tree,"remaining_cells":self.engine.s101.cells.len(),"remaining_raster_instances":self.engine.s102.bathymetry.len(),"history_written":false,"visible":self.window.as_ref().unwrap().is_visible(),"focused":self.window.as_ref().unwrap().has_focus()}),
             )?,
         )?;
         Ok(())
@@ -5827,28 +5865,28 @@ impl ChartApp {
     /// directory; it never alters official input bytes or the ordinary startup path.
     fn catalogue_audit_binding(&self) -> Result<serde_json::Value> {
         let r = self.renderer.as_ref().context("Renderer required")?;
-        let history = if self.engine.cancellation_history_path.exists() {
-            let length = fs::metadata(&self.engine.cancellation_history_path)?.len();
+        let history = if self.engine.s101.cancellation_history_path.exists() {
+            let length = fs::metadata(&self.engine.s101.cancellation_history_path)?.len();
             anyhow::ensure!(
                 length <= 8 * 1024 * 1024,
                 "Audit history exceeds bounded read"
             );
             Some(format!(
                 "{:x}",
-                Sha256::digest(fs::read(&self.engine.cancellation_history_path)?)
+                Sha256::digest(fs::read(&self.engine.s101.cancellation_history_path)?)
             ))
         } else {
             None
         };
         Ok(serde_json::json!({"model":self.publication_model()?,
-            "fc_digest":self.engine.fc.source_digest(),"pc_digest":self.engine.pc.source_digest(),
-            "fc_version":self.engine.fc.version,"pc_version":self.engine.pc.version,
-            "fc_product":self.engine.fc.product_id,"pc_product":self.engine.pc.product_id,
-            "dataset_catalogue_owners": self.engine.cells.iter().enumerate().map(|(index, cell)| -> Result<_> {
-                let key = EngineState::catalogue_dataset_key(&cell.dsid)?;
-                let owner = self.engine.catalogue_registry.owner_for(&key).context("Audit catalogue owner missing")?;
+            "fc_digest":self.engine.s101.fc.source_digest(),"pc_digest":self.engine.s101.pc.source_digest(),
+            "fc_version":self.engine.s101.fc.version,"pc_version":self.engine.s101.pc.version,
+            "fc_product":self.engine.s101.fc.product_id,"pc_product":self.engine.s101.pc.product_id,
+            "dataset_catalogue_owners": self.engine.s101.cells.iter().enumerate().map(|(index, cell)| -> Result<_> {
+                let key = S101Layer::catalogue_dataset_key(&cell.dsid)?;
+                let owner = self.engine.s101.catalogue_registry.owner_for(&key).context("Audit catalogue owner missing")?;
                 Ok(serde_json::json!({"cell_index":index,"dataset_key":key,
-                    "identity":self.engine.catalogue_registry.binding_identity(&key),
+                    "identity":self.engine.s101.catalogue_registry.binding_identity(&key),
                     "fc_version":owner.fc().version,"pc_version":owner.pc().version}))
             }).collect::<Result<Vec<_>>>()?,
             "symbol_cache_revision":self.symbol_cache.resource_revision(),"symbol_cache_len":self.symbol_cache.len(),
@@ -5925,7 +5963,7 @@ impl ChartApp {
             ));
         }
         fs::create_dir_all(output)?;
-        self.engine.cancellation_history_path = output.join("history.json");
+        self.engine.s101.cancellation_history_path = output.join("history.json");
         if !retained.is_empty() {
             anyhow::ensure!(
                 self.catalogue_audit_load(&retained)?.is_none(),
@@ -5948,7 +5986,7 @@ impl ChartApp {
                 "Manual audit initial load failed"
             );
             anyhow::ensure!(
-                self.engine.cells.len() == expected && expected > 0,
+                self.engine.s101.cells.len() == expected && expected > 0,
                 "Manual audit cell count mismatch"
             );
             let before = self.capture_catalogue_audit(&output.join("manual-before"))?;
@@ -5988,20 +6026,22 @@ impl ChartApp {
             }
         } else if mode == "mixed-success" {
             anyhow::ensure!(
-                !self.engine.cells.is_empty(),
+                !self.engine.s101.cells.is_empty(),
                 "Mixed audit requires retained cells"
             );
-            let retained_count = self.engine.cells.len();
+            let retained_count = self.engine.s101.cells.len();
             let retained_owners: Vec<_> = self
                 .engine
+                .s101
                 .cells
                 .iter()
                 .map(|cell| {
-                    let key = EngineState::catalogue_dataset_key(&cell.dsid)?;
+                    let key = S101Layer::catalogue_dataset_key(&cell.dsid)?;
                     Ok((
                         key.clone(),
                         Arc::clone(
                             self.engine
+                                .s101
                                 .catalogue_registry
                                 .owner_for(&key)
                                 .context("Missing retained owner")?,
@@ -6048,18 +6088,19 @@ impl ChartApp {
                 );
             }
             anyhow::ensure!(
-                self.engine.cells.len() == expected && expected > retained_count,
+                self.engine.s101.cells.len() == expected && expected > retained_count,
                 "Mixed publication count mismatch"
             );
             anyhow::ensure!(
                 self.cell_resources
                     .as_ref()
-                    .is_some_and(|r| r.cell_count() == self.engine.cells.len()),
+                    .is_some_and(|r| r.cell_count() == self.engine.s101.cells.len()),
                 "Mixed resources not installed"
             );
             for (key, owner) in retained_owners {
                 anyhow::ensure!(
                     self.engine
+                        .s101
                         .catalogue_registry
                         .owner_for(&key)
                         .is_some_and(|current| Arc::ptr_eq(current, &owner)),
@@ -6068,6 +6109,7 @@ impl ChartApp {
             }
             let editions = self
                 .engine
+                .s101
                 .cells
                 .iter()
                 .map(|c| s101_catalogue_selection::dataset_version(&c.dsid).map(|v| v.edition))
@@ -6077,7 +6119,7 @@ impl ChartApp {
                 "Audit did not publish mixed product Editions"
             );
             let instructions = self.engine.render_context.raw_instructions();
-            for index in 0..self.engine.cells.len() {
+            for index in 0..self.engine.s101.cells.len() {
                 anyhow::ensure!(
                     instructions
                         .iter()
@@ -6085,7 +6127,7 @@ impl ChartApp {
                     "A mixed cell has no original indexed instructions"
                 );
                 anyhow::ensure!(
-                    self.engine.catalogue_owner_for_cell(index).is_some(),
+                    self.engine.s101.catalogue_owner_for_cell(index).is_some(),
                     "Mixed source identity lost its catalogue binding"
                 );
             }
@@ -6123,7 +6165,7 @@ impl ChartApp {
             failures.push(error);
         } else {
             anyhow::ensure!(
-                mode == "success" && self.engine.cells.is_empty(),
+                mode == "success" && self.engine.s101.cells.is_empty(),
                 "Pair transition audit requires no retained S101 cells"
             );
             for (phase, history_fault) in [("material-failure", false), ("history-failure", true)] {
@@ -6152,15 +6194,15 @@ impl ChartApp {
                 "Catalogue retry failed"
             );
             anyhow::ensure!(
-                self.engine.cells.len() == expected && expected > 0,
+                self.engine.s101.cells.len() == expected && expected > 0,
                 "Unexpected successful dataset count"
             );
             anyhow::ensure!(
-                self.engine.pc.version == "1.0.2" && self.engine.fc.version == "1.0.2",
+                self.engine.s101.pc.version == "1.0.2" && self.engine.s101.fc.version == "1.0.2",
                 "Expected actual legacy catalogue1.0.2"
             );
             anyhow::ensure!(
-                self.engine.cells.iter().all(|c| c
+                self.engine.s101.cells.iter().all(|c| c
                     .dsid
                     .product_edition
                     .parse::<ferrite_kernel::SpecificationVersion>()
@@ -6174,16 +6216,16 @@ impl ChartApp {
             let first = self.capture_catalogue_audit(&output.join("retry"))?;
             let instruction_bytes =
                 bincode::serialize(self.engine.render_context.raw_instructions())?;
-            let fc_digest = *self.engine.fc.source_digest();
-            let pc_digest = *self.engine.pc.source_digest();
+            let fc_digest = *self.engine.s101.fc.source_digest();
+            let pc_digest = *self.engine.s101.pc.source_digest();
             let revision = self.symbol_cache.resource_revision();
             anyhow::ensure!(
                 self.catalogue_audit_load(&targets)?.is_none(),
                 "Repeat load failed"
             );
             anyhow::ensure!(
-                *self.engine.fc.source_digest() == fc_digest
-                    && *self.engine.pc.source_digest() == pc_digest
+                *self.engine.s101.fc.source_digest() == fc_digest
+                    && *self.engine.s101.pc.source_digest() == pc_digest
                     && self.symbol_cache.resource_revision() == revision,
                 "Repeat load unnecessarily replaced catalogue/cache owner"
             );
@@ -6235,7 +6277,7 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.chart_loaded
-                && !self.engine.cells.is_empty()
+                && !self.engine.s101.cells.is_empty()
                 && self.engine.s102.bathymetry.is_empty()
                 && self.dataset_open_discovery.is_none()
                 && self.dataset_open_session.is_none(),
@@ -6246,7 +6288,7 @@ impl ChartApp {
             "Settled camera required"
         );
         anyhow::ensure!(
-            self.engine.cells.len() <= 128
+            self.engine.s101.cells.len() <= 128
                 && self.engine.render_context.raw_instructions().len() <= 500_000,
             "Activation CPU inventory limit exceeded"
         );
@@ -6281,7 +6323,7 @@ impl ChartApp {
         let old_coverage_revision = self.engine.render_context.coverage_view_revision();
         let before = self.catalogue_audit_binding()?;
         let camera = self.navigation_camera_bits();
-        let registry = self.engine.catalogue_registry.checkpoint();
+        let registry = self.engine.s101.catalogue_registry.checkpoint();
         let expected_text_draws = std::env::var("FERRITE_READY_VECTOR_ACTIVATION_TEXT_DRAWS")
             .ok()
             .map(|v| {
@@ -6340,7 +6382,7 @@ impl ChartApp {
                     self.engine.render_context.raw_instructions().to_vec(),
                 );
                 prepare_flat_coverage(
-                    self.engine.coverage_inventory.as_deref(),
+                    self.engine.s101.coverage_inventory.as_deref(),
                     &mut next,
                     window.inner_size(),
                     window.scale_factor(),
@@ -6353,7 +6395,7 @@ impl ChartApp {
                     "Fresh coverage altered original ordered IR"
                 );
                 let resources =
-                    self.prepare_cell_resources(&self.engine.catalogue_registry, &request)?;
+                    self.prepare_cell_resources(&self.engine.s101.catalogue_registry, &request)?;
                 let wrap = 360.0 * next.scaler.scale_x() as f32;
                 let emission = renderer.prepare_private_vector_emission(
                     next,
@@ -6410,7 +6452,10 @@ impl ChartApp {
         let glyph_positive = text_draw_count > 0 && raw_text_count > 0;
         // Independent App checks occur AFTER complete candidate preparation, BEFORE Renderer activation.
         anyhow::ensure!(
-            self.engine.catalogue_registry.matches_checkpoint(&registry)
+            self.engine
+                .s101
+                .catalogue_registry
+                .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera
                 && self.catalogue_audit_binding()? == before,
             "Candidate preparation changed current App/source/model binding"
@@ -6431,7 +6476,10 @@ impl ChartApp {
             "New context revision was not adopted"
         );
         anyhow::ensure!(
-            self.engine.catalogue_registry.matches_checkpoint(&registry)
+            self.engine
+                .s101
+                .catalogue_registry
+                .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera
                 && self.catalogue_audit_binding()? == before,
             "Same-source activation changed App/model/camera/registry snapshot"
@@ -6483,7 +6531,10 @@ impl ChartApp {
             normal_frame_hashes.push(format!("{:x}", Sha256::digest(&image.rgba8)));
         }
         anyhow::ensure!(
-            self.engine.catalogue_registry.matches_checkpoint(&registry)
+            self.engine
+                .s101
+                .catalogue_registry
+                .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera
                 && self.catalogue_audit_binding()? == before,
             "Normal activation audit frames changed App/model/registry/camera snapshot"
@@ -6617,7 +6668,7 @@ impl ChartApp {
         let mut next = self.engine.render_context.empty_for_rebuild();
         next.set_instructions_from_cache(self.engine.render_context.raw_instructions().to_vec());
         prepare_flat_coverage(
-            self.engine.coverage_inventory.as_deref(),
+            self.engine.s101.coverage_inventory.as_deref(),
             &mut next,
             window.inner_size(),
             window.scale_factor(),
@@ -6631,7 +6682,8 @@ impl ChartApp {
             profile: profile.into(),
             settings: self.applied_settings.clone(),
         };
-        let resources = self.prepare_cell_resources(&self.engine.catalogue_registry, &request)?;
+        let resources =
+            self.prepare_cell_resources(&self.engine.s101.catalogue_registry, &request)?;
         let groups = self.get_visible_viewing_groups();
         let boxes = renderer.vector_world_map_chart_boxes();
         anyhow::ensure!(boxes.len() <= 4096, "Joint audit world map cap exceeded");
@@ -6685,7 +6737,7 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.chart_loaded
-                && !self.engine.cells.is_empty()
+                && !self.engine.s101.cells.is_empty()
                 && !self.engine.s102.bathymetry.is_empty()
                 && self.dataset_open_discovery.is_none()
                 && self.dataset_open_session.is_none(),
@@ -6696,7 +6748,7 @@ impl ChartApp {
             "Settled joint camera required"
         );
         anyhow::ensure!(
-            self.engine.cells.len() <= 128
+            self.engine.s101.cells.len() <= 128
                 && self.engine.s102.bathymetry.len() <= 32
                 && self.engine.render_context.raw_instructions().len() <= 500_000
                 && bincode::serialized_size(self.engine.render_context.raw_instructions())?
@@ -6720,7 +6772,7 @@ impl ChartApp {
         );
         let before = self.bathymetry_publication_model()?;
         let catalogue = self.catalogue_audit_binding()?;
-        let registry = self.engine.catalogue_registry.checkpoint();
+        let registry = self.engine.s101.catalogue_registry.checkpoint();
         let camera = self.navigation_camera_bits();
         let original_revision = self.engine.render_context.geometry_revision();
         let profile = self.engine.current_profile_name.clone();
@@ -6816,7 +6868,11 @@ impl ChartApp {
             capture(self, &output.join("after-camera-rejection.png"))? == reference
                 && self.bathymetry_publication_model()? == before
                 && self.catalogue_audit_binding()? == catalogue
-                && self.engine.catalogue_registry.matches_checkpoint(&registry)
+                && self
+                    .engine
+                    .s101
+                    .catalogue_registry
+                    .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera,
             "Wrong-camera rejection changed old mixed display/model/registry/camera"
         );
@@ -6846,7 +6902,11 @@ impl ChartApp {
             capture(self, &output.join("after-palette-rejection.png"))? == reference
                 && self.bathymetry_publication_model()? == before
                 && self.catalogue_audit_binding()? == catalogue
-                && self.engine.catalogue_registry.matches_checkpoint(&registry)
+                && self
+                    .engine
+                    .s101
+                    .catalogue_registry
+                    .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera,
             "Foreign-palette rejection changed old mixed display/model/registry/camera"
         );
@@ -6920,7 +6980,11 @@ impl ChartApp {
         anyhow::ensure!(
             self.bathymetry_publication_model()? == before
                 && self.catalogue_audit_binding()? == catalogue
-                && self.engine.catalogue_registry.matches_checkpoint(&registry)
+                && self
+                    .engine
+                    .s101
+                    .catalogue_registry
+                    .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera,
             "Joint preparation changed App owners"
         );
@@ -6970,7 +7034,11 @@ impl ChartApp {
         anyhow::ensure!(
             self.bathymetry_publication_model()? == before
                 && self.catalogue_audit_binding()? == catalogue
-                && self.engine.catalogue_registry.matches_checkpoint(&registry)
+                && self
+                    .engine
+                    .s101
+                    .catalogue_registry
+                    .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera
                 && bincode::serialize(
                     &self
@@ -6982,7 +7050,7 @@ impl ChartApp {
             "Joint activation changed original model/registry/camera/symbol source metadata"
         );
         let report = serde_json::json!({"passed":true,"scope":"same-original/current-camera genuine S101 and regular S102 Renderer joint activation; no full App/journal/continuous authorization or FPS claim",
-            "hidden":true,"focused":false,"charts":self.engine.cells.len(),"bathymetry_instances":self.engine.s102.bathymetry.len(),
+            "hidden":true,"focused":false,"charts":self.engine.s101.cells.len(),"bathymetry_instances":self.engine.s102.bathymetry.len(),
             "original_ir_count":self.engine.render_context.instruction_count(),"text_draw_count":text_draw_count,
             "original_ir_sha256":format!("{:x}",Sha256::digest(bincode::serialize(self.engine.render_context.raw_instructions())?)),
             "rgba_sha256":format!("{:x}",Sha256::digest(&reference.2)),"rgba_bytes":reference.2.len(),"extent":[reference.0,reference.1],
@@ -7017,7 +7085,7 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.chart_loaded
-                && self.engine.cells.len() == 1
+                && self.engine.s101.cells.len() == 1
                 && self.engine.s102.bathymetry.is_empty(),
             "Single original chain and vector-only scene required"
         );
@@ -7027,8 +7095,11 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.engine
+                .s101
                 .catalogue_owner_for_cell(0)
-                .is_some_and(|owner| owner.pc().source_digest() == self.engine.pc.source_digest()),
+                .is_some_and(
+                    |owner| owner.pc().source_digest() == self.engine.s101.pc.source_digest()
+                ),
             "Single PC audit cannot force global resources onto another cell PC"
         );
         anyhow::ensure!(
@@ -7043,7 +7114,7 @@ impl ChartApp {
         let original_hash = format!("{:x}", Sha256::digest(bincode::serialize(original)?));
         let before = self.catalogue_audit_binding()?;
         let camera = self.navigation_camera_bits();
-        let registry = self.engine.catalogue_registry.checkpoint();
+        let registry = self.engine.s101.catalogue_registry.checkpoint();
         let renderer = self.renderer.as_ref().context("Renderer required")?;
         let reference = renderer.audit_displayed_vector_frame()?;
         let settings = renderer.vector_emission_settings();
@@ -7055,7 +7126,7 @@ impl ChartApp {
             let mut next = self.engine.render_context.empty_for_rebuild();
             next.set_instructions_from_cache(original.to_vec());
             prepare_flat_coverage(
-                self.engine.coverage_inventory.as_deref(),
+                self.engine.s101.coverage_inventory.as_deref(),
                 &mut next,
                 window.inner_size(),
                 window.scale_factor(),
@@ -7069,13 +7140,13 @@ impl ChartApp {
             );
             let wrap = 360.0 * next.scaler.scale_x() as f32;
             let cache = SymbolCache::new_with_pattern_contract(
-                self.engine.pc.root_path.join("Symbols"),
-                self.engine.pc.sources(),
-                ferrite_s101::shallow_pattern_contract(&self.engine.pc),
+                self.engine.s101.pc.root_path.join("Symbols"),
+                self.engine.s101.pc.sources(),
+                ferrite_s101::shallow_pattern_contract(&self.engine.s101.pc),
             );
             let resources = ferrite_gpu::SinglePcVectorResources::new(
                 cache,
-                Arc::clone(&self.engine.pc),
+                Arc::clone(&self.engine.s101.pc),
                 &self.engine.current_profile_name,
                 groups.clone(),
             )?;
@@ -7125,7 +7196,10 @@ impl ChartApp {
             "Private Single PC refusal changed original GPU scene"
         );
         anyhow::ensure!(
-            self.engine.catalogue_registry.matches_checkpoint(&registry)
+            self.engine
+                .s101
+                .catalogue_registry
+                .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera
                 && self.catalogue_audit_binding()? == before,
             "Private Single PC stage changed App/registry/source/pick snapshot"
@@ -7138,11 +7212,11 @@ impl ChartApp {
         early_context.set_instructions_from_cache(original.to_vec());
         let early_resources = ferrite_gpu::SinglePcVectorResources::new(
             SymbolCache::new_with_pattern_contract(
-                self.engine.pc.root_path.join("Symbols"),
-                self.engine.pc.sources(),
-                ferrite_s101::shallow_pattern_contract(&self.engine.pc),
+                self.engine.s101.pc.root_path.join("Symbols"),
+                self.engine.s101.pc.sources(),
+                ferrite_s101::shallow_pattern_contract(&self.engine.s101.pc),
             ),
-            Arc::clone(&self.engine.pc),
+            Arc::clone(&self.engine.s101.pc),
             &self.engine.current_profile_name,
             groups.clone(),
         )?;
@@ -7281,9 +7355,9 @@ impl ChartApp {
             DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
             DisplayMode::All => ferrite_s101::DisplayPreset::Other,
         };
-        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.engine.pc, preset)?;
+        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.engine.s101.pc, preset)?;
         groups.extend(primary_viewing_layers::resolve(
-            &self.engine.pc,
+            &self.engine.s101.pc,
             &request.settings,
         )?);
         groups.insert(21010);
@@ -7326,15 +7400,16 @@ impl ChartApp {
         };
         let (capsule, counts) = if single {
             anyhow::ensure!(
-                self.engine.cells.iter().enumerate().all(|(i, _)| self
+                self.engine.s101.cells.iter().enumerate().all(|(i, _)| self
                     .engine
+                    .s101
                     .catalogue_owner_for_cell(i)
-                    .is_some_and(|o| Arc::ptr_eq(o.pc(), &self.engine.pc))),
+                    .is_some_and(|o| Arc::ptr_eq(o.pc(), &self.engine.s101.pc))),
                 "SinglePc TARGET fixture must have actual identical PC owners"
             );
             let resources = ferrite_gpu::SinglePcVectorResources::new(
                 symbols,
-                self.engine.pc.clone(),
+                self.engine.s101.pc.clone(),
                 &request.profile,
                 Some(groups),
             )?;
@@ -7400,6 +7475,7 @@ impl ChartApp {
     ) -> Result<ferrite_render::RenderContext> {
         let compilation_scale = self
             .engine
+            .s101
             .cells
             .iter()
             .map(ferrite_s101::coverage_scale::dataset_reference_scale)
@@ -7418,7 +7494,7 @@ impl ChartApp {
                 )?;
                 let (context, resources) = bindings.into_parts();
                 anyhow::ensure!(
-                    resources.cell_count() == self.engine.cells.len()
+                    resources.cell_count() == self.engine.s101.cells.len()
                         && resources.cell_profiles().all(|(_, p)| p.id == "Dusk"),
                     "Activated OwnedCells resources differ from actual target"
                 );
@@ -7432,7 +7508,7 @@ impl ChartApp {
                 )?;
                 let (context, resources) = bindings.into_parts();
                 anyhow::ensure!(
-                    Arc::ptr_eq(resources.catalogue(), &self.engine.pc)
+                    Arc::ptr_eq(resources.catalogue(), &self.engine.s101.pc)
                         && resources.profile().id == "Dusk",
                     "Activated SinglePc resources lost original PC owner"
                 );
@@ -7460,9 +7536,9 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.chart_loaded
-                && !self.engine.cells.is_empty()
+                && !self.engine.s101.cells.is_empty()
                 && self.engine.s102.bathymetry.is_empty()
-                && self.engine.cells.len() <= 128
+                && self.engine.s101.cells.len() <= 128
                 && self.engine.render_context.raw_instructions().len() <= 500_000
                 && bincode::serialized_size(self.engine.render_context.raw_instructions())?
                     <= 64 * 1024 * 1024,
@@ -7479,7 +7555,7 @@ impl ChartApp {
         let single = std::env::var("FERRITE_PRIVATE_SINGLE_PC_GPU_AUDIT").as_deref() == Ok("1");
         let before = self.publication_model()?;
         let catalogues = self.catalogue_audit_binding()?;
-        let registry = self.engine.catalogue_registry.checkpoint();
+        let registry = self.engine.s101.catalogue_registry.checkpoint();
         let camera = self.navigation_camera_bits();
         let raw = bincode::serialize(self.engine.render_context.raw_instructions())?;
         let order = self
@@ -7488,8 +7564,8 @@ impl ChartApp {
             .static_instruction_order_identity();
         let revision = self.engine.render_context.geometry_revision();
         let symbols_revision = self.symbol_cache.resource_revision();
-        let old_pc = self.engine.pc.clone();
-        let old_fc = self.engine.fc.clone();
+        let old_pc = self.engine.s101.pc.clone();
+        let old_fc = self.engine.s101.fc.clone();
         let renderer = self.renderer.as_ref().context("Renderer required")?;
         anyhow::ensure!(
             renderer.settings() == &self.applied_settings
@@ -7527,7 +7603,11 @@ impl ChartApp {
             anyhow::ensure!(
                 app.publication_model()? == before
                     && app.catalogue_audit_binding()? == catalogues
-                    && app.engine.catalogue_registry.matches_checkpoint(&registry)
+                    && app
+                        .engine
+                        .s101
+                        .catalogue_registry
+                        .matches_checkpoint(&registry)
                     && app.navigation_camera_bits() == camera
                     && bincode::serialize(app.engine.render_context.raw_instructions())? == raw
                     && app.engine.render_context.geometry_revision() == revision
@@ -7538,8 +7618,8 @@ impl ChartApp {
                             .static_instruction_order_identity()
                     )
                     && app.symbol_cache.resource_revision() == symbols_revision
-                    && Arc::ptr_eq(&old_pc, &app.engine.pc)
-                    && Arc::ptr_eq(&old_fc, &app.engine.fc),
+                    && Arc::ptr_eq(&old_pc, &app.engine.s101.pc)
+                    && Arc::ptr_eq(&old_fc, &app.engine.s101.fc),
                 "TARGET staging/rejection changed OLD App/source/registry/resources/picks"
             );
             Ok(())
@@ -7754,7 +7834,11 @@ impl ChartApp {
             );
             anyhow::ensure!(
                 self.publication_model()? == before
-                    && self.engine.catalogue_registry.matches_checkpoint(&registry)
+                    && self
+                        .engine
+                        .s101
+                        .catalogue_registry
+                        .matches_checkpoint(&registry)
                     && self.navigation_camera_bits() == camera,
                 "Renderer-only audit unexpectedly changed App model"
             );
@@ -7813,12 +7897,12 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.chart_loaded
-                && !self.engine.cells.is_empty()
+                && !self.engine.s101.cells.is_empty()
                 && self.engine.s102.bathymetry.is_empty(),
             "Loaded vector-only scene required"
         );
         anyhow::ensure!(
-            self.engine.cells.len() <= 128
+            self.engine.s101.cells.len() <= 128
                 && self.engine.render_context.raw_instructions().len() <= 500_000,
             "Private audit CPU inventory limit exceeded"
         );
@@ -7841,7 +7925,7 @@ impl ChartApp {
         let original_hash = format!("{:x}", Sha256::digest(bincode::serialize(original)?));
         let before = self.catalogue_audit_binding()?;
         let camera = self.navigation_camera_bits();
-        let registry = self.engine.catalogue_registry.checkpoint();
+        let registry = self.engine.s101.catalogue_registry.checkpoint();
         let renderer = self.renderer.as_ref().context("Renderer required")?;
         let (pan, zoom, pivot) = renderer.fast_view_transform();
         anyhow::ensure!(
@@ -7872,7 +7956,7 @@ impl ChartApp {
         let mut next = self.engine.render_context.empty_for_rebuild();
         next.set_instructions_from_cache(original.to_vec());
         prepare_flat_coverage(
-            self.engine.coverage_inventory.as_deref(),
+            self.engine.s101.coverage_inventory.as_deref(),
             &mut next,
             window.inner_size(),
             window.scale_factor(),
@@ -7884,7 +7968,8 @@ impl ChartApp {
             ) == original_hash,
             "Fresh coverage altered ordered original IR"
         );
-        let resources = self.prepare_cell_resources(&self.engine.catalogue_registry, &request)?;
+        let resources =
+            self.prepare_cell_resources(&self.engine.s101.catalogue_registry, &request)?;
         let wrap = 360.0 * next.scaler.scale_x() as f32; // Identical normal publish expression.
         let emission = renderer.prepare_private_vector_emission_from_origin(
             origin,
@@ -7946,7 +8031,7 @@ impl ChartApp {
         let mut rejected_context = self.engine.render_context.empty_for_rebuild();
         rejected_context.set_instructions_from_cache(original.to_vec());
         let rejected_resources =
-            self.prepare_cell_resources(&self.engine.catalogue_registry, &request)?;
+            self.prepare_cell_resources(&self.engine.s101.catalogue_registry, &request)?;
         let rejection = match renderer.prepare_private_vector_emission(
             rejected_context,
             rejected_resources,
@@ -7967,7 +8052,10 @@ impl ChartApp {
             "Private rejection changed displayed GPU scene"
         );
         anyhow::ensure!(
-            self.engine.catalogue_registry.matches_checkpoint(&registry)
+            self.engine
+                .s101
+                .catalogue_registry
+                .matches_checkpoint(&registry)
                 && self.navigation_camera_bits() == camera
                 && self.catalogue_audit_binding()? == before,
             "Private preparation changed App/model/catalogue/pick snapshot"
@@ -7976,7 +8064,7 @@ impl ChartApp {
         let mut early_context = self.engine.render_context.empty_for_rebuild();
         early_context.set_instructions_from_cache(original.to_vec());
         let early_resources =
-            self.prepare_cell_resources(&self.engine.catalogue_registry, &request)?;
+            self.prepare_cell_resources(&self.engine.s101.catalogue_registry, &request)?;
         let early_boxes = boxes.to_vec();
         let renderer = self.renderer.as_mut().context("Renderer required")?;
         let old_profile = std::mem::replace(
@@ -8023,16 +8111,16 @@ impl ChartApp {
 
     fn publication_model(&self) -> Result<serde_json::Value> {
         let renderer = self.renderer.as_ref().context("Renderer required")?;
-        let cells: Vec<_> = self.engine.cells.iter().enumerate().map(|(index, cell)| {
+        let cells: Vec<_> = self.engine.s101.cells.iter().enumerate().map(|(index, cell)| {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
-            self.engine.loaded_source_identities.hash_for_cell(index, &mut hash).expect("Loaded source aligned");
+            self.engine.s101.loaded_source_identities.hash_for_cell(index, &mut hash).expect("Loaded source aligned");
             serde_json::json!({"path":cell.file_path,"dataset":cell.dsid.dataset_name,
                 "edition":cell.dsid.edition_number,"update":cell.dsid.update_number,"features":cell.features.len(),
                 "source_key":std::hash::Hasher::finish(&hash),
                 "complete_cell_debug_sha256":format!("{:x}",Sha256::digest(format!("{cell:?}").as_bytes()))})
         }).collect();
         Ok(
-            serde_json::json!({"cells":cells,"chain_paths":self.engine.loaded_chain_paths,
+            serde_json::json!({"cells":cells,"chain_paths":self.engine.s101.loaded_chain_paths,
             "bounds_bits":[self.engine.bounds.min_x.to_bits(),self.engine.bounds.min_y.to_bits(),self.engine.bounds.max_x.to_bits(),self.engine.bounds.max_y.to_bits()],
             "chart_loaded":self.chart_loaded,"frames_since_loaded":self.frames_since_loaded,"base_instruction_count":self.engine.base_instruction_count,
             "instructions_sha256":format!("{:x}",Sha256::digest(bincode::serialize(self.engine.render_context.raw_instructions())?)),
@@ -8055,7 +8143,7 @@ impl ChartApp {
             "Visible audit forbidden"
         );
         anyhow::ensure!(
-            self.engine.cells.len() == 1 && self.engine.s102.bathymetry.is_empty(),
+            self.engine.s101.cells.len() == 1 && self.engine.s102.bathymetry.is_empty(),
             "One S101 chain required"
         );
         anyhow::ensure!(
@@ -8064,9 +8152,10 @@ impl ChartApp {
         );
         anyhow::ensure!(!output.exists(), "Audit destination must be new");
         fs::create_dir_all(output)?;
-        let paths = self.engine.loaded_chain_paths[0].clone();
+        let paths = self.engine.s101.loaded_chain_paths[0].clone();
         let mut phases = Vec::new();
         self.engine
+            .s101
             .decoded_chart_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("Cache poisoned"))?
@@ -8074,10 +8163,19 @@ impl ChartApp {
         let mut reference = None;
         for label in ["cold", "warm"] {
             self.ensure_navigation_scene()?;
-            let (product, name) = s101_update_plan::dataset_key(&self.engine.cells[0].dsid)?;
+            let (product, name) = s101_update_plan::dataset_key(&self.engine.s101.cells[0].dsid)?;
             self.unload_dataset(ferrite_ui::DatasetLayerId::S101 { product, name })?;
-            anyhow::ensure!(self.engine.cells.is_empty(), "Unload did not remove cell");
-            let before = self.engine.decoded_chart_cache.lock().unwrap().statistics();
+            anyhow::ensure!(
+                self.engine.s101.cells.is_empty(),
+                "Unload did not remove cell"
+            );
+            let before = self
+                .engine
+                .s101
+                .decoded_chart_cache
+                .lock()
+                .unwrap()
+                .statistics();
             let started = std::time::Instant::now();
             let error = self.catalogue_audit_load(&paths)?;
             anyhow::ensure!(error.is_none(), "Reopen rejected: {error:?}");
@@ -8089,7 +8187,13 @@ impl ChartApp {
                     self.update_view();
                 }
             }
-            let after = self.engine.decoded_chart_cache.lock().unwrap().statistics();
+            let after = self
+                .engine
+                .s101
+                .decoded_chart_cache
+                .lock()
+                .unwrap()
+                .statistics();
             if label == "cold" {
                 anyhow::ensure!(
                     after.misses == before.misses + 1 && after.hits == before.hits,
@@ -8148,7 +8252,7 @@ impl ChartApp {
             "Visible/focused cancellation audit forbidden"
         );
         anyhow::ensure!(
-            self.engine.cells.len() == 1 && self.engine.s102.bathymetry.is_empty(),
+            self.engine.s101.cells.len() == 1 && self.engine.s102.bathymetry.is_empty(),
             "Audit requires one vector cell and no raster"
         );
         let selected = PathBuf::from(
@@ -8163,27 +8267,29 @@ impl ChartApp {
             .canonicalize()?;
         anyhow::ensure!(
             selected.parent() == Some(private.as_path())
-                && self.engine.cells[0].file_path.canonicalize()?.parent()
+                && self.engine.s101.cells[0].file_path.canonicalize()?.parent()
                     == Some(private.as_path()),
             "Cancellation audit must use private input copies"
         );
         anyhow::ensure!(
             self.engine
+                .s101
                 .cancellation_history_path
                 .starts_with(output.parent().context("Audit parent")?),
             "Audit history must belong to this private case"
         );
         anyhow::ensure!(
-            !self.engine.cancellation_history_path.exists(),
+            !self.engine.s101.cancellation_history_path.exists(),
             "Audit requires fresh private history"
         );
         fs::create_dir_all(output)?;
         if std::env::var_os("FERRITE_ROOT_CANCELLATION_ANNOUNCEMENT").is_some() {
             return self.audit_root_cancellation_announcement(output, selected);
         }
-        let previous_id = self.engine.cells[0].dsid.clone();
+        let previous_id = self.engine.s101.cells[0].dsid.clone();
         let previous_date = self
             .engine
+            .s101
             .loaded_discovery
             .get(&s101_update_plan::dataset_key(&previous_id)?)
             .and_then(Option::as_ref)
@@ -8231,7 +8337,7 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.publication_model()? == original
-                && !self.engine.cancellation_history_path.exists(),
+                && !self.engine.s101.cancellation_history_path.exists(),
             "Rejected cancellation changed model/history"
         );
         self.renderer.as_mut().unwrap().render()?;
@@ -8249,9 +8355,9 @@ impl ChartApp {
             self.startup_error
         );
         anyhow::ensure!(
-            self.engine.cells.is_empty()
-                && self.engine.loaded_chain_paths.is_empty()
-                && self.engine.loaded_discovery.is_empty()
+            self.engine.s101.cells.is_empty()
+                && self.engine.s101.loaded_chain_paths.is_empty()
+                && self.engine.s101.loaded_discovery.is_empty()
                 && !self.chart_loaded,
             "Cancelled last dataset survived publication"
         );
@@ -8300,8 +8406,9 @@ impl ChartApp {
                 direct_pick_probes.push(serde_json::json!({"point":[point.x,point.y],"backend":"flat selection index","candidates":candidates}));
             }
         }
-        let history =
-            chart_publication::CancellationHistory::read(&self.engine.cancellation_history_path)?;
+        let history = chart_publication::CancellationHistory::read(
+            &self.engine.s101.cancellation_history_path,
+        )?;
         anyhow::ensure!(
             history
                 .validate_reuse(&previous_id, Some(previous_date))
@@ -8386,7 +8493,7 @@ impl ChartApp {
         fs::write(
             output.join("semantic.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"picks":picks,"profile":self.engine.current_profile_name,"source_cells":self.engine.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}),
+                &serde_json::json!({"picks":picks,"profile":self.engine.current_profile_name,"source_cells":self.engine.s101.cells.iter().map(|c|&c.file_path).collect::<Vec<_>>(),"window_visible":false,"window_focus":false}),
             )?,
         )?;
         fs::write(output.join("coverage-scope.json"), b"{\"mode\":\"2D\",\"scope\":\"actual Flat coverage and picking; no removed 3D geometry cache claim\"}")?;
@@ -8396,7 +8503,7 @@ impl ChartApp {
     /// Records may be released only while nothing needs every cell: no MCP
     /// index, no interoperability composition and no diagnostic audit.
     fn cell_release_allowed(&self) -> bool {
-        self.engine.resident_cells.is_some()
+        self.engine.s101.resident_cells.is_some()
             && self.s100_mcp.server.is_none()
             && self.active_ic().is_none()
             && !std::env::vars_os().any(|(name, _)| {
@@ -8410,7 +8517,7 @@ impl ChartApp {
         if !self.cell_release_allowed() {
             return;
         }
-        self.engine.release_nonresident_cells();
+        self.engine.s101.release_nonresident_cells();
     }
 
     /// The window's physical size and scale factor, once it exists.
@@ -8436,41 +8543,45 @@ impl ChartApp {
         if moving || self.loading_state.is_some() {
             return;
         }
-        if std::mem::take(&mut self.engine.cell_release_pending) {
-            self.engine.prune_cell_hydration();
+        if std::mem::take(&mut self.engine.s101.cell_release_pending) {
+            self.engine.s101.prune_cell_hydration();
             self.release_nonresident_cells();
         }
-        if self.engine.resident_cells.is_none() {
+        if self.engine.s101.resident_cells.is_none() {
             return;
         }
         let camera = self.navigation_camera_bits();
-        if self.engine.residency_camera != Some(camera) {
-            self.engine.residency_camera = Some(camera);
+        if self.engine.s101.residency_camera != Some(camera) {
+            self.engine.s101.residency_camera = Some(camera);
             self.update_residency();
         }
     }
 
     /// Re-portray if the resident cells for the current view changed.
     fn update_residency(&mut self) {
-        if self.engine.resident_cells.is_none() || self.loading_state.is_some() {
+        if self.engine.s101.resident_cells.is_none() || self.loading_state.is_some() {
             return;
         }
-        let Some(inventory) = self.engine.coverage_inventory.clone() else {
+        let Some(inventory) = self.engine.s101.coverage_inventory.clone() else {
             return;
         };
-        let desired = self
-            .engine
-            .residency_for_view(&inventory, true, self.viewport_pixels());
-        if desired == self.engine.resident_cells {
+        let desired = self.engine.s101.residency_for_view(
+            &inventory,
+            &self.engine.render_context,
+            self.engine.bounds,
+            true,
+            self.viewport_pixels(),
+        );
+        if desired == self.engine.s101.resident_cells {
             return;
         }
         let count =
             |r: &Option<Vec<bool>>| r.as_ref().map_or(0, |v| v.iter().filter(|b| **b).count());
         info!(
             "Residency: {} -> {} of {} cells",
-            count(&self.engine.resident_cells),
+            count(&self.engine.s101.resident_cells),
             count(&desired),
-            self.engine.cells.len()
+            self.engine.s101.cells.len()
         );
         let started = std::time::Instant::now();
         match self.prepare_instructions(true) {
@@ -9038,7 +9149,7 @@ impl ChartApp {
         anyhow::ensure!(
             !output.exists()
                 && self.loading_state.is_none()
-                && !self.engine.cells.is_empty()
+                && !self.engine.s101.cells.is_empty()
                 && self.engine.s102.bathymetry.is_empty(),
             "Fresh output and settled vector-only scene required"
         );
@@ -9063,10 +9174,11 @@ impl ChartApp {
         let center = GeographicPosition::new(origin.y, (origin.x + 180.).rem_euclid(360.) - 180.)?;
         let east = GeographicPosition::new(east.y, (east.x + 180.).rem_euclid(360.) - 180.)?;
         let radius = inverse(center, east)?.distance_m;
-        let cell = &self.engine.cells[0];
-        let key = EngineState::catalogue_dataset_key(&cell.dsid)?;
+        let cell = &self.engine.s101.cells[0];
+        let key = S101Layer::catalogue_dataset_key(&cell.dsid)?;
         let pc = self
             .engine
+            .s101
             .catalogue_registry
             .owner_for(&key)
             .context("Source PC required")?
@@ -9114,7 +9226,7 @@ impl ChartApp {
                 );
             }
             prepare_flat_coverage(
-                self.engine.coverage_inventory.as_deref(),
+                self.engine.s101.coverage_inventory.as_deref(),
                 &mut next,
                 window.inner_size(),
                 window.scale_factor(),
@@ -9124,7 +9236,7 @@ impl ChartApp {
                 settings: self.applied_settings.clone(),
             };
             let resources =
-                self.prepare_cell_resources(&self.engine.catalogue_registry, &request)?;
+                self.prepare_cell_resources(&self.engine.s101.catalogue_registry, &request)?;
             let groups = self.get_visible_viewing_groups();
             let wrap = 360. * next.scaler.scale_x() as f32;
             let emission = renderer.prepare_private_vector_emission(
@@ -9268,10 +9380,10 @@ impl ChartApp {
             "Completed vector-only load required"
         );
         anyhow::ensure!(
-            self.engine.requires_cell_resources(
-                &self.engine.catalogue_registry,
-                &self.engine.fc,
-                &self.engine.pc
+            self.engine.s101.requires_cell_resources(
+                &self.engine.s101.catalogue_registry,
+                &self.engine.s101.fc,
+                &self.engine.s101.pc
             )?,
             "Actual mixed PC resources required"
         );
@@ -9427,7 +9539,7 @@ impl ChartApp {
         }
         fs::create_dir_all(output)?;
         let original = self.bathymetry_publication_model()?;
-        let original_inventory = self.engine.coverage_inventory.clone();
+        let original_inventory = self.engine.s101.coverage_inventory.clone();
         self.audit_portrayal(&output.join("before"))?;
         self.renderer
             .as_mut()
@@ -9465,7 +9577,7 @@ impl ChartApp {
             "Late staging failure altered model"
         );
         anyhow::ensure!(
-            match (&original_inventory, &self.engine.coverage_inventory) {
+            match (&original_inventory, &self.engine.s101.coverage_inventory) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => true,
                 _ => false,
@@ -9526,6 +9638,7 @@ impl ChartApp {
         let key = s101_update_plan::dataset_key(&cancelled_id)?;
         anyhow::ensure!(
             self.engine
+                .s101
                 .cells
                 .iter()
                 .all(|c| s101_update_plan::dataset_key(&c.dsid).ok().as_ref() != Some(&key)),
@@ -9574,7 +9687,7 @@ impl ChartApp {
                 self.startup_error
             );
             anyhow::ensure!(
-                self.engine.cancellation_history_path.is_file()
+                self.engine.s101.cancellation_history_path.is_file()
                     && self
                         .renderer
                         .as_ref()
@@ -9608,8 +9721,9 @@ impl ChartApp {
             phases.push(serde_json::json!({"phase":phase,"model_unchanged":true,
                 "cache_arc_unchanged":true,"direct_frame_without_update_view":true}));
         }
-        let history =
-            chart_publication::CancellationHistory::read(&self.engine.cancellation_history_path)?;
+        let history = chart_publication::CancellationHistory::read(
+            &self.engine.s101.cancellation_history_path,
+        )?;
         let cancelled_date = chrono::NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
         anyhow::ensure!(
             history
@@ -9641,7 +9755,7 @@ impl ChartApp {
             "Hidden background test required"
         );
         anyhow::ensure!(
-            self.engine.cells.len() == 1 && self.engine.cells[0].dsid.update_number == 0,
+            self.engine.s101.cells.len() == 1 && self.engine.s101.cells[0].dsid.update_number == 0,
             "Audit starts with one original base"
         );
         let window = self.window.as_ref().context("Window required")?;
@@ -9653,7 +9767,7 @@ impl ChartApp {
         let originals: Vec<PathBuf> =
             serde_json::from_str(&std::env::var("FERRITE_ROOT_PUBLICATION_INPUTS")?)?;
         anyhow::ensure!(!originals.is_empty(), "Audit needs official updates");
-        let folder = self.engine.cells[0]
+        let folder = self.engine.s101.cells[0]
             .file_path
             .parent()
             .context("Base folder")?
@@ -9800,11 +9914,11 @@ impl ChartApp {
 
         // A first successful parse followed by another chain's malformed body
         // must not publish a partial batch. Its first metadata record is valid.
-        let base = fs::read(&self.engine.cells[0].file_path)?;
+        let base = fs::read(&self.engine.s101.cells[0].file_path)?;
         let ddr: usize = std::str::from_utf8(&base[..5])?.parse()?;
         let first: usize = std::str::from_utf8(&base[ddr..ddr + 5])?.parse()?;
         let mut bad = base[..ddr + first].to_vec();
-        let old_name = self.engine.cells[0].dsid.dataset_name.as_bytes();
+        let old_name = self.engine.s101.cells[0].dsid.dataset_name.as_bytes();
         let replacement = b"101ZZ99FAILXX.000";
         anyhow::ensure!(
             old_name.len() == replacement.len(),
@@ -9847,8 +9961,8 @@ impl ChartApp {
             self.startup_error
         );
         anyhow::ensure!(
-            self.engine.cells.len() == 1
-                && self.engine.cells[0].dsid.update_number == originals.len() as u16,
+            self.engine.s101.cells.len() == 1
+                && self.engine.s101.cells[0].dsid.update_number == originals.len() as u16,
             "Retry did not replace base at one index"
         );
         self.update_view();
@@ -10019,11 +10133,17 @@ impl ChartApp {
             .context("Selected object missing cell owner")? as usize;
         anyhow::ensure!(
             feature.source.as_deref()
-                == Some(self.engine.cells[cell].file_path.to_string_lossy().as_ref()),
+                == Some(
+                    self.engine.s101.cells[cell]
+                        .file_path
+                        .to_string_lossy()
+                        .as_ref()
+                ),
             "Wrong selected source"
         );
         let owner = self
             .engine
+            .s101
             .catalogue_owner_for_cell(cell)
             .context("Selected catalogue owner missing")?;
         let preview = renderer
@@ -10380,6 +10500,7 @@ impl ChartApp {
             let selected = self.describe_hit(expected);
             let source = self
                 .engine
+                .s101
                 .cells
                 .get(cell as usize)
                 .context("Wrong source cell")?;
@@ -10546,6 +10667,7 @@ impl ChartApp {
             // the overlay palette matching the active profile.
             let active = self
                 .engine
+                .s101
                 .pc
                 .color_profiles
                 .profiles
@@ -10558,6 +10680,7 @@ impl ChartApp {
             .context("Selected symbol lacks source cell")? as usize;
         let cell = self
             .engine
+            .s101
             .cells
             .get(index)
             .context("Selected symbol cell no longer loaded")?;
@@ -10567,6 +10690,7 @@ impl ChartApp {
         );
         let owner = Arc::clone(
             self.engine
+                .s101
                 .catalogue_owner_for_cell(index)
                 .context("Selected symbol exact retained source/PC binding unavailable")?,
         );
@@ -10595,7 +10719,7 @@ impl ChartApp {
             .and_then(|r| r.ui.ui_state.selected_feature.clone());
         if let Some(index) = selected.as_ref().and_then(|f| f.cell_index) {
             // A selection kept across a residency change may name a released cell.
-            if let Err(error) = self.engine.hydrate_cells(&[index as usize]) {
+            if let Err(error) = self.engine.s101.hydrate_cells(&[index as usize]) {
                 tracing::warn!("Selected cell cannot be re-materialized: {error:#}");
             }
         }
@@ -10603,13 +10727,13 @@ impl ChartApp {
             // Check actual retained source first; numeric cell ID is not identity.
             let cell = feature
                 .cell_index
-                .and_then(|index| self.engine.cells.get(index as usize));
+                .and_then(|index| self.engine.s101.cells.get(index as usize));
             let source_matches = cell.is_some_and(|cell| {
                 feature.source.as_deref() == Some(cell.file_path.to_string_lossy().as_ref())
             });
             let owner = feature
                 .cell_index
-                .and_then(|index| self.engine.catalogue_owner_for_cell(index as usize));
+                .and_then(|index| self.engine.s101.catalogue_owner_for_cell(index as usize));
             if source_matches
                 && owner.is_some_and(|owner| {
                     self.renderer
@@ -10985,6 +11109,7 @@ impl ChartApp {
                     symbol_cache: Box::new(std::mem::replace(&mut self.symbol_cache, stand_in)),
                     color_profile: self
                         .engine
+                        .s101
                         .pc
                         .color_profiles
                         .profiles
@@ -11002,7 +11127,7 @@ impl ChartApp {
         }
         context.zoom_to_fit(bounds);
         let mut job = renderer.begin_scene_build(context, resources, groups);
-        let inventory = self.engine.coverage_inventory.clone();
+        let inventory = self.engine.s101.coverage_inventory.clone();
         let (extent, density) = (window.inner_size(), window.scale_factor());
         self.scene_build_stats.started += 1;
         self.scene_build = Some(std::thread::spawn(move || {
@@ -11909,6 +12034,7 @@ impl ChartApp {
         // Pre-compute color profile and viewing groups before mutable borrow of renderer
         let color_profile = self
             .engine
+            .s101
             .pc
             .color_profiles
             .profiles
@@ -11921,7 +12047,7 @@ impl ChartApp {
             .map(|_| std::time::Instant::now());
         if let Some(renderer) = &self.renderer {
             if let Err(error) = prepare_flat_coverage(
-                self.engine.coverage_inventory.as_deref(),
+                self.engine.s101.coverage_inventory.as_deref(),
                 &mut self.engine.render_context,
                 renderer.ui.window().inner_size(),
                 renderer.ui.window().scale_factor(),
@@ -12523,15 +12649,15 @@ impl ApplicationHandler for ChartApp {
                             renderer.ui.ui_state.settings.viewing_layer_owner =
                                 self.applied_settings.viewing_layer_owner;
                             renderer.ui.ui_state.optional_viewing_layers =
-                                ferrite_s101::optional_viewing_layers(&self.engine.pc);
+                                ferrite_s101::optional_viewing_layers(&self.engine.s101.pc);
                             renderer.ui.ui_state.settings.display_mode =
                                 self.applied_settings.display_mode;
                             renderer.ui.ui_state.version = VERSION.to_string();
                             renderer.ui.ui_state.zoom_level = self.zoom_level;
                             renderer.ui.ui_state.signature_counts =
                                 Some((self.engine.verified_count, self.engine.unsigned_count));
-                            renderer.ui.ui_state.fc_status = self.engine.fc_status.clone();
-                            renderer.ui.ui_state.pc_status = self.engine.pc_status.clone();
+                            renderer.ui.ui_state.fc_status = self.engine.s101.fc_status.clone();
+                            renderer.ui.ui_state.pc_status = self.engine.s101.pc_status.clone();
                             renderer.ui.ui_state.debug_mode = self.debug_mode;
                             renderer.ui.ui_state.settings.interoperability_enabled =
                                 self.initial_interoperability_enabled;
@@ -12557,7 +12683,7 @@ impl ApplicationHandler for ChartApp {
                                 );
                             renderer.set_color_profile(&self.engine.current_profile_name);
                             renderer.background_color = lookup_pc_color(
-                                &self.engine.pc,
+                                &self.engine.s101.pc,
                                 "DEPDW",
                                 &self.engine.current_profile_name,
                             );
@@ -12571,6 +12697,7 @@ impl ApplicationHandler for ChartApp {
                             if self.chart_loaded {
                                 let color_profile = self
                                     .engine
+                                    .s101
                                     .pc
                                     .color_profiles
                                     .profiles
@@ -12578,7 +12705,7 @@ impl ApplicationHandler for ChartApp {
                                 let visible_vgs = self.get_visible_viewing_groups();
                                 self.engine.render_context.zoom_to_fit(self.engine.bounds);
                                 if let Err(error) = prepare_flat_coverage(
-                                    self.engine.coverage_inventory.as_deref(),
+                                    self.engine.s101.coverage_inventory.as_deref(),
                                     &mut self.engine.render_context,
                                     renderer.ui.window().inner_size(),
                                     renderer.ui.window().scale_factor(),
@@ -13404,7 +13531,7 @@ impl ApplicationHandler for ChartApp {
                             let fc = load_feature_catalogue(fc_path)?;
                             let pc = load_portrayal_catalogue(&pc_path)?;
                             ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
-                            for cell in &self.engine.cells {
+                            for cell in &self.engine.s101.cells {
                                 ferrite_s101::validate_dataset_catalogues(
                                     &cell.dsid,
                                     &fc,
@@ -13535,13 +13662,13 @@ impl ApplicationHandler for ChartApp {
                                 self.loading_state.is_none(),
                                 "Wait for dataset loading to finish before changing catalogues"
                             );
-                            ferrite_s101::validate_catalogue_pair(&new_fc, &self.engine.pc)?;
-                            for cell in &self.engine.cells {
+                            ferrite_s101::validate_catalogue_pair(&new_fc, &self.engine.s101.pc)?;
+                            for cell in &self.engine.s101.cells {
                                 ferrite_s101::validate_dataset_catalogues(
                                     &cell.dsid,
                                     &new_fc,
-                                    &self.engine.pc.product_id,
-                                    &self.engine.pc.version,
+                                    &self.engine.s101.pc.product_id,
+                                    &self.engine.s101.pc.version,
                                 )?;
                             }
                             Ok(new_fc)
@@ -13550,7 +13677,7 @@ impl ApplicationHandler for ChartApp {
                             Ok(new_fc) => {
                                 if let Err(error) = self.change_catalogue_pair_manually(
                                     Arc::new(new_fc),
-                                    self.engine.pc.clone(),
+                                    self.engine.s101.pc.clone(),
                                 ) {
                                     if let Some(r) = &mut self.renderer {
                                         r.ui.ui_state.notice = Some(format!(
@@ -13582,11 +13709,11 @@ impl ApplicationHandler for ChartApp {
                                 self.loading_state.is_none(),
                                 "Wait for dataset loading to finish before changing catalogues"
                             );
-                            ferrite_s101::validate_catalogue_pair(&self.engine.fc, &new_pc)?;
-                            for cell in &self.engine.cells {
+                            ferrite_s101::validate_catalogue_pair(&self.engine.s101.fc, &new_pc)?;
+                            for cell in &self.engine.s101.cells {
                                 ferrite_s101::validate_dataset_catalogues(
                                     &cell.dsid,
-                                    &self.engine.fc,
+                                    &self.engine.s101.fc,
                                     &new_pc.product_id,
                                     &new_pc.version,
                                 )?;
@@ -13600,7 +13727,7 @@ impl ApplicationHandler for ChartApp {
                         match candidate {
                             Ok(new_pc) => {
                                 if let Err(error) = self.change_catalogue_pair_manually(
-                                    self.engine.fc.clone(),
+                                    self.engine.s101.fc.clone(),
                                     Arc::new(new_pc),
                                 ) {
                                     if let Some(r) = &mut self.renderer {
@@ -13716,7 +13843,7 @@ impl ApplicationHandler for ChartApp {
                     let candidate_settings = settings_change
                         .map(|mut settings| {
                             primary_viewing_layers::capture_primary(
-                                &self.engine.pc,
+                                &self.engine.s101.pc,
                                 &mut settings,
                             )?;
                             Ok::<_, anyhow::Error>(settings)
@@ -14444,7 +14571,7 @@ impl ApplicationHandler for ChartApp {
                                     "native": self.native_s421.audit_data(),
                                     "native_gpu_encoded": self.renderer.as_ref().is_some_and(|r|r.native_route_encoded_in_last_pass()),
                                     "external_plugins": self.plugin_system.get_loaded_plugins().len(),
-                                    "charts": self.engine.cells.len(),
+                                    "charts": self.engine.s101.cells.len(),
                                     "background_test": true,
                                     "native_window_visible": self.window.as_ref().and_then(|w| w.is_visible()),
                                     "native_window_has_focus": self.window.as_ref().is_some_and(|w| w.has_focus()),
@@ -15223,7 +15350,7 @@ fn run_app() -> Result<()> {
     app.pending_auto_overlays = config.auto_overlay;
     app.applied_settings.display_mode = initial_display_mode;
     app.applied_settings.viewing_layers = config.initial_viewing_layers.into_iter().collect();
-    primary_viewing_layers::capture_primary(&app.engine.pc, &mut app.applied_settings)?;
+    primary_viewing_layers::capture_primary(&app.engine.s101.pc, &mut app.applied_settings)?;
     app.engine.ic = authenticated_ic;
     app.engine.ic_combination = config.ic_combination;
     app.own_ship = config.own_ship.as_deref().map(parse_own_ship).transpose()?;
@@ -15243,7 +15370,7 @@ fn run_app() -> Result<()> {
     app.pending_auto_s102 = config.auto_s102;
     app.s102_pc_path = config.s102_pc_path;
     app.initialize_product_catalogues();
-    app.engine.catalogue_inventory = config.catalogue_inventory;
+    app.engine.s101.catalogue_inventory = config.catalogue_inventory;
     app.s102_adjustments_path = config.s102_adjustments_path;
     app.engine.s102.journal_gate = s102_journal_gate;
     app.initial_interoperability_enabled = config.initial_interoperability_enabled;
@@ -16037,7 +16164,7 @@ mod installed_product_catalogue_tests {
         );
         app.s102_pc_path = base.join("Catalogues/PC/S-102");
         app.initialize_product_catalogues();
-        assert!(app.engine.cells.is_empty() && app.engine.s102.bathymetry.is_empty());
+        assert!(app.engine.s101.cells.is_empty() && app.engine.s102.bathymetry.is_empty());
         assert!(
             app.engine.s102.fc_status.loaded,
             "{:?}",

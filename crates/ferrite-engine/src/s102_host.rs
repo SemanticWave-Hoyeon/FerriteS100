@@ -223,8 +223,8 @@ pub fn prepare(
             settings,
             tile_edge: options.tile_edge,
             reuse_rule_instructions: options.reuse_rule_instructions,
-            lua: state.portrayal_source == crate::PortrayalSource::Lua,
-            export: state.precomputed_export,
+            lua: state.s101.portrayal_source == crate::PortrayalSource::Lua,
+            export: state.s101.precomputed_export,
             cache: state.platform.cache.as_ref(),
             interoperability: active_ic.as_deref().map(|catalogue| Interoperability {
                 catalogue,

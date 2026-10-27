@@ -1,8 +1,9 @@
 //! The product modules compiled into this build (`docs/ENGINE_DESIGN.md`,
 //! "제품 모듈화"). Each product crate is behind an engine feature of the same
-//! name (all on by default); this is the only place the engine names them.
-//! The rest of the engine reaches them through the product interfaces
-//! ([`ferrite_product_api`], [`ferrite_s100_gml::product`]).
+//! name (all on by default); the rest of the engine reaches them through the
+//! product interfaces ([`ferrite_product_api`], [`ferrite_s100_gml::product`]).
+//! S-101 is not behind a feature yet: the chart state ([`crate::EngineState`])
+//! and [`crate::ChartEngine`] hold the S-101 layer directly ([`s101`]).
 use ferrite_s100_gml::product::GmlRules;
 use ferrite_s100_gml::Product;
 
@@ -34,4 +35,10 @@ pub mod s421 {
         RouteInputError,
     };
     pub use ferrite_s421::layer::{S421Layer, S421};
+}
+
+/// The S-101 product (`ferrite_s101::layer`): the adapter and the layer the
+/// chart state holds as [`crate::EngineState::s101`].
+pub mod s101 {
+    pub use ferrite_s101::layer::{S101Layer, S101};
 }

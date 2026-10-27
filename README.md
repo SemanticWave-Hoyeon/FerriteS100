@@ -245,16 +245,17 @@ Test datasets belong in the git-ignored `TestData/` folder. Useful sources:
 ```text
 src/                          Desktop viewer: event loop, UI orchestration, audits
 crates/ferrite-engine/        Chart engine: ChartEngine facade, platform services,
-                              dataset opening, update chains, portrayal pipeline
+                              dataset opening, scene composition, interoperability
 crates/ferrite-cli/           ferrite command-line tool and offscreen rendering
 crates/ferrite-capi/          C ABI (libferrite, include/ferrite.h)
 crates/ferrite-wasm/          WebAssembly bindings and web demo
 crates/ferrite-gpu/           GPU renderer (no windowing or GUI toolkit)
 crates/ferrite-ui/            egui panels, winit host and overlay compositing
 crates/ferrite-render/        Rendering instructions and geometry
-crates/ferrite-s101/          S-101 product adapter
-crates/ferrite-s102/          S-102 adapter (C and pure-Rust HDF5 readers)
-crates/ferrite-product-api/   Common product module interface (adapters, layers, panel models, route overlay extension)
+crates/ferrite-s101/          S-101 product module: Lua conversion, product layer (update chains, lifecycle
+                              and exchange-set checks, catalogue selection, cell portrayal and caches)
+crates/ferrite-s102/          S-102 product module (C and pure-Rust HDF5 readers, product layer)
+crates/ferrite-product-api/   Common product module interface (adapters, layers, panel models, platform services, route overlay extension)
 crates/ferrite-s100-gml/      Shared GML infrastructure: reader, FC and exchange-set validation, XSLT portrayal input
 crates/ferrite-s124/          S-124 product module: lifecycle, imports, rules, per-user state, warning list model
 crates/ferrite-s129/          S-129 product module: S-158-129 rules, virtual portrayal features, plan panel model

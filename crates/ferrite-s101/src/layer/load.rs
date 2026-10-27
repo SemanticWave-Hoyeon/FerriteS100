@@ -1,5 +1,7 @@
 //! Products of a background S-101 chart load.
-use crate::{s101_lifecycle_metadata, s101_update_plan};
+use crate::layer::{
+    lifecycle_metadata as s101_lifecycle_metadata, update_plan as s101_update_plan,
+};
 use ferrite_s100_core::{CellSourceIdentity, S101Cell};
 use std::path::PathBuf;
 use std::sync::Arc;
