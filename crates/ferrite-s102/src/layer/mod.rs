@@ -43,6 +43,7 @@ use std::sync::Arc;
 pub mod depth_policy;
 pub mod input_capture;
 pub mod journal_admission;
+pub mod open_job;
 pub mod original_inputs;
 pub mod scene;
 pub mod trial_worker;
@@ -505,9 +506,12 @@ impl ProductLayer for S102Layer {
     fn is_empty(&self) -> bool {
         self.bathymetry.is_empty() && self.trials.is_empty()
     }
-    /// Decode a file from its bytes (no signature snapshot is retained) and
-    /// install it as [`Self::install`] does.
+    /// Decode a file from its bytes (the authenticated snapshot when the
+    /// policy requires signatures; an unauthenticated input is refused then;
+    /// no signature snapshot is retained) and install it as
+    /// [`Self::install`] does.
     fn open(&mut self, input: DatasetInput<'_>) -> Result<Opened> {
+        input.check_policy()?;
         let path = input.name.to_path_buf();
         if self.is_loaded(&path) || self.trials.iter().any(|(p, _)| *p == path) {
             return Ok(Opened::AlreadyOpen);
@@ -546,36 +550,59 @@ impl ProductLayer for S102Layer {
         false
     }
     /// The raster tiles as a [`BATHYMETRY_EXTENSION`] (no drawing
-    /// instructions), with the layer's options and cache store, the rule
-    /// evaluated with Lua when built with it, and no interoperability
-    /// composition (hosts composing interoperability call
-    /// [`Self::prepare`]); None without bathymetry or when portrayal fails
-    /// (logged).
-    fn portray(&mut self, request: &PortrayalRequest<'_>) -> Option<SceneContribution> {
+    /// instructions) with the layer's options and the request's host
+    /// services: the rule evaluated with Lua or read from the cache store
+    /// (the host's rule source, written there on export), the host's cache
+    /// store (else the layer's) and interoperability composition with the
+    /// host's selection for S-102; None without bathymetry.
+    fn portray(&mut self, request: &PortrayalRequest<'_>) -> Result<Option<SceneContribution>> {
         let defaults = ferrite_render::host_settings::SettingsState::default();
-        let cache = self.cache.clone();
+        let layer_cache = self.cache.clone();
         let none = NoStore;
+        let cache: &dyn CacheStore = match request.host.cache {
+            Some(cache) => cache,
+            None => layer_cache.as_deref().unwrap_or(&none),
+        };
+        let lua = match request.host.source {
+            Some(source) => source == ferrite_product_api::PortrayalSource::Lua,
+            None => cfg!(feature = "lua-native"),
+        };
+        let host_selection = |catalogue: &ferrite_interoperability::AuthenticatedCatalogue| {
+            let _ = catalogue;
+            let interoperability = request
+                .host
+                .interoperability
+                .context("No interoperability host")?;
+            (interoperability.selection)(PRODUCT)?
+                .downcast::<ferrite_interoperability::Selection>()
+                .map(|selection| *selection)
+                .map_err(|_| anyhow::anyhow!("Host selection is not an S-98 selection"))
+        };
+        let interoperability = match request.host.interoperability {
+            Some(host) => Some(Interoperability {
+                catalogue: host
+                    .catalogue
+                    .downcast_ref::<ferrite_interoperability::AuthenticatedCatalogue>()
+                    .context("Host catalogue is not an S-98 interoperability catalogue")?,
+                selection: &host_selection,
+            }),
+            None => None,
+        };
         let prepared = self.prepare(&S102Portrayal {
             profile: request.profile,
             settings: request.settings.unwrap_or(&defaults),
             tile_edge: self.options.tile_edge,
             reuse_rule_instructions: self.options.reuse_rule_instructions,
-            lua: cfg!(feature = "lua-native"),
-            export: false,
-            cache: cache.as_deref().unwrap_or(&none),
-            interoperability: None,
-        });
-        match prepared {
-            Ok(scene) => scene.map(|scene| SceneContribution {
-                revision: 0,
-                instructions: Arc::new(Vec::new()),
-                extensions: vec![scene.into_extension()],
-            }),
-            Err(error) => {
-                tracing::warn!("S-102 portrayal failed: {error:#}");
-                None
-            }
-        }
+            lua,
+            export: request.host.precomputed_export,
+            cache,
+            interoperability,
+        })?;
+        Ok(prepared.map(|scene| SceneContribution {
+            revision: 0,
+            instructions: Arc::new(Vec::new()),
+            extensions: vec![scene.into_extension()],
+        }))
     }
     fn coverage(&self) -> Option<GeoBounds> {
         let mut bounds = self.bathymetry_bounds.values().copied();
@@ -596,6 +623,30 @@ impl ProductLayer for S102Layer {
     }
     fn highlight(&mut self, _key: i64) -> Vec<Vec<WorldPoint>> {
         Vec::new()
+    }
+    fn open_stage(&self) -> Option<Box<dyn ferrite_product_api::open::OpenStage>> {
+        Some(Box::new(open_job::S102Stage::new(self)))
+    }
+    /// The depth coverages (S-98 Level 2 inputs).
+    fn numeric_coverages(&self) -> Vec<&dyn ferrite_kernel::NumericCoverageSource> {
+        self.bathymetry
+            .iter()
+            .map(|(_, c, _)| c as &dyn ferrite_kernel::NumericCoverageSource)
+            .collect()
+    }
+    fn install(
+        &mut self,
+        opened: Box<dyn Any + Send>,
+        context: &ferrite_product_api::open::InstallContext<'_>,
+        report: &mut ferrite_product_api::report::InstallReport,
+    ) -> Result<()> {
+        open_job::install(self, opened, context, report)
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

@@ -14,7 +14,7 @@ name = "ferrite"
 path = "src/main.rs"
 
 [features]
-default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s124", "s129", "s421"]
+default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s101", "s124", "s129", "s421"]
 lua54 = ["ferrite-engine/lua54"]
 lua55 = ["ferrite-engine/lua55"]
 parallel = ["ferrite-engine/parallel"]
@@ -26,6 +26,8 @@ s102-hdf5 = ["s102-pure", "ferrite-engine/s102-hdf5"]
 crypto-openssl = ["ferrite-engine/crypto-openssl"]
 crypto-rust = ["ferrite-engine/crypto-rust"]
 # Product modules (S-124, S-129 GML overlays; S-421 routes).
+# S-101 base chart (required: scenes are drawn with its portrayal catalogue).
+s101 = ["ferrite-engine/s101"]
 s124 = ["ferrite-engine/s124"]
 s129 = ["ferrite-engine/s129"]
 s421 = ["ferrite-engine/s421"]

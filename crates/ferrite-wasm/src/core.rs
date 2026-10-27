@@ -270,7 +270,8 @@ impl WebEngineCore {
         // S-102: with Lua, the rule's instruction string goes through the
         // cache store, so a page with the stored entry skips Lua for S-102
         // (without Lua the entry is required anyway).
-        engine.set_s102_options(ferrite_engine::s102_host::S102Options {
+        #[cfg(feature = "s102-pure")]
+        engine.set_s102_options(ferrite_engine::products::s102::S102Options {
             reuse_rule_instructions: LUA_AVAILABLE,
             ..Default::default()
         });
@@ -387,7 +388,7 @@ impl WebEngineCore {
     /// built and chosen, or `auto` lacks a payload of an opened cell (then
     /// the preparation falls back to Lua for every cell).
     pub fn lua_needed(&mut self) -> bool {
-        if !LUA_AVAILABLE || self.engine.state().s101.cells.is_empty() {
+        if !LUA_AVAILABLE || self.engine.state().layers.s101().cells.is_empty() {
             return false;
         }
         match self.portrayal {
@@ -635,8 +636,8 @@ impl WebEngineCore {
             }
             Err(error) => return Err(error),
         };
-        self.used_source =
-            (!self.engine.state().s101.cells.is_empty()).then(|| self.engine.portrayal_source());
+        self.used_source = (!self.engine.state().layers.s101().cells.is_empty())
+            .then(|| self.engine.portrayal_source());
         Arc::try_unwrap(scene).map_err(|_| anyhow::anyhow!("Prepared scene is shared"))
     }
 
@@ -665,9 +666,9 @@ impl WebEngineCore {
             "palette": self.engine.display().profile,
             "portrayal": self.used_source.map(source_name),
             "reprojected": reprojected,
-            "resident_cells": self.engine.state().s101.resident_cells.as_ref()
+            "resident_cells": self.engine.state().layers.s101().resident_cells.as_ref()
                 .map(|r| r.iter().filter(|r| **r).count()),
-            "cells": self.engine.state().s101.cells.len(),
+            "cells": self.engine.state().layers.s101().cells.len(),
             "bathymetry_files": self.engine.state().bathymetry_extents().len(),
             // Cache entries read by this preparation (per-cell portrayal
             // caches and precomputed payloads): hits skip Lua.

@@ -95,9 +95,9 @@ fn opens_and_prepares_s102_entirely_from_memory() {
     let cache = Arc::new(MemoryCacheStore::default());
     let mut engine = new_engine(memory, cache.clone());
     assert!(
-        engine.state().s102.pc.is_some(),
+        engine.state().layers.s102().pc.is_some(),
         "{:?}",
-        engine.state().s102.pc_status
+        engine.state().layers.s102().pc_status
     );
     let job = engine.open(DatasetSource::Folder(mem("/mem/data")));
     let opened = job.wait().unwrap();
@@ -105,12 +105,9 @@ fn opens_and_prepares_s102_entirely_from_memory() {
     let report = engine.install(opened).unwrap();
     assert!(report.issues.is_empty(), "{:#?}", report.issues);
     assert!(report.datasets.is_empty());
-    assert_eq!(report.bathymetry.len(), 3, "{report:#?}");
-    let coverage: Vec<_> = report
-        .bathymetry
-        .iter()
-        .filter(|b| !b.inspection_only)
-        .collect();
+    let bathymetry = report.bathymetry();
+    assert_eq!(bathymetry.len(), 3, "{report:#?}");
+    let coverage: Vec<_> = bathymetry.iter().filter(|b| !b.inspection_only).collect();
     assert_eq!(coverage.len(), 2);
     for b in &coverage {
         assert_eq!(b.product_specification, "INT.IHO.S-102.3.0.0");
@@ -118,11 +115,7 @@ fn opens_and_prepares_s102_entirely_from_memory() {
         assert_eq!(b.provenance, "signature not verified");
         assert!(b.bounds.is_some());
     }
-    let trial = report
-        .bathymetry
-        .iter()
-        .find(|b| b.inspection_only)
-        .unwrap();
+    let trial = bathymetry.iter().find(|b| b.inspection_only).unwrap();
     assert_eq!(trial.instances, 0);
     assert!(trial.product_specification.starts_with("INT.IHO.S-102.2.1"));
     assert_eq!(engine.bathymetry().len(), 3);
@@ -205,14 +198,14 @@ fn bytes_source_without_s102_catalogue_is_refused_with_an_issue() {
     let mut memory = MemoryDataSource::new();
     catalogues(&mut memory, &["FC/S-101", "PC/S-101"]);
     let mut engine = new_engine(memory, Arc::new(MemoryCacheStore::default()));
-    assert!(engine.state().s102.pc.is_none());
+    assert!(engine.state().layers.s102().pc.is_none());
     let report = engine
         .open_blocking(DatasetSource::Bytes(vec![(
             mem("/host/102FR00SMALOG000001.H5"),
             std::fs::read(shom(1)).unwrap().into(),
         )]))
         .unwrap();
-    assert!(report.bathymetry.is_empty());
+    assert!(report.bathymetry().is_empty());
     assert!(
         report
             .issues

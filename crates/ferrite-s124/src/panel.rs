@@ -6,6 +6,13 @@ use chrono::Utc;
 use ferrite_s100_gml::overlay::{format_time, OverlayCore};
 use ferrite_s100_gml::product::GmlOverlayProduct;
 
+/// The panel the product publishes (drawn by UI crates from this module's
+/// data model).
+pub const PANEL: ferrite_product_api::PanelDescriptor = ferrite_product_api::PanelDescriptor {
+    id: "S-124/warnings",
+    title: "Navigational warnings",
+};
+
 /// User relevance classification (S-124 11.1.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NavwarnClassification {

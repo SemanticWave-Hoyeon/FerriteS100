@@ -10,15 +10,23 @@ use ferrite_engine::chart_engine::{
 };
 use ferrite_engine::pick::FeatureReport;
 use ferrite_engine::platform::Platform;
-use ferrite_engine::s102_host::BathymetrySummary;
 use ferrite_engine::scene::PreparedScene;
 use ferrite_gpu::headless::{HeadlessSurface, HeadlessUi};
 use ferrite_gpu::{PhysicalSize, SurfaceHost, SymbolCache, UiLayer, WgpuRenderer};
+#[cfg(feature = "s102-pure")]
+use ferrite_s102::layer::BathymetrySummary;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use image::RgbaImage;
+
+// Scenes are drawn with the S-101 portrayal catalogue (palette, symbols,
+// line styles), which the engine's base chart layer provides.
+#[cfg(not(feature = "s101"))]
+compile_error!(
+    "ferrite-cli draws scenes with the S-101 portrayal catalogue: enable the s101 feature"
+);
 
 /// An engine configuration for `platform` and `catalogues` with the GPU
 /// renderer's stored area triangulation and overlay symbol registration
@@ -110,6 +118,7 @@ pub fn feature_json(report: &FeatureReport) -> Value {
 }
 
 /// An opened S-102 file.
+#[cfg(feature = "s102-pure")]
 pub fn bathymetry_json(summary: &BathymetrySummary) -> Value {
     json!({
         "source": summary.source.display().to_string(),
@@ -136,18 +145,30 @@ pub fn inspection_json(engine: &ChartEngine, report: &OpenReport) -> Value {
             .iter()
             .map(|d| dataset_json(engine, d))
             .collect::<Vec<_>>(),
-        "bathymetry": engine.bathymetry().iter().map(bathymetry_json).collect::<Vec<_>>(),
+        "bathymetry": bathymetry(engine),
         "issues": report.issues.iter().map(issue_json).collect::<Vec<_>>(),
         "notices": report.notices,
         "catalogue_notes": engine.catalogue_errors(),
     })
 }
 
+/// The opened S-102 files (none without S-102).
+fn bathymetry(engine: &ChartEngine) -> Vec<Value> {
+    #[cfg(feature = "s102-pure")]
+    return engine.bathymetry().iter().map(bathymetry_json).collect();
+    #[cfg(not(feature = "s102-pure"))]
+    {
+        let _ = engine;
+        Vec::new()
+    }
+}
+
 /// Colour profile names of the bound portrayal catalogue, sorted.
 pub fn palettes(engine: &ChartEngine) -> Vec<String> {
     let mut names: Vec<_> = engine
         .state()
-        .s101
+        .layers
+        .s101()
         .pc
         .color_profiles
         .profiles
@@ -263,7 +284,7 @@ impl SceneEmitter {
         let state = engine.state();
         let display = engine.display();
         let profile = display.profile.as_str();
-        let pc = &state.s101.pc;
+        let pc = &state.layers.s101().pc;
         let key = (*pc.source_digest(), profile.to_string());
         let color_profile = pc
             .color_profiles
@@ -286,7 +307,8 @@ impl SceneEmitter {
             renderer.background_color = ferrite_s101::lookup_pc_color(pc, "DEPDW", profile);
             // Producer reference scales; zero denotes unknown (as the viewer).
             let reference_scale = state
-                .s101
+                .layers
+                .s101()
                 .cells
                 .iter()
                 .filter_map(|cell| {
@@ -307,14 +329,16 @@ impl SceneEmitter {
                     ),
                 ));
             }
-            let visible = state.viewing_groups(&display.settings)?;
-            let resources = if state.s101.requires_cell_resources(
+            let visible = state.layers.s101().viewing_groups(&display.settings)?;
+            let resources = if state.layers.s101().requires_cell_resources(
                 &scene.catalogue_registry,
-                &state.s101.fc,
+                &state.layers.s101().fc,
                 pc,
             )? {
                 // Cells of other catalogue editions draw with their own owners.
                 let bindings = state
+                    .layers
+                    .s101()
                     .cell_resource_bindings(&scene.catalogue_registry, &display.settings)?
                     .into_iter()
                     .map(|binding| ferrite_gpu::CellPortrayalResourceBinding {
@@ -325,8 +349,8 @@ impl SceneEmitter {
                     .collect::<Vec<_>>();
                 let mut resources =
                     ferrite_gpu::CellPortrayalResources::prepare(&bindings, profile, 4096)?;
-                for index in 0..state.s101.cells.len() {
-                    let groups = state.cell_viewing_groups(
+                for index in 0..state.layers.s101().cells.len() {
+                    let groups = state.layers.s101().cell_viewing_groups(
                         &scene.catalogue_registry,
                         index,
                         &display.settings,
@@ -431,7 +455,7 @@ impl SceneEmitter {
         let suppress = engine.display().settings.interoperability_enabled
             && state.ic.as_ref().is_some_and(|ic| {
                 let mut displayed = Vec::new();
-                if !state.s101.cells.is_empty() {
+                if !state.layers.s101().cells.is_empty() {
                     displayed.push("S-101");
                 }
                 if !state.bathymetry_extents().is_empty() {

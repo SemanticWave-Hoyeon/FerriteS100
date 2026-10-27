@@ -85,8 +85,9 @@ pub struct OwnShipIndication {
 pub struct AppUiState {
     pub s100_mcp: crate::mcp_ui::State,
     pub llm_chat: crate::llm_chat_ui::State,
-    /// S-124 warning list and S-129 plan windows.
-    pub overlays: crate::overlay_ui::State,
+    /// The registered products' panels (S-124 warning list, S-129 plan
+    /// window) and their shared options.
+    pub panels: crate::panels::PanelRegistry,
     pub reduced_motion: bool,
     /// Optional edge annotations; never mutate chart geometry or portrayal settings.
     pub coordinate_rulers: bool,
@@ -1208,7 +1209,7 @@ impl EguiIntegration {
 
         crate::mcp_ui::draw(&self.ctx, &mut ui_state.s100_mcp);
         crate::llm_chat_ui::draw(&self.ctx, &mut ui_state.llm_chat, &ui_state.s100_mcp);
-        crate::overlay_ui::draw(&self.ctx, &mut ui_state.overlays);
+        ui_state.panels.draw(&self.ctx);
 
         // Status bar
         egui::TopBottomPanel::bottom("status_bar")
@@ -1571,17 +1572,7 @@ impl EguiIntegration {
                 ui_state.object_details_hidden = !details;
             }
             ui.checkbox(&mut ui_state.coordinate_rulers, "Coordinate Rulers");
-            let new = ui_state.overlays.new_count;
-            let label = if new > 0 {
-                format!("S-124 Navigational Warnings ({new} new)")
-            } else {
-                "S-124 Navigational Warnings".to_owned()
-            };
-            ui.checkbox(&mut ui_state.overlays.navwarn_open, label);
-            ui.checkbox(
-                &mut ui_state.overlays.ukc_open,
-                "S-129 Under Keel Clearance",
-            );
+            ui_state.panels.menu(ui);
             ui.separator();
             ui.menu_button("Color Palette", |ui| {
                 for profile in ["Day", "Dusk", "Night"] {

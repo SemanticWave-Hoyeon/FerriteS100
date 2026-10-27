@@ -508,6 +508,132 @@ pub trait UserRecord: Send + Sync {
 /// Guard of [`UserRecord::lock`] (an OS file lock for native records).
 pub type RecordLock = Box<dyn std::any::Any + Send>;
 
+/// Per-user persistent state of the products, keyed by product: S-124 keeps
+/// one record per OS user (key: the user name), S-101 its cancellation
+/// history (one key). How each product's records are kept is registered as
+/// a [`RecordKind`].
+pub trait UserStore: Send + Sync {
+    /// Record `key` of `product` (None: not persisted by this host).
+    fn product_state(&self, product: crate::ProductId, key: &str) -> Option<Box<dyn UserRecord>>;
+    /// Native file of the record, for hosts that address it directly; None
+    /// for stores without files.
+    fn product_state_path(&self, product: crate::ProductId, key: &str) -> Option<PathBuf>;
+}
+
+/// How a product keeps its per-user records.
+#[derive(Clone, Copy)]
+pub struct RecordKind {
+    pub product: crate::ProductId,
+    /// The record in a native file at `path`.
+    pub native_record: fn(path: PathBuf) -> Box<dyn UserRecord>,
+    /// Standard native file of `key` under the per-user application data
+    /// folder (None when the OS has none); None: not persisted.
+    pub standard_path: fn(data_dir: Option<&Path>, key: &str) -> Option<PathBuf>,
+    /// Key of `key` in an in-memory store.
+    pub memory_key: fn(key: &str) -> String,
+}
+
+impl std::fmt::Debug for RecordKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordKind")
+            .field("product", &self.product)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A [`UserRecord`] in a file: private directory, temporary file and rename.
+#[derive(Clone, Debug)]
+pub struct FileRecord {
+    pub path: PathBuf,
+    /// File name prefix of the temporary file written beside the record.
+    pub temporary_prefix: &'static str,
+}
+impl UserRecord for FileRecord {
+    fn read(&self, limit: u64) -> io::Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+    fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        let path = &self.path;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let temporary = parent.join(format!(
+            "{}-{}-{nonce}.tmp",
+            self.temporary_prefix,
+            std::process::id()
+        ));
+        let result = (|| -> io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            // wasm32: the std::fs stub File has no Drop (native-only path).
+            #[allow(clippy::drop_non_drop)]
+            drop(file);
+            std::fs::rename(&temporary, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+    fn set_aside(&self, suffix: &str) {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(suffix);
+        if let Err(error) = std::fs::rename(&self.path, &name) {
+            tracing::warn!("Could not set aside {}: {error}", self.path.display());
+        }
+    }
+    fn describe(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
+/// A user name as a safe file name.
+pub fn user_file_name(user: &str) -> String {
+    let file: String = user
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let file = file.trim_start_matches('.');
+    if file.is_empty() {
+        "unknown".into()
+    } else {
+        file.into()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Executor
 // ─────────────────────────────────────────────────────────────────────────

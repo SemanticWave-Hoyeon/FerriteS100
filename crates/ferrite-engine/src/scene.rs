@@ -1,24 +1,25 @@
 //! The renderer-agnostic product of a portrayal: the prepared scene a host
-//! renderer attaches its GPU resources to, and the description of the
-//! per-cell portrayal resources it needs.
-use crate::state::EngineState;
-use anyhow::{Context, Result};
-use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
-use ferrite_render::host_settings::{DisplayMode, SettingsState};
+//! renderer attaches its GPU resources to. The per-cell portrayal resources
+//! a renderer needs for the base chart are described by the S-101 layer
+//! ([`CellResourceBinding`], `S101Layer::cell_resource_bindings`).
+use anyhow::Result;
 use ferrite_render::RenderContext;
+#[cfg(feature = "s101")]
 use ferrite_s101::coverage_projection::GeographicCoverageInventory;
+#[cfg(feature = "s101")]
 use ferrite_s101::layer::catalogue_selection::DatasetCatalogueRegistry;
-use ferrite_s101::layer::S101Layer;
-use ferrite_s101::layer::{portrayal::validated_lua_context, primary_viewing_layers};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A portrayal ready to publish: drawing instructions with the view they
 /// were prepared for, the S-101 coverage they are clipped by and the
-/// catalogue owners of the cells. GPU resources stay with the host.
+/// catalogue owners of the cells (with the S-101 product), and the
+/// renderer extensions of the other layers. GPU resources stay with the
+/// host.
 pub struct PreparedScene {
     pub context: RenderContext,
+    #[cfg(feature = "s101")]
     pub coverage: Arc<GeographicCoverageInventory>,
+    #[cfg(feature = "s101")]
     pub catalogue_registry: DatasetCatalogueRegistry,
     /// Vector instructions changed by interoperability composition.
     pub ic_changed: usize,
@@ -27,8 +28,9 @@ pub struct PreparedScene {
     /// compares it to know that a later frame of the same, re-projected
     /// scene still shows them.
     pub id: Arc<()>,
-    /// Product output for renderer paths beyond drawing instructions: the
-    /// S-102 raster tiles (`ferrite_s102::layer::BATHYMETRY_EXTENSION`).
+    /// Product output for renderer paths beyond drawing instructions, from
+    /// the grid layers: the S-102 raster tiles
+    /// (`ferrite_s102::layer::BATHYMETRY_EXTENSION`).
     pub extensions: Vec<ferrite_product_api::RendererExtension>,
 }
 
@@ -38,83 +40,22 @@ impl PreparedScene {
     }
 }
 
-/// The portrayal catalogue a cell's resources (symbols, patterns, line
-/// styles) come from.
-#[derive(Clone)]
-pub struct CellResourceBinding {
-    pub cell_index: usize,
-    pub catalogue: Arc<BoundPortrayalCatalogue>,
-    pub shallow_pattern: Option<ferrite_render::ShallowPatternContract>,
-}
+/// The portrayal catalogue a cell's resources come from (S-101 layer).
+#[cfg(feature = "s101")]
+pub use ferrite_s101::layer::resources::CellResourceBinding;
 
-impl EngineState {
-    /// The resource binding of every loaded cell to its own catalogue owner,
-    /// validating each owner's context for `settings`.
-    pub fn cell_resource_bindings(
-        &self,
-        registry: &DatasetCatalogueRegistry,
-        settings: &SettingsState,
-    ) -> Result<Vec<CellResourceBinding>> {
-        self.s101
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(cell_index, cell)| {
-                let owner = registry
-                    .owner_for(&S101Layer::catalogue_dataset_key(&cell.dsid)?)
-                    .context("Missing cell PC resource owner")?;
-                validated_lua_context(owner.pc(), Some(settings))?;
-                Ok(CellResourceBinding {
-                    cell_index,
-                    catalogue: Arc::clone(owner.pc()),
-                    shallow_pattern: ferrite_s101::shallow_pattern_contract(owner.pc()),
-                })
-            })
-            .collect()
-    }
-
-    /// Viewing groups displayed with the bound catalogue for `settings`: the
-    /// display mode preset plus the primary viewing layers (the viewer adds
-    /// its own plugin overlay group).
-    pub fn viewing_groups(&self, settings: &SettingsState) -> Result<HashSet<u32>> {
-        let preset = match settings.display_mode {
-            DisplayMode::Base => ferrite_s101::DisplayPreset::Base,
-            DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
-            DisplayMode::All => ferrite_s101::DisplayPreset::Other,
-        };
-        let mut groups = ferrite_s101::viewing_groups_for_preset(&self.s101.pc, preset)?;
-        groups.extend(primary_viewing_layers::resolve(&self.s101.pc, settings)?);
-        Ok(groups)
-    }
-
-    /// Viewing groups displayed for loaded cell `index` with its own
-    /// catalogue: the display mode preset plus the primary viewing layers.
-    pub fn cell_viewing_groups(
-        &self,
-        registry: &DatasetCatalogueRegistry,
-        index: usize,
-        settings: &SettingsState,
-    ) -> Result<HashSet<u32>> {
-        let cell = self.s101.cells.get(index).context("Missing cell")?;
-        let preset = match settings.display_mode {
-            DisplayMode::Base => ferrite_s101::DisplayPreset::Base,
-            DisplayMode::Standard => ferrite_s101::DisplayPreset::Standard,
-            DisplayMode::All => ferrite_s101::DisplayPreset::Other,
-        };
-        let owner = registry
-            .owner_for(&S101Layer::catalogue_dataset_key(&cell.dsid)?)
-            .context("Missing cell viewing-group owner")?;
-        let mut groups = ferrite_s101::viewing_groups_for_preset(owner.pc(), preset)?;
-        groups.extend(primary_viewing_layers::resolve(owner.pc(), settings)?);
-        Ok(groups)
-    }
-}
+/// The coverage inventory scenes are clipped by (S-101 M_COVR; without the
+/// S-101 product no scene has one).
+#[cfg(feature = "s101")]
+pub type CoverageInventory = GeographicCoverageInventory;
+#[cfg(not(feature = "s101"))]
+pub type CoverageInventory = std::convert::Infallible;
 
 /// Prepare S-101 coverage clipping of `context` for a view of `extent`
 /// physical pixels at `density` pixels per logical pixel (also sorts the
 /// instructions for drawing).
 pub fn prepare_flat_coverage(
-    inventory: Option<&GeographicCoverageInventory>,
+    inventory: Option<&CoverageInventory>,
     context: &mut RenderContext,
     extent: [u32; 2],
     density: f64,
@@ -124,6 +65,21 @@ pub fn prepare_flat_coverage(
     let Some(inventory) = inventory else {
         return Ok(());
     };
+    #[cfg(not(feature = "s101"))]
+    {
+        let _ = extent;
+        match *inventory {}
+    }
+    #[cfg(feature = "s101")]
+    prepare_clipping(inventory, context, extent)
+}
+
+#[cfg(feature = "s101")]
+fn prepare_clipping(
+    inventory: &GeographicCoverageInventory,
+    context: &mut RenderContext,
+    extent: [u32; 2],
+) -> Result<()> {
     if inventory.current_dataset_count() == 0 {
         context.clear_prepared_coverage();
         return Ok(());

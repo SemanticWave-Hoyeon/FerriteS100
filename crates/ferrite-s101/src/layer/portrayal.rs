@@ -197,26 +197,44 @@ pub fn write_cell_cache(
     }
 }
 
-/// Where S-101 cell drawing instructions come from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PortrayalSource {
-    /// Run the portrayal catalogue's Lua rules (`lua-native` feature), with
-    /// the per-cell cache.
-    Lua,
-    /// Read precomputed per-cell instruction payloads (Part 9a portrayal
-    /// output, converted) from the cache store under portable keys
-    /// ([`PrecomputedCells::key`]); a missing payload is an error. Payloads
-    /// are exported by a native build ([`PrecomputedCells::export`]).
-    Precomputed,
+/// Where S-101 cell drawing instructions come from (a host setting of the
+/// product interface).
+pub use ferrite_product_api::PortrayalSource;
+
+/// Lua when it is built, otherwise precomputed payloads.
+pub fn default_source() -> PortrayalSource {
+    if cfg!(feature = "lua-native") {
+        PortrayalSource::Lua
+    } else {
+        PortrayalSource::Precomputed
+    }
 }
 
-impl Default for PortrayalSource {
-    /// Lua when it is built, otherwise precomputed payloads.
+/// The host's rule source for a cell portrayal: where instructions come
+/// from and whether precomputed payloads are exported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuleSource {
+    pub source: PortrayalSource,
+    /// Write precomputed payloads of every cell portrayed with Lua to the
+    /// cache store (see [`PrecomputedCells`]).
+    pub export: bool,
+}
+
+impl Default for RuleSource {
     fn default() -> Self {
-        if cfg!(feature = "lua-native") {
-            Self::Lua
-        } else {
-            Self::Precomputed
+        Self {
+            source: default_source(),
+            export: false,
+        }
+    }
+}
+
+impl RuleSource {
+    /// The rule source of a request's host services.
+    pub fn of(host: &ferrite_product_api::HostServices<'_>) -> Self {
+        Self {
+            source: host.source.unwrap_or_else(default_source),
+            export: host.precomputed_export,
         }
     }
 }

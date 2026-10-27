@@ -19,10 +19,14 @@ pub mod discovery;
 pub mod interoperability;
 pub mod lifecycle_metadata;
 pub mod load;
+pub mod open_job;
+pub mod pick;
+pub mod pick_fields;
 pub mod portrayal;
 pub mod portrayal_cache;
 pub mod primary_viewing_layers;
 pub mod publication;
+pub mod resources;
 pub mod signatures;
 pub mod source_identity;
 pub mod update_plan;
@@ -32,7 +36,7 @@ pub mod xc_coverage;
 pub mod xc_region;
 
 pub use load::{CellHydrationSource, ChartLoadResult};
-pub use portrayal::PortrayalSource;
+pub use portrayal::{PortrayalSource, RuleSource};
 pub mod state;
 
 pub use state::{
@@ -40,11 +44,15 @@ pub use state::{
 };
 
 use anyhow::Result;
+use ferrite_product_api::report::{
+    DatasetId, DatasetSummary, FeatureReport, InstallReport, ValidationIssue,
+};
 use ferrite_product_api::{
     DatasetInput, Encoding, FeaturePick, GeoBounds, Opened, PortrayalRequest, ProductAdapter,
     ProductId, ProductInfo, ProductLayer, Recognised, SceneContribution, SceneRole, WorldPoint,
 };
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -101,7 +109,8 @@ impl S101Layer {
     }
 
     /// Instructions of every cell for `request` in a whole-world view (no
-    /// residency, no per-cell cache, no interoperability).
+    /// residency, no per-cell cache, no interoperability), with the
+    /// request's rule source.
     fn portray_all(&mut self, request: &PortrayalRequest<'_>) -> Result<SceneContribution> {
         let mut view =
             ferrite_render::RenderContext::new(ferrite_render::Viewport::new(1920.0, 1080.0));
@@ -117,6 +126,7 @@ impl S101Layer {
             None,
             false,
             no_triangulation,
+            RuleSource::of(&request.host),
         )?;
         use std::hash::{Hash, Hasher};
         let mut revision = std::collections::hash_map::DefaultHasher::new();
@@ -146,18 +156,20 @@ impl ProductLayer for S101Layer {
     fn is_empty(&self) -> bool {
         self.cells.is_empty()
     }
-    /// Read a base cell (or reissue) from its bytes, validate it against the
+    /// Read a base cell (or reissue) and its updates from their bytes (the
+    /// authenticated snapshots when the policy requires signatures; an
+    /// unauthenticated input is refused then), validate the cell against the
     /// bound catalogues, normalize its feature codes and install it as a
     /// batch of one (the same identity is already open; a newer edition
-    /// replaces the loaded dataset). Update chains, signature snapshots,
-    /// lifecycle metadata and cancellations go through the update planner
-    /// ([`update_plan`]) and the host's install.
+    /// replaces the loaded dataset). Exchange sets, lifecycle metadata and
+    /// cancellations go through the host's open job ([`open_job`]).
     fn open(&mut self, input: DatasetInput<'_>) -> Result<Opened> {
+        input.check_policy()?;
         let (mut cell, source_identity) =
             ferrite_s100_core::S101Cell::load_update_chain_bytes_with_identity(
                 input.name,
                 input.bytes.to_vec(),
-                Vec::new(),
+                input.updates.iter().map(|update| update.to_vec()).collect(),
             )?;
         S101Layer::admit_with(&mut cell, &self.fc, &self.pc)?;
         cell.normalize_feature_codes(&Arc::new(self.fc.feature_type_codes()));
@@ -177,6 +189,15 @@ impl ProductLayer for S101Layer {
         if let Inserted::AlreadyOpen(_) = inserted {
             return Ok(Opened::AlreadyOpen);
         }
+        if let Inserted::Added {
+            replaced: Some(index),
+        } = inserted
+        {
+            if index < self.provenance.len() {
+                self.provenance.remove(index);
+            }
+        }
+        self.provenance.push(input.provenance.label());
         self.finish_batch()?;
         Ok(Opened::New(self.assign_id(identity)))
     }
@@ -194,26 +215,94 @@ impl ProductLayer for S101Layer {
     fn set_visible(&mut self, _id: u32, _visible: bool) -> bool {
         false
     }
-    /// Lua (or precomputed) portrayal of every cell; None without cells or
-    /// when portrayal fails (logged).
-    fn portray(&mut self, request: &PortrayalRequest<'_>) -> Option<SceneContribution> {
+    /// Lua (or precomputed, by the request's rule source) portrayal of
+    /// every cell; None without cells.
+    fn portray(&mut self, request: &PortrayalRequest<'_>) -> Result<Option<SceneContribution>> {
         if self.cells.is_empty() {
-            return None;
+            return Ok(None);
         }
-        self.portray_all(request)
-            .map_err(|error| tracing::warn!("S-101 portrayal failed: {error:#}"))
-            .ok()
+        self.portray_all(request).map(Some)
     }
     fn coverage(&self) -> Option<GeoBounds> {
         (!self.cells.is_empty()).then(|| cells::chart_data_bounds(&self.cells, []))
     }
-    /// Feature reports of S-101 picks come from the host's pick surface
-    /// (`ferrite_engine::pick`), which resolves the drawn instruction's cell.
+    /// S-101 features are identified by their cell ([`Self::describe_in`]).
     fn describe(&mut self, _key: i64) -> Option<FeaturePick> {
         None
     }
+    /// Feature `key` of loaded cell `dataset`, described with the cell's own
+    /// Feature Catalogue ([`S101Layer::describe_feature`]).
+    fn describe_in(&mut self, dataset: u32, key: i64) -> Option<FeatureReport> {
+        self.cells.get(dataset as usize)?.features.get(&key)?;
+        Some(self.describe_feature(Some(dataset), key, ""))
+    }
     fn highlight(&mut self, _key: i64) -> Vec<Vec<WorldPoint>> {
         Vec::new()
+    }
+    fn open_stage(&self) -> Option<Box<dyn ferrite_product_api::open::OpenStage>> {
+        Some(Box::new(open_job::S101Stage::new(self)))
+    }
+    fn check_opened(&self, opened: &(dyn Any + Send)) -> Result<()> {
+        open_job::check_opened(self, opened)
+    }
+    /// The job's validated cancellations, before any layer installs.
+    fn install_early(
+        &mut self,
+        opened: &mut (dyn Any + Send),
+        context: &ferrite_product_api::open::InstallContext<'_>,
+        report: &mut InstallReport,
+    ) -> Result<()> {
+        open_job::apply_cancellations(self, opened, context, report)
+    }
+    fn install(
+        &mut self,
+        opened: Box<dyn Any + Send>,
+        context: &ferrite_product_api::open::InstallContext<'_>,
+        report: &mut InstallReport,
+    ) -> Result<()> {
+        open_job::install(self, opened, context, report)
+    }
+    fn datasets(&self) -> Vec<DatasetSummary> {
+        (0..self.cells.len())
+            .map(|index| self.cell_summary(index))
+            .collect()
+    }
+    fn feature_types(&self, id: DatasetId) -> Option<BTreeMap<String, usize>> {
+        let DatasetId::Cell(index) = id else {
+            return None;
+        };
+        let mut counts = BTreeMap::new();
+        if let Some(cell) = self.cells.get(index) {
+            for feature in cell.features.values() {
+                let code = feature.feature_code.clone().unwrap_or_else(|| "?".into());
+                *counts.entry(code).or_default() += 1;
+            }
+        }
+        Some(counts)
+    }
+    fn exchange_set_checks(&self) -> (Vec<ValidationIssue>, Vec<String>) {
+        open_job::exchange_set_checks(self)
+    }
+    /// The bound portrayal catalogue has the colour profile and a valid Lua
+    /// context for `settings`.
+    fn check_display(
+        &self,
+        profile: &str,
+        settings: &ferrite_render::host_settings::SettingsState,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.pc.color_profiles.profiles.contains_key(profile),
+            "Portrayal catalogue has no colour profile {}",
+            profile
+        );
+        portrayal::validated_lua_context(&self.pc, Some(settings))?;
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -307,11 +396,8 @@ mod tests {
         assert_eq!(layer.products(), vec![PRODUCT]);
         assert!(layer.coverage().is_none());
         let bytes = std::fs::read(&cell).unwrap();
-        let input = |bytes| DatasetInput {
-            name: &cell,
-            bytes,
-            provenance: ferrite_product_api::Provenance::Unverified,
-        };
+        let input =
+            |bytes| DatasetInput::new(&cell, bytes, ferrite_product_api::Provenance::Unverified);
         let Opened::New(id) = layer.open(input(&bytes)).unwrap() else {
             panic!("not opened");
         };
@@ -322,25 +408,21 @@ mod tests {
         assert!(coverage.min_x < coverage.max_x && coverage.min_y < coverage.max_y);
         assert!(!layer.set_visible(id, false));
         if cfg!(feature = "lua-native") {
-            let request = PortrayalRequest {
-                profile: "Day",
-                viewing_time: None,
-                settings: None,
-            };
-            let first = layer.portray(&request).unwrap();
+            let request = PortrayalRequest::new("Day");
+            let first = layer.portray(&request).unwrap().unwrap();
             assert!(!first.instructions.is_empty());
             assert!(first.extensions.is_empty());
-            assert_eq!(layer.portray(&request).unwrap().revision, first.revision);
+            assert_eq!(
+                layer.portray(&request).unwrap().unwrap().revision,
+                first.revision
+            );
         }
         assert!(layer.remove(id));
         assert!(!layer.remove(id));
         assert!(ProductLayer::is_empty(&layer));
         assert!(layer
-            .portray(&PortrayalRequest {
-                profile: "Day",
-                viewing_time: None,
-                settings: None,
-            })
+            .portray(&PortrayalRequest::new("Day"))
+            .unwrap()
             .is_none());
     }
 }

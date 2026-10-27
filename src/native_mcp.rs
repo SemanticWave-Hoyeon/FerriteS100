@@ -48,7 +48,7 @@ impl super::ChartApp {
         }
         if self.s100_mcp.server.is_some() {
             // The index reads every cell; released records come back first.
-            if let Err(error) = self.engine.s101.hydrate_all_cells() {
+            if let Err(error) = self.engine.layers.s101_mut().hydrate_all_cells() {
                 tracing::warn!("MCP index cannot re-materialize released cells: {error:#}");
             }
         }
@@ -64,8 +64,8 @@ impl super::ChartApp {
                 .clone();
             let signature = format!(
                 "{layers:?}:{:p}:{:p}",
-                Arc::as_ptr(&self.engine.s101.fc),
-                Arc::as_ptr(&self.engine.s101.pc)
+                Arc::as_ptr(&self.engine.layers.s101().fc),
+                Arc::as_ptr(&self.engine.layers.s101().pc)
             );
             if (ui.refresh || signature != self.s100_mcp.signature)
                 && self.s100_mcp.pending.is_some()
@@ -85,7 +85,8 @@ impl super::ChartApp {
                     for file in &layer.files {
                         let index = if layer.product == "S-101" {
                             self.engine
-                                .s101
+                                .layers
+                                .s101()
                                 .cells
                                 .iter()
                                 .find(|c| c.dsid.dataset_name == file.name)
@@ -93,9 +94,9 @@ impl super::ChartApp {
                                     // Never force an index onto an incompatible catalogue. The common metadata remains available.
                                     ferrite_s101::validate_dataset_catalogues(
                                         &cell.dsid,
-                                        &self.engine.s101.fc,
-                                        &self.engine.s101.pc.product_id,
-                                        &self.engine.s101.pc.version,
+                                        &self.engine.layers.s101().fc,
+                                        &self.engine.layers.s101().pc.product_id,
+                                        &self.engine.layers.s101().pc.version,
                                     )
                                     .ok()?;
                                     Some(cell.clone())
@@ -109,7 +110,7 @@ impl super::ChartApp {
                 self.s100_mcp.error = None;
                 self.s100_mcp.signature = signature.clone();
                 self.s100_mcp.published = 0;
-                let fc = Arc::new((**self.engine.s101.fc).clone());
+                let fc = Arc::new((**self.engine.layers.s101().fc).clone());
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let launch = std::thread::Builder::new()
                     .name("ferrite-mcp-index".into())

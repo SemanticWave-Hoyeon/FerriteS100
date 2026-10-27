@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 pub mod input;
+pub mod open_job;
 pub mod overlay;
 
 use input::CapturedRouteInput;
@@ -280,24 +281,27 @@ impl ProductLayer for S421Layer {
         true
     }
     /// The visible routes as one route overlay renderer extension (no
-    /// drawing instructions). None without datasets or when the routes
-    /// exceed the overlay budgets ([`S421Layer::portray_error`]).
-    fn portray(&mut self, _request: &PortrayalRequest<'_>) -> Option<SceneContribution> {
+    /// drawing instructions); None without datasets. Routes exceeding the
+    /// overlay budgets fail (the reason is kept: [`S421Layer::portray_error`]).
+    fn portray(
+        &mut self,
+        _request: &PortrayalRequest<'_>,
+    ) -> anyhow::Result<Option<SceneContribution>> {
         if self.entries.is_empty() {
-            return None;
+            return Ok(None);
         }
         match self.samples() {
             Ok(samples) => {
                 self.portray_error = None;
-                Some(SceneContribution {
+                Ok(Some(SceneContribution {
                     revision: self.revision,
                     instructions: Arc::new(Vec::new()),
                     extensions: vec![route_overlay::extension(samples)],
-                })
+                }))
             }
             Err(error) => {
-                self.portray_error = Some(error);
-                None
+                self.portray_error = Some(error.clone());
+                Err(anyhow::anyhow!(error))
             }
         }
     }
@@ -414,6 +418,33 @@ impl ProductLayer for S421Layer {
             _ => Vec::new(),
         }
     }
+    /// Routes are captured while the job classifies its inputs.
+    fn open_stage(&self) -> Option<Box<dyn ferrite_product_api::open::OpenStage>> {
+        Some(Box::new(open_job::S421Stage::default()))
+    }
+    /// Routes depend on no other dataset: inserted in the first pass.
+    fn install_early(
+        &mut self,
+        opened: &mut (dyn Any + Send),
+        _context: &ferrite_product_api::open::InstallContext<'_>,
+        report: &mut ferrite_product_api::report::InstallReport,
+    ) -> anyhow::Result<()> {
+        open_job::install(self, opened, report)
+    }
+    fn install(
+        &mut self,
+        _opened: Box<dyn Any + Send>,
+        _context: &ferrite_product_api::open::InstallContext<'_>,
+        _report: &mut ferrite_product_api::report::InstallReport,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -445,11 +476,7 @@ mod tests {
     }
 
     fn request() -> PortrayalRequest<'static> {
-        PortrayalRequest {
-            profile: "Day",
-            viewing_time: None,
-            settings: None,
-        }
+        PortrayalRequest::new("Day")
     }
 
     #[test]
@@ -475,13 +502,13 @@ mod tests {
     #[test]
     fn layer_opens_bytes_once_and_reports_coverage_and_picks() {
         let mut layer = S421Layer::new();
-        assert!(layer.portray(&request()).is_none());
+        assert!(layer.portray(&request()).unwrap().is_none());
         let open = |layer: &mut S421Layer, bytes: &[u8]| {
-            layer.open(DatasetInput {
-                name: Path::new("/m/route.gml"),
+            layer.open(DatasetInput::new(
+                Path::new("/m/route.gml"),
                 bytes,
-                provenance: Provenance::Unverified,
-            })
+                Provenance::Unverified,
+            ))
         };
         let xml = route_xml();
         let id = match open(&mut layer, xml.as_bytes()).unwrap() {
@@ -503,7 +530,7 @@ mod tests {
             assert!((bounds.min_y..=bounds.max_y).contains(&p.lat));
         }
 
-        let scene = layer.portray(&request()).unwrap();
+        let scene = layer.portray(&request()).unwrap().unwrap();
         assert!(scene.instructions.is_empty());
         let samples = route_overlay::payload(&scene.extensions[0]).unwrap();
         assert_eq!(samples.paths().len(), 1);
@@ -513,7 +540,7 @@ mod tests {
         assert_eq!(samples.declarations().len(), 2);
         assert_eq!(samples.declarations()[0].source_profile, 1);
         // Cached until the content changes.
-        let again = layer.portray(&request()).unwrap();
+        let again = layer.portray(&request()).unwrap().unwrap();
         assert!(Arc::ptr_eq(
             &samples,
             &route_overlay::payload(&again.extensions[0]).unwrap()
@@ -554,7 +581,7 @@ mod tests {
 
         assert!(layer.set_visible(id, false));
         assert!(layer.coverage().is_none());
-        let hidden = layer.portray(&request()).unwrap();
+        let hidden = layer.portray(&request()).unwrap().unwrap();
         assert!(route_overlay::payload(&hidden.extensions[0])
             .unwrap()
             .paths()

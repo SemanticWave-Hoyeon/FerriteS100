@@ -104,7 +104,7 @@ def main() -> int:
         subprocess.run(
             ["cargo", "build", "-p", "ferrite-wasm", "--target", "wasm32-unknown-unknown",
              "--profile", args.profile,
-             *(["--no-default-features", "--features", "s124,s129,s421"] if args.no_s102 else []),
+             *(["--no-default-features", "--features", "s101,s124,s129,s421"] if args.no_s102 else []),
              *([] if args.no_lua else ["--features", "lua-wasm"])],
             cwd=REPO, env=env, check=True,
         )

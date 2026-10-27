@@ -57,19 +57,42 @@ ferrite-engine ──┼─ CLI / library    ferrite-cli  (inspect, validate, re
                  └─ Web              ferrite-wasm (wasm-bindgen, WebGPU / WebGL2)
 ```
 
+Each S-100 product is a separate crate behind a common interface
+(`ferrite-product-api`): an adapter that recognises the product's datasets and
+a layer that opens, validates, portrays, reports and describes them. The engine
+holds the registered layers and composes them without naming products:
+
+```text
+ferrite-product-api   ProductAdapter, ProductLayer, open-job stages, report model,
+                      platform services (data source, cache, user records, clock)
+      ▲
+ferrite-s101  ferrite-s102  ferrite-s124  ferrite-s129  ferrite-s421
+ (ENC cells)  (bathymetry)  (warnings)     (UKC plans)   (routes)
+      ▲             (S-124/S-129 share ferrite-s100-gml)
+ferrite-engine        product registry (products.rs), open jobs, scene composition
+                      by role (base chart, overlays, grids), picking, caches
+      ▲
+ferrite-ui            panel registry drawing the products' panel data models
+```
+
 `ferrite-engine` exposes a `ChartEngine` facade (open, prepare a scene, pick,
 describe features) and platform services (data source, cache store, user store,
 clock, executor). Datasets can be opened from files or from bytes in memory,
 including signature verification and S-101 update planning. Native-only
-dependencies sit behind features, so the engine also builds without OpenSSL,
-C HDF5, rayon or a GPU:
+dependencies and the products sit behind features, so the engine also builds
+without OpenSSL, C HDF5, rayon, a GPU or any given product:
 
 | Feature | Default | Without it |
 |---------|---------|------------|
 | `lua54` / `lua55` | Lua 5.4 | S-101 is drawn from precomputed Part 9a payloads |
 | `parallel` | on | Everything runs on the calling thread, same results |
-| `s102-hdf5` / `s102-pure` | C HDF5 | Pure-Rust HDF5 reader only (`s102-pure`) |
+| `s102-hdf5` / `s102-pure` | C HDF5 | Pure-Rust HDF5 reader only (`s102-pure`); neither: S-102 not built |
 | `crypto-openssl` / `crypto-rust` | OpenSSL | Pure-Rust X.509/ECDSA backend |
+| `s101`, `s124`, `s129`, `s421` | on | The product's datasets are not recognised or opened |
+
+The CLI, C ABI and web crates forward the same product features (the CLI draws
+with the S-101 portrayal catalogue, so `s101` stays on there); `ferrite-ui` has
+`s124`, `s129` and `s421` for its product panels.
 
 The design, the stages of the split and measurements are in
 [docs/ENGINE_DESIGN.md](docs/ENGINE_DESIGN.md).
@@ -244,18 +267,19 @@ Test datasets belong in the git-ignored `TestData/` folder. Useful sources:
 
 ```text
 src/                          Desktop viewer: event loop, UI orchestration, audits
-crates/ferrite-engine/        Chart engine: ChartEngine facade, platform services,
-                              dataset opening, scene composition, interoperability
+crates/ferrite-engine/        Chart engine: ChartEngine facade, product registry and layers,
+                              open jobs, platform services, scene composition, interoperability
 crates/ferrite-cli/           ferrite command-line tool and offscreen rendering
 crates/ferrite-capi/          C ABI (libferrite, include/ferrite.h)
 crates/ferrite-wasm/          WebAssembly bindings and web demo
 crates/ferrite-gpu/           GPU renderer (no windowing or GUI toolkit)
-crates/ferrite-ui/            egui panels, winit host and overlay compositing
+crates/ferrite-ui/            egui panels (product panel registry), winit host and overlay compositing
 crates/ferrite-render/        Rendering instructions and geometry
-crates/ferrite-s101/          S-101 product module: Lua conversion, product layer (update chains, lifecycle
-                              and exchange-set checks, catalogue selection, cell portrayal and caches)
-crates/ferrite-s102/          S-102 product module (C and pure-Rust HDF5 readers, product layer)
-crates/ferrite-product-api/   Common product module interface (adapters, layers, panel models, platform services, route overlay extension)
+crates/ferrite-s101/          S-101 product module: Lua conversion, product layer (open-job stage, update chains,
+                              lifecycle and exchange-set checks, catalogue selection, cell portrayal, caches, picks)
+crates/ferrite-s102/          S-102 product module (C and pure-Rust HDF5 readers, product layer, open-job stage)
+crates/ferrite-product-api/   Common product module interface (adapters, layers, open-job stages, report model,
+                              panel descriptors, platform services, route overlay extension)
 crates/ferrite-s100-gml/      Shared GML infrastructure: reader, FC and exchange-set validation, XSLT portrayal input
 crates/ferrite-s124/          S-124 product module: lifecycle, imports, rules, per-user state, warning list model
 crates/ferrite-s129/          S-129 product module: S-158-129 rules, virtual portrayal features, plan panel model

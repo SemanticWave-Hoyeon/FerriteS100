@@ -171,7 +171,7 @@ impl ChartApp {
                 fork.invalidate_coverage_view();
                 let start = std::time::Instant::now();
                 prepare_flat_coverage(
-                    self.engine.s101.coverage_inventory.as_deref(),
+                    self.engine.layers.s101().coverage_inventory.as_deref(),
                     &mut fork,
                     extent,
                     density,
@@ -190,7 +190,7 @@ impl ChartApp {
                 fork.invalidate_coverage_view();
                 let start = std::time::Instant::now();
                 prepare_flat_coverage(
-                    self.engine.s101.coverage_inventory.as_deref(),
+                    self.engine.layers.s101().coverage_inventory.as_deref(),
                     &mut fork,
                     extent,
                     density,
@@ -207,7 +207,7 @@ impl ChartApp {
             fork.invalidate_coverage_view();
             let start = std::time::Instant::now();
             prepare_flat_coverage(
-                self.engine.s101.coverage_inventory.as_deref(),
+                self.engine.layers.s101().coverage_inventory.as_deref(),
                 &mut fork,
                 extent,
                 density,

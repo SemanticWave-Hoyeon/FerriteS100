@@ -48,10 +48,15 @@ pub mod mcp_ui;
 /// Chat with locally installed LLM command-line clients.
 pub mod llm_chat_ui;
 pub mod overlay_ui;
+/// The registered products' panels.
+pub mod panels;
 
 /// S-421 readers for the native route editing overlay.
+#[cfg(feature = "s421")]
 pub mod native_route;
+#[cfg(feature = "s421")]
 pub use native_route::{load_native_route_overlay_resources, S421_EDITING_STYLE};
 
 mod chart_text_tests;
+#[cfg(feature = "s421")]
 mod native_route_overlay_tests;

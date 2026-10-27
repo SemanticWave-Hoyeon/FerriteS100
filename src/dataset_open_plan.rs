@@ -1,4 +1,7 @@
-//! Read-only opening queue. Discovery never authenticates or materializes cells.
+//! Read-only opening queue of the viewer (moved from the engine: the
+//! viewer's own plan over S-101 chains, S-102 HDF5 files, S-421 routes and
+//! the GML overlays; `ChartEngine` opens through the registered layers).
+//! Discovery never authenticates or materializes cells.
 //! All numeric S-101 members go through the existing authorized single batch:
 //! DSID latest edition/reissue, complete chains, identical-operation merge and
 //! conflicting-operation rejection remain owned by s101_update_plan.
@@ -17,21 +20,18 @@ pub struct Plan {
     /// prevent a different supported product from being opened.
     pub rasters: Vec<PathBuf>,
     pub notices: Vec<String>,
-    #[cfg(feature = "s421")]
-    pub routes: Vec<crate::products::s421::CapturedRouteInput>,
+    pub routes: Vec<ferrite_engine::products::s421::CapturedRouteInput>,
     /// S-124 / S-129 GML datasets and imported warnings (KML, GPX,
     /// shapefile, zipped shapefile), each opened independently.
     pub overlays: Vec<PathBuf>,
     /// S-102 2.1 trial files: inspection only, never depth coverage.
     pub trials: Vec<PathBuf>,
     /// Filled by the discovery worker thread through the isolated inspector.
-    #[cfg(feature = "s102-hdf5")]
     pub trial_inspections: Vec<(
         PathBuf,
         Result<ferrite_s102::trial_inspection::TrialInspection, String>,
     )>,
 }
-#[cfg(feature = "s102-hdf5")]
 impl Plan {
     /// Run the isolated S-102 2.1 trial inspector for each discovered trial.
     pub fn inspect_trials(&mut self) {
@@ -51,10 +51,8 @@ fn supported_product(spec: &str) -> bool {
     spec == "INT.IHO.S-102.3.0.0"
 }
 
-#[cfg(feature = "s102-hdf5")]
 const MAX_HDF_DISCOVERY_BYTES: u64 = 512 * 1024 * 1024;
 
-#[cfg(feature = "s102-hdf5")]
 fn checked_product_text(raw: &[u8]) -> Result<String> {
     ensure!(
         raw.len() <= 255 && !raw.contains(&0),
@@ -63,15 +61,6 @@ fn checked_product_text(raw: &[u8]) -> Result<String> {
     Ok(std::str::from_utf8(raw)?.to_owned())
 }
 
-#[cfg(not(feature = "s102-hdf5"))]
-fn hdf_product(path: &Path) -> Result<String> {
-    anyhow::bail!(
-        "S-102 (HDF5) support is not built (feature s102-hdf5): {}",
-        path.display()
-    )
-}
-
-#[cfg(feature = "s102-hdf5")]
 fn hdf_product(path: &Path) -> Result<String> {
     use ferrite_s102::hdf5::{
         types::{FixedAscii, FixedUnicode, TypeDescriptor, VarLenAscii, VarLenUnicode},
@@ -146,26 +135,24 @@ fn classify_rasters(plan: &mut Plan, files: Vec<PathBuf>) {
     }
 }
 
-/// `on_system`: see [`crate::gml_overlay::discover`].
+/// `on_system`: see [`ferrite_engine::gml_overlay::discover`].
 pub fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Plan> {
-    let (charts, rasters) = crate::dataset_discovery::discover_recursive_files(root)?;
+    let (charts, rasters) = ferrite_engine::dataset_discovery::discover_recursive_files(root)?;
     let mut plan = Plan {
         charts,
         ..Plan::default()
     };
     classify_rasters(&mut plan, rasters);
-    #[cfg(feature = "s421")]
     {
-        let (routes, notices) =
-            crate::products::s421::discover_routes_in(&crate::platform::NativeDataSource, root)?;
+        let (routes, notices) = ferrite_engine::products::s421::discover_routes_in(
+            &ferrite_engine::platform::NativeDataSource,
+            root,
+        )?;
         plan.routes = routes;
         plan.notices.extend(notices);
     }
-    #[cfg(feature = "s421")]
     let no_routes = plan.routes.is_empty();
-    #[cfg(not(feature = "s421"))]
-    let no_routes = true;
-    plan.overlays = crate::gml_overlay::discover(root, on_system)?;
+    plan.overlays = ferrite_engine::gml_overlay::discover(root, on_system)?;
     if plan.charts.is_empty()
         && plan.rasters.is_empty()
         && plan.trials.is_empty()
@@ -182,7 +169,7 @@ pub fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Plan> {
             ensure!(count < 100_000, "Archive discovery exceeds entry limit");
             let entry = entry?;
             if entry.file_type().is_file()
-                && crate::dataset_discovery::is_dataset_file(entry.path(), "zip")
+                && ferrite_engine::dataset_discovery::is_dataset_file(entry.path(), "zip")
             {
                 archives.push(entry.into_path());
                 if archives.len() == 3 {
@@ -228,25 +215,21 @@ pub fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
         });
     }
     let mut plan = Plan::default();
-    if crate::gml_overlay::is_overlay_file(path) {
+    if ferrite_engine::gml_overlay::is_overlay_file(path) {
         plan.overlays.push(path.to_path_buf());
-    } else if crate::dataset_discovery::is_dataset_file(path, "h5")
-        || crate::dataset_discovery::is_dataset_file(path, "hdf5")
+    } else if ferrite_engine::dataset_discovery::is_dataset_file(path, "h5")
+        || ferrite_engine::dataset_discovery::is_dataset_file(path, "hdf5")
     {
         classify_rasters(&mut plan, vec![path.to_path_buf()]);
-    } else if crate::dataset_discovery::is_dataset_file(path, "gml")
-        || crate::dataset_discovery::is_dataset_file(path, "xml")
+    } else if ferrite_engine::dataset_discovery::is_dataset_file(path, "gml")
+        || ferrite_engine::dataset_discovery::is_dataset_file(path, "xml")
     {
-        #[cfg(feature = "s421")]
-        match crate::products::s421::capture_if_route(path)? {
+        match ferrite_engine::products::s421::capture_if_route(path)? {
             Some(input) => plan.routes.push(input),
             None => plan
                 .notices
                 .push(format!("Skipped non-S421 XML: {}", path.display())),
         }
-        #[cfg(not(feature = "s421"))]
-        plan.notices
-            .push(format!("Skipped non-S421 XML: {}", path.display()));
     } else {
         plan.notices.push(format!(
             "Skipped unsupported dataset file: {}",
@@ -256,7 +239,7 @@ pub fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
     Ok(plan)
 }
 
-#[cfg(all(test, feature = "s102-hdf5"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use ferrite_s102::hdf5::{
@@ -412,7 +395,6 @@ mod tests {
         assert!(checked_product_text(&[b'X'; 255]).is_ok());
     }
     #[test]
-    #[cfg(feature = "s421")]
     fn empty_and_unknown_inputs_produce_visible_diagnostics_not_guessed_products() {
         let tmp = TestDir::new();
         assert_eq!(

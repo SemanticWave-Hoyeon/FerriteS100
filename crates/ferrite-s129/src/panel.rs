@@ -3,6 +3,13 @@
 use ferrite_s100_gml::overlay::OverlayCore;
 use ferrite_s100_gml::{Object, Product};
 
+/// The panel the product publishes (drawn by UI crates from this module's
+/// data model).
+pub const PANEL: ferrite_product_api::PanelDescriptor = ferrite_product_api::PanelDescriptor {
+    id: "S-129/plans",
+    title: "Under keel clearance plans",
+};
+
 /// A control point of an S-129 plan.
 #[derive(Debug, Clone, Default)]
 pub struct ControlPointRow {

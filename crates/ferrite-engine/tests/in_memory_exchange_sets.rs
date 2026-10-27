@@ -97,10 +97,11 @@ fn memory_engine(memory: MemoryDataSource, user: &MemoryUserStore) -> ChartEngin
 }
 
 fn native_engine(history: &Path) -> ChartEngine {
-    let platform = Platform::native_with_user_store(NativeUserStore {
-        history_path: history.to_path_buf(),
-        navwarn_path: Arc::new(|_| None),
-    })
+    let history = history.to_path_buf();
+    let platform = Platform::native_with_user_store(NativeUserStore::new().with(
+        ferrite_s101::layer::PRODUCT,
+        Arc::new(move |_| Some(history.clone())),
+    ))
     .with_clock(clock());
     required(platform, repository().join("Catalogues"))
 }
@@ -120,14 +121,15 @@ fn state(engine: &ChartEngine, report: &OpenReport) -> Vec<String> {
         })
         .collect();
     let state = engine.state();
-    for (index, cell) in state.s101.cells.iter().enumerate() {
+    for (index, cell) in state.layers.s101().cells.iter().enumerate() {
         rows.push(format!(
             "{} {}.{} {:02x?}",
             cell.dsid.dataset_name,
             cell.dsid.edition_number,
             cell.dsid.update_number,
             state
-                .s101
+                .layers
+                .s101()
                 .loaded_source_identities
                 .get(index)
                 .unwrap()
@@ -197,10 +199,10 @@ fn required_signatures_plan_in_memory_exchange_sets_like_the_native_folder_path(
     engine
         .open_blocking(DatasetSource::Folder(mem("/xs")))
         .unwrap();
-    let cell = &engine.state().s101.cells[0];
+    let cell = &engine.state().layers.s101().cells[0];
     assert_eq!(cell.dsid.dataset_name, "101FR00571300.000");
     assert_eq!((cell.dsid.edition_number, cell.dsid.update_number), (1, 2));
-    assert_eq!(engine.state().s101.loaded_chain_paths[0].len(), 3);
+    assert_eq!(engine.state().layers.s101().loaded_chain_paths[0].len(), 3);
 }
 
 /// The ed1er2 exchange set under `/xs/load`.
@@ -234,7 +236,7 @@ fn tampered_update_in_memory_is_rejected() {
         .err()
         .expect("tampered update rejected");
     assert!(format!("{error:#}").contains("signature"), "{error:#}");
-    assert!(engine.state().s101.cells.is_empty());
+    assert!(engine.state().layers.s101().cells.is_empty());
 
     // Removing the update from the exchange set does not downgrade either.
     let complete = ed1er2_source();
@@ -381,12 +383,12 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
     let report = engine
         .open_blocking(DatasetSource::Folder(mem("/xs/cancel")))
         .unwrap();
-    assert!(report.cancellations.is_empty());
+    assert!(report.cancellations().is_empty());
     assert!(report
         .notices
         .iter()
         .any(|n| n.contains("explicit selection required")));
-    assert_eq!(engine.state().s101.cells.len(), 1);
+    assert_eq!(engine.state().layers.s101().cells.len(), 1);
     assert!(user.get(MEMORY_HISTORY_KEY).is_none());
 
     // Explicitly selected: verified, validated against the loaded edition 1
@@ -395,14 +397,15 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
         .open_blocking(DatasetSource::Files(vec![mem(CANCEL)]))
         .unwrap();
     assert!(report.issues.is_empty(), "{:#?}", report.issues);
-    assert_eq!(report.cancellations.len(), 1, "{report:#?}");
-    let record = &report.cancellations[0];
+    assert_eq!(report.cancellations().len(), 1, "{report:#?}");
+    let cancellations = report.cancellations();
+    let record = &cancellations[0];
     assert_eq!(record.key.1, "101FR00571300");
     assert_eq!(
         (record.cancelled_edition, record.cancellation_update),
         (1, 3)
     );
-    assert!(engine.state().s101.cells.is_empty());
+    assert!(engine.state().layers.s101().cells.is_empty());
     assert!(engine.datasets().is_empty());
     let stored = String::from_utf8(user.get(MEMORY_HISTORY_KEY).unwrap()).unwrap();
     assert!(stored.contains("101FR00571300") && stored.contains("2026-03-25"));
@@ -417,7 +420,7 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
         format!("{error:#}").contains("cancellation history"),
         "{error:#}"
     );
-    assert!(engine.state().s101.cells.is_empty());
+    assert!(engine.state().layers.s101().cells.is_empty());
     // Selected explicitly, the stale chain is skipped with a notice.
     let report = engine
         .open_blocking(DatasetSource::Files(vec![mem(UPDATE_2)]))
@@ -444,7 +447,7 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
         .unwrap();
     // A fresh synthetic producer signs different bytes than the recorded
     // one; the record itself (key, edition, update, date) is the same.
-    assert_eq!(report.cancellations.len(), 1, "{report:#?}");
+    assert_eq!(report.cancellations().len(), 1, "{report:#?}");
     assert!(report.notices.iter().any(|n| n.contains("announcement")));
 }
 

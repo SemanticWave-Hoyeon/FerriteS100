@@ -6,6 +6,7 @@ pub use ferrite_product_api::platform::is_dataset_file;
 
 /// Recursive discovery of S-101 chain members and S-102 files (the open-all
 /// planner), defined with the S-101 update planner.
+#[cfg(feature = "s101")]
 pub use ferrite_s101::layer::discovery::{discover_recursive_files, discover_recursive_files_in};
 
 /// FC folders must resolve deterministically to one real XML file.

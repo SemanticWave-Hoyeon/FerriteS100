@@ -286,29 +286,56 @@ python3 tools/pixel_regression.py --skip-build    # 이전 빌드 재사용
 
 ### 목표 구조
 
+5단계까지 마친 구조다.
+
 ```
-ferrite-product-api   공통 인터페이스: ProductAdapter, ProductLayer, 데이터 모델,
-                      제품이 쓰는 플랫폼 서비스(Clock, UserRecord). egui·wgpu 비의존
+                       ferrite-product-api
+        ProductAdapter · ProductLayer · open(OpenStage) · report · platform
+              ▲              ▲               ▲               ▲
+   ┌──────────┴───┐  ┌───────┴──────┐  ┌─────┴──────┐  ┌─────┴──────┐
+   ferrite-s101    ferrite-s102     ferrite-s421    ferrite-s124/-s129
+   (S101Layer)     (S102Layer)      (S421Layer)       └ ferrite-s100-gml
+        ▲              ▲               ▲               (GML 공통 기반)
+        └──────────────┴───────┬───────┴───────────────┘
+                               │ 기능 플래그 s101·s102-pure·s421·s124·s129
+                ferrite-engine │ products.rs (유일한 등록 지점)
+     EngineState { layers: ProductLayers(Box<dyn ProductLayer>), … }
+     ChartEngine: 열기 작업(단계별 sniff·accept·load) → install → 보고·합성
+                               │
+     ┌──────────────┬──────────┴──────┬──────────────┐
+  ferrite-cli   ferrite-capi    ferrite-wasm    ferrite-s100(앱)
+                                                  └ ferrite-ui: PanelRegistry
+                                                    (제품 패널 데이터 모델)
+```
+
+```
+ferrite-product-api   공통 인터페이스: ProductAdapter, ProductLayer, 열기 작업 단계
+                      (open), 공통 보고 모델(report), 데이터 모델, 제품이 쓰는 플랫폼
+                      서비스(Clock, UserRecord, UserStore, DataSource, CacheStore,
+                      Executor). egui·wgpu·서명 백엔드 비의존
 ferrite-s100-gml      GML 공통 기반: Part 10b 판독기, FC 검증, 교환 세트 검증,
                       Part 9 XSLT 입력·변환, 오버레이 계층 상태, GML 제품 인터페이스
 ferrite-s101 / -s102 / -s124 / -s129 / -s421
-                      제품별 크레이트. 제품 고유 코드를 모두 가진다
-ferrite-engine        제품 비의존: 등록된 어댑터, 데이터셋 저장, 장면 합성, 커버리지,
-                      캐시, 플랫폼 서비스. 제품 크레이트는 기능 플래그 뒤에서 등록
-ferrite-ui            등록된 제품의 패널 데이터 모델을 그린다
+                      제품별 크레이트. 제품 고유 코드(판별, 열기 단계, 설치, 보고,
+                      포트레이얼, 피킹, 패널 모델, 사용자 기록 형식)를 모두 가진다
+ferrite-engine        제품 비의존: 등록된 계층의 저장소(ProductLayers), 열기 작업,
+                      장면 합성(역할별), 커버리지, 캐시, 플랫폼 서비스. 제품 크레이트는
+                      기능 플래그 뒤에서 products.rs가 등록
+ferrite-ui            패널 등록부(PanelRegistry)가 등록된 제품의 패널 데이터 모델을 그린다
 ```
-
-의존 방향: `제품 크레이트 → ferrite-product-api (+ 공통 기반)`, `engine → 제품 크레이트`, `ui → 제품 크레이트(패널 모델)`. 제품 크레이트는 엔진·UI에 의존하지 않는다.
 
 ### 인터페이스 (`ferrite-product-api`)
 
 | 항목 | 내용 |
 |---|---|
 | `ProductAdapter` | 제품 하나. `info()`(`ProductId`, 이름, 인코딩, 장면 역할 `SceneRole`), `sniff(name, head)`(파일 이름과 앞 64 KiB로 데이터셋·가져오기 형식 판별), `import_extensions()`·`imports_archives()`, `panels()`(`PanelDescriptor`), `as_any()`/`as_any_mut()`(제품을 아는 호스트가 제품 고유 기능에 접근) |
-| `ProductLayer` | 같은 인코딩·포트레이얼 경로를 쓰는 제품들의 데이터셋 저장소. `open(DatasetInput)`(이름, 바이트(검증 시 인증 스냅숏), `Provenance`), `remove`, `set_visible`, `portray(PortrayalRequest)` → `SceneContribution`(리비전, `DrawingInstruction`, `RendererExtension`), `coverage`, `describe(key)` → `FeaturePick`, `highlight(key)` |
+| `ProductLayer` | 같은 인코딩·포트레이얼 경로를 쓰는 제품들의 데이터셋 저장소(`Any`, 형식 접근은 `as_any`). `open(DatasetInput)`(이름, 바이트(검증 시 인증 스냅숏), 갱신 체인 `updates`, `Provenance`, 서명 정책 `signatures`; `check_policy`로 정책 확인), `remove`, `set_visible`, `portray(PortrayalRequest)` → `Result<Option<SceneContribution>>`(리비전, `DrawingInstruction`, `RendererExtension`), `coverage`, `describe(key)` → `FeaturePick`, `describe_in(dataset, key)` → `FeatureReport`(셀 색인이 있는 계층), `highlight(key)`. 열기 작업: `open_stage` → `OpenStage`, `check_opened`, `install_early`, `install`. 보고: `datasets`, `feature_types`, `validation_issues`, `exchange_set_checks`. 호스트 검사: `check_display`(색상 프로필·설정), `numeric_coverages`(S-98 Level 2 입력) |
+| `PortrayalRequest` | 프로필, 보기 시각, 표시 설정과 호스트 서비스 `HostServices`(규칙 출처 `PortrayalSource`(Lua/사전 계산), 사전 계산 내보내기, 캐시 저장소, 상호운용 `Interoperability`(카탈로그와 제품별 선택을 `Any`로 넘김: API가 서명 백엔드에 의존하지 않도록)) |
+| `open` | 호스트 열기 작업의 단계 계약. `OpenStage`(`sniffs_head`·`sniff`(어댑터 판별), `accept`, `counted_inputs`, `after_claims`, `load` → `Loaded`(페이로드와 종류별 개수)), `OpenContext`(데이터 원천, 실행기, `SignaturePolicy`, 명시 선택 여부, 인증 함수 `Authorize`(`ferrite_security::AuthorizedDatasets`를 `Any`로), 사용자 저장소, 취소), `OpenNotes`, `InstallContext` |
+| `report` | 공통 보고 모델: `DatasetId`, `DatasetSummary`, `IssueSeverity`, `ValidationIssue`, `FeatureReport`, `InstallReport`, 제품 고유 보고 `ProductReport`(제품·종류·페이로드; S-101 취소 기록, S-102 파일 요약) |
 | `RendererExtension` | 렌더러가 아는 종류 이름과 페이로드. S-102 래스터 타일, S-421 경로 오버레이를 그리기 명령 밖의 데이터로 넘기는 자리 |
 | 패널 데이터 모델 | 제품 크레이트가 행·옵션 타입을 정의하고(`ferrite_s124::panel`, `ferrite_s129::panel`), UI 크레이트는 그 타입만 그린다. API 크레이트는 egui에 의존하지 않는다 |
-| `platform::{Clock, UserRecord, DataSource, CacheStore, Executor, Services}` | 제품이 직접 쓰는 플랫폼 서비스(시각, 사용자별 기록, 데이터 원천, 캐시 저장소, 실행기)와 계층이 보관하는 핸들 묶음. 로컬 파일·메모리 데이터 원천(`NativeDataSource`, `MemoryDataSource`), 순차 실행기, `parallel_map`, 캐시 항목 한도도 여기 있다(4단계). `ferrite_engine::platform`이 다시 내보내고 나머지를 구현한다 |
+| `platform::{Clock, UserRecord, UserStore, RecordKind, FileRecord, DataSource, CacheStore, Executor, Services}` | 제품이 직접 쓰는 플랫폼 서비스(시각, 사용자별 기록, 데이터 원천, 캐시 저장소, 실행기)와 계층이 보관하는 핸들 묶음. `UserStore::product_state(product, key)`·`product_state_path`는 제품별 기록이고, 기록 형식(파일 기록, 표준 위치, 메모리 키)은 제품이 `RecordKind`로 준다(5단계). 로컬 파일·메모리 데이터 원천(`NativeDataSource`, `MemoryDataSource`), 순차 실행기, `parallel_map`, 캐시 항목 한도도 여기 있다(4단계). `ferrite_engine::platform`이 다시 내보내고 나머지를 구현한다 |
 | `route_overlay` | 경로 오버레이 렌더러 확장(종류 `"S-421/route-overlay"`, 페이로드 `NativeRouteWorldSamples`): 경로별 웨이포인트(`NativeRoutePath`), 선언된 구간(`NativeRouteLegDeclaration`), 그 WGS84 표본, 편집 PC 판독기 계약(`EditingStyleReader`). 제품(생산)과 렌더러(소비)가 함께 쓴다 |
 
 GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한다.
@@ -329,7 +356,7 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 
 ### 기능 플래그
 
-`ferrite-engine`의 `s124`, `s129`, `s421`(기본 켜짐)이 제품 크레이트를 등록한다(`ferrite_engine::products`, 엔진에서 제품을 이름으로 부르는 유일한 곳). 끄면 그 제품의 데이터셋은 탐색·판별·열기 대상이 아니고 카탈로그도 적재하지 않는다(`s421`을 끄면 경로를 탐색·캡처하지 않고 `ChartEngine::routes`가 없다). `ferrite-cli`·`ferrite-capi`·`ferrite-wasm`은 같은 이름의 기능을 기본으로 켜서 넘기고, 뷰어는 엔진 의존에 세 기능을 명시한다. `tools/build_wasm.py --no-s102`도 세 기능을 유지한다.
+`ferrite-engine`의 `s101`, `s124`, `s129`, `s421`(기본 켜짐)과 `s102-pure`/`s102-hdf5`가 제품 크레이트를 등록한다(`ferrite_engine::products`, 엔진에서 제품을 이름으로 부르는 유일한 곳). 끄면 그 제품의 데이터셋은 탐색·판별·열기 대상이 아니고 카탈로그도 적재하지 않는다(`s421`을 끄면 경로를 탐색·캡처하지 않고 `ChartEngine::routes`가 없다. `s101`을 끄면 `ChartEngine`은 S-101 카탈로그 없이 만들어지고 장면에 셀·커버리지가 없다. S-102가 없으면 HDF5 입력은 "not built" 알림이다). `s124`/`s129`는 오버레이 포트레이얼이 쓰는 Part 9a 명령 변환 때문에 `ferrite-s101` 크레이트를 연결한다(등록은 하지 않음). `ferrite-cli`·`ferrite-capi`·`ferrite-wasm`은 같은 이름의 기능을 기본으로 켜서 넘기고(`s101`은 CLI의 장면 출력이 S-101 PC로 그리므로 필수: 끄면 `compile_error!`), 뷰어는 엔진 의존에 다섯 기능을 명시한다. `ferrite-ui`의 `s124`, `s129`, `s421`(기본 켜짐)은 패널(경고 목록, 계획 창)과 경로 편집 자원 판독기를 넣는다. `tools/build_wasm.py --no-s102`는 `s101,s124,s129,s421`을 유지한다.
 
 ### 단계
 
@@ -341,7 +368,7 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 | 2 | **완료.** S-102: 엔진 `s102_*` 모듈과 `EngineState`의 `s102_*` 필드를 `ferrite-s102`(제품 계층 `layer`)로 옮기고 래스터 타일을 `RendererExtension`으로 넘김. `main.rs`의 S-102 분기 일부를 계층 호출로 바꿈(아래). |
 | 3 | **완료.** S-421: `s421_dataset_input`, `src/native_s421.rs`의 제품 로직을 `ferrite-s421`로 모으고, `ferrite-gpu` `native_route_*`의 데이터 모델을 경로 오버레이 확장(`ferrite_product_api::route_overlay`)으로 옮겨 경로 오버레이를 확장으로 넘긴다(아래). |
 | 4 | **완료.** S-101: 엔진 `s101_*`(업데이트 계획, 생명주기, 교환 세트 검사, 카탈로그 선택)와 셀 포트레이얼의 제품 고유 부분을 `ferrite-s101` 제품 계층(`layer`)으로 옮기고 `EngineState`의 S-101 필드를 `S101Layer`로 모은다(아래). |
-| 5 | 엔진·UI 정리: `ChartEngine`이 `Vec<Box<dyn ProductLayer>>`로 계층을 합성하고, UI는 등록된 패널을 그리며, UI·애플리케이션·CLI·C ABI·웹에 제품별 기능 플래그를 둔다. `ferrite_s100_gml::Product` 열거형을 `ProductId` 등록으로 바꾼다. |
+| 5 | **완료(일부, 아래 남은 일).** 엔진·UI 정리: `EngineState`가 등록된 계층을 `ProductLayers`(`Box<dyn ProductLayer>`)로 가지고 `ChartEngine`이 열기·설치·보고·장면 합성·피킹을 계층 인터페이스로만 한다. 열기 작업은 등록된 어댑터의 판별을 쓴다. 엔진 `s101` 기능, UI 패널 등록부와 UI 제품 기능, 제품별 사용자 기록. `ferrite_s100_gml::Product` 열거형 교체는 남았다. |
 
 ### 1단계 결과
 
@@ -389,7 +416,37 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 - 동작: S-101 열기·업데이트 계획·서명 처리·취소와 이력, 검증 문제와 알림 문구, 포트레이얼 출력(픽셀 회귀 동일, 차가운·따뜻한 셀 캐시), 캐시 형식·키(`CACHE_SCHEMA_VERSION` 43, 셀 캐시·사전 계산 키 유도)는 그대로다. 같은 Lua 빌드 식별자(`FERRITE_LUA_LOCK_PATH`로 같은 잠금 파일을 지정)로 빌드한 기준·작업 바이너리에서, 기준이 쓴 셀 캐시 4개를 작업 바이너리가 모두 적중으로 읽고(새 파일 없음, 화면 동일) 세 위치에서 확인했다. 의존 관계가 바뀌어 `Cargo.lock`이 달라졌으므로 보통 빌드에서는 Lua 빌드 식별자(`ferrite-lua-runtime` 빌드 지문, 잠금 파일 포함)가 바뀌어 기존 셀 캐시가 한 번 다시 만들어진다(의도된 무효화).
 - `s101` 기능은 두지 않았다. `EngineState`와 `ChartEngine`(열기 작업, 설치, 준비, 피킹, 보고)이 S-101 계층을 바탕 해도로 직접 가지므로 기능으로 끄려면 엔진 전체의 분기가 필요하다. 5단계에서 엔진이 `Vec<Box<dyn ProductLayer>>`로 계층을 합성할 때 함께 둔다.
 
-### 2~5단계 참고
+### 5단계 결과
+
+- 인터페이스(`ferrite-product-api`): `portray`는 `Result<Option<SceneContribution>>`이고 요청에 `HostServices`(규칙 출처 `PortrayalSource`, 사전 계산 내보내기, 캐시 저장소, 상호운용)를 싣는다. `PortrayalSource`는 API로 옮겼다(`ferrite_s101::layer::PortrayalSource`는 다시 내보내기, 기본값은 `portrayal::default_source`). `DatasetInput`은 갱신 체인(`updates`)과 서명 정책(`signatures`, `check_policy`)을 싣는다. 새 모듈 `open`(열기 작업 단계)과 `report`(공통 보고 모델: 엔진 `chart_engine`의 `DatasetId`·`DatasetSummary`·`IssueSeverity`·`ValidationIssue`, `pick::FeatureReport`는 다시 내보내기). `ProductLayer`에 `as_any`/`as_any_mut`, `describe_in`, 열기 작업 훅(`open_stage`, `check_opened`, `install_early`, `install`), 보고(`datasets`, `feature_types`, `validation_issues`, `exchange_set_checks`), `check_display`, `numeric_coverages`를 더했다(기본 구현 있음). `platform`에 `UserStore`(`product_state(product, key)`, `product_state_path`), `RecordKind`, `FileRecord`, `user_file_name`을 옮겼다.
+- 제품 크레이트:
+  - `ferrite-s101`: `layer::open_job`(엔진 `ChartEngine`의 S-101 열기 작업과 설치를 옮김: `S101Stage`(이름 판별, 승인된 계획기·바이트 체인·카탈로그 소유자), `check_opened`(카탈로그 변경 확인), `apply_cancellations`(`install_early`), `install`, `cell_summary`, `exchange_set_checks`), `layer::pick`(엔진 `pick::describe_feature` → `S101Layer::describe_feature`), `layer::pick_fields`(`git mv` 엔진 `dataset_pick_fields.rs`), `layer::resources`(엔진 `scene`의 `CellResourceBinding`, `cell_resource_bindings`, `viewing_groups`, `cell_viewing_groups`). `S101Layer`에서 `portrayal_source`/`precomputed_export`를 없애고 셀 포트레이얼 메서드(`portray_loaded_cells`, `portray_change_cells`, `portray_cells_with_owners`, `portrayal_run`)가 호스트의 `RuleSource`를 인자로 받는다. 셀별 출처 문자열(`provenance`)은 계층이 가진다. 사용자 기록 `publication::{USER_RECORDS, HISTORY_KEY, MEMORY_HISTORY_KEY, history_record, history_path}`.
+  - `ferrite-s102`: `layer::open_job`(`git mv` 엔진 `s102_host.rs`: `S102Stage`, 설치와 `"bathymetry"` 보고). 트레이트 `portray`가 호스트 서비스(규칙 출처, 내보내기, 캐시, 상호운용 선택)를 쓰므로 엔진도 트레이트로 부른다. `numeric_coverages`는 수심 커버리지다. 엔진의 S-102 없는 같은 모양 자료형(`S102Options`, `BathymetrySummary`, `OpenedS102`)은 없앴다.
+  - `ferrite-s421`: `layer::open_job`(분류 중 경로 캡처, `install_early`에서 삽입과 알림).
+  - `ferrite-s124`/`ferrite-s129`: `PRODUCT`(`ProductId`), `panel::PANEL`(패널 서술자), S-124 `user_state::{USER_RECORDS, user_record}`.
+- 엔진: `layers::ProductLayers`(등록 순서의 `Box<dyn ProductLayer>`, 역할 `SceneRole`, 형식 접근 `get`/`get_mut`, 단축 `s101()`·`s102()`·`routes()`(기능별), `overlays()`). `EngineState`는 `s101`·`s102` 필드 대신 `layers`를 가지고, 호스트 설정 `portrayal_source`·`precomputed_export`를 가진다. 상호운용(`displayed_products`, `ic_selection`, `ic_level2`)은 계층의 역할·`numeric_coverages`로 구한다. `ChartEngine`의 필드는 상태, 서명 정책, 신뢰 앵커, 삼각분할, 표시뿐이다(`overlays`·`routes`·`provenance`·`s102`는 계층으로). `products::engine_layers`가 S-101(필수 카탈로그), GML 오버레이 계층, S-421, S-102(또는 "not built" 계층) 순서로 등록하고, 뷰어는 `products::chart_layers`(S-101, S-102)를 쓴다. 열기 작업은 입력마다 등록 순서대로 단계의 `sniff`(이름만, 필요하면 앞 64 KiB를 한 번 읽음) → `accept`, 입력 한도(4096) 확인, `after_claims`, `load`를 거치고, 설치는 모든 계층의 `check_opened` → `install_early`(S-101 취소, S-421 경로) → `install`(등록 순서)이다. 보고(`datasets`, `feature_types`, `validation_issues`, `exchange_set_checks`, `feature`)와 장면 합성(바탕 해도 → `SceneRole::Overlay` 명령 → 커버리지 → `SceneRole::Grid` 확장)은 계층 인터페이스로 한다. `OpenReport`는 `products: Vec<ProductReport>`와 `cancellations()`(`s101`)·`bathymetry()`(`s102-pure`)를 가진다. GML 오버레이 계층(`gml_overlay`)은 자기 열기 단계(`GmlStage`: 판별, 서명 스냅숏 읽기, 설치)와 보고를 가진다. 플랫폼의 `NativeUserStore`(`paths: ProductId → 위치`)·`MemoryUserStore`는 등록된 `RecordKind`로 기록을 만든다(NAVWARN 파일 위치·형식과 메모리 키 `navwarn/<user>`, `s101-cancellations` 그대로). 뷰어 전용 열기 계획 `dataset_open_plan.rs`는 앱으로 옮겼다(`git mv`).
+- `s101` 기능(기본 켜짐): 끄면 `ferrite-s101`이 등록되지 않고 `PreparedScene::{coverage, catalogue_registry}`, `CellScene`, 셀 포트레이얼 메서드, `cancellation_history`, `set_residency_threshold`, `cell_cache_entries`가 빠진다. 엔진은 `crypto-rust`만, 그리고 각 제품 기능 하나씩으로 빌드된다.
+- UI: `ferrite_ui::panels`(`ProductPanel`, `PanelRegistry`, `SharedPanelState`). `overlay_ui::State`는 등록부이고 S-124 `NavwarnPanel`, S-129 `UkcPanel`이 각 UI 기능 뒤에서 등록된다. 공유 옵션(오류 정정, 옵션 변경)은 `shared`에 있다. 보기 메뉴의 패널 항목은 등록부가 그린다(표시 문구 그대로). `AppUiState::overlays` → `panels`.
+- 동작: 열기 알림·검증 문제의 순서와 문구, 설치 순서, 포트레이얼 출력(픽셀 회귀 동일), S-102·S-124/S-129·S-421 화면, 캐시 키, NAVWARN 상태 파일 위치·형식, 취소 이력은 그대로다. `ProductLayer` 기본 구현을 직접 부르는 경우의 차이: `S101Layer::open`이 갱신 체인을 받고, 계층들의 `open`은 정책이 서명을 요구할 때 인증되지 않은 입력을 거부한다. `S421Layer::portray`는 예산 초과를 오류로 돌려준다(이유는 `portray_error`에도 남음).
+- 테스트 이동: 엔진 `dataset_pick_fields::tests::*` → `ferrite-s101` `layer::pick_fields::tests::*`, 엔진 `dataset_open_plan::tests::*` → 앱 `dataset_open_plan::tests::*`(이름 그대로). 엔진 통합 시험은 계층 접근(`state().layers.s101()`)과 보고 메서드를 쓴다. `overlay_ui::tests::windows_draw_rows_without_raising_requests`는 등록부로 그린다.
+
+### 남은 일 (2~5단계 참고)
+
+- `ferrite_s100_gml::Product` 열거형(판독기 제품 판별, `namespaced_symbol`, 교환 세트의 제품 판별)과 판독기의 S-129 검사 식별자(`S-158-129/15`)가 아직 공통 기반에 있다. 판독기·교환 세트 검증에 등록된 GML 제품 목록을 넘기도록 바꾸면 `ProductId`로 대신할 수 있다(판독기 API와 시험 다수가 바뀐다).
+- GML 오버레이 포트레이얼은 Part 9a 명령 변환(`ferrite_s101::convert_lua_results_for_cell`, 합성 셀)을 쓴다. 변환을 제품 비의존 크레이트로 옮기면 `s124`/`s129`가 `ferrite-s101`을 연결하지 않아도 된다.
+- 경로 패널(`ferrite-ui::egui_integration`)은 여전히 플러그인 UI JSON(`ferrite_s421::ui::UiData` + 편집기 필드)을 그리고 패널 등록부 밖에 있다. 형식이 있는 패널 모델(`S421::panels()`의 `S-421/routes`)로 바꿔 등록부에 넣는다.
+- S-421의 두 저장소(엔진 `S421Layer`, 뷰어 `RouteEditor`)와 뷰어의 S-101·S-102 열기·게시 거래(`main.rs`의 로더, 카탈로그 변경 거래, 래스터 경로)는 그대로다. 뷰어는 엔진 열기 작업을 쓰지 않고 계층의 형식 접근(`engine.layers.s101()`)으로 S-101·S-102를 직접 다룬다.
+- CLI의 장면 출력(`SceneEmitter`)은 S-101 PC(팔레트, 기호, 선 모양)로 그리므로 CLI·C ABI·웹은 `s101` 없이 빌드하지 않는다.
+- `PreparedScene`의 `coverage`·`catalogue_registry`는 S-101 형식이다(`s101` 기능 뒤). 바탕 해도 계층이 커버리지를 확장처럼 넘기면 장면 형식에서 S-101을 뺄 수 있다.
+- `Provenance::label`의 가져오기 문구가 S-124를 말한다. 가져오기 제품이 늘면 제품이 문구를 준다.
+- 엔진 `catalogue`의 적재 오류 문구는 S-101 배치(`Catalogues/FC/S-101`)를 말한다. 제품별 카탈로그 적재로 나눌 때 제품이 문구를 준다.
+- S-102 ID(`ProductLayer::remove`의 `u32`)는 계층이 파일 경로마다 매긴다. 뷰어의 데이터셋 트리는 아직 경로(`DatasetLayerId::S102(path)`)로 부른다.
+- 렌더러 확장 페이로드는 `Arc<dyn Any + Send + Sync>`라 제품 크레이트가 GPU에 의존하지 않는다. S-102는 GPU로 옮길 때 꺼내야 해서 페이로드 안에 `Mutex`를 둔다(`BathymetryScene::take_tiles`).
+- `S101Layer`는 생성 때 플랫폼 서비스 핸들을 복제한다(`Services`). `EngineState::platform`을 나중에 바꾸는 호스트는 계층의 `services`도 함께 바꿔야 한다.
+- `ProductLayers`는 `Send`가 아니다(GML 오버레이 계층의 XSLT 상태가 `Rc`를 쓴다). 이전의 `ChartEngine`도 `Send`가 아니었다.
+
+### 이전 단계 참고 (기록)
+
 
 - `ferrite_s100_gml::Product` 열거형(판독기 제품 판별, `namespaced_symbol`, 교환 세트의 제품 판별)과 판독기의 S-129 검사 식별자(`S-158-129/15`)가 아직 공통 기반에 있다. 5단계에서 `ProductId` 등록으로 바꾼다.
 - `Provenance::label`의 가져오기 문구가 S-124를 말한다. 가져오기 제품이 늘면 제품이 문구를 준다.

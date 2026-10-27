@@ -15,6 +15,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ferrite_feature_catalog::FeatureCatalogue;
 use ferrite_portrayal_catalog::PortrayalCatalogue;
+use ferrite_product_api::open::{InstallContext, Loaded, OpenContext, OpenNotes, OpenStage};
+use ferrite_product_api::report::{
+    DatasetId, DatasetSummary, InstallReport, IssueSeverity, ValidationIssue,
+};
 use ferrite_product_api::{
     DatasetInput, FeaturePick, Opened, PortrayalRequest, ProductId, ProductLayer, SceneContribution,
 };
@@ -302,6 +306,25 @@ fn marker(p: [f64; 2]) -> Vec<WorldPoint> {
     ]
 }
 
+/// The Part 9a conversion of drawing instructions to host instructions,
+/// shared with S-101 cell portrayal (`ferrite_s101`, linked with any GML
+/// product; without one no overlay dataset is ever opened).
+fn convert_part9a(
+    results: &[ferrite_lua::PortrayalResult],
+    cell: &ferrite_s100_core::S101Cell,
+    pc: &PortrayalCatalogue,
+    context: &mut RenderContext,
+    profile: &str,
+) -> Result<()> {
+    #[cfg(any(feature = "s101", feature = "s124", feature = "s129"))]
+    return ferrite_s101::convert_lua_results_for_cell(results, cell, pc, context, 0, profile);
+    #[cfg(not(any(feature = "s101", feature = "s124", feature = "s129")))]
+    {
+        let _ = (results, cell, pc, context, profile);
+        anyhow::bail!("No GML product is built")
+    }
+}
+
 /// Part 9a strings of one dataset to host instructions marked as overlays.
 pub fn convert(
     pc: &PortrayalCatalogue,
@@ -332,9 +355,7 @@ pub fn convert(
     }
     let new_context = || RenderContext::new(Viewport::new(1.0, 1.0));
     let mut context = new_context();
-    if let Err(error) =
-        ferrite_s101::convert_lua_results_for_cell(&results, &cell, pc, &mut context, 0, profile)
-    {
+    if let Err(error) = convert_part9a(&results, &cell, pc, &mut context, profile) {
         // One bad feature must not hide the rest of the dataset.
         warn!(
             "{}: overlay conversion failed ({error:#}); converting features separately",
@@ -343,12 +364,11 @@ pub fn convert(
         context = new_context();
         for result in &results {
             let mut single = new_context();
-            match ferrite_s101::convert_lua_results_for_cell(
+            match convert_part9a(
                 std::slice::from_ref(result),
                 &cell,
                 pc,
                 &mut single,
-                0,
                 profile,
             ) {
                 Ok(()) => context.append_converted(single.raw_instructions().to_vec()),
@@ -1283,6 +1303,7 @@ impl ProductLayer for GmlOverlays {
         GmlOverlays::is_empty(self)
     }
     fn open(&mut self, input: DatasetInput<'_>) -> Result<Opened> {
+        input.check_policy()?;
         let dataset = self.read_bytes(input.name, input.bytes)?;
         Ok(match self.add(dataset, input.provenance)? {
             Added::New => Opened::New(self.core.datasets.last().expect("just added").id),
@@ -1295,14 +1316,15 @@ impl ProductLayer for GmlOverlays {
     fn set_visible(&mut self, id: u32, visible: bool) -> bool {
         GmlOverlays::set_visible(self, id, visible)
     }
-    fn portray(&mut self, request: &PortrayalRequest<'_>) -> Option<SceneContribution> {
+    fn portray(&mut self, request: &PortrayalRequest<'_>) -> Result<Option<SceneContribution>> {
         self.set_viewing_time(request.viewing_time);
-        let (revision, instructions) = self.instructions(request.profile)?;
-        Some(SceneContribution {
-            revision,
-            instructions,
-            extensions: Vec::new(),
-        })
+        Ok(self
+            .instructions(request.profile)
+            .map(|(revision, instructions)| SceneContribution {
+                revision,
+                instructions,
+                extensions: Vec::new(),
+            }))
     }
     fn coverage(&self) -> Option<GeoBounds> {
         self.bounds()
@@ -1313,6 +1335,229 @@ impl ProductLayer for GmlOverlays {
     fn highlight(&mut self, key: i64) -> Vec<Vec<WorldPoint>> {
         self.highlight_geometry(key)
     }
+    fn open_stage(&self) -> Option<Box<dyn OpenStage>> {
+        Some(Box::new(GmlStage {
+            products: crate::products::gml_products(),
+            catalogues: self.has_catalogues(),
+            paths: Vec::new(),
+        }))
+    }
+    fn install(
+        &mut self,
+        opened: Box<dyn std::any::Any + Send>,
+        _context: &InstallContext<'_>,
+        report: &mut InstallReport,
+    ) -> Result<()> {
+        let opened = opened
+            .downcast::<Vec<(PathBuf, Vec<u8>, Provenance)>>()
+            .map_err(|_| anyhow::anyhow!("Not a GML open result"))?;
+        for (path, bytes, provenance) in *opened {
+            match ProductLayer::open(self, DatasetInput::new(&path, &bytes, provenance)) {
+                Ok(Opened::New(id)) => {
+                    let overlay = self.dataset(id).expect("just added");
+                    report.datasets.push(overlay_summary(overlay));
+                    report.issues.extend(overlay_issues(overlay));
+                }
+                Ok(Opened::AlreadyOpen) => {
+                    report
+                        .notices
+                        .push(format!("Already open: {}", path.display()));
+                }
+                Err(error) => report.issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    subject: path.display().to_string(),
+                    check: "GML load".into(),
+                    message: format!("{error:#}"),
+                }),
+            }
+        }
+        Ok(())
+    }
+    fn datasets(&self) -> Vec<DatasetSummary> {
+        self.datasets.iter().map(overlay_summary).collect()
+    }
+    fn feature_types(&self, id: DatasetId) -> Option<BTreeMap<String, usize>> {
+        let DatasetId::Overlay(id) = id else {
+            return None;
+        };
+        let mut counts = BTreeMap::new();
+        if let Some(overlay) = self.dataset(id) {
+            for object in &overlay.dataset.objects {
+                *counts.entry(object.code.clone()).or_default() += 1;
+            }
+        }
+        Some(counts)
+    }
+    fn validation_issues(&self) -> Vec<ValidationIssue> {
+        self.datasets.iter().flat_map(overlay_issues).collect()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// An opened overlay dataset in the common report model.
+fn overlay_summary(overlay: &OverlayDataset) -> DatasetSummary {
+    DatasetSummary {
+        id: DatasetId::Overlay(overlay.id),
+        product: overlay.product().identifier().to_string(),
+        name: overlay.name(),
+        source: overlay.dataset.source.clone(),
+        edition: overlay
+            .dataset
+            .identification
+            .product_edition()
+            .unwrap_or_default()
+            .to_string(),
+        features: overlay.dataset.objects.len(),
+        provenance: overlay.provenance.label(),
+    }
+}
+
+/// The validation findings kept with an opened overlay dataset.
+fn overlay_issues(overlay: &OverlayDataset) -> Vec<ValidationIssue> {
+    overlay
+        .issues
+        .iter()
+        .map(|issue| ValidationIssue {
+            severity: if issue.severity == Severity::Error {
+                IssueSeverity::Error
+            } else {
+                IssueSeverity::Warning
+            },
+            subject: match &issue.object {
+                Some(object) => format!("{} {object}", overlay.name()),
+                None => overlay.name(),
+            },
+            check: issue.check.clone(),
+            message: issue.message.clone(),
+        })
+        .collect()
+}
+
+/// The overlay stage of a host open job: GML datasets of the registered
+/// products by name and head, read (the authenticated snapshot when
+/// verified) on the worker and opened into the layer on install.
+struct GmlStage {
+    products: Vec<Product>,
+    /// The products' catalogues are installed.
+    catalogues: bool,
+    paths: Vec<PathBuf>,
+}
+
+impl OpenStage for GmlStage {
+    fn sniffs_head(&self, name: &Path) -> bool {
+        overlay::sniffable_name(name)
+    }
+    fn sniff(&self, name: &Path, head: &[u8]) -> Option<ferrite_product_api::Recognised> {
+        if head.is_empty() {
+            return None;
+        }
+        overlay::sniff(name, head, &self.products).map(|_| ferrite_product_api::Recognised::Dataset)
+    }
+    fn accept(&mut self, path: &Path, _: &OpenContext<'_>, _: &mut OpenNotes) -> bool {
+        self.paths.push(path.to_path_buf());
+        true
+    }
+    fn counted_inputs(&self) -> usize {
+        self.paths.len()
+    }
+    fn after_claims(&mut self, notes: &mut OpenNotes) {
+        if !self.catalogues && !self.paths.is_empty() {
+            notes.notices.push(format!(
+                "{} S-124/S-129 dataset(s) skipped: overlay catalogues are not installed",
+                self.paths.len()
+            ));
+            self.paths.clear();
+        }
+    }
+    fn load(self: Box<Self>, context: &OpenContext<'_>, notes: &mut OpenNotes) -> Result<Loaded> {
+        let mut loaded = Vec::new();
+        for path in self.paths {
+            context.check_cancelled()?;
+            match read_overlay(context, &path) {
+                Ok((bytes, provenance)) => loaded.push((path, bytes, provenance)),
+                Err(error) => notes.issues.push(ValidationIssue {
+                    severity: IssueSeverity::Error,
+                    subject: path.display().to_string(),
+                    check: "GML load".into(),
+                    message: format!("{error:#}"),
+                }),
+            }
+        }
+        let counts = vec![("overlays", loaded.len())];
+        Ok(Loaded {
+            payload: Box::new(loaded),
+            counts,
+        })
+    }
+}
+
+fn authorized(
+    context: &OpenContext<'_>,
+    paths: &[PathBuf],
+) -> Result<ferrite_security::AuthorizedDatasets> {
+    (context.authorize)(paths)?
+        .downcast::<ferrite_security::AuthorizedDatasets>()
+        .map(|report| *report)
+        .map_err(|_| anyhow::anyhow!("Host authorization is not a signature report"))
+}
+
+/// Overlay bytes (the authenticated snapshot when verified).
+fn read_overlay(context: &OpenContext<'_>, path: &Path) -> Result<(Vec<u8>, Provenance)> {
+    use crate::dataset_signature_policy;
+    let data = context.data;
+    let limits = ferrite_s100_gml::ReadLimits::default();
+    if !data.local_paths() && context.required() {
+        // Bytes source: the authenticated in-memory snapshot.
+        let report = authorized(context, &[path.to_path_buf()])?;
+        let snapshot = dataset_signature_policy::dataset_snapshot_in(data, &report, path, true)?
+            .context("Required authenticated dataset snapshot is missing")?;
+        let bytes = snapshot
+            .bytes()
+            .context("Authenticated snapshot of a bytes source holds no bytes")?;
+        anyhow::ensure!(
+            bytes.len() <= limits.bytes,
+            "{} exceeds the {} byte dataset limit",
+            path.display(),
+            limits.bytes
+        );
+        return Ok((bytes.to_vec(), Provenance::Authenticated));
+    }
+    let (bytes_path, provenance) = if data.local_paths() {
+        let require = context.required();
+        let report = authorized(context, &[path.to_path_buf()])?;
+        let snapshot = dataset_signature_policy::dataset_snapshot(&report, path, require)?;
+        let provenance = if snapshot.is_some() {
+            Provenance::Authenticated
+        } else {
+            Provenance::Unverified
+        };
+        (
+            snapshot
+                .map(|s| s.path().to_path_buf())
+                .unwrap_or_else(|| path.to_path_buf()),
+            provenance,
+        )
+    } else {
+        (path.to_path_buf(), Provenance::Unverified)
+    };
+    let length = data
+        .len(&bytes_path)
+        .with_context(|| format!("Cannot open {}", path.display()))?;
+    anyhow::ensure!(
+        length as usize <= limits.bytes,
+        "{} exceeds the {} byte dataset limit",
+        path.display(),
+        limits.bytes
+    );
+    let bytes = data
+        .read(&bytes_path)
+        .with_context(|| format!("Cannot read {}", path.display()))?;
+    Ok((bytes, provenance))
 }
 
 /// FC names and enumeration labels for attribute values.

@@ -15,4 +15,7 @@ pub mod rules;
 pub mod user_state;
 
 pub use overlay::S124Overlay;
+
+/// The S-124 product identifier.
+pub const PRODUCT: ferrite_product_api::ProductId = ferrite_product_api::ProductId("S-124");
 pub use rules::{S124Rules, S124};

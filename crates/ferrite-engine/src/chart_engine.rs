@@ -28,49 +28,51 @@
 //! platform user store's cancellation history. Opening runs as a background
 //! job on the platform executor; its result is installed on the owner
 //! thread, like the viewer's publication.
-use crate::catalogue::{load_feature_catalogue_from, load_portrayal_catalogue_from};
-use crate::gml_overlay::{self, GmlOverlays, Provenance, SymbolRegistrar};
+use crate::dataset_signature_policy;
+use crate::gml_overlay::{self, GmlOverlays, SymbolRegistrar};
+use crate::layers::ProductLayers;
 use crate::pick::{find_features_at, FeatureReport, GeometryPicker, PickCandidate, PickSurface};
-use crate::platform::{parallel_map, EntryKind, Platform};
+use crate::platform::{EntryKind, Platform};
 #[cfg(feature = "s421")]
-use crate::products::s421::{CapturedRouteInput, S421Layer, S421};
-use ferrite_s101::layer::cells::chart_data_bounds;
-use ferrite_s101::layer::portrayal::{AreaTriangulator, PortrayalChangeRequest, PortrayalSource};
-use ferrite_s101::layer::publication::{
-    CancellationHistory, CancellationRecord, HistoryStore, ValidatedRemoval,
-};
-/// Without the S-421 product no route is captured.
-#[cfg(not(feature = "s421"))]
-type CapturedRouteInput = std::convert::Infallible;
+use crate::products::s421::{CapturedRouteInput, S421Layer};
 use crate::scene::{prepare_flat_coverage, PreparedScene};
 use crate::state::{EngineState, ViewportPixels};
-use crate::{dataset_signature_policy, CellHydrationSource, ChartLoadResult};
 use anyhow::{bail, ensure, Context, Result};
-use ferrite_feature_catalog::BoundFeatureCatalogue;
-use ferrite_portrayal_catalog::BoundPortrayalCatalogue;
-use ferrite_product_api::{DatasetInput, Opened, PortrayalRequest, ProductLayer};
+use ferrite_product_api::open::{InstallContext, Loaded, OpenContext, OpenNotes, OpenStage};
+use ferrite_product_api::report::{InstallReport, ProductReport};
+use ferrite_product_api::{
+    HostServices, Interoperability, PortrayalRequest, PortrayalSource, ProductId, SceneRole,
+};
 use ferrite_render::host_settings::SettingsState;
 use ferrite_render::GeoBounds;
-use ferrite_s100_core::{DatasetIdentification, S101Cell};
-use ferrite_s101::layer::catalogue::{validate_fc, validate_pc};
-use ferrite_s101::layer::update_plan as s101_update_plan;
-use ferrite_s101::layer::{Inserted, S101Layer};
-use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::any::Any;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(feature = "s101")]
+use {
+    ferrite_s101::layer::cells::chart_data_bounds,
+    ferrite_s101::layer::portrayal::{AreaTriangulator, PortrayalChangeRequest},
+    ferrite_s101::layer::publication::{CancellationHistory, CancellationRecord},
+    ferrite_s101::layer::S101Layer,
+};
 
-/// Whether dataset signatures must verify before data is opened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignaturePolicy {
-    /// Open without verification (datasets are marked unverified).
-    Off,
-    /// Reject unsigned or invalid datasets (S-100 Part 15). Exchange sets are
-    /// verified through the platform data source (files or bytes) and S-101
-    /// chains are planned from the authenticated snapshots, as the viewer
-    /// does for local folders.
-    Required,
-}
+/// Whether dataset signatures must verify before data is opened (defined
+/// with the product interface, which layers check inputs against).
+pub use ferrite_product_api::open::SignaturePolicy;
+/// The common report model (defined with the product interface).
+pub use ferrite_product_api::report::{DatasetId, DatasetSummary, IssueSeverity, ValidationIssue};
+
+/// Stored area triangulation of the renderer (S-101 cell portrayal).
+#[cfg(feature = "s101")]
+type Triangulator = AreaTriangulator;
+#[cfg(not(feature = "s101"))]
+type Triangulator = fn(
+    &ferrite_render::AreaInstruction,
+    ferrite_render::FlatProjection,
+    usize,
+) -> Option<ferrite_render::AreaTriangulation>;
 
 /// How an engine is set up.
 pub struct EngineConfig {
@@ -87,7 +89,7 @@ pub struct EngineConfig {
     pub profile: String,
     /// Stored area triangulation (the renderer's; none by default, the
     /// renderer then triangulates when drawing).
-    pub triangulate: AreaTriangulator,
+    pub triangulate: Triangulator,
     /// Overlay symbol registration with the renderer (accept by default).
     pub register_overlay_symbols: SymbolRegistrar,
 }
@@ -204,63 +206,6 @@ impl View {
     }
 }
 
-/// Identity of an opened dataset in an engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum DatasetId {
-    /// Loaded S-101 cell (index in load order).
-    Cell(usize),
-    /// S-124/S-129 overlay dataset.
-    Overlay(u32),
-}
-
-/// One opened dataset.
-#[derive(Clone, Debug)]
-pub struct DatasetSummary {
-    pub id: DatasetId,
-    /// Product identifier ("S-101", "S-124", ...).
-    pub product: String,
-    pub name: String,
-    pub source: Option<PathBuf>,
-    /// S-101: dataset edition and update ("2.0" for edition 2 update 0);
-    /// S-124/S-129: the product specification edition.
-    pub edition: String,
-    pub features: usize,
-    /// How its authenticity was established.
-    pub provenance: String,
-}
-
-/// Severity of a [`ValidationIssue`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum IssueSeverity {
-    Warning,
-    Error,
-}
-
-/// A validation finding or a rejected input.
-#[derive(Clone, Debug)]
-pub struct ValidationIssue {
-    pub severity: IssueSeverity,
-    /// Dataset or input the finding is about.
-    pub subject: String,
-    /// Check identifier ("S-158-124/12", "S-101 load", ...).
-    pub check: String,
-    pub message: String,
-}
-
-impl std::fmt::Display for ValidationIssue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let severity = match self.severity {
-            IssueSeverity::Warning => "warning",
-            IssueSeverity::Error => "error",
-        };
-        write!(
-            f,
-            "{severity} [{}] {}: {}",
-            self.check, self.subject, self.message
-        )
-    }
-}
-
 /// Outcome of installing an open job.
 #[derive(Clone, Debug, Default)]
 pub struct OpenReport {
@@ -269,40 +214,77 @@ pub struct OpenReport {
     pub issues: Vec<ValidationIssue>,
     /// Inputs not opened and other information.
     pub notices: Vec<String>,
-    /// S-101 cancellations applied and recorded in the cancellation history
-    /// by this job (removals of loaded datasets and announcements).
-    pub cancellations: Vec<CancellationRecord>,
-    /// S-102 files newly opened by this job.
-    pub bathymetry: Vec<crate::s102_host::BathymetrySummary>,
+    /// Product-specific reports in installation order: S-101 cancellations
+    /// applied and recorded in the cancellation history by this job
+    /// (removals of loaded datasets and announcements), S-102 files newly
+    /// opened by this job.
+    pub products: Vec<ProductReport>,
 }
 
-/// Datasets loaded by an [`OpenJob`], not yet installed.
+impl From<InstallReport> for OpenReport {
+    fn from(report: InstallReport) -> Self {
+        Self {
+            datasets: report.datasets,
+            issues: report.issues,
+            notices: report.notices,
+            products: report.products,
+        }
+    }
+}
+
+impl OpenReport {
+    /// The product reports of `product` of kind `kind` as `T`.
+    pub fn product_reports<T: Clone + 'static>(&self, product: ProductId, kind: &str) -> Vec<T> {
+        self.products
+            .iter()
+            .filter(|r| r.product == product && r.kind == kind)
+            .filter_map(|r| r.get::<T>().cloned())
+            .collect()
+    }
+    /// S-101 cancellations applied and recorded by this job.
+    #[cfg(feature = "s101")]
+    pub fn cancellations(&self) -> Vec<CancellationRecord> {
+        self.product_reports(ferrite_s101::layer::PRODUCT, "cancellation")
+    }
+    /// S-102 files newly opened by this job.
+    #[cfg(feature = "s102-pure")]
+    pub fn bathymetry(&self) -> Vec<ferrite_s102::layer::BathymetrySummary> {
+        self.product_reports(ferrite_s102::layer::PRODUCT, "bathymetry")
+    }
+}
+
+/// Datasets loaded by an [`OpenJob`], not yet installed: what each
+/// registered layer's stage loaded, in registration order.
 pub struct OpenedDatasets {
-    cells: Vec<(ChartLoadResult, String)>,
-    overlays: Vec<(PathBuf, Vec<u8>, Provenance)>,
-    removals: Vec<(PathBuf, ValidatedRemoval)>,
-    routes: Vec<CapturedRouteInput>,
+    stages: Vec<(usize, Loaded)>,
     issues: Vec<ValidationIssue>,
     notices: Vec<String>,
-    catalogues: ([u8; 32], [u8; 32]),
-    /// Decoded S-102 inputs.
-    s102: crate::s102_host::OpenedS102,
 }
 
 impl OpenedDatasets {
+    /// Loaded inputs of kind `kind` (`"cells"`, `"cancellations"`,
+    /// `"overlays"`, `"bathymetry"`, `"routes"`).
+    pub fn count(&self, kind: &str) -> usize {
+        self.stages
+            .iter()
+            .flat_map(|(_, loaded)| loaded.counts.iter())
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, n)| n)
+            .sum()
+    }
     /// Decoded S-102 files (coverage and trial inspections).
     pub fn bathymetry_count(&self) -> usize {
-        self.s102.len()
+        self.count("bathymetry")
     }
     pub fn cell_count(&self) -> usize {
-        self.cells.len()
+        self.count("cells")
     }
     pub fn overlay_count(&self) -> usize {
-        self.overlays.len()
+        self.count("overlays")
     }
     /// Validated S-101 cancellations (removals and announcements).
     pub fn cancellation_count(&self) -> usize {
-        self.removals.len()
+        self.count("cancellations")
     }
 }
 
@@ -392,148 +374,126 @@ impl From<&PickCandidate> for FeatureId {
     }
 }
 
-/// The S-100 chart engine.
+/// The S-100 chart engine: a chart state with the registered product layers
+/// of this build ([`crate::products::engine_layers`]) composed generically.
 pub struct ChartEngine {
     state: EngineState,
-    overlays: GmlOverlays,
     signatures: SignaturePolicy,
     trust_anchors: Arc<Vec<(String, Vec<u8>)>>,
-    triangulate: AreaTriangulator,
+    #[cfg(feature = "s101")]
+    triangulate: Triangulator,
     display: DisplayOptions,
-    provenance: Vec<String>,
-    /// S-421 routes (product layer; captured, not portrayed by the engine).
-    #[cfg(feature = "s421")]
-    routes: S421Layer,
-    /// S-102 host options (depth adjustments, raster tile edge).
-    s102: crate::s102_host::S102Options,
 }
 
 impl ChartEngine {
-    /// Load the S-101 catalogue pair (required) and the S-124/S-129
-    /// catalogues (optional) from `config.catalogues`.
+    /// The registered layers with their catalogues from `config.catalogues`:
+    /// the S-101 pair (required), the overlay products' and S-102
+    /// catalogues (optional).
     pub fn new(config: EngineConfig) -> Result<Self> {
-        let data = config.platform.data.as_ref();
-        let fc_path = config.catalogues.join("FC/S-101");
-        let pc_path = config.catalogues.join("PC/S-101");
-        let fc = load_feature_catalogue_from(data, &fc_path)?;
-        let pc = load_portrayal_catalogue_from(data, &pc_path)?;
-        ferrite_s101::validate_catalogue_pair(&fc, &pc)?;
-        let fc_status = validate_fc(&fc, &fc.source_path);
-        let pc_status = validate_pc(&pc, &pc.root_path);
-        ensure!(
-            pc.color_profiles.profiles.contains_key(&config.profile),
-            "Portrayal catalogue has no colour profile {}",
-            config.profile
-        );
-        let overlays = GmlOverlays::load_catalogues(
-            &config.platform,
-            &config.catalogues,
-            config.register_overlay_symbols,
-        );
-        let mut state = EngineState::new(
-            config.platform,
-            Arc::new(fc),
-            Arc::new(pc),
-            fc_status,
-            pc_status,
-            config.profile.clone(),
-            config.inventory.unwrap_or_default(),
-        );
-        // S-102 catalogues are optional, like the overlay catalogues.
-        let data = Arc::clone(&state.platform.data);
-        crate::s102_host::load_catalogues(&mut state, data.as_ref(), &config.catalogues);
+        let layers = crate::products::engine_layers(&config)?;
+        let state = EngineState::new(config.platform, config.profile.clone(), layers);
         Ok(Self {
             state,
-            overlays,
             signatures: config.signatures,
             trust_anchors: Arc::new(config.trust_anchors),
+            #[cfg(feature = "s101")]
             triangulate: config.triangulate,
             display: DisplayOptions {
                 profile: config.profile,
                 ..DisplayOptions::default()
             },
-            provenance: Vec::new(),
-            #[cfg(feature = "s421")]
-            routes: S421Layer::new(),
-            s102: Default::default(),
         })
     }
 
-    /// Opened S-102 files ([`crate::s102_host::SUPPORT`] says what is served).
-    pub fn bathymetry(&self) -> Vec<crate::s102_host::BathymetrySummary> {
-        crate::s102_host::summaries(&self.state)
+    /// Opened S-102 files ([`crate::products::S102_SUPPORT`] says what is
+    /// served).
+    #[cfg(feature = "s102-pure")]
+    pub fn bathymetry(&self) -> Vec<ferrite_s102::layer::BathymetrySummary> {
+        self.state.layers.s102().summaries()
     }
-    pub fn s102_options(&self) -> &crate::s102_host::S102Options {
-        &self.s102
+    #[cfg(feature = "s102-pure")]
+    pub fn s102_options(&self) -> &ferrite_s102::layer::S102Options {
+        &self.state.layers.s102().options
     }
     /// Depth adjustments and raster tile edge for S-102 opened and prepared
     /// from now on.
-    pub fn set_s102_options(&mut self, options: crate::s102_host::S102Options) {
-        #[cfg(feature = "s102-pure")]
-        {
-            self.state.s102.options = options.clone();
-        }
-        self.s102 = options;
+    #[cfg(feature = "s102-pure")]
+    pub fn set_s102_options(&mut self, options: ferrite_s102::layer::S102Options) {
+        self.state.layers.s102_mut().options = options;
     }
 
     /// Estimated instruction count from which preparations portray only the
     /// cells near the view (residency); None restores the default
     /// (`FERRITE_RESIDENCY_THRESHOLD` or 1,500,000; 0 always activates it).
     /// Applies from the next [`Self::prepare`].
+    #[cfg(feature = "s101")]
     pub fn set_residency_threshold(&mut self, threshold: Option<usize>) {
-        self.state.s101.residency_threshold_override = threshold;
+        self.state.layers.s101_mut().residency_threshold_override = threshold;
     }
 
-    /// The chart state (cells, catalogues, coverage).
+    /// The chart state (layers, catalogues, coverage).
     pub fn state(&self) -> &EngineState {
         &self.state
     }
-    /// The S-124/S-129 overlay registry.
+    /// The registered product layers.
+    pub fn layers(&self) -> &ProductLayers {
+        &self.state.layers
+    }
+    /// Mutable [`Self::layers`] (product-specific host operations).
+    pub fn layers_mut(&mut self) -> &mut ProductLayers {
+        &mut self.state.layers
+    }
+    /// The GML overlay layer (S-124/S-129).
     pub fn overlays(&self) -> &GmlOverlays {
-        &self.overlays
+        self.state
+            .layers
+            .overlays()
+            .expect("The overlay layer is registered")
     }
     pub fn platform(&self) -> &Platform {
         &self.state.platform
     }
     /// Catalogue errors of the optional overlay products.
     pub fn catalogue_errors(&self) -> &[String] {
-        &self.overlays.catalogue_errors
+        &self.overlays().catalogue_errors
     }
     /// S-421 routes captured by the opened inputs, in opening order (not
     /// portrayed by the engine; under [`SignaturePolicy::Required`] none are
     /// admitted).
     #[cfg(feature = "s421")]
     pub fn routes(&self) -> Vec<&CapturedRouteInput> {
-        self.routes.inputs().collect()
+        self.state.layers.routes().inputs().collect()
     }
     /// The S-421 product layer holding the routes (coverage, feature
     /// reports, the route overlay renderer extension).
     #[cfg(feature = "s421")]
     pub fn route_layer(&mut self) -> &mut S421Layer {
-        &mut self.routes
+        self.state.layers.routes_mut()
     }
     /// The S-101 cancellation history of the platform user store (empty when
     /// the host keeps none).
+    #[cfg(feature = "s101")]
     pub fn cancellation_history(&self) -> Result<CancellationHistory> {
-        match self.state.platform.user.cancellation_history() {
+        match ferrite_s101::layer::publication::history_record(self.state.platform.user.as_ref()) {
             Some(record) => CancellationHistory::read_record(record.as_ref()),
             None => Ok(CancellationHistory::default()),
         }
     }
 
-    /// Where S-101 cell instructions come from (default: Lua when the
-    /// `lua-native` feature is built, otherwise precomputed payloads).
+    /// Where rule-based products take their instructions from (default:
+    /// Lua when the `lua-native` feature is built, otherwise precomputed
+    /// payloads).
     pub fn portrayal_source(&self) -> PortrayalSource {
-        self.state.s101.portrayal_source
+        self.state.portrayal_source
     }
     pub fn set_portrayal_source(&mut self, source: PortrayalSource) {
-        self.state.s101.portrayal_source = source;
+        self.state.portrayal_source = source;
     }
     /// Export: also write a precomputed payload of every cell the following
     /// preparations portray with Lua to the platform cache store, for hosts
     /// without Lua ([`PortrayalSource::Precomputed`]).
     pub fn set_precomputed_export(&mut self, export: bool) {
-        self.state.s101.precomputed_export = export;
+        self.state.precomputed_export = export;
     }
 
     /// Geographic extent of `camera` in `viewport` over the loaded data, and
@@ -589,33 +549,27 @@ impl ChartEngine {
         Ok((bounds(zoom)?, zoom))
     }
 
-    /// Start opening `source` in the background.
+    /// Start opening `source` in the background: every registered layer's
+    /// stage takes the inputs its products' adapters recognise.
     pub fn open(&mut self, source: DatasetSource) -> OpenJob {
         let shared = Arc::new(JobShared {
             slot: Mutex::new(JobSlot::Running),
             done: Condvar::new(),
             cancel: AtomicBool::new(false),
         });
+        let stages = self
+            .state
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| Some((index, entry.layer.open_stage()?)))
+            .collect();
         let task = OpenTask {
             platform: self.state.platform.clone(),
             source,
             signatures: self.signatures,
             trust_anchors: Arc::clone(&self.trust_anchors),
-            fc: Arc::clone(&self.state.s101.fc),
-            pc: Arc::clone(&self.state.s101.pc),
-            decoded: Arc::clone(&self.state.s101.decoded_chart_cache),
-            overlay_products: self.overlays.has_catalogues(),
-            inventory: self.state.s101.catalogue_inventory.clone(),
-            loaded: self.state.s101.loaded_datasets(),
-            loaded_inputs: self
-                .state
-                .s101
-                .loaded_chain_paths
-                .iter()
-                .flatten()
-                .cloned()
-                .collect(),
-            s102_options: self.s102.clone(),
+            stages,
         };
         let worker = Arc::clone(&shared);
         self.state.platform.executor.spawn(Box::new(move || {
@@ -630,313 +584,147 @@ impl ChartEngine {
         OpenJob { shared }
     }
 
-    /// Validate the job's cancellations against the current cells and a
-    /// fresh, locked cancellation history, persist them, then remove the
-    /// cancelled cells. Nothing changes when any check or the write fails.
-    fn apply_cancellations(
-        &mut self,
-        removals: Vec<(PathBuf, ValidatedRemoval)>,
-        incoming: &[(ChartLoadResult, String)],
-        report: &mut OpenReport,
-    ) -> Result<()> {
-        let record = self.state.platform.user.cancellation_history();
-        if removals.is_empty() {
-            // Reused cancelled names need a newer issueDate (fresh history).
-            if !incoming.is_empty() {
-                if let Some(record) = record {
-                    let history = CancellationHistory::read_record(record.as_ref())?;
-                    for (result, _) in incoming {
-                        history.validate_reuse(
-                            &result.cell.dsid,
-                            result.base_metadata.as_ref().map(|m| m.issue_date),
-                        )?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-        let record = record.context("This host keeps no S-101 cancellation history")?;
-        let mut store = HistoryStore::begin_record(record)?;
-        let incoming_keys = incoming
-            .iter()
-            .map(|(result, _)| s101_update_plan::dataset_key(&result.cell.dsid))
-            .collect::<Result<HashSet<_>>>()?;
-        let mut targets = Vec::new();
-        for (path, removal) in &removals {
-            store.history.validate_cancellation(removal.record())?;
-            ensure!(
-                !incoming_keys.contains(removal.key()),
-                "Same dataset cannot be loaded and cancelled in one batch: {}",
-                path.display()
-            );
-            let index = self.state.s101.cells.iter().position(|cell| {
-                s101_update_plan::dataset_key(&cell.dsid).is_ok_and(|key| &key == removal.key())
-            });
-            if removal.removes_content() {
-                let index = index.with_context(|| {
-                    format!("Cancellation target is not loaded: {}", path.display())
-                })?;
-                ensure!(
-                    removal.targets(
-                        &self.state.s101.cells[index].dsid,
-                        self.state.s101.loaded_source_identities.get(index)
-                    ),
-                    "Cancellation target changed after validation: {}",
-                    path.display()
-                );
-                ensure!(!targets.contains(&index), "Duplicate cancellation target");
-                targets.push(index);
-            } else {
-                ensure!(
-                    index.is_none(),
-                    "Cancellation absence changed after announcement validation: {}",
-                    path.display()
-                );
-            }
-        }
-        for (result, _) in incoming {
-            store.history.validate_reuse(
-                &result.cell.dsid,
-                result.base_metadata.as_ref().map(|m| m.issue_date),
-            )?;
-        }
-        let records: Vec<CancellationRecord> =
-            removals.iter().map(|(_, r)| r.record().clone()).collect();
-        store.persist(records.clone())?;
-        targets.sort_unstable();
-        for index in targets.into_iter().rev() {
-            let cell = self.state.s101.remove_dataset(index);
-            self.provenance.remove(index);
-            report.notices.push(format!(
-                "Cancelled S-101 dataset {} (edition {}, update {})",
-                cell.dsid.dataset_name, cell.dsid.edition_number, cell.dsid.update_number
-            ));
-        }
-        for (path, removal) in &removals {
-            if !removal.removes_content() {
-                report.notices.push(format!(
-                    "Recorded S-101 cancellation announcement {} (no loaded content)",
-                    path.display()
-                ));
-            }
-        }
-        report.cancellations = records;
-        Ok(())
-    }
-
     /// Open and install in one call.
     pub fn open_blocking(&mut self, source: DatasetSource) -> Result<OpenReport> {
         let job = self.open(source);
         self.install(job.wait()?)
     }
 
-    /// Publish the datasets of a finished job into the engine.
+    /// Publish the datasets of a finished job into the engine: every layer
+    /// checks its result first; then the first installation pass
+    /// (removals, independent results) and the installs run in registration
+    /// order.
     pub fn install(&mut self, opened: OpenedDatasets) -> Result<OpenReport> {
-        ensure!(
-            opened.catalogues
-                == (
-                    *self.state.s101.fc.source_digest(),
-                    *self.state.s101.pc.source_digest()
-                ),
-            "Bound catalogues changed while loading; reopen the datasets"
-        );
-        let mut report = OpenReport {
-            datasets: Vec::new(),
-            issues: opened.issues,
-            notices: opened.notices,
-            cancellations: Vec::new(),
-            bathymetry: Vec::new(),
+        let OpenedDatasets {
+            mut stages,
+            issues,
+            notices,
+        } = opened;
+        for (index, loaded) in &stages {
+            self.layer_at(*index)?
+                .layer
+                .check_opened(loaded.payload.as_ref())?;
+        }
+        let mut report = InstallReport {
+            issues,
+            notices,
+            ..InstallReport::default()
         };
-        self.apply_cancellations(opened.removals, &opened.cells, &mut report)?;
-        #[cfg(feature = "s421")]
-        for route in opened.routes {
-            let path = route.path().to_path_buf();
-            match self.routes.insert(route) {
-                ferrite_product_api::Opened::AlreadyOpen => report
-                    .notices
-                    .push(format!("Already open: {}", path.display())),
-                ferrite_product_api::Opened::New(_) => report.notices.push(format!(
-                    "S-421 route captured (not portrayed by ChartEngine): {}",
-                    path.display()
-                )),
-            }
+        let user = Arc::clone(&self.state.platform.user);
+        let context = InstallContext {
+            user: user.as_ref(),
+        };
+        for (index, loaded) in &mut stages {
+            self.layer_at_mut(*index)?.layer.install_early(
+                loaded.payload.as_mut(),
+                &context,
+                &mut report,
+            )?;
         }
-        #[cfg(not(feature = "s421"))]
-        for route in opened.routes {
-            match route {}
+        for (index, loaded) in stages {
+            self.layer_at_mut(index)?
+                .layer
+                .install(loaded.payload, &context, &mut report)?;
         }
-        let mut added = 0usize;
-        let mut batch = self.state.s101.begin_batch();
-        for (result, provenance) in opened.cells {
-            match self.state.s101.insert_loaded(&mut batch, result)? {
-                Inserted::AlreadyOpen(path) => {
-                    report
-                        .notices
-                        .push(format!("Already open: {}", path.display()));
-                }
-                Inserted::Added { replaced } => {
-                    if let Some(index) = replaced {
-                        self.provenance.remove(index);
-                    }
-                    self.provenance.push(provenance);
-                    added += 1;
-                }
-            }
-        }
-        self.state.s101.finish_batch()?;
-        let first_new = self.state.s101.cells.len() - added;
-        for (index, cell) in self.state.s101.cells.iter().enumerate().skip(first_new) {
-            report.datasets.push(self.cell_summary(index, cell));
-        }
-        for (path, bytes, provenance) in opened.overlays {
-            let added = self.overlays.open(DatasetInput {
-                name: &path,
-                bytes: &bytes,
-                provenance,
-            });
-            match added {
-                Ok(Opened::New(id)) => {
-                    let overlay = self.overlays.dataset(id).expect("just added");
-                    report.datasets.push(overlay_summary(overlay));
-                    report.issues.extend(overlay_issues(overlay));
-                }
-                Ok(Opened::AlreadyOpen) => {
-                    report
-                        .notices
-                        .push(format!("Already open: {}", path.display()));
-                }
-                Err(error) => report.issues.push(ValidationIssue {
-                    severity: IssueSeverity::Error,
-                    subject: path.display().to_string(),
-                    check: "GML load".into(),
-                    message: format!("{error:#}"),
-                }),
-            }
-        }
-        crate::s102_host::install(&mut self.state, opened.s102, &mut report);
         self.state.bounds = self.data_bounds();
-        Ok(report)
+        Ok(report.into())
     }
 
+    fn layer_at(&self, index: usize) -> Result<&crate::layers::RegisteredLayer> {
+        self.state.layers.iter().nth(index).context("Unknown layer")
+    }
+    fn layer_at_mut(&mut self, index: usize) -> Result<&mut crate::layers::RegisteredLayer> {
+        self.state
+            .layers
+            .iter_mut()
+            .nth(index)
+            .context("Unknown layer")
+    }
+
+    /// The all-data view: the base chart and grid data extent (S-101 cells
+    /// and S-102 rasters) with a margin; else the overlays' extent; else the
+    /// world.
     fn data_bounds(&self) -> GeoBounds {
-        let bathymetry = self.state.bathymetry_extents();
-        if !self.state.s101.cells.is_empty() || !bathymetry.is_empty() {
-            // The viewer's all-data view: the data extent (S-101 cells and
-            // S-102 rasters) with a margin.
-            let mut bounds = chart_data_bounds(&self.state.s101.cells, bathymetry);
+        let layers = &self.state.layers;
+        let grids: Vec<GeoBounds> = layers
+            .with_role(SceneRole::Grid)
+            .filter_map(|layer| layer.coverage())
+            .collect();
+        let base = layers
+            .with_role(SceneRole::BaseChart)
+            .any(|layer| !layer.is_empty());
+        if base || !grids.is_empty() {
+            #[cfg(feature = "s101")]
+            let mut bounds = match layers.get::<S101Layer>() {
+                Some(s101) => chart_data_bounds(&s101.cells, grids),
+                None => chart_data_bounds(&[], grids),
+            };
+            #[cfg(not(feature = "s101"))]
+            let mut bounds = {
+                let mut bounds = GeoBounds::default();
+                for grid in grids {
+                    bounds.expand(ferrite_render::WorldPoint::new(grid.min_x, grid.min_y));
+                    bounds.expand(ferrite_render::WorldPoint::new(grid.max_x, grid.max_y));
+                }
+                bounds
+            };
             bounds.expand_by_percent(0.1);
             return bounds;
         }
-        self.overlays
-            .bounds()
+        layers
+            .with_role(SceneRole::Overlay)
+            .filter_map(|layer| layer.coverage())
+            .reduce(|a, b| {
+                GeoBounds::new(
+                    a.min_x.min(b.min_x),
+                    a.min_y.min(b.min_y),
+                    a.max_x.max(b.max_x),
+                    a.max_y.max(b.max_y),
+                )
+            })
             .unwrap_or_else(|| GeoBounds::new(-180.0, -90.0, 180.0, 90.0))
     }
 
-    fn cell_summary(&self, index: usize, cell: &S101Cell) -> DatasetSummary {
-        DatasetSummary {
-            id: DatasetId::Cell(index),
-            product: "S-101".into(),
-            name: cell.dsid.dataset_name.clone(),
-            source: Some(cell.file_path.clone()),
-            edition: format!("{}.{}", cell.dsid.edition_number, cell.dsid.update_number),
-            features: self.state.s101.cell_feature_count(index),
-            provenance: self.provenance.get(index).cloned().unwrap_or_default(),
-        }
-    }
-
-    /// Every opened dataset.
+    /// Every opened dataset, in registration order of the layers.
     pub fn datasets(&self) -> Vec<DatasetSummary> {
-        let mut out: Vec<_> = self
-            .state
-            .s101
-            .cells
+        self.state
+            .layers
             .iter()
-            .enumerate()
-            .map(|(index, cell)| self.cell_summary(index, cell))
-            .collect();
-        out.extend(self.overlays.datasets.iter().map(overlay_summary));
-        out
+            .flat_map(|entry| entry.layer.datasets())
+            .collect()
     }
 
     /// Feature counts by feature type of a dataset.
     pub fn feature_types(&self, id: DatasetId) -> BTreeMap<String, usize> {
-        let mut counts = BTreeMap::new();
-        match id {
-            DatasetId::Cell(index) => {
-                if let Some(cell) = self.state.s101.cells.get(index) {
-                    for feature in cell.features.values() {
-                        let code = feature.feature_code.clone().unwrap_or_else(|| "?".into());
-                        *counts.entry(code).or_default() += 1;
-                    }
-                }
-            }
-            DatasetId::Overlay(id) => {
-                if let Some(overlay) = self.overlays.dataset(id) {
-                    for object in &overlay.dataset.objects {
-                        *counts.entry(object.code.clone()).or_default() += 1;
-                    }
-                }
-            }
-        }
-        counts
+        self.state
+            .layers
+            .iter()
+            .find_map(|entry| entry.layer.feature_types(id))
+            .unwrap_or_default()
     }
 
-    /// Validation findings of the opened overlay datasets (S-101 cells are
-    /// validated when opened; failures are reported by [`ChartEngine::install`]).
+    /// Validation findings kept with the opened datasets (overlay datasets;
+    /// S-101 cells are validated when opened, failures are reported by
+    /// [`ChartEngine::install`]).
     pub fn validation_issues(&self) -> Vec<ValidationIssue> {
-        self.overlays
-            .datasets
+        self.state
+            .layers
             .iter()
-            .flat_map(overlay_issues)
+            .flat_map(|entry| entry.layer.validation_issues())
             .collect()
     }
 
-    /// Exchange-set checks of the loaded S-101 datasets: the discovery
-    /// metadata of each dataset's exchange catalogue (`CATALOG.XML`) against
-    /// the materialized cell (XC profile, effective scales, regional
-    /// coverage). Disagreements are issues; outcomes and datasets without
-    /// catalogue metadata are notices.
+    /// Exchange-set checks of the opened datasets (S-101: the discovery
+    /// metadata of each dataset's exchange catalogue against the
+    /// materialized cell). Disagreements are issues; outcomes and datasets
+    /// without catalogue metadata are notices.
     pub fn exchange_set_checks(&self) -> (Vec<ValidationIssue>, Vec<String>) {
         let mut issues = Vec::new();
         let mut notices = Vec::new();
-        for cell in &self.state.s101.cells {
-            let subject = cell.file_path.display().to_string();
-            let metadata = s101_update_plan::dataset_key(&cell.dsid)
-                .ok()
-                .and_then(|key| self.state.s101.loaded_discovery.get(&key))
-                .and_then(Option::as_ref);
-            let Some(metadata) = metadata else {
-                notices.push(format!(
-                    "{}: no exchange catalogue metadata; exchange-set checks not applied",
-                    cell.dsid.dataset_name
-                ));
-                continue;
-            };
-            let mut issue = |check: &str, error: anyhow::Error| {
-                issues.push(ValidationIssue {
-                    severity: IssueSeverity::Error,
-                    subject: subject.clone(),
-                    check: check.into(),
-                    message: format!("{error:#}"),
-                })
-            };
-            if let Err(error) = metadata.validate_xc_profile(&cell.dsid) {
-                issue("XC profile", error);
-            }
-            match metadata.validate_effective_xc_scales(cell) {
-                Ok(status) => notices.push(format!(
-                    "{}: exchange catalogue scales {status:?}",
-                    cell.dsid.dataset_name
-                )),
-                Err(error) => issue("XC scales", error),
-            }
-            match metadata.validate_xc_regions(cell) {
-                Ok(status) => notices.push(format!(
-                    "{}: exchange catalogue coverage {status:?}",
-                    cell.dsid.dataset_name
-                )),
-                Err(error) => issue("XC coverage", error),
-            }
+        for entry in self.state.layers.iter() {
+            let (i, n) = entry.layer.exchange_set_checks();
+            issues.extend(i);
+            notices.extend(n);
         }
         (issues, notices)
     }
@@ -945,27 +733,22 @@ impl ChartEngine {
         &self.display
     }
 
-    /// Colour profile and portrayal settings of the next scene.
+    /// Colour profile and portrayal settings of the next scene (every layer
+    /// must accept them).
     pub fn set_display(&mut self, display: DisplayOptions) -> Result<()> {
-        ensure!(
-            self.state
-                .s101
-                .pc
-                .color_profiles
-                .profiles
-                .contains_key(&display.profile),
-            "Portrayal catalogue has no colour profile {}",
-            display.profile
-        );
-        ferrite_s101::layer::portrayal::validated_lua_context(
-            &self.state.s101.pc,
-            Some(&display.settings),
-        )?;
+        for entry in self.state.layers.iter() {
+            entry
+                .layer
+                .check_display(&display.profile, &display.settings)?;
+        }
         self.display = display;
         Ok(())
     }
 
-    /// Portray the opened datasets for `view`.
+    /// Portray the opened datasets for `view`: the base chart (S-101 cells
+    /// with residency, per-cell caches and interoperability), the overlay
+    /// layers' instructions (cell-less, coverage-exempt), coverage clipping
+    /// and the grid layers' renderer extensions (S-102 raster tiles).
     pub fn prepare(&mut self, view: &View) -> Result<Arc<PreparedScene>> {
         let ViewportPixels {
             width,
@@ -995,102 +778,180 @@ impl ChartEngine {
             .scaler
             .set_pixel_ratio(scale_factor);
 
-        let (fc, pc) = (
-            Arc::clone(&self.state.s101.fc),
-            Arc::clone(&self.state.s101.pc),
-        );
-        let (mut context, coverage, registry, ic_changed) = if self.state.s101.cells.is_empty() {
+        #[cfg(feature = "s101")]
+        let (mut context, coverage, registry, ic_changed) = self.prepare_base(view, &settings)?;
+        #[cfg(not(feature = "s101"))]
+        let (mut context, ic_changed) = {
             let mut context = self.state.render_context.empty_for_rebuild();
             context.set_bounds(self.state.bounds);
-            (
+            (context, 0)
+        };
+        // Overlay layers (S-124/S-129): cell-less, coverage-exempt instructions.
+        let request = PortrayalRequest {
+            profile: &self.display.profile,
+            viewing_time: gml_overlay::viewing_time(&self.state.render_context.settings),
+            settings: Some(&settings),
+            host: HostServices::default(),
+        };
+        for layer in self.state.layers.with_role_mut(SceneRole::Overlay) {
+            if let Some(overlay) = layer.portray(&request)? {
+                context.append_converted(overlay.instructions.to_vec());
+            }
+        }
+        context.set_viewport(width as f32, height as f32);
+        context.scaler = self.state.render_context.scaler.clone();
+        #[cfg(feature = "s101")]
+        let inventory = Some(coverage.as_ref());
+        #[cfg(not(feature = "s101"))]
+        let inventory = None;
+        prepare_flat_coverage(inventory, &mut context, [width, height], scale_factor)?;
+        // Grid layers (S-102): the viewer's raster portrayal of the loaded
+        // bathymetry, handed to the renderer as extensions.
+        let extensions = self.portray_grids(&settings)?;
+        #[cfg(feature = "s101")]
+        {
+            let s101 = self.state.layers.s101_mut();
+            s101.catalogue_registry = registry.clone();
+            s101.coverage_inventory = Some(Arc::clone(&coverage));
+        }
+        self.state.ic_assigned_vectors = ic_changed;
+        Ok(Arc::new(PreparedScene {
+            context,
+            #[cfg(feature = "s101")]
+            coverage,
+            #[cfg(feature = "s101")]
+            catalogue_registry: registry,
+            ic_changed,
+            id: Arc::new(()),
+            extensions,
+        }))
+    }
+
+    /// The base chart part of [`Self::prepare`]: the cells portrayed with
+    /// their catalogue owners or the bound pair, their coverage, the
+    /// catalogue registry and the interoperability changes.
+    #[cfg(feature = "s101")]
+    #[allow(clippy::type_complexity)]
+    fn prepare_base(
+        &mut self,
+        view: &View,
+        settings: &SettingsState,
+    ) -> Result<(
+        ferrite_render::RenderContext,
+        Arc<ferrite_s101::coverage_projection::GeographicCoverageInventory>,
+        ferrite_s101::layer::catalogue_selection::DatasetCatalogueRegistry,
+        usize,
+    )> {
+        let s101 = self.state.layers.s101();
+        let (fc, pc) = (Arc::clone(&s101.fc), Arc::clone(&s101.pc));
+        if s101.cells.is_empty() {
+            let mut context = self.state.render_context.empty_for_rebuild();
+            context.set_bounds(self.state.bounds);
+            return Ok((
                 context,
                 Arc::new(
                     ferrite_s101::coverage_projection::GeographicCoverageInventory::from_cells(&[])?,
                 ),
                 Default::default(),
                 0,
-            )
-        } else {
-            let registry = self.state.s101.prepare_catalogue_registry(&fc, &pc, true)?;
-            if self
+            ));
+        }
+        let registry = self
+            .state
+            .layers
+            .s101_mut()
+            .prepare_catalogue_registry(&fc, &pc, true)?;
+        if self
+            .state
+            .layers
+            .s101()
+            .requires_cell_resources(&registry, &fc, &pc)?
+        {
+            // Cells owned by other installed catalogues: per-owner portrayal.
+            let coverage = self
                 .state
-                .s101
-                .requires_cell_resources(&registry, &fc, &pc)?
-            {
-                // Cells owned by other installed catalogues: per-owner portrayal.
-                let coverage = self
-                    .state
-                    .prepare_view_residency(
-                        true,
-                        Some(view.viewport),
-                        settings.interoperability_enabled,
-                    )?
-                    .context("Coverage of loaded cells")?;
-                let request = PortrayalChangeRequest {
-                    profile: self.display.profile.clone(),
-                    settings: settings.clone(),
-                };
-                let change = self.state.portray_change_cells(
-                    &request,
-                    &fc,
-                    &pc,
-                    &registry,
+                .prepare_view_residency(
                     true,
-                    true,
-                    self.triangulate,
-                )?;
-                let mut context = change.context;
-                context.set_bounds(self.state.bounds);
-                (context, coverage, registry, change.ic_changed)
-            } else {
-                let active_ic = settings
-                    .interoperability_enabled
-                    .then(|| self.state.ic.clone())
-                    .flatten();
-                let scene = self.state.portray_loaded_cells(
-                    true,
-                    Some(&settings),
                     Some(view.viewport),
-                    active_ic,
-                    self.triangulate,
-                )?;
-                (scene.context, scene.coverage, registry, scene.ic_changed)
-            }
+                    settings.interoperability_enabled,
+                )?
+                .context("Coverage of loaded cells")?;
+            let request = PortrayalChangeRequest {
+                profile: self.display.profile.clone(),
+                settings: settings.clone(),
+            };
+            let change = self.state.portray_change_cells(
+                &request,
+                &fc,
+                &pc,
+                &registry,
+                true,
+                true,
+                self.triangulate,
+            )?;
+            let mut context = change.context;
+            context.set_bounds(self.state.bounds);
+            Ok((context, coverage, registry, change.ic_changed))
+        } else {
+            let active_ic = settings
+                .interoperability_enabled
+                .then(|| self.state.ic.clone())
+                .flatten();
+            let scene = self.state.portray_loaded_cells(
+                true,
+                Some(settings),
+                Some(view.viewport),
+                active_ic,
+                self.triangulate,
+            )?;
+            Ok((scene.context, scene.coverage, registry, scene.ic_changed))
+        }
+    }
+
+    /// The grid layers' renderer extensions for the display, with the
+    /// host's rule source, cache store and interoperability selection.
+    fn portray_grids(
+        &mut self,
+        settings: &SettingsState,
+    ) -> Result<Vec<ferrite_product_api::RendererExtension>> {
+        let active_ic = settings
+            .interoperability_enabled
+            .then(|| self.state.ic.clone())
+            .flatten();
+        let base = self.state.base_products();
+        let combination = self.state.ic_combination.clone();
+        let selection = |product: ProductId| -> Result<Box<dyn Any>> {
+            let ic = active_ic
+                .as_ref()
+                .context("No interoperability catalogue")?;
+            let mut displayed = vec![product.as_str()];
+            displayed.extend(base.iter().copied().filter(|p| *p != product.as_str()));
+            Ok(Box::new(
+                ic.catalogue.select(combination.as_deref(), &displayed)?,
+            ))
         };
-        // GML overlays (S-124/S-129): cell-less, coverage-exempt instructions.
+        let cache = Arc::clone(&self.state.platform.cache);
         let request = PortrayalRequest {
             profile: &self.display.profile,
-            viewing_time: gml_overlay::viewing_time(&self.state.render_context.settings),
-            settings: Some(&settings),
+            viewing_time: None,
+            settings: Some(settings),
+            host: HostServices {
+                source: Some(self.state.portrayal_source),
+                precomputed_export: self.state.precomputed_export,
+                cache: Some(cache.as_ref()),
+                interoperability: active_ic.as_deref().map(|catalogue| Interoperability {
+                    catalogue,
+                    selection: &selection,
+                }),
+            },
         };
-        if let Some(overlay) = self.overlays.portray(&request) {
-            context.append_converted(overlay.instructions.to_vec());
+        let mut extensions = Vec::new();
+        for layer in self.state.layers.with_role_mut(SceneRole::Grid) {
+            if let Some(grid) = layer.portray(&request)? {
+                extensions.extend(grid.extensions);
+            }
         }
-        context.set_viewport(width as f32, height as f32);
-        context.scaler = self.state.render_context.scaler.clone();
-        prepare_flat_coverage(
-            Some(coverage.as_ref()),
-            &mut context,
-            [width, height],
-            scale_factor,
-        )?;
-        // S-102: the viewer's raster portrayal of the loaded bathymetry,
-        // handed to the renderer as an extension.
-        let extensions =
-            crate::s102_host::prepare(&self.state, &self.display.profile, &settings, &self.s102)?
-                .into_iter()
-                .collect();
-        self.state.s101.catalogue_registry = registry.clone();
-        self.state.s101.coverage_inventory = Some(Arc::clone(&coverage));
-        self.state.ic_assigned_vectors = ic_changed;
-        Ok(Arc::new(PreparedScene {
-            context,
-            coverage,
-            catalogue_registry: registry,
-            ic_changed,
-            id: Arc::new(()),
-            extensions,
-        }))
+        Ok(extensions)
     }
 
     /// Cache-store entries a [`Self::prepare`] with the current display reads
@@ -1100,11 +961,13 @@ impl ChartEngine {
     /// or without a cache. A host whose persistent store is asynchronous
     /// (the web's IndexedDB) loads these entries into the platform cache
     /// store before preparing, and saves the entries the preparation wrote.
+    #[cfg(feature = "s101")]
     pub fn cell_cache_entries(&mut self) -> Vec<PathBuf> {
         // The key covers the colour profile `prepare` selects first.
         let paths = self
             .state
-            .s101
+            .layers
+            .s101()
             .cell_instruction_cache_paths(Some(&self.display.settings), &self.display.profile);
         paths.into_iter().flatten().flatten().collect()
     }
@@ -1115,27 +978,41 @@ impl ChartEngine {
     /// [`PortrayalSource::Precomputed`] reads; empty without cells or cache
     /// store. A host keeping payloads in an asynchronous store loads these
     /// before preparing.
+    #[cfg(feature = "s101")]
     pub fn precomputed_cell_entries(&self) -> Vec<PathBuf> {
         let common =
             S101Layer::precomputed_common(Some(&self.display.settings), &self.display.profile);
-        let identities = self.state.s101.cell_identities();
+        let identities = self.state.layers.s101().cell_identities();
         let cells = ferrite_s101::layer::portrayal::PrecomputedCells {
             store: self.state.platform.cache.as_ref(),
             common,
             identities: &identities,
             export: false,
         };
-        (0..self.state.s101.cells.len())
-            .filter_map(|index| cells.key(&self.state.s101.fc, &self.state.s101.pc, index))
+        (0..self.state.layers.s101().cells.len())
+            .filter_map(|index| {
+                cells.key(
+                    &self.state.layers.s101().fc,
+                    &self.state.layers.s101().pc,
+                    index,
+                )
+            })
             .collect()
     }
 
     /// Cache-store entry of the S-102 portrayal rule's instructions the
     /// next [`Self::prepare`] reads for the loaded bathymetry with the
     /// current display (precomputed portrayal, or Lua with
-    /// [`crate::s102_host::S102Options::reuse_rule_instructions`]).
+    /// `S102Options::reuse_rule_instructions`); None without S-102.
     pub fn s102_cache_entry(&self) -> Option<PathBuf> {
-        crate::s102_host::instruction_entry(&self.state, &self.display.settings)
+        #[cfg(feature = "s102-pure")]
+        return self
+            .state
+            .layers
+            .get::<ferrite_s102::layer::S102Layer>()?
+            .instruction_entry(self.state.platform.cache.as_ref(), &self.display.settings);
+        #[cfg(not(feature = "s102-pure"))]
+        None
     }
 
     /// Move `scene` to `view` without portraying again, as the viewer's
@@ -1166,25 +1043,28 @@ impl ChartEngine {
         context.set_viewport(width as f32, height as f32);
         context.zoom_to_fit(fit);
         context.scaler.set_pixel_ratio(scale_factor);
-        if !self.state.s101.cells.is_empty()
-            && self.state.s101.residency_for_view(
-                &scene.coverage,
-                &self.state.render_context,
-                self.state.bounds,
-                true,
-                Some(view.viewport),
-            ) != self.state.s101.resident_cells
+        #[cfg(feature = "s101")]
         {
-            return Ok(false);
+            let s101 = self.state.layers.s101();
+            if !s101.cells.is_empty()
+                && s101.residency_for_view(
+                    &scene.coverage,
+                    &self.state.render_context,
+                    self.state.bounds,
+                    true,
+                    Some(view.viewport),
+                ) != s101.resident_cells
+            {
+                return Ok(false);
+            }
         }
         scene.context.set_viewport(width as f32, height as f32);
         scene.context.scaler = self.state.render_context.scaler.clone();
-        prepare_flat_coverage(
-            Some(scene.coverage.as_ref()),
-            &mut scene.context,
-            [width, height],
-            scale_factor,
-        )?;
+        #[cfg(feature = "s101")]
+        let inventory = Some(scene.coverage.as_ref());
+        #[cfg(not(feature = "s101"))]
+        let inventory = None;
+        prepare_flat_coverage(inventory, &mut scene.context, [width, height], scale_factor)?;
         Ok(true)
     }
 
@@ -1223,70 +1103,24 @@ impl ChartEngine {
         }
     }
 
-    /// Plain-data report of a feature (ENC feature or overlay object).
+    /// Plain-data report of a feature: an overlay object (no cell index)
+    /// described by the overlay layers, or a base chart feature by the base
+    /// chart layer with the dataset's own catalogue.
     pub fn feature(&mut self, id: FeatureId) -> Option<FeatureReport> {
-        if id.cell_index.is_none() {
-            let pick = self.overlays.describe(id.feature_id)?;
-            return Some(FeatureReport {
-                feature_type: pick.feature_type,
-                feature_id: id.feature_id,
-                foid: pick.foid,
-                cell_index: None,
-                primitive_type: pick.primitive,
-                source: Some(pick.source),
-                attributes: pick.attributes,
-                definition: pick.definition,
-            });
+        match id.cell_index {
+            None => self
+                .state
+                .layers
+                .with_role_mut(SceneRole::Overlay)
+                .find_map(|layer| layer.describe(id.feature_id))
+                .map(|pick| FeatureReport::from_pick(pick, id.feature_id)),
+            Some(index) => self
+                .state
+                .layers
+                .with_role_mut(SceneRole::BaseChart)
+                .find_map(|layer| layer.describe_in(index, id.feature_id)),
         }
-        let index = id.cell_index? as usize;
-        self.state
-            .s101
-            .cells
-            .get(index)?
-            .features
-            .get(&id.feature_id)?;
-        Some(
-            self.state
-                .describe_feature(id.cell_index, id.feature_id, ""),
-        )
     }
-}
-
-fn overlay_summary(overlay: &gml_overlay::OverlayDataset) -> DatasetSummary {
-    DatasetSummary {
-        id: DatasetId::Overlay(overlay.id),
-        product: overlay.product().identifier().to_string(),
-        name: overlay.name(),
-        source: overlay.dataset.source.clone(),
-        edition: overlay
-            .dataset
-            .identification
-            .product_edition()
-            .unwrap_or_default()
-            .to_string(),
-        features: overlay.dataset.objects.len(),
-        provenance: overlay.provenance.label(),
-    }
-}
-
-fn overlay_issues(overlay: &gml_overlay::OverlayDataset) -> Vec<ValidationIssue> {
-    overlay
-        .issues
-        .iter()
-        .map(|issue| ValidationIssue {
-            severity: if issue.severity == ferrite_s100_gml::Severity::Error {
-                IssueSeverity::Error
-            } else {
-                IssueSeverity::Warning
-            },
-            subject: match &issue.object {
-                Some(object) => format!("{} {object}", overlay.name()),
-                None => overlay.name(),
-            },
-            check: issue.check.clone(),
-            message: issue.message.clone(),
-        })
-        .collect()
 }
 
 /// Everything an open job needs, moved to the worker.
@@ -1295,23 +1129,15 @@ struct OpenTask {
     source: DatasetSource,
     signatures: SignaturePolicy,
     trust_anchors: Arc<Vec<(String, Vec<u8>)>>,
-    fc: Arc<BoundFeatureCatalogue>,
-    pc: Arc<BoundPortrayalCatalogue>,
-    decoded: ferrite_s101::layer::decoded_cache::SharedDecodedChartCache,
-    overlay_products: bool,
-    /// Installed S-101 catalogue inventory (empty: none).
-    inventory: PathBuf,
-    /// Loaded logical datasets when the job started (cancellation targets).
-    loaded: s101_update_plan::LoadedDatasets,
-    /// Inputs of the loaded chains (predecessors of selected updates).
-    loaded_inputs: Vec<PathBuf>,
-    s102_options: crate::s102_host::S102Options,
+    /// The registered layers' stages with their registry index.
+    stages: Vec<(usize, Box<dyn OpenStage>)>,
 }
 
-/// One S-101 chain read into memory.
-struct ByteChain {
-    base: (PathBuf, Vec<u8>),
-    updates: Vec<Vec<u8>>,
+/// The job's signature verification (shared by the stages).
+struct Authorizer {
+    platform: Platform,
+    signatures: SignaturePolicy,
+    trust_anchors: Arc<Vec<(String, Vec<u8>)>>,
 }
 
 impl OpenTask {
@@ -1331,8 +1157,6 @@ impl OpenTask {
             .run(cancel);
         }
         let data = self.platform.data.as_ref();
-        let mut notices = Vec::new();
-        let mut issues = Vec::new();
         let inputs = match &self.source {
             DatasetSource::Folder(root) => {
                 ensure!(
@@ -1363,80 +1187,72 @@ impl OpenTask {
             self.source,
             DatasetSource::Files(_) | DatasetSource::Bytes(_)
         );
-        let mut charts = Vec::new();
-        let mut overlays = Vec::new();
-        let mut routes = Vec::new();
-        let mut s102_inputs = Vec::new();
+        let authorizer = Authorizer {
+            platform: self.platform.clone(),
+            signatures: self.signatures,
+            trust_anchors: Arc::clone(&self.trust_anchors),
+        };
+        let authorize = |paths: &[PathBuf]| -> Result<Box<dyn Any>> {
+            Ok(Box::new(authorizer.authorize(paths)?))
+        };
+        let context = OpenContext {
+            data,
+            executor: self.platform.executor.as_ref(),
+            signatures: self.signatures,
+            explicit,
+            authorize: &authorize,
+            user: self.platform.user.as_ref(),
+            cancel,
+        };
+        let mut notes = OpenNotes::default();
+        let mut stages = self.stages;
+        // Every input goes to the first stage whose products recognise it.
         for path in inputs {
-            if s101_update_plan::is_chart_file(&path) {
-                charts.push(path);
-            } else if gml_overlay::sniff_product_in(data, &path).is_some() {
-                overlays.push(path);
-            } else if self.capture_route(&path, &mut notices, &mut routes) {
-                // Captured into `routes`.
-            } else if crate::s102_host::is_hdf5_input(&path) {
-                s102_inputs.push(path);
-            } else if explicit {
-                notices.push(format!("Not a supported dataset: {}", path.display()));
+            let mut head: Option<Vec<u8>> = None;
+            let mut taken = false;
+            for (_, stage) in stages.iter_mut() {
+                let mut recognised = stage.sniff(&path, &[]);
+                if recognised.is_none() && stage.sniffs_head(&path) {
+                    let head = head.get_or_insert_with(|| {
+                        data.read_limited(&path, 64 * 1024 - 1).unwrap_or_default()
+                    });
+                    recognised = stage.sniff(&path, head);
+                }
+                if recognised.is_some() && stage.accept(&path, &context, &mut notes) {
+                    taken = true;
+                    break;
+                }
+            }
+            if !taken && explicit {
+                notes
+                    .notices
+                    .push(format!("Not a supported dataset: {}", path.display()));
             }
         }
         ensure!(
-            charts.len() + overlays.len() <= 4096,
+            stages
+                .iter()
+                .map(|(_, stage)| stage.counted_inputs())
+                .sum::<usize>()
+                <= 4096,
             "Dataset inputs exceed 4096"
         );
-        if !self.overlay_products && !overlays.is_empty() {
-            notices.push(format!(
-                "{} S-124/S-129 dataset(s) skipped: overlay catalogues are not installed",
-                overlays.len()
-            ));
-            overlays.clear();
+        for (_, stage) in stages.iter_mut() {
+            stage.after_claims(&mut notes);
         }
-        let require = self.signatures == SignaturePolicy::Required;
-        let (cells, removals) = if charts.is_empty() {
-            (Vec::new(), Vec::new())
-        } else if data.local_paths() || require {
-            self.load_planned_charts(charts, explicit, cancel, &mut notices, &mut issues)?
-        } else {
-            (
-                self.load_byte_charts(charts, cancel, &mut notices, &mut issues)?,
-                Vec::new(),
-            )
-        };
-        let mut loaded_overlays = Vec::new();
-        for path in overlays {
-            ensure!(!cancel.load(Ordering::Relaxed), "Open cancelled");
-            match self.read_overlay(&path) {
-                Ok((bytes, provenance)) => loaded_overlays.push((path, bytes, provenance)),
-                Err(error) => issues.push(ValidationIssue {
-                    severity: IssueSeverity::Error,
-                    subject: path.display().to_string(),
-                    check: "GML load".into(),
-                    message: format!("{error:#}"),
-                }),
-            }
+        let mut loaded = Vec::with_capacity(stages.len());
+        for (index, stage) in stages {
+            loaded.push((index, stage.load(&context, &mut notes)?));
         }
-        let s102 = crate::s102_host::open_inputs(
-            s102_inputs,
-            data,
-            &|paths| self.authorize(paths),
-            require,
-            &self.s102_options,
-            cancel,
-            &mut notices,
-            &mut issues,
-        )?;
         Ok(OpenedDatasets {
-            cells,
-            overlays: loaded_overlays,
-            removals,
-            routes,
-            issues,
-            notices,
-            catalogues: (*self.fc.source_digest(), *self.pc.source_digest()),
-            s102,
+            stages: loaded,
+            issues: notes.issues,
+            notices: notes.notices,
         })
     }
+}
 
+impl Authorizer {
     fn trust_anchors(&self) -> Result<ferrite_security::TrustAnchors> {
         let mut anchors = ferrite_security::TrustAnchors::default();
         for (administrator, pem) in self.trust_anchors.iter() {
@@ -1469,511 +1285,6 @@ impl OpenTask {
             ),
         }
     }
-
-    /// Overlay bytes (the authenticated snapshot when verified).
-    fn read_overlay(&self, path: &Path) -> Result<(Vec<u8>, Provenance)> {
-        let data = self.platform.data.as_ref();
-        let limits = ferrite_s100_gml::ReadLimits::default();
-        if !data.local_paths() && self.signatures == SignaturePolicy::Required {
-            // Bytes source: the authenticated in-memory snapshot.
-            let report = self.authorize(&[path.to_path_buf()])?;
-            let snapshot =
-                dataset_signature_policy::dataset_snapshot_in(data, &report, path, true)?
-                    .context("Required authenticated dataset snapshot is missing")?;
-            let bytes = snapshot
-                .bytes()
-                .context("Authenticated snapshot of a bytes source holds no bytes")?;
-            ensure!(
-                bytes.len() <= limits.bytes,
-                "{} exceeds the {} byte dataset limit",
-                path.display(),
-                limits.bytes
-            );
-            return Ok((bytes.to_vec(), Provenance::Authenticated));
-        }
-        let (bytes_path, provenance) = if data.local_paths() {
-            let require = self.signatures == SignaturePolicy::Required;
-            let report = self.authorize(&[path.to_path_buf()])?;
-            let snapshot = dataset_signature_policy::dataset_snapshot(&report, path, require)?;
-            let provenance = if snapshot.is_some() {
-                Provenance::Authenticated
-            } else {
-                Provenance::Unverified
-            };
-            (
-                snapshot
-                    .map(|s| s.path().to_path_buf())
-                    .unwrap_or_else(|| path.to_path_buf()),
-                provenance,
-            )
-        } else {
-            (path.to_path_buf(), Provenance::Unverified)
-        };
-        let length = data
-            .len(&bytes_path)
-            .with_context(|| format!("Cannot open {}", path.display()))?;
-        ensure!(
-            length as usize <= limits.bytes,
-            "{} exceeds the {} byte dataset limit",
-            path.display(),
-            limits.bytes
-        );
-        let bytes = data
-            .read(&bytes_path)
-            .with_context(|| format!("Cannot read {}", path.display()))?;
-        Ok((bytes, provenance))
-    }
-
-    /// Validate and normalize a materialized cell as the viewer does.
-    fn admit(&self, cell: &mut S101Cell) -> Result<()> {
-        self.admit_with(cell, &self.fc, &self.pc)
-    }
-
-    /// [`Self::admit`] against the catalogue pair that owns the cell.
-    fn admit_with(
-        &self,
-        cell: &mut S101Cell,
-        fc: &BoundFeatureCatalogue,
-        pc: &BoundPortrayalCatalogue,
-    ) -> Result<()> {
-        S101Layer::admit_with(cell, fc, pc)
-    }
-
-    /// An S-421 route among the inputs (the S-421 adapter recognises the
-    /// name and head), captured once into `routes` (true); capture failures
-    /// and routes refused by the signature policy are notices.
-    #[cfg(feature = "s421")]
-    fn capture_route(
-        &self,
-        path: &Path,
-        notices: &mut Vec<String>,
-        routes: &mut Vec<CapturedRouteInput>,
-    ) -> bool {
-        use ferrite_product_api::ProductAdapter;
-        let data = self.platform.data.as_ref();
-        if !S421::is_route_name(path) {
-            return false;
-        }
-        let Ok(head) = data.read_limited(path, 64 * 1024 - 1) else {
-            return false;
-        };
-        if S421.sniff(path, &head).is_none() {
-            return false;
-        }
-        match crate::products::s421::capture_if_route_in(data, path) {
-            Ok(Some(route)) => {
-                match route.allowed_xml(self.signatures == SignaturePolicy::Required) {
-                    Ok(_) => {
-                        routes.push(route);
-                        true
-                    }
-                    Err(error) => {
-                        notices.push(format!("Not opened: {}: {error}", path.display()));
-                        false
-                    }
-                }
-            }
-            Ok(None) => false,
-            Err(error) => {
-                notices.push(format!("Not opened: {}: {error}", path.display()));
-                false
-            }
-        }
-    }
-    /// Without the S-421 product no input is a route.
-    #[cfg(not(feature = "s421"))]
-    fn capture_route(
-        &self,
-        _path: &Path,
-        _notices: &mut Vec<String>,
-        _routes: &mut Vec<CapturedRouteInput>,
-    ) -> bool {
-        false
-    }
-
-    /// The viewer's authorized planner and loader, over any data source:
-    /// local files (private snapshot files) or bytes (owned copies). An
-    /// explicit selection also plans its physical cancellations.
-    #[allow(clippy::type_complexity)]
-    fn load_planned_charts(
-        &self,
-        charts: Vec<PathBuf>,
-        explicit: bool,
-        cancel: &AtomicBool,
-        notices: &mut Vec<String>,
-        issues: &mut Vec<ValidationIssue>,
-    ) -> Result<(
-        Vec<(ChartLoadResult, String)>,
-        Vec<(PathBuf, ValidatedRemoval)>,
-    )> {
-        let data = self.platform.data.as_ref();
-        let require = self.signatures == SignaturePolicy::Required;
-        // An explicit selection also opens the base and predecessors of a
-        // selected update (as the viewer does).
-        let selected = charts.clone();
-        // Planned inputs are canonical paths, the keys of their authorization
-        // and lifecycle metadata.
-        let charts = if explicit {
-            s101_update_plan::expand_candidates_in(data, &charts, &self.loaded_inputs)?
-        } else {
-            let mut canonical = Vec::with_capacity(charts.len());
-            for path in charts {
-                match data.canonicalize(&path) {
-                    Ok(path) => canonical.push(path),
-                    Err(error) => {
-                        notices.push(format!("Skipped S-101 input {}: {error}", path.display()))
-                    }
-                }
-            }
-            canonical
-        };
-        let authorization = self.authorize(&charts)?;
-        let provenance = if require {
-            "signature verified"
-        } else {
-            "signature not verified"
-        };
-        let (plans, cancellations, plan_notices) = if explicit {
-            let record = self.platform.user.cancellation_history();
-            let history = match &record {
-                Some(record) => CancellationHistory::read_record(record.as_ref())?,
-                None => CancellationHistory::default(),
-            };
-            let (plans, mut cancellations, mut plan_notices) =
-                s101_update_plan::authorized_selection_plans_in(
-                    data,
-                    charts,
-                    &selected,
-                    &authorization,
-                    require,
-                    &self.loaded,
-                    &history,
-                )?;
-            if record.is_none() {
-                for plan in cancellations.drain(..) {
-                    plan_notices.push(format!(
-                        "Skipped S-101 cancellation {}: this host keeps no cancellation history",
-                        plan.original().display()
-                    ));
-                }
-            }
-            (plans, cancellations, plan_notices)
-        } else {
-            let (plans, plan_notices) = s101_update_plan::authorized_folder_plans_in(
-                data,
-                charts,
-                &authorization,
-                require,
-            )?;
-            (plans, Vec::new(), plan_notices)
-        };
-        notices.extend(plan_notices);
-        let mut removals = Vec::new();
-        for plan in cancellations {
-            ensure!(!cancel.load(Ordering::Relaxed), "Open cancelled");
-            let path = plan.original().to_path_buf();
-            match plan.load() {
-                Ok(removal) => removals.push((path, removal)),
-                Err(error) => issues.push(ValidationIssue {
-                    severity: IssueSeverity::Error,
-                    subject: path.display().to_string(),
-                    check: "S-101 cancellation".into(),
-                    message: format!("{error:#}"),
-                }),
-            }
-        }
-        let codes = Arc::new(self.fc.feature_type_codes());
-        let owners = self.inventory_owners(&plans, notices);
-        let plans: Vec<_> = plans.into_iter().map(Arc::new).collect();
-        let results = parallel_map(self.platform.executor.as_ref(), &plans, |plan| {
-            if cancel.load(Ordering::Relaxed) {
-                bail!("Open cancelled");
-            }
-            let (mut cell, source_identity) = plan.load_with_decoded_cache(&self.decoded)?;
-            // Datasets of other catalogue editions: their installed owner.
-            let owner = owners.as_ref().and_then(|(registry, codes)| {
-                let key = S101Layer::catalogue_dataset_key(&plan.base.id).ok()?;
-                let owner = registry.owner_for(&key)?;
-                Some((owner, codes.get(owner.fc().source_digest())?))
-            });
-            let codes = match owner {
-                Some((owner, owner_codes)) => {
-                    self.admit_with(&mut cell, owner.fc(), owner.pc())?;
-                    Arc::clone(owner_codes)
-                }
-                None => {
-                    self.admit(&mut cell)?;
-                    Arc::clone(&codes)
-                }
-            };
-            cell.normalize_feature_codes(&codes);
-            Ok(ChartLoadResult {
-                base_metadata: plan.base.metadata.clone(),
-                metadata: plan.ending_metadata().cloned(),
-                input_paths: plan.input_paths(),
-                cell,
-                source_identity,
-                hydration: Some(CellHydrationSource {
-                    plan: Arc::clone(plan),
-                    codes: vec![Arc::clone(&codes)],
-                }),
-            })
-        });
-        // Retain authenticated snapshots until every plan was parsed.
-        drop(authorization);
-        let mut cells = Vec::new();
-        for (plan, result) in plans.iter().zip(results) {
-            match result {
-                Ok(result) => cells.push((result, provenance.to_string())),
-                Err(error) => {
-                    ensure!(!cancel.load(Ordering::Relaxed), "Open cancelled");
-                    issues.push(load_issue(&plan.base.original, error));
-                }
-            }
-        }
-        Ok((cells, removals))
-    }
-
-    /// Catalogue owners from the installed inventory for planned datasets
-    /// the bound pair cannot process (as the viewer's loader stages them),
-    /// with each owner's feature type codes. None without an inventory or
-    /// when no dataset needs one; a failed selection is a notice (those
-    /// datasets are then rejected by the bound pair).
-    #[allow(clippy::type_complexity)]
-    fn inventory_owners(
-        &self,
-        plans: &[s101_update_plan::Plan],
-        notices: &mut Vec<String>,
-    ) -> Option<(
-        ferrite_s101::layer::catalogue_selection::DatasetCatalogueRegistry,
-        BTreeMap<[u8; 32], Arc<Vec<String>>>,
-    )> {
-        use ferrite_s101::layer::catalogue_selection::{
-            DatasetCatalogueOwner, DatasetCatalogueRegistry, DatasetCatalogueRequest,
-        };
-        if self.inventory.as_os_str().is_empty()
-            || plans.iter().all(|plan| {
-                ferrite_s101::validate_dataset_catalogues(
-                    &plan.base.id,
-                    &self.fc,
-                    &self.pc.product_id,
-                    &self.pc.version,
-                )
-                .is_ok()
-            })
-        {
-            return None;
-        }
-        let staged = (|| -> Result<DatasetCatalogueRegistry> {
-            let requests = plans
-                .iter()
-                .map(|plan| {
-                    Ok(DatasetCatalogueRequest {
-                        dataset_key: S101Layer::catalogue_dataset_key(&plan.base.id)?,
-                        source_identity: plan.captured_source_identity_sha(),
-                        identification: plan.base.id.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let fallback = Arc::new(DatasetCatalogueOwner::new(
-                Arc::clone(&self.fc),
-                Arc::clone(&self.pc),
-            )?);
-            DatasetCatalogueRegistry::default().stage_in(
-                self.platform.data.as_ref(),
-                &requests,
-                fallback,
-                &self.inventory,
-            )
-        })();
-        let registry = match staged {
-            Ok(registry) => registry,
-            Err(error) => {
-                notices.push(format!("Installed catalogue selection failed: {error:#}"));
-                return None;
-            }
-        };
-        let mut codes = BTreeMap::new();
-        for plan in plans {
-            let Some(owner) = S101Layer::catalogue_dataset_key(&plan.base.id)
-                .ok()
-                .and_then(|key| registry.owner_for(&key))
-            else {
-                continue;
-            };
-            codes
-                .entry(*owner.fc().source_digest())
-                .or_insert_with(|| Arc::new(owner.fc().feature_type_codes()));
-        }
-        Some((registry, codes))
-    }
-
-    /// Any source: chains planned from the dataset identifications and
-    /// materialized from bytes (no signature verification).
-    fn load_byte_charts(
-        &self,
-        charts: Vec<PathBuf>,
-        cancel: &AtomicBool,
-        notices: &mut Vec<String>,
-        issues: &mut Vec<ValidationIssue>,
-    ) -> Result<Vec<(ChartLoadResult, String)>> {
-        let data = self.platform.data.as_ref();
-        let max = ferrite_s100_core::updates::UpdateLimits::default().max_dataset_bytes as u64;
-        let mut inputs = Vec::new();
-        let mut total = 0u64;
-        for path in charts {
-            ensure!(!cancel.load(Ordering::Relaxed), "Open cancelled");
-            let read = (|| -> Result<(DatasetIdentification, Vec<u8>)> {
-                let bytes = data.read_limited(&path, max)?;
-                ensure!(
-                    bytes.len() as u64 <= max,
-                    "S-101 input byte budget exceeded"
-                );
-                let id = ferrite_s100_core::inspect_dataset_identification_bytes(&bytes)?;
-                Ok((id, bytes))
-            })();
-            match read {
-                Ok((id, bytes)) => {
-                    total += bytes.len() as u64;
-                    ensure!(total <= max, "S-101 aggregate input budget exceeded");
-                    inputs.push((path, id, bytes));
-                }
-                Err(error) => {
-                    notices.push(format!("Skipped S-101 input {}: {error:#}", path.display()))
-                }
-            }
-        }
-        let chains = plan_byte_chains(inputs, notices);
-        let codes = Arc::new(self.fc.feature_type_codes());
-        let chains: Vec<Mutex<Option<ByteChain>>> =
-            chains.into_iter().map(|c| Mutex::new(Some(c))).collect();
-        let results = parallel_map(self.platform.executor.as_ref(), &chains, |chain| {
-            let chain = chain
-                .lock()
-                .ok()
-                .and_then(|mut c| c.take())
-                .context("Chain taken")?;
-            let path = chain.base.0.clone();
-            let run = || -> Result<ChartLoadResult> {
-                if cancel.load(Ordering::Relaxed) {
-                    bail!("Open cancelled");
-                }
-                let (mut cell, source_identity) = S101Cell::load_update_chain_bytes_with_identity(
-                    &chain.base.0,
-                    chain.base.1,
-                    chain.updates,
-                )?;
-                self.admit(&mut cell)?;
-                cell.normalize_feature_codes(&codes);
-                Ok(ChartLoadResult {
-                    base_metadata: None,
-                    metadata: None,
-                    input_paths: vec![path.clone()],
-                    cell,
-                    source_identity,
-                    hydration: None,
-                })
-            };
-            Ok::<_, anyhow::Error>((path.clone(), run()))
-        });
-        let mut cells = Vec::new();
-        for result in results {
-            let (path, result) = result?;
-            match result {
-                Ok(result) => cells.push((result, "signature not verified".to_string())),
-                Err(error) => {
-                    ensure!(!cancel.load(Ordering::Relaxed), "Open cancelled");
-                    issues.push(load_issue(&path, error));
-                }
-            }
-        }
-        Ok(cells)
-    }
-}
-
-fn load_issue(path: &Path, error: anyhow::Error) -> ValidationIssue {
-    ValidationIssue {
-        severity: IssueSeverity::Error,
-        subject: path.display().to_string(),
-        check: "S-101 load".into(),
-        message: format!("{error:#}"),
-    }
-}
-
-/// Group inputs by logical dataset and select the latest edition's base
-/// (or reissue) and its consecutive updates, as the S-101 update planner
-/// does for authorized inputs. Rejected groups become notices.
-/// An S-101 input read into memory with its identification.
-type ByteInput = (PathBuf, DatasetIdentification, Vec<u8>);
-
-fn plan_byte_chains(inputs: Vec<ByteInput>, notices: &mut Vec<String>) -> Vec<ByteChain> {
-    let mut groups: BTreeMap<(String, String), Vec<ByteInput>> = BTreeMap::new();
-    for input in inputs {
-        match s101_update_plan::dataset_key(&input.1) {
-            Ok(key) => groups.entry(key).or_default().push(input),
-            Err(error) => notices.push(format!(
-                "Skipped invalid S-101 dataset identity {}: {error:#}",
-                input.0.display()
-            )),
-        }
-    }
-    let counter = |id: &DatasetIdentification| -> Option<u16> {
-        Path::new(&id.dataset_name)
-            .extension()?
-            .to_str()?
-            .parse()
-            .ok()
-    };
-    let mut chains = Vec::new();
-    for ((product, name), mut group) in groups {
-        let planned = (|| -> Result<ByteChain> {
-            ensure!(
-                group.iter().all(|(_, id, _)| id.edition_number > 0),
-                "Cancellation datasets need an explicit removal operation"
-            );
-            let edition = group
-                .iter()
-                .map(|(_, id, _)| id.edition_number)
-                .max()
-                .context("Empty group")?;
-            group.retain(|(_, id, _)| id.edition_number == edition);
-            let base_counter = group
-                .iter()
-                .filter(|(_, id, _)| id.application_profile == "1")
-                .filter_map(|(_, id, _)| counter(id))
-                .max()
-                .context("Update chain has no profile-1 base in its latest edition")?;
-            let mut bases = Vec::new();
-            let mut updates = BTreeMap::new();
-            for (path, id, bytes) in group {
-                let Some(n) = counter(&id) else {
-                    bail!("Missing dataset counter: {}", path.display());
-                };
-                if id.application_profile == "1" && n == base_counter {
-                    bases.push((path, bytes));
-                } else if id.application_profile == "2" && n > base_counter {
-                    ensure!(updates.insert(n, bytes).is_none(), "Duplicate update {n}");
-                }
-            }
-            ensure!(bases.len() == 1, "Ambiguous duplicate base/reissue");
-            let mut expected = base_counter;
-            for n in updates.keys() {
-                expected = expected.checked_add(1).context("Update counter overflow")?;
-                ensure!(*n == expected, "Missing update {expected} before {n}");
-            }
-            Ok(ByteChain {
-                base: bases.pop().expect("one base"),
-                updates: updates.into_values().collect(),
-            })
-        })();
-        match planned {
-            Ok(chain) => chains.push(chain),
-            Err(error) => {
-                notices.push(format!("Skipped S-101 dataset {product}/{name}: {error:#}"))
-            }
-        }
-    }
-    chains
 }
 
 #[cfg(test)]

@@ -328,136 +328,57 @@ impl CacheStore for MemoryCacheStore {
 /// product interface, which product modules persist through).
 pub use ferrite_product_api::platform::{RecordLock, UserRecord};
 
-/// Per-user persistent state of the engine.
-pub trait UserStore: Send + Sync {
-    /// The S-124 user state record of an OS user (None: not persisted).
-    fn navwarn_state(&self, user: &str) -> Option<Box<dyn UserRecord>>;
-    /// The transactional S-101 cancellation history record
-    /// ([`ferrite_s101::layer::publication::HistoryStore`]). None: cancellations are
-    /// not supported by this host.
-    fn cancellation_history(&self) -> Option<Box<dyn UserRecord>>;
-    /// Native location of the cancellation history file, for hosts that
-    /// address it directly (the viewer); None for stores without files.
-    fn cancellation_history_path(&self) -> Option<PathBuf>;
-}
+/// Per-user persistent state of the products (defined with the product
+/// interface): records by product and key, kept as the registered
+/// [`RecordKind`]s say ([`crate::products::user_record_kinds`]).
+pub use ferrite_product_api::platform::{user_file_name, FileRecord, RecordKind, UserStore};
+use ferrite_product_api::ProductId;
 
-/// A [`UserRecord`] in a file: private directory, temporary file and rename.
-#[derive(Clone, Debug)]
-pub struct FileRecord {
-    pub path: PathBuf,
-    /// File name prefix of the temporary file written beside the record.
-    pub temporary_prefix: &'static str,
-}
-impl UserRecord for FileRecord {
-    fn read(&self, limit: u64) -> io::Result<Option<Vec<u8>>> {
-        use std::io::Read;
-        let file = match std::fs::File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let mut bytes = Vec::new();
-        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
-        Ok(Some(bytes))
-    }
-    fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        use std::io::Write;
-        let path = &self.path;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(parent)?;
-        let nonce = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        let temporary = parent.join(format!(
-            "{}-{}-{nonce}.tmp",
-            self.temporary_prefix,
-            std::process::id()
-        ));
-        let result = (|| -> io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            // wasm32: the std::fs stub File has no Drop (native-only path).
-            #[allow(clippy::drop_non_drop)]
-            drop(file);
-            std::fs::rename(&temporary, path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
-    }
-    fn set_aside(&self, suffix: &str) {
-        let mut name = self.path.as_os_str().to_owned();
-        name.push(suffix);
-        if let Err(error) = std::fs::rename(&self.path, &name) {
-            tracing::warn!("Could not set aside {}: {error}", self.path.display());
-        }
-    }
-    fn describe(&self) -> String {
-        self.path.display().to_string()
-    }
-}
-
-/// Location of a per-user file for an OS user (None: not persisted).
+/// Location of a product's per-user file for a record key (None: not
+/// persisted).
 pub type UserPathFn = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
 
-/// Native user data locations, chosen by the host (the viewer passes its
-/// application data paths, which differ under its hidden test modes).
-#[derive(Clone)]
+/// Native user data locations by product, chosen by the host (the viewer
+/// passes its application data paths, which differ under its hidden test
+/// modes). Records of products without a location are not persisted.
+#[derive(Clone, Default)]
 pub struct NativeUserStore {
-    pub history_path: PathBuf,
-    pub navwarn_path: UserPathFn,
+    pub paths: std::collections::BTreeMap<ProductId, UserPathFn>,
 }
 impl NativeUserStore {
-    /// The standard per-user application data folder
-    /// (`FerriteS100/s101-cancellations.json`, `FerriteS100/navwarn/<user>.json`).
+    /// No product persists anything.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Keep `product`'s records at `path(key)`.
+    pub fn with(mut self, product: ProductId, path: UserPathFn) -> Self {
+        self.paths.insert(product, path);
+        self
+    }
+    /// The standard per-user application data folder of every registered
+    /// product (`FerriteS100/s101-cancellations.json`,
+    /// `FerriteS100/navwarn/<user>.json`).
     pub fn standard() -> Self {
-        Self {
-            history_path: standard_data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("FerriteS100/s101-cancellations.json"),
-            navwarn_path: Arc::new(|user| {
-                Some(
-                    standard_data_dir()?
-                        .join("FerriteS100/navwarn")
-                        .join(format!("{}.json", user_file_name(user))),
-                )
-            }),
+        let mut store = Self::new();
+        for kind in crate::products::user_record_kinds() {
+            let standard = kind.standard_path;
+            store = store.with(
+                kind.product,
+                Arc::new(move |key| standard(standard_data_dir().as_deref(), key)),
+            );
         }
+        store
     }
 }
 impl UserStore for NativeUserStore {
-    fn navwarn_state(&self, user: &str) -> Option<Box<dyn UserRecord>> {
-        (self.navwarn_path)(user).map(|path| {
-            Box::new(FileRecord {
-                path,
-                temporary_prefix: ".navwarn-state",
-            }) as Box<dyn UserRecord>
-        })
+    fn product_state(&self, product: ProductId, key: &str) -> Option<Box<dyn UserRecord>> {
+        let kind = crate::products::user_record_kind(product)?;
+        let path = self.product_state_path(product, key)?;
+        Some((kind.native_record)(path))
     }
-    fn cancellation_history(&self) -> Option<Box<dyn UserRecord>> {
-        Some(Box::new(
-            ferrite_s101::layer::publication::HistoryFile::new(self.history_path.clone()),
-        ))
-    }
-    fn cancellation_history_path(&self) -> Option<PathBuf> {
-        Some(self.history_path.clone())
+    fn product_state_path(&self, product: ProductId, key: &str) -> Option<PathBuf> {
+        crate::products::user_record_kind(product)?;
+        (self.paths.get(&product)?)(key)
     }
 }
 
@@ -475,37 +396,20 @@ pub fn standard_data_dir() -> Option<PathBuf> {
     base
 }
 
-/// A user name as a safe file name.
-pub fn user_file_name(user: &str) -> String {
-    let file: String = user
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let file = file.trim_start_matches('.');
-    if file.is_empty() {
-        "unknown".into()
-    } else {
-        file.into()
-    }
-}
-
-/// User records kept in memory (lost when the process ends).
+/// User records kept in memory (lost when the process ends), under the
+/// registered products' memory keys (`navwarn/<user>`,
+/// `s101-cancellations`).
 #[derive(Clone, Default)]
 pub struct MemoryUserStore {
     records: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 /// Key of the S-101 cancellation history in a [`MemoryUserStore`].
-pub const MEMORY_HISTORY_KEY: &str = "s101-cancellations";
+#[cfg(feature = "s101")]
+pub use ferrite_s101::layer::publication::MEMORY_HISTORY_KEY;
 
 impl MemoryUserStore {
     /// The stored bytes of a record (`navwarn/<user>`,
-    /// [`MEMORY_HISTORY_KEY`]), for inspection.
+    /// `s101-cancellations`), for inspection.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.records.lock().ok()?.get(key).cloned()
     }
@@ -546,19 +450,14 @@ impl UserRecord for MemoryRecord {
     }
 }
 impl UserStore for MemoryUserStore {
-    fn navwarn_state(&self, user: &str) -> Option<Box<dyn UserRecord>> {
+    fn product_state(&self, product: ProductId, key: &str) -> Option<Box<dyn UserRecord>> {
+        let kind = crate::products::user_record_kind(product)?;
         Some(Box::new(MemoryRecord {
-            key: format!("navwarn/{}", user_file_name(user)),
+            key: (kind.memory_key)(key),
             records: Arc::clone(&self.records),
         }))
     }
-    fn cancellation_history(&self) -> Option<Box<dyn UserRecord>> {
-        Some(Box::new(MemoryRecord {
-            key: MEMORY_HISTORY_KEY.into(),
-            records: Arc::clone(&self.records),
-        }))
-    }
-    fn cancellation_history_path(&self) -> Option<PathBuf> {
+    fn product_state_path(&self, _product: ProductId, _key: &str) -> Option<PathBuf> {
         None
     }
 }
@@ -829,13 +728,18 @@ mod tests {
         assert!(cache.read(&root.join("b")).is_err());
         assert_eq!(cache.read(&root.join("a")).unwrap(), b"123");
 
-        let user = MemoryUserStore::default();
-        let record = user.navwarn_state("a b").unwrap();
-        assert_eq!(record.read(10).unwrap(), None);
-        record.write(b"state").unwrap();
-        assert_eq!(record.read(10).unwrap().unwrap(), b"state");
-        assert_eq!(user.get("navwarn/a_b").unwrap(), b"state");
-        assert!(user.cancellation_history_path().is_none());
+        #[cfg(feature = "s124")]
+        {
+            let user = MemoryUserStore::default();
+            let record = ferrite_s124::user_state::user_record(&user, "a b").unwrap();
+            assert_eq!(record.read(10).unwrap(), None);
+            record.write(b"state").unwrap();
+            assert_eq!(record.read(10).unwrap().unwrap(), b"state");
+            assert_eq!(user.get("navwarn/a_b").unwrap(), b"state");
+            assert!(user
+                .product_state_path(ferrite_s124::PRODUCT, "a b")
+                .is_none());
+        }
     }
 
     #[test]
@@ -853,6 +757,7 @@ mod tests {
     /// corrupted entry is still rejected. Host-checked entries
     /// (`write_verified`) start checked; stores without memory (the default
     /// `read_entry`) check every read.
+    #[cfg(feature = "s101")]
     #[test]
     fn memory_store_remembers_integrity_checks_per_write() {
         use ferrite_render::PointInstruction;
@@ -917,6 +822,7 @@ mod tests {
         assert!(read_and_deserialize_cache(&NoCacheStore, path).is_err());
     }
 
+    #[cfg(feature = "s101")]
     #[test]
     fn history_store_in_a_memory_user_store_round_trips_and_refuses_corruption() {
         use ferrite_s101::layer::publication::{
@@ -929,13 +835,19 @@ mod tests {
             cancellation_update: 3,
             issue_date: chrono::NaiveDate::from_ymd_opt(2024, 10, 17).unwrap(),
         };
-        let mut store = HistoryStore::begin_record(user.cancellation_history().unwrap()).unwrap();
+        let mut store = HistoryStore::begin_record(
+            ferrite_s101::layer::publication::history_record(&user).unwrap(),
+        )
+        .unwrap();
         assert!(store.history.is_empty());
         store.persist(vec![record.clone()]).unwrap();
         drop(store);
-        let reopened =
-            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
-                .unwrap();
+        let reopened = CancellationHistory::read_record(
+            ferrite_s101::layer::publication::history_record(&user)
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
         assert_eq!(reopened.get(&record.key), Some(&record));
         // Same document bytes as the native file.
         let folder = tempfile::tempdir().unwrap();
@@ -948,14 +860,19 @@ mod tests {
             user.get(MEMORY_HISTORY_KEY).unwrap(),
             std::fs::read(&path).unwrap()
         );
-        user.cancellation_history()
+        ferrite_s101::layer::publication::history_record(&user)
             .unwrap()
             .write(b"truncated")
             .unwrap();
-        assert!(
-            CancellationHistory::read_record(user.cancellation_history().unwrap().as_ref())
-                .is_err()
-        );
-        assert!(HistoryStore::begin_record(user.cancellation_history().unwrap()).is_err());
+        assert!(CancellationHistory::read_record(
+            ferrite_s101::layer::publication::history_record(&user)
+                .unwrap()
+                .as_ref()
+        )
+        .is_err());
+        assert!(HistoryStore::begin_record(
+            ferrite_s101::layer::publication::history_record(&user).unwrap()
+        )
+        .is_err());
     }
 }

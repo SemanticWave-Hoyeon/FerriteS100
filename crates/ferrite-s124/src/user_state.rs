@@ -6,11 +6,39 @@
 use crate::navwarn::{NavwarnUserState, UserClassification};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ferrite_product_api::platform::UserRecord;
+use ferrite_product_api::platform::{
+    user_file_name, FileRecord, RecordKind, UserRecord, UserStore,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Prefix of the temporary file a native record is written through.
 pub const RECORD_TEMPORARY_PREFIX: &str = ".navwarn-state";
+
+/// How the S-124 records are kept (key: the OS user name): natively
+/// `FerriteS100/navwarn/<user>.json` through a [`FileRecord`], in memory
+/// under `navwarn/<user>`.
+pub const USER_RECORDS: RecordKind = RecordKind {
+    product: crate::PRODUCT,
+    native_record: |path| {
+        Box::new(FileRecord {
+            path,
+            temporary_prefix: RECORD_TEMPORARY_PREFIX,
+        })
+    },
+    standard_path: |data_dir, user| {
+        Some(
+            data_dir?
+                .join("FerriteS100/navwarn")
+                .join(format!("{}.json", user_file_name(user))),
+        )
+    },
+    memory_key: |user| format!("navwarn/{}", user_file_name(user)),
+};
+
+/// The S-124 record of OS user `user` in `store` (None: not persisted).
+pub fn user_record(store: &dyn UserStore, user: &str) -> Option<Box<dyn UserRecord>> {
+    store.product_state(crate::PRODUCT, user)
+}
 
 const USER_STATE_VERSION: u8 = 1;
 const MAX_USER_STATE_BYTES: u64 = 4 * 1024 * 1024;

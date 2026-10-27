@@ -13,3 +13,6 @@ pub mod virtual_features;
 
 pub use overlay::S129Overlay;
 pub use rules::{S129Rules, S129};
+
+/// The S-129 product identifier.
+pub const PRODUCT: ferrite_product_api::ProductId = ferrite_product_api::ProductId("S-129");

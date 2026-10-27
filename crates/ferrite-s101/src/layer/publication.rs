@@ -4,7 +4,7 @@ use crate::layer::{
     load::ChartLoadResult, source_identity::LoadedSourceIdentities, update_plan as s101_update_plan,
 };
 use anyhow::{ensure, Result};
-use ferrite_product_api::platform::{RecordLock, UserRecord};
+use ferrite_product_api::platform::{RecordKind, RecordLock, UserRecord, UserStore};
 use ferrite_s100_core::{CellSourceIdentity, S101Cell};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -257,6 +257,39 @@ impl CancellationHistory {
     pub fn records(&self) -> impl Iterator<Item = &CancellationRecord> {
         self.by_dataset.values()
     }
+}
+
+/// Key of the cancellation history among the S-101 user records.
+pub const HISTORY_KEY: &str = "cancellations";
+/// Key of the cancellation history in an in-memory user store.
+pub const MEMORY_HISTORY_KEY: &str = "s101-cancellations";
+
+/// How the S-101 records are kept: the cancellation history natively in
+/// `FerriteS100/s101-cancellations.json` ([`HistoryFile`]), in memory under
+/// [`MEMORY_HISTORY_KEY`].
+pub const USER_RECORDS: RecordKind = RecordKind {
+    product: crate::layer::PRODUCT,
+    native_record: |path| Box::new(HistoryFile::new(path)),
+    standard_path: |data_dir, _| {
+        Some(
+            data_dir
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("FerriteS100/s101-cancellations.json"),
+        )
+    },
+    memory_key: |_| MEMORY_HISTORY_KEY.into(),
+};
+
+/// The transactional cancellation history record of `store` ([`HistoryStore`]);
+/// None: cancellations are not supported by this host.
+pub fn history_record(store: &dyn UserStore) -> Option<Box<dyn UserRecord>> {
+    store.product_state(crate::layer::PRODUCT, HISTORY_KEY)
+}
+
+/// Native location of the cancellation history file of `store`, for hosts
+/// that address it directly (the viewer); None for stores without files.
+pub fn history_path(store: &dyn UserStore) -> Option<PathBuf> {
+    store.product_state_path(crate::layer::PRODUCT, HISTORY_KEY)
 }
 
 /// The native cancellation history file: replaced atomically through a

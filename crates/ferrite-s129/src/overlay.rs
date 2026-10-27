@@ -3,7 +3,7 @@
 //! catalogue errata the "Correct known PC errata" option corrects.
 use crate::rules::S129;
 use ferrite_product_api::{
-    Encoding, PanelDescriptor, ProductAdapter, ProductId, ProductInfo, Recognised, SceneRole,
+    Encoding, PanelDescriptor, ProductAdapter, ProductInfo, Recognised, SceneRole,
 };
 use ferrite_s100_gml::portrayal::{CatalogueInfo, ConvertOptions, InputOptions};
 use ferrite_s100_gml::product::{GmlOverlayProduct, GmlRules, PortrayalSettings};
@@ -33,7 +33,7 @@ impl Default for S129Overlay {
 impl ProductAdapter for S129Overlay {
     fn info(&self) -> ProductInfo {
         ProductInfo {
-            id: ProductId("S-129"),
+            id: crate::PRODUCT,
             title: "Under Keel Clearance Management",
             encoding: Encoding::Gml,
             role: SceneRole::Overlay,
@@ -43,10 +43,7 @@ impl ProductAdapter for S129Overlay {
         ferrite_s100_gml::overlay::sniff(name, head, &[Product::S129]).map(|_| Recognised::Dataset)
     }
     fn panels(&self) -> &'static [PanelDescriptor] {
-        &[PanelDescriptor {
-            id: "S-129/plans",
-            title: "Under keel clearance plans",
-        }]
+        std::slice::from_ref(&crate::panel::PANEL)
     }
     fn as_any(&self) -> &dyn Any {
         self

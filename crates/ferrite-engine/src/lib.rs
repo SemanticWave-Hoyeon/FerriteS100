@@ -26,34 +26,28 @@
 //!
 //! Product modularization (`docs/ENGINE_DESIGN.md`, "제품 모듈화") moves each
 //! product into its own crate behind the common interface of
-//! `ferrite-product-api`. The GML products S-124 (`ferrite-s124`) and S-129
-//! (`ferrite-s129`) are registered in [`products`] behind the features `s124`
-//! and `s129` (on by default); the overlay layer ([`gml_overlay`]) is
-//! product-agnostic. S-102 is the product layer `ferrite_s102::layer`
-//! (input policies, opened files, raster portrayal), held as
-//! [`EngineState::s102`] with `s102-pure` and called through [`s102_host`];
-//! its raster tiles reach renderers as a renderer extension of the
-//! prepared scene. S-421 is the product layer `ferrite_s421::layer` behind
-//! the feature `s421` (on by default): route discovery and capture
-//! ([`dataset_open_plan`], [`ChartEngine`]) and the route store of
-//! [`ChartEngine`] go through it ([`products`]). S-101 is the product layer
-//! `ferrite_s101::layer` (update planning, lifecycle and exchange-set
-//! checks, catalogue selection, publication, caches and cell portrayal),
-//! held as [`EngineState::s101`]; the engine composes interoperability and
-//! the published scene around it. The stage descriptions above name the
-//! modules where they were before the move.
+//! `ferrite-product-api`. The engine is product-agnostic: [`products`] (the
+//! only module naming products) registers the product crates built into
+//! this engine (features `s101`, `s124`, `s129`, `s421`, `s102-pure`; all on
+//! by default) as layers of [`EngineState::layers`] ([`ProductLayers`]).
+//! [`ChartEngine`] opens datasets through the layers' open-job stages (their
+//! adapters recognise the inputs), installs and reports through the layer
+//! interface and composes the scene by scene role: the base chart (S-101
+//! cells with residency, caches and interoperability), the overlay layers'
+//! instructions ([`gml_overlay`], S-124/S-129) and the grid layers'
+//! renderer extensions (S-102 raster tiles). S-421 routes are held but not
+//! portrayed by the engine. The stage descriptions above name the modules
+//! where they were before the moves.
 
 pub mod catalogue;
 pub mod chart_engine;
 pub mod dataset_discovery;
-pub mod dataset_open_plan;
-pub mod dataset_pick_fields;
 pub mod dataset_signature_policy;
 pub mod gml_overlay;
+pub mod layers;
 pub mod pick;
 pub mod platform;
 pub mod products;
-pub mod s102_host;
 pub mod scene;
 pub mod secure_instruction_cache;
 
@@ -61,5 +55,10 @@ mod state;
 pub use chart_engine::{
     Camera, ChartEngine, DatasetSource, EngineConfig, SignaturePolicy, View, Zoom,
 };
-pub use ferrite_s101::layer::{CellHydrationSource, ChartLoadResult, PortrayalSource};
-pub use state::{CellHydration, CellScene, ChangeCellScene, EngineState, ViewportPixels};
+pub use ferrite_product_api::PortrayalSource;
+#[cfg(feature = "s101")]
+pub use ferrite_s101::layer::{CellHydrationSource, ChartLoadResult};
+pub use layers::ProductLayers;
+#[cfg(feature = "s101")]
+pub use state::{CellHydration, CellScene, ChangeCellScene};
+pub use state::{EngineState, ViewportPixels};

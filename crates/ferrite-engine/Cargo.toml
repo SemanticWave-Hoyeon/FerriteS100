@@ -6,17 +6,17 @@ license.workspace = true
 description = "S-100 chart engine: dataset discovery, opening, signatures, update chains, caches and product adapters, independent of windowing, GUI and GPU"
 
 [features]
-default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s124", "s129", "s421"]
+default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s101", "s124", "s129", "s421"]
 # Threads and rayon: parallel cell loading, Lua portrayal workers, cache
 # coding, suppression and coverage projection. Off: everything runs on the
 # calling thread (sequential executor) with identical results.
-parallel = ["ferrite-kernel/parallel", "ferrite-render/parallel", "ferrite-s101/parallel", "ferrite-portrayal-catalog/parallel"]
+parallel = ["ferrite-kernel/parallel", "ferrite-render/parallel", "ferrite-s101?/parallel", "ferrite-portrayal-catalog/parallel"]
 # mlua S-101 portrayal (needs lua54 or lua55, which select the interpreter).
 # Off: S-101 cells are portrayed from precomputed per-cell instruction
 # payloads in the cache store (`PortrayalSource::Precomputed`).
-lua-native = ["ferrite-lua/native", "ferrite-s101/lua-native", "ferrite-s102?/lua-native"]
-lua54 = ["lua-native", "ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102?/lua54"]
-lua55 = ["lua-native", "ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102?/lua55"]
+lua-native = ["ferrite-lua/native", "ferrite-s101?/lua-native", "ferrite-s102?/lua-native"]
+lua54 = ["lua-native", "ferrite-lua/lua54", "ferrite-s101?/lua54", "ferrite-s102?/lua54"]
+lua55 = ["lua-native", "ferrite-lua/lua55", "ferrite-s101?/lua55", "ferrite-s102?/lua55"]
 # S-102 bathymetry with the pure-Rust HDF5 reader only (no C library;
 # builds for wasm32). Without lua-native the PC rule's instructions come
 # from the cache store (precomputed). Off (with s102-hdf5): S-102 inputs
@@ -33,13 +33,18 @@ crypto-rust = ["ferrite-security/crypto-rust"]
 # Product modules (docs/ENGINE_DESIGN.md, "제품 모듈화"). Off: the product's
 # datasets are not recognised (not discovered, sniffed or opened) and its
 # catalogues are not loaded.
-s124 = ["dep:ferrite-s124"]
-s129 = ["dep:ferrite-s129"]
+# S-101 ENC base chart (ferrite-s101 product layer): the bound catalogue pair
+# ChartEngine requires, cell opening and portrayal, coverage clipping.
+s101 = ["dep:ferrite-s101"]
+# The GML products' overlay portrayal shares the Part 9a instruction
+# conversion of the ferrite-s101 crate (linked, not registered).
+s124 = ["dep:ferrite-s124", "dep:ferrite-s101"]
+s129 = ["dep:ferrite-s129", "dep:ferrite-s101"]
 # S-421 routes (ferrite-s421 product layer): discovery, capture and the
 # route store of ChartEngine.
 s421 = ["dep:ferrite-s421"]
 # Test-only helpers used by the application's own tests.
-test-support = ["ferrite-s101/test-support"]
+test-support = ["ferrite-s101?/test-support"]
 
 [dependencies]
 anyhow.workspace = true
@@ -64,7 +69,7 @@ ferrite-product-api = { path = "../ferrite-product-api" }
 ferrite-render.workspace = true
 ferrite-s100-core.workspace = true
 ferrite-s100-gml = { path = "../ferrite-s100-gml" }
-ferrite-s101.workspace = true
+ferrite-s101 = { workspace = true, optional = true }
 ferrite-s102 = { workspace = true, optional = true }
 ferrite-s124 = { path = "../ferrite-s124", optional = true }
 ferrite-s129 = { path = "../ferrite-s129", optional = true }

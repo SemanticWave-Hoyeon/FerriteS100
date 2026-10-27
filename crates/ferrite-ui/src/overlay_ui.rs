@@ -1,79 +1,159 @@
-//! Windows for overlay products shown over the ENC: the S-124 navigational
-//! warning list (S-124 2.0.0 clause 11.1.1) and the S-129 under keel clearance
-//! plan panel. The product modules define the panels' data models
-//! (`ferrite_s124::panel`, `ferrite_s129::panel`) and the host publishes them
-//! from the registered products; this module only draws the rows it is given
-//! and records requests, which the host consumes on the next frame.
+//! Windows of the GML overlay products shown over the ENC: the S-124
+//! navigational warning list (S-124 2.0.0 clause 11.1.1) and the S-129
+//! under keel clearance plan panel, registered in the panel registry
+//! ([`crate::panels`]) by the UI features `s124` and `s129`. The product
+//! modules define the panels' data models (`ferrite_s124::panel`,
+//! `ferrite_s129::panel`) and the host publishes them from the registered
+//! products; this module only draws the rows it is given and records
+//! requests, which the host consumes on the next frame.
+use crate::panels::PanelRegistry;
+#[cfg(any(feature = "s124", feature = "s129"))]
+use crate::panels::{ProductPanel, SharedPanelState};
+#[cfg(feature = "s124")]
 use crate::ui_chrome::Theme;
+#[cfg(any(feature = "s124", feature = "s129"))]
+use ferrite_product_api::PanelDescriptor;
+#[cfg(any(feature = "s124", feature = "s129"))]
+use std::any::Any;
 
 // The panels' data models belong to the product modules.
+#[cfg(feature = "s124")]
 pub use ferrite_s124::panel::{NavwarnClassification, NavwarnPartRow, NavwarnRow, NavwarnSort};
+#[cfg(feature = "s129")]
 pub use ferrite_s129::panel::{ControlPointRow, UkcPlanRow};
 
+/// The overlay windows' state: the product panel registry.
+pub type State = PanelRegistry;
+
+/// The S-124 warning list panel (`S-124/warnings`).
+#[cfg(feature = "s124")]
 #[derive(Debug, Clone, Default)]
-pub struct State {
-    pub navwarn_open: bool,
-    pub ukc_open: bool,
+pub struct NavwarnPanel {
+    pub open: bool,
     pub messages: Vec<NavwarnRow>,
     /// In-force bulletin missing-message indications (9.2.2).
     pub missing: Vec<String>,
     pub sort: NavwarnSort,
     pub new_count: usize,
-    pub plans: Vec<UkcPlanRow>,
-    /// S-129 context parameter PlainBoundaries.
-    pub plain_boundaries: bool,
-    /// Apply the S-129 feature attribute scaleMinimum.
-    pub apply_scale_minimum: bool,
     /// Show S-124 parts before their fixedDateRange starts.
     pub show_before_range: bool,
     /// Show messages classified as Information on the chart.
     pub show_information: bool,
-    /// "Correct known PC errata" (shared by the S-124 and S-129 windows);
-    /// off applies the portrayal catalogues literally per S-100 Part 9.
-    pub correct_pc_errata: bool,
     /// The OS user the classifications and indications belong to, and
     /// whether they are saved (11.1.1).
     pub user_status: String,
     /// Instant the lifecycle was evaluated at (viewing time or clock).
     pub lifecycle_time: String,
-    // Requests from the windows, consumed by the host.
+    // Requests from the window, consumed by the host.
     pub sort_changed: bool,
     pub classify: Option<(u32, NavwarnClassification)>,
     /// Select and zoom to a message (dataset) or one of its parts.
     pub select: Option<(u32, Option<String>)>,
-    pub options_changed: bool,
-    pub select_plan: Option<u32>,
 }
 
-impl State {
+/// Requests of the S-124 window, consumed by the host.
+#[cfg(feature = "s124")]
+#[derive(Debug, Clone, Default)]
+pub struct NavwarnRequests {
+    pub sort_changed: bool,
+    pub classify: Option<(u32, NavwarnClassification)>,
+    pub select: Option<(u32, Option<String>)>,
+}
+
+#[cfg(feature = "s124")]
+impl NavwarnPanel {
     /// Mark every request consumed (host side).
-    pub fn take_requests(&mut self) -> Requests {
-        Requests {
+    pub fn take_requests(&mut self) -> NavwarnRequests {
+        NavwarnRequests {
             sort_changed: std::mem::take(&mut self.sort_changed),
             classify: self.classify.take(),
             select: self.select.take(),
-            options_changed: std::mem::take(&mut self.options_changed),
-            select_plan: self.select_plan.take(),
         }
     }
 }
 
+#[cfg(feature = "s124")]
+impl ProductPanel for NavwarnPanel {
+    fn descriptor(&self) -> PanelDescriptor {
+        ferrite_s124::panel::PANEL
+    }
+    fn is_open(&self) -> bool {
+        self.open
+    }
+    fn set_open(&mut self, open: bool) {
+        self.open = open;
+    }
+    fn menu_label(&self) -> String {
+        if self.new_count > 0 {
+            format!("S-124 Navigational Warnings ({} new)", self.new_count)
+        } else {
+            "S-124 Navigational Warnings".to_owned()
+        }
+    }
+    fn draw(&mut self, ctx: &egui::Context, shared: &mut SharedPanelState) {
+        draw_navwarn(ctx, self, shared);
+    }
+    fn clone_box(&self) -> Box<dyn ProductPanel> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// The S-129 plan panel (`S-129/plans`).
+#[cfg(feature = "s129")]
 #[derive(Debug, Clone, Default)]
-pub struct Requests {
-    pub sort_changed: bool,
-    pub classify: Option<(u32, NavwarnClassification)>,
-    pub select: Option<(u32, Option<String>)>,
-    pub options_changed: bool,
+pub struct UkcPanel {
+    pub open: bool,
+    pub plans: Vec<UkcPlanRow>,
+    /// S-129 context parameter PlainBoundaries.
+    pub plain_boundaries: bool,
+    /// Apply the S-129 feature attribute scaleMinimum.
+    pub apply_scale_minimum: bool,
+    /// Request from the window: zoom to a plan (dataset).
     pub select_plan: Option<u32>,
 }
 
-pub fn draw(ctx: &egui::Context, state: &mut State) {
-    draw_navwarn(ctx, state);
-    draw_ukc(ctx, state);
+#[cfg(feature = "s129")]
+impl ProductPanel for UkcPanel {
+    fn descriptor(&self) -> PanelDescriptor {
+        ferrite_s129::panel::PANEL
+    }
+    fn is_open(&self) -> bool {
+        self.open
+    }
+    fn set_open(&mut self, open: bool) {
+        self.open = open;
+    }
+    fn menu_label(&self) -> String {
+        "S-129 Under Keel Clearance".to_owned()
+    }
+    fn draw(&mut self, ctx: &egui::Context, shared: &mut SharedPanelState) {
+        draw_ukc(ctx, self, shared);
+    }
+    fn clone_box(&self) -> Box<dyn ProductPanel> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
-fn draw_navwarn(ctx: &egui::Context, state: &mut State) {
-    if !state.navwarn_open {
+/// Draw every open panel of the registry.
+pub fn draw(ctx: &egui::Context, state: &mut State) {
+    state.draw(ctx);
+}
+
+#[cfg(feature = "s124")]
+fn draw_navwarn(ctx: &egui::Context, state: &mut NavwarnPanel, shared: &mut SharedPanelState) {
+    if !state.open {
         return;
     }
     let theme = Theme::current(ctx);
@@ -114,15 +194,15 @@ fn draw_navwarn(ctx: &egui::Context, state: &mut State) {
                     )
                     .changed()
                 {
-                    state.options_changed = true;
+                    shared.options_changed = true;
                 }
                 if ui
                     .checkbox(&mut state.show_information, "Show Information on chart")
                     .changed()
                 {
-                    state.options_changed = true;
+                    shared.options_changed = true;
                 }
-                errata_checkbox(ui, state);
+                errata_checkbox(ui, shared);
             });
             if !state.user_status.is_empty() || !state.lifecycle_time.is_empty() {
                 ui.horizontal_wrapped(|ui| {
@@ -149,24 +229,10 @@ fn draw_navwarn(ctx: &egui::Context, state: &mut State) {
                     }
                 });
         });
-    state.navwarn_open = open;
+    state.open = open;
 }
 
-/// The shared "Correct known PC errata" option.
-fn errata_checkbox(ui: &mut egui::Ui, state: &mut State) {
-    if ui
-        .checkbox(&mut state.correct_pc_errata, "Correct known PC errata")
-        .on_hover_text(
-            "Off (default): the IHO portrayal catalogues are applied literally (S-100 Part 9).\n\
-             On: S-129 information box text with transparency 1 is drawn opaque, and S-124 \
-             instructions in viewing groups the catalogue does not declare are drawn.",
-        )
-        .changed()
-    {
-        state.options_changed = true;
-    }
-}
-
+#[cfg(feature = "s124")]
 fn draw_message(
     ui: &mut egui::Ui,
     row: &NavwarnRow,
@@ -256,8 +322,25 @@ fn draw_message(
     ui.separator();
 }
 
-fn draw_ukc(ctx: &egui::Context, state: &mut State) {
-    if !state.ukc_open {
+/// The shared "Correct known PC errata" option.
+#[cfg(any(feature = "s124", feature = "s129"))]
+fn errata_checkbox(ui: &mut egui::Ui, shared: &mut SharedPanelState) {
+    if ui
+        .checkbox(&mut shared.correct_pc_errata, "Correct known PC errata")
+        .on_hover_text(
+            "Off (default): the IHO portrayal catalogues are applied literally (S-100 Part 9).\n\
+             On: S-129 information box text with transparency 1 is drawn opaque, and S-124 \
+             instructions in viewing groups the catalogue does not declare are drawn.",
+        )
+        .changed()
+    {
+        shared.options_changed = true;
+    }
+}
+
+#[cfg(feature = "s129")]
+fn draw_ukc(ctx: &egui::Context, state: &mut UkcPanel, shared: &mut SharedPanelState) {
+    if !state.open {
         return;
     }
     let mut open = true;
@@ -274,7 +357,7 @@ fn draw_ukc(ctx: &egui::Context, state: &mut State) {
                     .on_hover_text("S-129 context parameter PlainBoundaries")
                     .changed()
                 {
-                    state.options_changed = true;
+                    shared.options_changed = true;
                 }
                 if ui
                     .checkbox(&mut state.apply_scale_minimum, "Apply scaleMinimum")
@@ -283,9 +366,9 @@ fn draw_ukc(ctx: &egui::Context, state: &mut State) {
                     )
                     .changed()
                 {
-                    state.options_changed = true;
+                    shared.options_changed = true;
                 }
-                errata_checkbox(ui, state);
+                errata_checkbox(ui, shared);
             });
             ui.separator();
             if state.plans.is_empty() {
@@ -351,19 +434,19 @@ fn draw_ukc(ctx: &egui::Context, state: &mut State) {
                     }
                 });
         });
-    state.ukc_open = open;
+    state.open = open;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "s124", feature = "s129"))]
 mod tests {
     use super::*;
 
     #[test]
     fn windows_draw_rows_without_raising_requests() {
         let ctx = egui::Context::default();
-        let mut state = State {
-            navwarn_open: true,
-            ukc_open: true,
+        let mut state = State::default();
+        *state.get_mut::<NavwarnPanel>().unwrap() = NavwarnPanel {
+            open: true,
             messages: vec![
                 NavwarnRow {
                     dataset: 1,
@@ -389,6 +472,10 @@ mod tests {
             ],
             missing: vec!["In-force bulletin lists warnings not held: WZ 41/26".into()],
             new_count: 1,
+            ..Default::default()
+        };
+        *state.get_mut::<UkcPanel>().unwrap() = UkcPanel {
+            open: true,
             plans: vec![UkcPlanRow {
                 dataset: 3,
                 name: "Torres Strait".into(),
@@ -407,9 +494,11 @@ mod tests {
         for _ in 0..2 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| draw(ctx, &mut state));
         }
-        assert!(state.navwarn_open && state.ukc_open);
-        let requests = state.take_requests();
-        assert!(requests.classify.is_none() && requests.select.is_none());
-        assert!(!requests.sort_changed && !requests.options_changed);
+        assert!(state.iter().all(|panel| panel.is_open()));
+        let navwarn = state.get_mut::<NavwarnPanel>().unwrap().take_requests();
+        assert!(navwarn.classify.is_none() && navwarn.select.is_none());
+        assert!(!navwarn.sort_changed);
+        assert!(state.get_mut::<UkcPanel>().unwrap().select_plan.is_none());
+        assert!(!state.take_options_changed());
     }
 }

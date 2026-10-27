@@ -24,7 +24,7 @@ use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext};
 use ferrite_s100_gml::{Product, Severity};
 use ferrite_s124::S124Overlay;
 use ferrite_s129::S129Overlay;
-use ferrite_ui::overlay_ui::{NavwarnRow, UkcPlanRow};
+use ferrite_ui::overlay_ui::{NavwarnPanel, NavwarnRequests, NavwarnRow, UkcPanel, UkcPlanRow};
 use std::path::{Path, PathBuf};
 
 pub(crate) use ferrite_engine::gml_overlay::{
@@ -325,34 +325,51 @@ impl ChartApp {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        let requests = renderer.ui.ui_state.overlays.take_requests();
+        let panels = &mut renderer.ui.ui_state.panels;
+        let options_changed = panels.take_options_changed();
+        let correct_pc_errata = panels.shared.correct_pc_errata;
+        let navwarn = panels.get_mut::<NavwarnPanel>();
+        let (requests, navwarn_options) = match navwarn {
+            Some(panel) => (
+                panel.take_requests(),
+                Some((
+                    panel.show_before_range,
+                    panel.show_information,
+                    panel.sort.into(),
+                )),
+            ),
+            None => (NavwarnRequests::default(), None),
+        };
+        let ukc = panels.get_mut::<UkcPanel>();
+        let ukc_options = ukc
+            .as_ref()
+            .map(|panel| (panel.plain_boundaries, panel.apply_scale_minimum));
+        let select_plan = ukc.and_then(|panel| panel.select_plan.take());
         let visibility = renderer.ui.ui_state.overlay_visibility_requested.take();
-        let ui = &renderer.ui.ui_state.overlays;
-        let options = (
-            ui.plain_boundaries,
-            ui.apply_scale_minimum,
-            ui.show_before_range,
-            ui.show_information,
-            ui.correct_pc_errata,
-        );
-        let sort = ui.sort.into();
         let mut changed = false;
-        if requests.options_changed {
+        if options_changed {
             let g = &mut self.gml_overlays;
-            if let Some((s129, _)) = g.product_mut::<S129Overlay>() {
-                s129.plain_boundaries = options.0;
-                s129.apply_scale_minimum = options.1;
+            if let (Some((s129, _)), Some((plain_boundaries, apply_scale_minimum))) =
+                (g.product_mut::<S129Overlay>(), ukc_options)
+            {
+                s129.plain_boundaries = plain_boundaries;
+                s129.apply_scale_minimum = apply_scale_minimum;
             }
-            if let Some((s124, _)) = g.product_mut::<S124Overlay>() {
-                s124.policy.show_before_fixed_date_range = options.2;
-                s124.policy.show_information = options.3;
+            if let (Some((s124, _)), Some((show_before_range, show_information, _))) =
+                (g.product_mut::<S124Overlay>(), navwarn_options)
+            {
+                s124.policy.show_before_fixed_date_range = show_before_range;
+                s124.policy.show_information = show_information;
             }
-            g.set_correct_pc_errata(options.4);
+            g.set_correct_pc_errata(correct_pc_errata);
             g.invalidate();
             changed = true;
         }
         if requests.sort_changed {
-            if let Some((s124, _)) = self.gml_overlays.product_mut::<S124Overlay>() {
+            if let (Some((s124, _)), Some((_, _, sort))) = (
+                self.gml_overlays.product_mut::<S124Overlay>(),
+                navwarn_options,
+            ) {
                 s124.sort = sort;
             }
             self.gml_overlays.ui_revision = 0;
@@ -376,7 +393,7 @@ impl ChartApp {
         if let Some((id, part)) = requests.select {
             self.select_overlay_message(id, part);
         }
-        if let Some(id) = requests.select_plan {
+        if let Some(id) = select_plan {
             if let Some(b) = self.gml_overlays.dataset(id).and_then(|d| d.bounds(None)) {
                 self.focus_geo_bounds(b);
             }
@@ -425,22 +442,26 @@ impl ChartApp {
             .map(|d| d.id)
             .collect();
         if let Some(renderer) = &mut self.renderer {
-            let ui = &mut renderer.ui.ui_state.overlays;
-            ui.messages = messages;
-            ui.missing = missing;
-            ui.new_count = new_count;
-            ui.plans = plans;
-            if let Some(s129) = s129 {
-                ui.plain_boundaries = s129.plain_boundaries;
-                ui.apply_scale_minimum = s129.apply_scale_minimum;
+            let panels = &mut renderer.ui.ui_state.panels;
+            panels.shared.correct_pc_errata = g.correct_pc_errata();
+            if let Some(ui) = panels.get_mut::<NavwarnPanel>() {
+                ui.messages = messages;
+                ui.missing = missing;
+                ui.new_count = new_count;
+                if let Some(s124) = s124 {
+                    ui.show_before_range = s124.policy.show_before_fixed_date_range;
+                    ui.show_information = s124.policy.show_information;
+                    ui.user_status = s124.user_status();
+                }
+                ui.lifecycle_time = lifecycle_time;
             }
-            ui.correct_pc_errata = g.correct_pc_errata();
-            if let Some(s124) = s124 {
-                ui.show_before_range = s124.policy.show_before_fixed_date_range;
-                ui.show_information = s124.policy.show_information;
-                ui.user_status = s124.user_status();
+            if let Some(ui) = panels.get_mut::<UkcPanel>() {
+                ui.plans = plans;
+                if let Some(s129) = s129 {
+                    ui.plain_boundaries = s129.plain_boundaries;
+                    ui.apply_scale_minimum = s129.apply_scale_minimum;
+                }
             }
-            ui.lifecycle_time = lifecycle_time;
             renderer.ui.ui_state.overlay_hidden = hidden;
         }
     }

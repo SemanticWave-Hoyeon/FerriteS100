@@ -22,7 +22,7 @@ pub fn resolve(
     };
     CataloguePickFields {
         definition: feature.definition.clone(),
-        attributes: ferrite_s101::pick_report_attributes(catalogue, feature_code, attributes),
+        attributes: crate::pick_report_attributes(catalogue, feature_code, attributes),
         resolved: true,
     }
 }

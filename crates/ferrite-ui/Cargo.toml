@@ -5,6 +5,12 @@ edition.workspace = true
 description = "egui panels and compositing for the S-100 chart renderer"
 
 [features]
+# Product panels and readers (docs/ENGINE_DESIGN.md, "제품 모듈화"): S-124
+# warning list, S-129 plan window, S-421 route editing resources.
+default = ["s124", "s129", "s421"]
+s124 = ["dep:ferrite-s124"]
+s129 = ["dep:ferrite-s129"]
+s421 = ["dep:ferrite-s421"]
 s102-portrayal = ["ferrite-gpu/s102-portrayal"]
 lua54 = ["ferrite-gpu/lua54"]
 lua55 = ["ferrite-gpu/lua55"]
@@ -13,9 +19,9 @@ lua55 = ["ferrite-gpu/lua55"]
 ferrite-gpu.workspace = true
 ferrite-render = { workspace = true, features = ["parallel"] }
 ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
-ferrite-s124 = { path = "../ferrite-s124" }
-ferrite-s129 = { path = "../ferrite-s129" }
-ferrite-s421 = { path = "../ferrite-s421" }
+ferrite-s124 = { path = "../ferrite-s124", optional = true }
+ferrite-s129 = { path = "../ferrite-s129", optional = true }
+ferrite-s421 = { path = "../ferrite-s421", optional = true }
 ferrite-product-api = { path = "../ferrite-product-api" }
 tracing.workspace = true
 serde_json.workspace = true

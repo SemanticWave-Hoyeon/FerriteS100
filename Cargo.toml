@@ -135,7 +135,7 @@ lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferri
 lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-gpu/lua55", "ferrite-ui/lua55", "ferrite-engine/lua55"]
 
 [dependencies]
-ferrite-engine = { workspace = true, features = ["parallel", "s102-hdf5", "crypto-openssl", "s124", "s129", "s421"] }
+ferrite-engine = { workspace = true, features = ["parallel", "s102-hdf5", "crypto-openssl", "s101", "s124", "s129", "s421"] }
 quick-xml.workspace = true
 roxmltree = "=0.20.0"
 chrono.workspace = true

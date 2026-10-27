@@ -33,7 +33,9 @@ use std::any::Any;
 use std::path::Path;
 use std::sync::Arc;
 
+pub mod open;
 pub mod platform;
+pub mod report;
 pub mod route_overlay;
 
 pub use ferrite_render::host_settings::CatalogueStatus;
@@ -160,11 +162,41 @@ impl Provenance {
 }
 
 /// A dataset handed to a layer: the name it is known by, its bytes (the
-/// authenticated snapshot when signatures are verified) and its provenance.
+/// authenticated snapshot when signatures are verified), further members
+/// of the same dataset (S-101 updates of a base cell, in order), its
+/// provenance and the signature policy it was opened under.
 pub struct DatasetInput<'a> {
     pub name: &'a Path,
     pub bytes: &'a [u8],
+    /// Later members of the dataset (S-101 update chain), each an
+    /// authenticated snapshot like `bytes` when signatures are verified.
+    pub updates: &'a [&'a [u8]],
     pub provenance: Provenance,
+    pub signatures: open::SignaturePolicy,
+}
+
+impl<'a> DatasetInput<'a> {
+    /// A single unverified-policy input.
+    pub fn new(name: &'a Path, bytes: &'a [u8], provenance: Provenance) -> Self {
+        Self {
+            name,
+            bytes,
+            updates: &[],
+            provenance,
+            signatures: open::SignaturePolicy::Off,
+        }
+    }
+    /// Refuse an input that is not authenticated when the policy requires
+    /// signatures (the host verifies; layers only check the outcome).
+    pub fn check_policy(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.signatures == open::SignaturePolicy::Off
+                || self.provenance == Provenance::Authenticated,
+            "Signature verification is required: {} is not authenticated",
+            self.name.display()
+        );
+        Ok(())
+    }
 }
 
 /// Outcome of [`ProductLayer::open`].
@@ -176,8 +208,51 @@ pub enum Opened {
     AlreadyOpen,
 }
 
+/// Where rule-based products take their drawing instructions from (S-101
+/// cells, the S-102 PC rule): a host setting carried by
+/// [`HostServices::source`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortrayalSource {
+    /// Run the portrayal catalogue's Lua rules (built with Lua), with the
+    /// per-cell cache.
+    Lua,
+    /// Read precomputed instruction payloads from the cache store under
+    /// portable keys; a missing payload is an error. Payloads are exported
+    /// by a native build ([`HostServices::precomputed_export`]).
+    Precomputed,
+}
+
+/// S-98 interoperability offered by the host for a portrayal. The catalogue
+/// and selection types belong to `ferrite-interoperability`
+/// (`AuthenticatedCatalogue`, `Selection`); they are passed as `Any` so the
+/// interface does not depend on the signature backends.
+#[derive(Clone, Copy)]
+pub struct Interoperability<'a> {
+    /// The active catalogue (`ferrite_interoperability::AuthenticatedCatalogue`).
+    pub catalogue: &'a (dyn Any + Send + Sync),
+    /// The selection (`ferrite_interoperability::Selection`) for the
+    /// product being composed now, evaluated when the product needs it
+    /// (after its own rules).
+    pub selection: &'a dyn Fn(ProductId) -> anyhow::Result<Box<dyn Any>>,
+}
+
+/// Host services and settings a portrayal runs with.
+#[derive(Clone, Copy, Default)]
+pub struct HostServices<'a> {
+    /// Rule source of rule-based products; None: the product's default
+    /// (Lua when built with it).
+    pub source: Option<PortrayalSource>,
+    /// Also write precomputed payloads of what is portrayed with Lua to the
+    /// cache store, for hosts without Lua.
+    pub precomputed_export: bool,
+    /// The cache store; None: the layer's own (or none).
+    pub cache: Option<&'a dyn platform::CacheStore>,
+    /// Active interoperability catalogue (settings permitting).
+    pub interoperability: Option<Interoperability<'a>>,
+}
+
 /// What a layer portrays for.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct PortrayalRequest<'a> {
     /// Colour profile (palette) name.
     pub profile: &'a str,
@@ -185,6 +260,21 @@ pub struct PortrayalRequest<'a> {
     pub viewing_time: Option<chrono::DateTime<chrono::Utc>>,
     /// Display settings (contours, display mode); None: the defaults.
     pub settings: Option<&'a ferrite_render::host_settings::SettingsState>,
+    /// Host services (rule source, precomputed export, cache store,
+    /// interoperability).
+    pub host: HostServices<'a>,
+}
+
+impl<'a> PortrayalRequest<'a> {
+    /// A request for `profile` with default settings and host services.
+    pub fn new(profile: &'a str) -> Self {
+        Self {
+            profile,
+            viewing_time: None,
+            settings: None,
+            host: HostServices::default(),
+        }
+    }
 }
 
 /// Renderer-specific output expressed as data the renderer understands.
@@ -217,7 +307,12 @@ pub struct FeaturePick {
 }
 
 /// A store of opened datasets of one or more products sharing a pipeline.
-pub trait ProductLayer {
+///
+/// Beyond the single-dataset operations, a layer can take part in a host's
+/// background open job ([`ProductLayer::open_stage`], then
+/// [`ProductLayer::install`] on the owner thread) and report its datasets in
+/// the common report model ([`report`]).
+pub trait ProductLayer: Any {
     /// Products served by this layer, in registration order.
     fn products(&self) -> Vec<ProductId>;
     fn is_empty(&self) -> bool;
@@ -225,13 +320,93 @@ pub trait ProductLayer {
     fn open(&mut self, input: DatasetInput<'_>) -> anyhow::Result<Opened>;
     fn remove(&mut self, id: u32) -> bool;
     fn set_visible(&mut self, id: u32, visible: bool) -> bool;
-    /// Drawing instructions of every visible dataset; None when the layer
-    /// holds no dataset (the host then behaves as without the layer).
-    fn portray(&mut self, request: &PortrayalRequest<'_>) -> Option<SceneContribution>;
+    /// Drawing instructions and renderer extensions of every visible
+    /// dataset; Ok(None) when the layer has nothing to portray (the host
+    /// then behaves as without the layer).
+    fn portray(
+        &mut self,
+        request: &PortrayalRequest<'_>,
+    ) -> anyhow::Result<Option<SceneContribution>>;
     /// Geographic extent of the visible datasets.
     fn coverage(&self) -> Option<GeoBounds>;
     /// Report of the feature behind a drawing-instruction feature key.
     fn describe(&mut self, key: i64) -> Option<FeaturePick>;
+    /// Report of feature `key` of dataset `dataset` (layers whose drawing
+    /// instructions carry a dataset index, such as S-101 cells).
+    fn describe_in(&mut self, _dataset: u32, _key: i64) -> Option<report::FeatureReport> {
+        None
+    }
     /// Extra geometry to highlight when the feature is selected.
     fn highlight(&mut self, key: i64) -> Vec<Vec<WorldPoint>>;
+
+    /// A stage of a host open job for this layer's products, taken on the
+    /// owner thread with what the job needs of the layer (catalogues,
+    /// loaded datasets, options). None: the layer opens nothing in jobs.
+    fn open_stage(&self) -> Option<Box<dyn open::OpenStage>> {
+        None
+    }
+    /// Check a finished stage's result against the layer before anything
+    /// of the job is installed (catalogues changed meanwhile, ...).
+    fn check_opened(&self, _opened: &(dyn Any + Send)) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// First installation pass, run for every layer of the job before any
+    /// [`ProductLayer::install`]: removals the job validated (S-101
+    /// cancellations) and results that depend on no other layer's datasets
+    /// (S-421 routes), taken out of `opened`.
+    fn install_early(
+        &mut self,
+        _opened: &mut (dyn Any + Send),
+        _context: &open::InstallContext<'_>,
+        _report: &mut report::InstallReport,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Install a finished stage's result ([`open::OpenStage::load`]).
+    fn install(
+        &mut self,
+        opened: Box<dyn Any + Send>,
+        _context: &open::InstallContext<'_>,
+        _report: &mut report::InstallReport,
+    ) -> anyhow::Result<()> {
+        drop(opened);
+        anyhow::bail!("{:?} installs no open-job results", self.products())
+    }
+    /// Every opened dataset, in the common report model.
+    fn datasets(&self) -> Vec<report::DatasetSummary> {
+        Vec::new()
+    }
+    /// Feature counts by feature type of dataset `id` (None: not this
+    /// layer's).
+    fn feature_types(
+        &self,
+        _id: report::DatasetId,
+    ) -> Option<std::collections::BTreeMap<String, usize>> {
+        None
+    }
+    /// Validation findings kept with the opened datasets.
+    fn validation_issues(&self) -> Vec<report::ValidationIssue> {
+        Vec::new()
+    }
+    /// Whether the layer can portray with colour profile `profile` and
+    /// `settings` (hosts check before accepting a display).
+    fn check_display(
+        &self,
+        _profile: &str,
+        _settings: &ferrite_render::host_settings::SettingsState,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Numeric coverages of the visible datasets (S-98 Level 2 inputs of
+    /// interoperability: S-102 depths).
+    fn numeric_coverages(&self) -> Vec<&dyn ferrite_kernel::NumericCoverageSource> {
+        Vec::new()
+    }
+    /// Consistency checks of the opened datasets against their exchange
+    /// sets: issues and notices.
+    fn exchange_set_checks(&self) -> (Vec<report::ValidationIssue>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }

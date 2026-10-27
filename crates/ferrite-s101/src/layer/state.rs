@@ -11,7 +11,7 @@ use crate::layer::cells::{canonical_cell_digest, CANONICAL_CELL_PARTS};
 use crate::layer::portrayal::{
     try_lua_portrayal, try_lua_portrayal_for_cells, validated_lua_context, AreaTriangulator,
     CellCaches, CellPortrayalSelection, PortrayalChangeRequest, PortrayalRun, PortrayalSource,
-    PrecomputedCells,
+    PrecomputedCells, RuleSource,
 };
 use crate::layer::{
     catalogue_selection as s101_catalogue_selection, decoded_cache as decoded_chart_cache,
@@ -113,12 +113,9 @@ pub struct S101Layer {
     /// Camera bits of the last residency check (checked again once settled).
     pub residency_camera: Option<[u64; 12]>,
     pub decoded_chart_cache: decoded_chart_cache::SharedDecodedChartCache,
-    /// Where cell drawing instructions come from (Lua or precomputed). The
-    /// host's S-102 portrayal follows the same setting.
-    pub portrayal_source: PortrayalSource,
-    /// Write precomputed payloads of every cell portrayed with Lua to the
-    /// cache store (see [`PrecomputedCells`]).
-    pub precomputed_export: bool,
+    /// Provenance label of each loaded cell (by cell index) for hosts that
+    /// open through [`ferrite_product_api::ProductLayer::install`].
+    pub provenance: Vec<String>,
     /// Residency estimate threshold of this layer; None: the process-wide
     /// [`Self::residency_threshold`] (hosts without environment variables,
     /// such as the web, set it here).
@@ -165,8 +162,7 @@ impl S101Layer {
             decoded_chart_cache: Arc::new(std::sync::Mutex::new(
                 decoded_chart_cache::DecodedChartCache::new(),
             )),
-            portrayal_source: PortrayalSource::default(),
-            precomputed_export: false,
+            provenance: Vec::new(),
             residency_threshold_override: None,
             services,
             ids: Vec::new(),
@@ -202,23 +198,26 @@ impl S101Layer {
             .collect()
     }
 
-    /// How a portrayal with `common` inputs runs on this state's platform.
+    /// How a portrayal with `common` inputs and the host's rule source runs
+    /// on this layer's platform services.
     pub fn portrayal_run<'a>(
         &'a self,
         common: [u8; 32],
         identities: &'a [Option<[u8; 32]>],
+        rules: RuleSource,
     ) -> PortrayalRun<'a> {
-        let precomputed = (self.portrayal_source == PortrayalSource::Precomputed
-            || self.precomputed_export)
-            .then(|| PrecomputedCells {
-                store: self.services.cache.as_ref(),
-                common,
-                identities,
-                export: self.precomputed_export,
+        let precomputed =
+            (rules.source == PortrayalSource::Precomputed || rules.export).then(|| {
+                PrecomputedCells {
+                    store: self.services.cache.as_ref(),
+                    common,
+                    identities,
+                    export: rules.export,
+                }
             });
         PortrayalRun {
             executor: self.services.executor.as_ref(),
-            source: self.portrayal_source,
+            source: rules.source,
             precomputed,
         }
     }
@@ -362,6 +361,7 @@ impl S101Layer {
         next: &mut RenderContext,
         request: &PortrayalChangeRequest,
         triangulate: AreaTriangulator,
+        rules: RuleSource,
     ) -> Result<()> {
         let mut owners = std::collections::BTreeMap::new();
         for cell in &self.cells {
@@ -394,7 +394,7 @@ impl S101Layer {
                 Some(&request.settings),
                 None,
                 triangulate,
-                self.portrayal_run(common, &identities),
+                self.portrayal_run(common, &identities, rules),
             )?;
             for instruction in staged.raw_instructions() {
                 let index = instruction
@@ -723,6 +723,7 @@ impl S101Layer {
         viewport: Option<ViewportPixels>,
         interoperating: bool,
         triangulate: AreaTriangulator,
+        rules: RuleSource,
     ) -> Result<(RenderContext, Arc<GeographicCoverageInventory>)> {
         crate::validate_catalogue_pair(&self.fc, &self.pc)?;
         let coverage_inventory = self.memo_coverage_inventory()?;
@@ -767,12 +768,11 @@ impl S101Layer {
         // caches. (A whole-scene cache keyed by every cell was removed: it
         // missed on any change of the open set and accumulated without bound.)
         // Exports and precomputed scenes never read the native cell cache.
-        let cell_caches =
-            if self.precomputed_export || self.portrayal_source == PortrayalSource::Precomputed {
-                None
-            } else {
-                self.cell_instruction_cache_paths(settings, profile)
-            };
+        let cell_caches = if rules.export || rules.source == PortrayalSource::Precomputed {
+            None
+        } else {
+            self.cell_instruction_cache_paths(settings, profile)
+        };
         let common = Self::precomputed_common(settings, profile);
         let identities = self.cell_identities();
         try_lua_portrayal(
@@ -791,7 +791,7 @@ impl S101Layer {
                 resident: self.resident_cells.as_deref(),
             },
             triangulate,
-            self.portrayal_run(common, &identities),
+            self.portrayal_run(common, &identities, rules),
         )?;
         Ok((next, coverage_inventory))
     }
@@ -837,6 +837,7 @@ impl S101Layer {
         owned: bool,
         preflight_resources: bool,
         triangulate: AreaTriangulator,
+        rules: RuleSource,
     ) -> Result<RenderContext> {
         validated_lua_context(pc, Some(&request.settings))?;
         crate::validate_catalogue_pair(fc, pc)?;
@@ -873,6 +874,7 @@ impl S101Layer {
                     &mut next,
                     request,
                     triangulate,
+                    rules,
                 )?;
             } else {
                 let common = Self::precomputed_common(Some(&request.settings), &request.profile);
@@ -889,7 +891,7 @@ impl S101Layer {
                         resident: self.resident_cells.as_deref(),
                     },
                     triangulate,
-                    self.portrayal_run(common, &identities),
+                    self.portrayal_run(common, &identities, rules),
                 )?;
             }
         }

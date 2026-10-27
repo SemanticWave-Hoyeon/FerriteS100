@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use ferrite_feature_catalog::FeatureCatalogue;
 use ferrite_product_api::platform::UserRecord;
 use ferrite_product_api::{
-    Encoding, PanelDescriptor, ProductAdapter, ProductId, ProductInfo, Recognised, SceneRole,
+    Encoding, PanelDescriptor, ProductAdapter, ProductInfo, Recognised, SceneRole,
 };
 use ferrite_s100_gml::overlay::{format_time, OverlayCore};
 use ferrite_s100_gml::portrayal::ConvertOptions;
@@ -145,7 +145,7 @@ impl S124Overlay {
 impl ProductAdapter for S124Overlay {
     fn info(&self) -> ProductInfo {
         ProductInfo {
-            id: ProductId("S-124"),
+            id: crate::PRODUCT,
             title: "Navigational Warnings",
             encoding: Encoding::Gml,
             role: SceneRole::Overlay,
@@ -170,10 +170,7 @@ impl ProductAdapter for S124Overlay {
         true
     }
     fn panels(&self) -> &'static [PanelDescriptor] {
-        &[PanelDescriptor {
-            id: "S-124/warnings",
-            title: "Navigational warnings",
-        }]
+        std::slice::from_ref(&crate::panel::PANEL)
     }
     fn as_any(&self) -> &dyn Any {
         self
