@@ -6,7 +6,7 @@ license.workspace = true
 description = "S-100 chart engine: dataset discovery, opening, signatures, update chains, caches and product adapters, independent of windowing, GUI and GPU"
 
 [features]
-default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s124", "s129"]
+default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s124", "s129", "s421"]
 # Threads and rayon: parallel cell loading, Lua portrayal workers, cache
 # coding, suppression and coverage projection. Off: everything runs on the
 # calling thread (sequential executor) with identical results.
@@ -35,6 +35,9 @@ crypto-rust = ["ferrite-security/crypto-rust"]
 # catalogues are not loaded.
 s124 = ["dep:ferrite-s124"]
 s129 = ["dep:ferrite-s129"]
+# S-421 routes (ferrite-s421 product layer): discovery, capture and the
+# route store of ChartEngine.
+s421 = ["dep:ferrite-s421"]
 # Test-only helpers used by the application's own tests.
 test-support = []
 
@@ -65,14 +68,11 @@ ferrite-s101.workspace = true
 ferrite-s102 = { workspace = true, optional = true }
 ferrite-s124 = { path = "../ferrite-s124", optional = true }
 ferrite-s129 = { path = "../ferrite-s129", optional = true }
+# The product layer builds for wasm32; the native-only plugin layer of the
+# crate stays behind its own target gating.
+ferrite-s421 = { path = "../ferrite-s421", optional = true }
 ferrite-security.workspace = true
 ferrite-xslt = { path = "../ferrite-xslt" }
-
-# S-421 route input reads the profile through ferrite-s421, whose plugin layer
-# (abi_stable/libloading) does not build for wasm32; the web build mirrors the
-# two items it needs in `s421_dataset_input` (S-421 input is native-only).
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ferrite-s421 = { path = "../ferrite-s421" }
 
 # ARMv8 SHA-256 instructions (runtime-detected) for the portrayal cache check,
 # as the root package selects for the viewer: without it, builds of the engine

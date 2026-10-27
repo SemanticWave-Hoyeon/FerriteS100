@@ -9,7 +9,7 @@ description = "Web (wasm32-unknown-unknown) bindings of the S-100 ChartEngine: i
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["s102-pure", "s124", "s129"]
+default = ["s102-pure", "s124", "s129", "s421"]
 # S-101 portrayal with the catalogue's Lua rules in the browser: the vendored
 # Lua 5.4 compiled to wasm32 by ferrite-lua-runtime (needs a clang with the
 # WebAssembly target, e.g. Homebrew LLVM, and llvm-ar; see its build script).
@@ -20,9 +20,10 @@ lua-wasm = ["ferrite-engine/lua54", "ferrite-cli/lua54", "dep:ferrite-lua", "fer
 # rule runs with Lua under lua-wasm, otherwise from precomputed instructions.
 s102-pure = ["ferrite-cli/s102-pure", "ferrite-engine/s102-pure"]
 
-# Product modules: S-124 and S-129 GML overlays.
+# Product modules: S-124 and S-129 GML overlays, S-421 routes.
 s124 = ["ferrite-cli/s124", "ferrite-engine/s124"]
 s129 = ["ferrite-cli/s129", "ferrite-engine/s129"]
+s421 = ["ferrite-cli/s421", "ferrite-engine/s421"]
 
 [[example]]
 name = "part9a_dump"

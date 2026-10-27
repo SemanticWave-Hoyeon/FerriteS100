@@ -13,7 +13,7 @@ s102-portrayal = ["s102-material", "ferrite-s102/crypto-openssl"]
 lua54 = ["ferrite-s102?/lua54"]
 lua55 = ["ferrite-s102?/lua55"]
 # Test-only hooks used by ferrite-ui tests.
-test-support = []
+test-support = ["ferrite-product-api/test-support"]
 
 [dependencies]
 ferrite-kernel.workspace = true
@@ -42,6 +42,8 @@ serde_json.workspace = true
 sha2.workspace = true
 
 # Internal crates
+# Renderer extensions of the product modules (the route overlay data model).
+ferrite-product-api = { path = "../ferrite-product-api" }
 ferrite-render = { workspace = true, features = ["parallel"] }
 ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
 serde.workspace = true

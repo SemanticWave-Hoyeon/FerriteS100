@@ -24,3 +24,14 @@ pub fn gml_rules() -> Vec<&'static dyn GmlRules> {
 pub fn gml_products() -> Vec<Product> {
     gml_rules().iter().map(|r| r.product()).collect()
 }
+
+/// The S-421 route product (`ferrite_s421::layer`), when built: route input
+/// capture and discovery, the adapter and the route layer.
+#[cfg(feature = "s421")]
+pub mod s421 {
+    pub use ferrite_s421::layer::input::{
+        capture_if_route, capture_if_route_in, discover_routes_in, CapturedRouteInput,
+        RouteInputError,
+    };
+    pub use ferrite_s421::layer::{S421Layer, S421};
+}

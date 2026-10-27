@@ -17,7 +17,8 @@ pub struct Plan {
     /// prevent a different supported product from being opened.
     pub rasters: Vec<PathBuf>,
     pub notices: Vec<String>,
-    pub routes: Vec<crate::s421_dataset_input::CapturedRouteInput>,
+    #[cfg(feature = "s421")]
+    pub routes: Vec<crate::products::s421::CapturedRouteInput>,
     /// S-124 / S-129 GML datasets and imported warnings (KML, GPX,
     /// shapefile, zipped shapefile), each opened independently.
     pub overlays: Vec<PathBuf>,
@@ -153,14 +154,22 @@ pub fn discover(root: &Path, on_system: &HashSet<String>) -> Result<Plan> {
         ..Plan::default()
     };
     classify_rasters(&mut plan, rasters);
-    let (routes, notices) = crate::s421_dataset_input::discover_routes(root)?;
-    plan.routes = routes;
-    plan.notices.extend(notices);
+    #[cfg(feature = "s421")]
+    {
+        let (routes, notices) =
+            crate::products::s421::discover_routes_in(&crate::platform::NativeDataSource, root)?;
+        plan.routes = routes;
+        plan.notices.extend(notices);
+    }
+    #[cfg(feature = "s421")]
+    let no_routes = plan.routes.is_empty();
+    #[cfg(not(feature = "s421"))]
+    let no_routes = true;
     plan.overlays = crate::gml_overlay::discover(root, on_system)?;
     if plan.charts.is_empty()
         && plan.rasters.is_empty()
         && plan.trials.is_empty()
-        && plan.routes.is_empty()
+        && no_routes
         && plan.overlays.is_empty()
         && plan.notices.is_empty()
     {
@@ -228,12 +237,16 @@ pub fn single_file(path: &Path, on_system: &HashSet<String>) -> Result<Plan> {
     } else if crate::dataset_discovery::is_dataset_file(path, "gml")
         || crate::dataset_discovery::is_dataset_file(path, "xml")
     {
-        match crate::s421_dataset_input::capture_if_route(path)? {
+        #[cfg(feature = "s421")]
+        match crate::products::s421::capture_if_route(path)? {
             Some(input) => plan.routes.push(input),
             None => plan
                 .notices
                 .push(format!("Skipped non-S421 XML: {}", path.display())),
         }
+        #[cfg(not(feature = "s421"))]
+        plan.notices
+            .push(format!("Skipped non-S421 XML: {}", path.display()));
     } else {
         plan.notices.push(format!(
             "Skipped unsupported dataset file: {}",
@@ -399,6 +412,7 @@ mod tests {
         assert!(checked_product_text(&[b'X'; 255]).is_ok());
     }
     #[test]
+    #[cfg(feature = "s421")]
     fn empty_and_unknown_inputs_produce_visible_diagnostics_not_guessed_products() {
         let tmp = TestDir::new();
         assert_eq!(

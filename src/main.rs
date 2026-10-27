@@ -105,7 +105,7 @@ use ferrite_engine::portrayal::{validated_lua_context, PortrayalChangeRequest};
 use ferrite_engine::scene::PreparedScene;
 use ferrite_engine::{
     chart_publication, dataset_discovery, dataset_open_plan, dataset_signature_policy,
-    primary_viewing_layers, s101_catalogue_selection, s101_update_plan, s421_dataset_input,
+    primary_viewing_layers, s101_catalogue_selection, s101_update_plan,
 };
 use ferrite_engine::{
     CellHydration, CellHydrationSource, CellScene, ChangeCellScene, ChartLoadResult, EngineState,
@@ -115,6 +115,7 @@ use ferrite_s102::layer::{
     journal_admission as s102_journal_admission, original_inputs as s102_original_inputs,
     trial_worker as s102_trial_worker,
 };
+use ferrite_s421::layer::input as s421_dataset_input;
 
 use std::fs;
 use std::path::{Path, PathBuf};

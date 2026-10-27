@@ -3,11 +3,11 @@
 #![cfg(test)]
 mod tests {
     use crate::native_route::load_native_route_overlay_resources;
-    use ferrite_gpu::native_route_leg::{sample_leg, MAX_LEG_VERTICES};
-    use ferrite_gpu::native_route_overlay::MAX_WORLD_SAMPLE_BYTES;
-    use ferrite_gpu::{
+    use ferrite_gpu::PreparedNativeRouteOverlay;
+    use ferrite_product_api::route_overlay::leg::{sample_leg, MAX_LEG_VERTICES};
+    use ferrite_product_api::route_overlay::{
         NativeRouteLegDeclaration, NativeRoutePath, NativeRouteWaypoint, NativeRouteWorldSamples,
-        PreparedNativeRouteOverlay,
+        MAX_WORLD_SAMPLE_BYTES,
     };
     use ferrite_render::{Scaler, WorldPoint};
     fn point(id: u32, x: f64, y: f64) -> NativeRouteWaypoint {
@@ -67,7 +67,7 @@ mod tests {
     }
     #[test]
     fn immutable_world_samples_match_original_solver_and_do_not_recompute_for_cameras() {
-        use ferrite_gpu::NativeRouteLegGeometry;
+        use ferrite_product_api::route_overlay::NativeRouteLegGeometry;
         use ferrite_render::{GeoBounds, Viewport};
         let fixture = Fixture::new();
         let resources = load_native_route_overlay_resources(&fixture.0, "Day").unwrap();
@@ -93,7 +93,7 @@ mod tests {
             .zip(&legacy)
             .all(|(a, b)| a[0].to_bits() == b[0].to_bits() && a[1].to_bits() == b[1].to_bits()));
         assert_eq!(world.solver_invocations(), 1);
-        let calls = ferrite_gpu::native_route_leg::solver_call_count();
+        let calls = ferrite_product_api::route_overlay::leg::solver_call_count();
         for (width, x) in [(800., 0.), (1000., 0.1)] {
             let scaler = Scaler::new(
                 GeoBounds::new(x, 68., 4. + x, 72.),
@@ -113,7 +113,10 @@ mod tests {
                 .validate(&resources, 11, &scaler, scaler.pixels_per_mm())
                 .unwrap();
         }
-        assert_eq!(ferrite_gpu::native_route_leg::solver_call_count(), calls);
+        assert_eq!(
+            ferrite_product_api::route_overlay::leg::solver_call_count(),
+            calls
+        );
         assert!(world.payload_bytes() <= MAX_WORLD_SAMPLE_BYTES);
         let mut altered = paths.clone();
         altered[0].waypoints[1].latitude = 70.00000000000001;
@@ -127,8 +130,80 @@ mod tests {
         assert!(!world.matches(&paths, &lexical, 11));
     }
     #[test]
+    fn route_overlay_extension_projects_like_its_world_samples() {
+        use ferrite_product_api::route_overlay::{self, NativeRouteLegGeometry};
+        use ferrite_render::{GeoBounds, Viewport};
+        let fixture = Fixture::new();
+        let resources = load_native_route_overlay_resources(&fixture.0, "Day").unwrap();
+        let paths = [NativeRoutePath {
+            route_id: 7,
+            waypoints: vec![point(9, 1., 70.), point(3, 3., 70.), point(4, 3.5, 70.5)],
+        }];
+        let legs = [NativeRouteLegDeclaration {
+            route_id: 7,
+            from: 9,
+            to: 3,
+            geometry: NativeRouteLegGeometry::Orthodrome,
+            source_profile: 0,
+            source_gml_id: String::new(),
+            original_geometry_text: String::new(),
+        }];
+        let world = NativeRouteWorldSamples::prepare(&paths, &legs, 5).unwrap();
+        let scaler = Scaler::new(GeoBounds::new(0., 68., 4., 72.), Viewport::new(800., 600.));
+        let expected = PreparedNativeRouteOverlay::prepare_with_world_samples(
+            resources.clone(),
+            5,
+            &paths,
+            &legs,
+            &world,
+            &scaler,
+            scaler.pixels_per_mm(),
+        )
+        .unwrap();
+        let extension = route_overlay::extension(world.clone());
+        assert_eq!(extension.kind, route_overlay::ROUTE_OVERLAY_EXTENSION);
+        let actual = PreparedNativeRouteOverlay::from_extension(
+            resources.clone(),
+            &extension,
+            &scaler,
+            scaler.pixels_per_mm(),
+        )
+        .unwrap();
+        actual
+            .validate(&resources, 5, &scaler, scaler.pixels_per_mm())
+            .unwrap();
+        let bits = |p: &ferrite_render::ScreenPoint| (p.x.to_bits(), p.y.to_bits());
+        assert_eq!(actual.paths().len(), expected.paths().len());
+        for (a, b) in actual.paths().iter().zip(expected.paths()) {
+            assert_eq!(a.route_id, b.route_id);
+            assert_eq!(a.segment_owners, b.segment_owners);
+            assert!(a
+                .waypoints
+                .iter()
+                .zip(&b.waypoints)
+                .all(|(a, b)| a.0 == b.0 && bits(&a.1) == bits(&b.1)));
+            assert!(a
+                .line_points
+                .iter()
+                .zip(&b.line_points)
+                .all(|(a, b)| bits(a) == bits(b)));
+            assert_eq!(a.line_points.len(), b.line_points.len());
+        }
+        let other = ferrite_product_api::RendererExtension {
+            kind: "S-102/bathymetry-tiles",
+            payload: world,
+        };
+        assert!(PreparedNativeRouteOverlay::from_extension(
+            resources,
+            &other,
+            &scaler,
+            scaler.pixels_per_mm()
+        )
+        .is_err());
+    }
+    #[test]
     fn semantic_packet_has_curve_vertices_original_pick_owners_and_stale_camera_guard() {
-        use ferrite_gpu::NativeRouteLegGeometry;
+        use ferrite_product_api::route_overlay::NativeRouteLegGeometry;
         use ferrite_render::{GeoBounds, Viewport};
         let fixture = Fixture::new();
         let resources = load_native_route_overlay_resources(&fixture.0, "Day").unwrap();
@@ -211,7 +286,7 @@ mod tests {
             route_id: 7,
             from: 9,
             to: 3,
-            geometry: ferrite_gpu::NativeRouteLegGeometry::Loxodrome,
+            geometry: ferrite_product_api::route_overlay::NativeRouteLegGeometry::Loxodrome,
             source_profile: 1,
             source_gml_id: "LEG.1".into(),
             original_geometry_text: "1".into(),

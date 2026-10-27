@@ -4,8 +4,8 @@
 //! Stage 1 holds the pure domain modules moved out of the application:
 //! dataset discovery and open planning, signature policy, the S-101 update
 //! chain and lifecycle metadata, exchange-set checks, cell publication,
-//! catalogue selection, decoded/instruction caches, S-421 route input and
-//! the non-UI S-124/S-129 overlay parts. Stage 2 adds the chart state ([`EngineState`]) and the S-101
+//! catalogue selection, decoded/instruction caches, S-421 route input (now
+//! `ferrite_s421::layer::input`) and the non-UI S-124/S-129 overlay parts. Stage 2 adds the chart state ([`EngineState`]) and the S-101
 //! portrayal pipeline ([`portrayal`], [`portrayal_cache`], [`catalogue`],
 //! [`chart_cells`]) and the S-124/S-129 overlay registry; renderer-specific
 //! pieces (area triangulation, overlay symbol sources) are supplied by the
@@ -33,7 +33,10 @@
 //! (input policies, opened files, raster portrayal), held as
 //! [`EngineState::s102`] with `s102-pure` and called through [`s102_host`];
 //! its raster tiles reach renderers as a renderer extension of the
-//! prepared scene.
+//! prepared scene. S-421 is the product layer `ferrite_s421::layer` behind
+//! the feature `s421` (on by default): route discovery and capture
+//! ([`dataset_open_plan`], [`ChartEngine`]) and the route store of
+//! [`ChartEngine`] go through it ([`products`]).
 
 pub mod catalogue;
 pub mod cell_source_identity;
@@ -61,7 +64,6 @@ pub mod s101_xc_consistency;
 pub mod s101_xc_coverage;
 pub mod s101_xc_region;
 pub mod s102_host;
-pub mod s421_dataset_input;
 pub mod scene;
 pub mod secure_instruction_cache;
 

@@ -16,6 +16,7 @@ ferrite-portrayal-catalog = { workspace = true, features = ["parallel"] }
 ferrite-s124 = { path = "../ferrite-s124" }
 ferrite-s129 = { path = "../ferrite-s129" }
 ferrite-s421 = { path = "../ferrite-s421" }
+ferrite-product-api = { path = "../ferrite-product-api" }
 tracing.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

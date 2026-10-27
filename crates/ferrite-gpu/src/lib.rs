@@ -17,19 +17,16 @@
 //!                      Area Renderer
 //! ```
 
-mod draw_range_index;
-mod error;
-#[doc(hidden)]
-pub mod native_route_leg;
-#[doc(hidden)]
-pub mod native_route_overlay;
-pub use native_route_leg::{NativeRouteLegDeclaration, NativeRouteLegGeometry};
 mod area_candidates;
 mod area_index_upload_reuse;
 mod audit_buffer_export;
 pub mod chart_fonts;
+mod draw_range_index;
 mod emitter_wave_diagnostics;
+mod error;
 mod exact_line_quad;
+#[doc(hidden)]
+pub mod native_route_overlay;
 pub use area_index_upload_reuse::Work as AreaIndexUploadReuseWork;
 mod immutable_line_topology;
 mod line_preparation_diagnostics;

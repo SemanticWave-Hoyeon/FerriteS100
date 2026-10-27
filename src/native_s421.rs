@@ -1,85 +1,56 @@
-//! Statically linked route receiver/editor state. No external DLL or ENC owner.
-use abi_stable::std_types::RStr;
+//! The viewer's glue for the S-421 route editor (`ferrite_s421::editor`):
+//! the editing portrayal resources, the screen-projected route overlay and
+//! its GPU publication, the file dialogs and the dataset-tree rows. Route
+//! state, commands, import/export and the route overlay extension belong to
+//! the product.
 use anyhow::{ensure, Context, Result};
-use ferrite_plugin_api::Plugin;
-use ferrite_s421::{s421::PublishedExport, ui::UiEvent, RouteController};
-use std::{
-    collections::HashMap,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use ferrite_s421::editor::RouteEditor;
+use ferrite_s421::ui::UiEvent;
+use std::path::{Path, PathBuf};
 
-pub const PROVIDER_ID: &str = "native:s421-route";
-const MAX_EVENT_BYTES: usize = 64 * 1024;
+pub use ferrite_s421::editor::PROVIDER_ID;
 
 pub struct NativeS421 {
-    controller: RouteController,
-    sources: HashMap<u32, PathBuf>,
-    revision: u64,
-    overlay_revision: u64,
-    gpu_capable: bool,
-    gpu_error: Option<String>,
-    ui_json: String,
-    editing_pc_root: PathBuf,
+    route: RouteEditor,
     editing_resources: Option<std::sync::Arc<ferrite_gpu::NativeRouteOverlayResources>>,
     editing_resource_error: Option<String>,
     prepared_overlay: Option<std::sync::Arc<ferrite_gpu::PreparedNativeRouteOverlay>>,
     overlay_prepare_error: Option<String>,
-    world_samples: Option<std::sync::Arc<ferrite_gpu::NativeRouteWorldSamples>>,
     overlay_cache_hits: u64,
     overlay_preparations: u64,
-    world_sample_preparations: u64,
 }
 
 impl NativeS421 {
     pub fn new(catalogues: PathBuf) -> Self {
-        let editing_pc_root = catalogues.join("PC/S-421");
-        let mut host = Self {
-            controller: RouteController::with_catalogues(catalogues),
-            sources: HashMap::new(),
-            revision: 0,
-            overlay_revision: 0,
-            gpu_capable: false,
-            gpu_error: None,
-            ui_json: String::new(),
-            editing_pc_root,
+        Self {
+            route: RouteEditor::new(catalogues),
             editing_resources: None,
             editing_resource_error: None,
             prepared_overlay: None,
             overlay_prepare_error: None,
-            world_samples: None,
             overlay_cache_hits: 0,
             overlay_preparations: 0,
-            world_sample_preparations: 0,
-        };
-        host.refresh();
-        host
+        }
     }
     /// Returns a disconnected workspace: failures leave the displayed controller,
     /// source owners, epochs and GPU publication intact.
     fn fork_local_edit(&self, palette: &str) -> Result<Self> {
         let resources = match &self.editing_resources {
             Some(resources) if resources.palette() == palette => resources.clone(),
-            _ => ferrite_ui::load_native_route_overlay_resources(&self.editing_pc_root, palette)
-                .map_err(anyhow::Error::msg)?,
+            _ => ferrite_ui::load_native_route_overlay_resources(
+                self.route.editing_pc_root(),
+                palette,
+            )
+            .map_err(anyhow::Error::msg)?,
         };
         Ok(Self {
-            controller: self.controller.fork_native_transaction(),
-            sources: self.sources.clone(),
-            revision: self.revision,
-            overlay_revision: self.overlay_revision,
-            gpu_capable: self.gpu_capable,
-            gpu_error: self.gpu_error.clone(),
-            ui_json: self.ui_json.clone(),
-            editing_pc_root: self.editing_pc_root.clone(),
+            route: self.route.fork(),
             editing_resources: Some(resources),
             editing_resource_error: None,
             prepared_overlay: self.prepared_overlay.clone(),
             overlay_prepare_error: None,
-            world_samples: self.world_samples.clone(),
             overlay_cache_hits: self.overlay_cache_hits,
             overlay_preparations: self.overlay_preparations,
-            world_sample_preparations: self.world_sample_preparations,
         })
     }
     /// Synchronous transaction: all CPU preparation/validation precedes renderer
@@ -92,23 +63,23 @@ impl NativeS421 {
         palette: &str,
     ) -> Result<()> {
         ensure!(
-            next.revision == self.revision && next.overlay_revision == self.overlay_revision,
+            next.route.revision() == self.route.revision()
+                && next.route.overlay_revision() == self.route.overlay_revision(),
             "Native edit workspace became stale"
         );
         ensure!(
-            next.revision < u64::MAX && next.overlay_revision < u64::MAX,
+            next.route.revision() < u64::MAX && next.route.overlay_revision() < u64::MAX,
             "Native edit revision exhausted"
         );
-        next.refresh();
+        next.route.refresh();
         let packet = next.prepare_overlay(scaler, palette)?;
-        next.gpu_capable = true;
-        next.gpu_error = None;
+        next.route.mark_displayed();
         // Serialize UI before GPU publication; nothing fallible remains afterward.
         ensure!(
-            next.revision < u64::MAX,
+            next.route.revision() < u64::MAX,
             "Native edit UI revision exhausted"
         );
-        next.refresh_ui();
+        next.route.refresh_ui();
         renderer
             .sync_native_route_gpu(packet, scaler)
             .map_err(anyhow::Error::msg)?;
@@ -116,7 +87,7 @@ impl NativeS421 {
         Ok(())
     }
     pub fn editing(&self) -> bool {
-        self.controller.editing()
+        self.route.editing()
     }
     pub fn begin_local_edit(
         &mut self,
@@ -125,7 +96,8 @@ impl NativeS421 {
         palette: &str,
     ) -> Result<()> {
         let mut next = self.fork_local_edit(palette)?;
-        next.controller
+        next.route
+            .controller_mut()
             .begin_native_local_route()
             .map_err(anyhow::Error::msg)?;
         self.publish_local_edit(next, renderer, scaler, palette)
@@ -139,7 +111,8 @@ impl NativeS421 {
         palette: &str,
     ) -> Result<()> {
         let mut next = self.fork_local_edit(palette)?;
-        next.controller
+        next.route
+            .controller_mut()
             .append_native_local_waypoint(lon, lat)
             .map_err(anyhow::Error::msg)?;
         self.publish_local_edit(next, renderer, scaler, palette)
@@ -151,7 +124,8 @@ impl NativeS421 {
         palette: &str,
     ) -> Result<()> {
         let mut next = self.fork_local_edit(palette)?;
-        next.controller
+        next.route
+            .controller_mut()
             .finish_native_local_route()
             .map_err(anyhow::Error::msg)?;
         self.publish_local_edit(next, renderer, scaler, palette)
@@ -165,7 +139,8 @@ impl NativeS421 {
         palette: &str,
     ) -> Result<()> {
         let mut next = self.fork_local_edit(palette)?;
-        next.controller
+        next.route
+            .controller_mut()
             .set_native_leg_geometry(id, geometry)
             .map_err(anyhow::Error::msg)?;
         self.publish_local_edit(next, renderer, scaler, palette)
@@ -173,50 +148,43 @@ impl NativeS421 {
     /// Escape stops collecting clicks; it retains the authored draft. This is
     /// distinct from Finish/export validation and does not mint a product.
     pub fn stop_local_edit(&mut self) {
-        self.controller.set_editing(false);
-        self.refresh_ui();
+        self.route.stop_local_edit();
     }
 
     pub fn panel_visible(&self) -> bool {
-        self.controller.panel_visible()
+        self.route.panel_visible()
     }
     pub fn revision(&self) -> u64 {
-        self.revision
+        self.route.revision()
     }
     pub fn ui_json(&self) -> &str {
-        &self.ui_json
+        self.route.ui_json()
     }
     pub fn audit_data(&self) -> serde_json::Value {
-        use sha2::{Digest, Sha256};
-        serde_json::json!({
-            "provider_id": PROVIDER_ID, "panel_visible": self.panel_visible(),
-            "revision": self.revision, "editing": self.controller.editing(),
-            "routes": self.controller.routes().iter().map(|route| serde_json::json!({
-                "id":route.id, "waypoints":route.waypoints.len(),
-                "source":self.sources.get(&route.id),
-                "original_xml_sha256":self.controller.source_for_route(route.id)
-                    .map(|s| format!("{:x}", Sha256::digest(s.original_xml.as_bytes()))),
-            })).collect::<Vec<_>>(),
-            "editing_resources": self.editing_resources.as_ref().map(|resources| serde_json::json!({
+        let published =
+            self.route.display_available() && self.route.controller().rendering_enabled();
+        let mut audit = self.route.audit_data();
+        for (key, value) in [
+            ("editing_resources", serde_json::json!(self.editing_resources.as_ref().map(|resources| serde_json::json!({
                 "source_digest": resources.source_digest().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
                 "actual_product": resources.actual_product(), "actual_version": resources.actual_version(),
                 "palette": resources.palette(), "leg_width_mm": resources.leg_style().pen.width,
                 "waypoint_pixels": [resources.waypoint_symbol().width, resources.waypoint_symbol().height],
-                "gpu_published": self.gpu_capable && self.controller.rendering_enabled(), "official_rules_executed": false,
-            })),
-            "editing_resource_error": self.editing_resource_error,
-            "overlay_prepare_error": self.overlay_prepare_error,
-            "gpu_capable":self.gpu_capable,"gpu_error":self.gpu_error,"overlay_revision":self.overlay_revision,
-            "overlay_cache": {"hits":self.overlay_cache_hits,"preparations":self.overlay_preparations},
-            "world_cache": self.world_samples.as_ref().map(|w|serde_json::json!({"payload_bytes":w.payload_bytes(),"solver_legs_in_cache":w.solver_invocations(),"committed_preparations":self.world_sample_preparations})),
-            "prepared_overlay": self.prepared_overlay.as_ref().map(|p| serde_json::json!({
+                "gpu_published": published, "official_rules_executed": false,
+            })))),
+            ("editing_resource_error", serde_json::json!(self.editing_resource_error)),
+            ("overlay_prepare_error", serde_json::json!(self.overlay_prepare_error)),
+            ("overlay_cache", serde_json::json!({"hits":self.overlay_cache_hits,"preparations":self.overlay_preparations})),
+            ("prepared_overlay", serde_json::json!(self.prepared_overlay.as_ref().map(|p| serde_json::json!({
                 "revision":p.route_revision(), "camera":p.camera_identity(),
                 "route_count":p.paths().len(), "points":p.paths().iter().map(|r|r.waypoints.len()).sum::<usize>(),
-                "pixels_per_mm":p.pixels_per_mm(), "gpu_published":self.gpu_capable && self.controller.rendering_enabled(),
+                "pixels_per_mm":p.pixels_per_mm(), "gpu_published":published,
                 "curve_points":p.paths().iter().map(|r|r.line_points.len()).sum::<usize>(),"segment_owners":p.paths().iter().map(|r|r.segment_owners.len()).sum::<usize>(),
-            })),
-            "ui":serde_json::from_str::<serde_json::Value>(&self.ui_json).expect("typed native UI")
-        })
+            })))),
+        ] {
+            audit.insert(key.into(), value);
+        }
+        serde_json::Value::Object(audit)
     }
 
     /// Frame producer only. A cache hit is O(1); it does not authorize a GPU
@@ -235,8 +203,8 @@ impl NativeS421 {
         scaler: &ferrite_render::Scaler,
         palette: &str,
     ) -> Result<Option<std::sync::Arc<ferrite_gpu::PreparedNativeRouteOverlay>>> {
-        if self.controller.routes().is_empty() {
-            self.world_samples = None;
+        if self.route.controller().routes().is_empty() {
+            self.route.clear_route_overlay();
             self.prepared_overlay = None;
             return Ok(None);
         }
@@ -248,153 +216,36 @@ impl NativeS421 {
             palette == resources.palette(),
             "S-421 editing palette {palette} unavailable; no Day substitution"
         );
-        if !self.controller.rendering_enabled() {
+        if !self.route.controller().rendering_enabled() {
             self.prepared_overlay = None;
             return Ok(None);
         }
+        let revision = self.route.overlay_revision();
         if let Some(packet) = &self.prepared_overlay {
             if packet
-                .validate(
-                    resources,
-                    self.overlay_revision,
-                    scaler,
-                    scaler.pixels_per_mm(),
-                )
+                .validate(resources, revision, scaler, scaler.pixels_per_mm())
                 .is_ok()
             {
                 self.overlay_cache_hits = self.overlay_cache_hits.saturating_add(1);
                 return Ok(Some(packet.clone()));
             }
         }
-        let paths = self
-            .controller
-            .routes()
-            .iter()
-            .map(|route| ferrite_gpu::NativeRoutePath {
-                route_id: route.id,
-                waypoints: route
-                    .waypoints
-                    .iter()
-                    .map(|point| ferrite_gpu::NativeRouteWaypoint {
-                        waypoint_id: point.id,
-                        longitude: point.lon,
-                        latitude: point.lat,
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        let mut declarations = Vec::new();
-        for route in self.controller.routes() {
-            if let Some(source) = self.controller.source_for_route(route.id) {
-                for imported in &source.routes {
-                    // Imported CRS is explicitly checked EPSG:4326 by the core parser.
-                    // Native edits cannot borrow a declaration for changed original coordinates.
-                    if !imported.legs.is_empty()
-                        && (route.waypoints.len() != imported.route.waypoints.len()
-                            || route.waypoints.iter().zip(&imported.route.waypoints).any(
-                                |(a, b)| {
-                                    a.id != b.id
-                                        || a.lon.to_bits() != b.lon.to_bits()
-                                        || a.lat.to_bits() != b.lat.to_bits()
-                                },
-                            ))
-                    {
-                        return Err(anyhow::anyhow!(
-                            "Edited route cannot reuse original declared leg endpoints"
-                        ));
-                    }
-                    for leg in &imported.legs {
-                        declarations.push(ferrite_gpu::NativeRouteLegDeclaration {
-                            route_id: route.id,
-                            from: leg.from_waypoint_id,
-                            to: leg.to_waypoint_id,
-                            source_profile: match source.profile {
-                                ferrite_s421::s421::Profile::Published1 => 1,
-                                ferrite_s421::s421::Profile::Candidate2 => 2,
-                            },
-                            source_gml_id: leg.gml_id.clone(),
-                            original_geometry_text: leg.original_geometry_text.clone(),
-                            geometry: match leg.geometry {
-                                ferrite_s421::s421::LegGeometry::Loxodrome => {
-                                    ferrite_gpu::NativeRouteLegGeometry::Loxodrome
-                                }
-                                ferrite_s421::s421::LegGeometry::Orthodrome => {
-                                    ferrite_gpu::NativeRouteLegGeometry::Orthodrome
-                                }
-                            },
-                        });
-                    }
-                }
-            }
-        }
-        // Profile 0 is an explicit locally authored draft, never a producer/FC profile.
-        for route in self
-            .controller
-            .routes()
-            .iter()
-            .filter(|route| self.controller.source_for_route(route.id).is_none())
-        {
-            for pair in route.waypoints.windows(2) {
-                if let Some(geometry) = pair[1].incoming_geometry {
-                    declarations.push(ferrite_gpu::NativeRouteLegDeclaration {
-                        route_id: route.id,
-                        from: pair[0].id,
-                        to: pair[1].id,
-                        geometry: match geometry {
-                            ferrite_s421::s421::LegGeometry::Loxodrome => {
-                                ferrite_gpu::NativeRouteLegGeometry::Loxodrome
-                            }
-                            ferrite_s421::s421::LegGeometry::Orthodrome => {
-                                ferrite_gpu::NativeRouteLegGeometry::Orthodrome
-                            }
-                        },
-                        source_profile: 0,
-                        source_gml_id: String::new(),
-                        original_geometry_text: String::new(),
-                    });
-                }
-            }
-        }
-        let reused_world = self
-            .world_samples
-            .as_ref()
-            .is_some_and(|samples| samples.matches(&paths, &declarations, self.overlay_revision));
-        let world = match &self.world_samples {
-            Some(samples) if samples.matches(&paths, &declarations, self.overlay_revision) => {
-                samples.clone()
-            }
-            _ => ferrite_gpu::NativeRouteWorldSamples::prepare(
-                &paths,
-                &declarations,
-                self.overlay_revision,
-            )
-            .map_err(anyhow::Error::msg)?,
-        };
-        let prepared = ferrite_gpu::PreparedNativeRouteOverlay::prepare_with_world_samples(
+        // The product's route overlay renderer extension, projected for this camera.
+        let overlay = self.route.route_overlay()?;
+        let prepared = ferrite_gpu::PreparedNativeRouteOverlay::from_extension(
             resources.clone(),
-            self.overlay_revision,
-            &paths,
-            &declarations,
-            &world,
+            &overlay.extension(),
             scaler,
             scaler.pixels_per_mm(),
         )
         .map_err(anyhow::Error::msg)?;
         prepared
-            .validate(
-                resources,
-                self.overlay_revision,
-                scaler,
-                scaler.pixels_per_mm(),
-            )
+            .validate(resources, revision, scaler, scaler.pixels_per_mm())
             .map_err(anyhow::Error::msg)?;
         let packet = std::sync::Arc::new(prepared);
         // Failed candidates leave the previous complete cache intact. The caller
         // receives an error and cannot use it under another camera/palette.
-        if !reused_world {
-            self.world_sample_preparations = self.world_sample_preparations.saturating_add(1);
-        }
-        self.world_samples = Some(world);
+        self.route.commit_route_overlay(overlay);
         self.prepared_overlay = Some(packet.clone());
         self.overlay_preparations = self.overlay_preparations.saturating_add(1);
         Ok(Some(packet))
@@ -403,116 +254,65 @@ impl NativeS421 {
         self.editing_resources
             .as_ref()
             .is_some_and(|p| p.palette() == palette)
-            && !self.controller.routes().is_empty()
+            && !self.route.controller().routes().is_empty()
     }
     pub fn set_gpu_capability(&mut self, available: bool, error: Option<String>) {
-        if self.gpu_capable != available || self.gpu_error != error {
-            self.gpu_capable = available;
-            self.gpu_error = error;
-            self.refresh_ui(); // Display state does not change route geometry epoch.
-        }
+        self.route.set_display(available, error);
     }
     pub fn toggle_panel(&mut self) {
-        self.controller.set_active(!self.controller.panel_visible());
-        self.refresh();
+        self.route.toggle_panel();
     }
-    pub fn clear(&mut self) {
-        self.controller.clear();
-        self.controller.set_editing(false);
-        self.controller.set_active(false);
-        self.sources.clear();
+    /// Drop the drawing resources and the projected overlay.
+    fn release_drawing(&mut self) {
         self.editing_resources = None;
         self.editing_resource_error = None;
         self.prepared_overlay = None;
         self.overlay_prepare_error = None;
-        self.refresh();
+    }
+    pub fn clear(&mut self) {
+        self.release_drawing();
+        self.route.clear();
+    }
+    /// Capture own public editing resources lazily (Day is explicit
+    /// preparation metadata; nothing is rendered under it).
+    fn capture_editing_resources(
+        pc_root: &Path,
+        resources: &mut Option<std::sync::Arc<ferrite_gpu::NativeRouteOverlayResources>>,
+        error: &mut Option<String>,
+    ) {
+        if resources.is_none() && error.is_none() {
+            match ferrite_ui::load_native_route_overlay_resources(pc_root, "Day") {
+                Ok(loaded) => *resources = Some(loaded),
+                Err(e) => *error = Some(e),
+            }
+        }
     }
     pub fn import_path(&mut self, path: &Path, require_signatures: bool) -> Result<u32> {
-        // Existing failclosed policy remains before any path I/O.
-        ensure!(
-            !require_signatures,
-            "Authenticated S-421 exchange import is not yet available; unsigned route rejected"
+        let pc_root = self.route.editing_pc_root().to_path_buf();
+        let (resources, error) = (
+            &mut self.editing_resources,
+            &mut self.editing_resource_error,
         );
-        let captured = crate::s421_dataset_input::capture_if_route(path)?
-            .context("Selected XML is not S421 Dataset")?;
-        self.import_captured(&captured, require_signatures)
+        self.route.import_path(path, require_signatures, || {
+            Self::capture_editing_resources(&pc_root, resources, error)
+        })
     }
     pub fn import_captured(
         &mut self,
-        input: &crate::s421_dataset_input::CapturedRouteInput,
+        input: &ferrite_s421::layer::input::CapturedRouteInput,
         require_signatures: bool,
     ) -> Result<u32> {
-        // Namespace discovery is never authentication. Current operational mode rejects ALL bare inputs.
-        let xml = input.allowed_xml(require_signatures)?;
-        // Exact original bytes, not digest-only matching. Reopen is idempotent;
-        // changed bytes at the same retained origin require explicit unload, not a silent replacement.
-        for (id, path) in &self.sources {
-            if path == input.path() {
-                if self
-                    .controller
-                    .source_for_route(*id)
-                    .is_some_and(|source| source.original_xml.as_bytes() == xml.as_bytes())
-                {
-                    return Ok(*id);
-                }
-                anyhow::bail!(
-                    "S421 source changed at retained origin; unload before replacing {}",
-                    path.display()
-                );
-            }
-        }
-        let id = self
-            .controller
-            .import_xml_atomic(xml)
-            .map_err(crate::s421_dataset_input::RouteInputError::Malformed)?;
-        // Capture own public editing resources lazily. A missing/unsupported PC
-        // does not prevent route inspection and must never enable map editing.
-        // Day is explicit preparation metadata; nothing is rendered under it.
-        if self.editing_resources.is_none() && self.editing_resource_error.is_none() {
-            match ferrite_ui::load_native_route_overlay_resources(&self.editing_pc_root, "Day") {
-                Ok(resources) => self.editing_resources = Some(resources),
-                Err(error) => self.editing_resource_error = Some(error),
-            }
-        }
-        self.sources.insert(id, input.path().to_path_buf());
-        self.controller.set_editing(false);
-        self.controller.set_active(true);
-        self.refresh();
-        Ok(id)
+        let pc_root = self.route.editing_pc_root().to_path_buf();
+        let (resources, error) = (
+            &mut self.editing_resources,
+            &mut self.editing_resource_error,
+        );
+        self.route.import_captured(input, require_signatures, || {
+            Self::capture_editing_resources(&pc_root, resources, error)
+        })
     }
     pub fn catalogue_layer(&self) -> ferrite_ui::DatasetCatalogueLayer {
-        fn status(
-            raw: &ferrite_s421::catalogue::CatalogueStatus,
-            path: PathBuf,
-        ) -> ferrite_gpu::CatalogueStatus {
-            let mut out = ferrite_gpu::CatalogueStatus {
-                product_id: "S-421".into(),
-                path: path.display().to_string(),
-                ..Default::default()
-            };
-            match raw {
-                ferrite_s421::catalogue::CatalogueStatus::Loaded {
-                    version,
-                    feature_count,
-                } => {
-                    out.loaded = true;
-                    out.version = version.clone();
-                    out.item_count = *feature_count;
-                    out.validation_message=Some("Legacy public adjunct metadata; path is catalogue directory, not authenticated producer authority or full portrayal proof".into());
-                }
-                ferrite_s421::catalogue::CatalogueStatus::Error(e) => {
-                    out.validation_message = Some(e.clone())
-                }
-                _ => {}
-            }
-            out
-        }
-        let base = self
-            .editing_pc_root
-            .parent()
-            .and_then(Path::parent)
-            .unwrap_or(Path::new(""));
-        let mut pc = status(self.controller.pc_status(), self.editing_pc_root.clone());
+        let (fc, mut pc) = self.route.catalogue_status();
         if let Some(resources) = &self.editing_resources {
             pc.version = resources.actual_version().to_owned();
             pc.validation_message = Some(format!(
@@ -522,95 +322,37 @@ impl NativeS421 {
         }
         ferrite_ui::DatasetCatalogueLayer {
             product: "S-421".into(),
-            fc: status(self.controller.fc_status(), base.join("FC/S-421")),
+            fc,
             pc,
         }
     }
     pub fn dataset_rows(&self) -> Vec<ferrite_ui::DatasetLayerEntry> {
-        self.controller
-            .routes()
-            .iter()
-            .map(|route| {
-                let source = self
-                    .sources
-                    .get(&route.id)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                let profile = self
-                    .controller
-                    .source_for_route(route.id)
-                    .map(|s| match s.profile {
-                        ferrite_s421::s421::Profile::Published1 => "published1.0 subset",
-                        ferrite_s421::s421::Profile::Candidate2 => "2.0CDV subset",
-                    })
-                    .unwrap_or("locally authored");
-                ferrite_ui::DatasetLayerEntry {
-                    id: ferrite_ui::DatasetLayerId::S421 { route_id: route.id },
-                    name: route
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("Route {}", route.id)),
-                    source,
-                    detail: format!(
-                        "{profile} · {}waypoints · host editing overlay; rules not executed",
-                        route.waypoints.len()
-                    ),
-                }
+        self.route
+            .dataset_rows()
+            .into_iter()
+            .map(|row| ferrite_ui::DatasetLayerEntry {
+                id: ferrite_ui::DatasetLayerId::S421 {
+                    route_id: row.route_id,
+                },
+                name: row.name,
+                source: row.source,
+                detail: row.detail,
             })
             .collect()
     }
     pub fn unload_route(&mut self, id: u32) -> Result<()> {
-        ensure!(
-            self.controller.routes().iter().any(|r| r.id == id),
-            "S421 route no longer retained"
-        );
-        let event = serde_json::to_string(&UiEvent::DeleteRoute { id })?;
-        self.controller.handle_ui_event(RStr::from(event.as_str()));
-        self.sources.remove(&id);
+        self.route.unload_route(id)?;
         self.prepared_overlay = None;
-        self.gpu_capable = false;
-        self.controller.set_editing(false);
-        self.refresh();
         Ok(())
     }
     pub fn export_path(&self, path: &Path) -> Result<()> {
-        let route = self.controller.active_route().context("No active route")?;
-        let local_id = format!("FERRITE.ROUTE.{}", route.id);
-        let xml = if self.controller.source_for_route(route.id).is_some() {
-            self.controller.export_active_original()
-        } else {
-            self.controller.export_active_published(PublishedExport {
-                route_id: &local_id,
-                edition: 1,
-                status: 1,
-            })
-        }
-        .map_err(anyhow::Error::msg)?;
-        // Imported datasets retain their exact source XML and edition. Locally
-        // authored routes use the explicitly supported published geometry subset.
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        temporary.write_all(xml.as_bytes())?;
-        temporary.flush()?;
-        temporary.as_file().sync_all()?;
-        temporary.persist(path).map_err(|e| e.error)?;
-        Ok(())
+        self.route.export_path(path)
     }
     pub fn handle_event(&mut self, json: &str, require_signatures: bool) -> Result<()> {
-        ensure!(
-            json.len() <= MAX_EVENT_BYTES,
-            "S-421 command exceeds receiver byte limit"
-        );
-        let event: UiEvent = serde_json::from_str(json).context("Invalid S-421 command")?;
+        let event = RouteEditor::parse_event(json)?;
         match &event {
             UiEvent::Import => {
-                ensure!(
-                    !require_signatures,
-                    "Authenticated S-421 exchange import is not yet available; unsigned route rejected"
-                );
+                RouteEditor::check_import_allowed(require_signatures)?;
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("S-421 route", &["gml", "xml"])
                     .pick_file()
@@ -629,145 +371,19 @@ impl NativeS421 {
                 }
                 return Ok(());
             }
-            UiEvent::New | UiEvent::Finish => {
-                anyhow::bail!("Route chart editing/display is not yet available");
-            }
-            UiEvent::SetTurnRadius { id, radius_nm } => {
-                self.controller
-                    .set_native_turn_radius(*id, radius_nm)
-                    .map_err(anyhow::Error::msg)?;
-                self.refresh_ui();
-                return Ok(());
-            }
-            UiEvent::DeleteWaypoint { .. } | UiEvent::RenameWaypoint { .. }
-                if self
-                    .controller
-                    .active_route()
-                    .is_some_and(|route| self.controller.source_for_route(route.id).is_some()) =>
-            {
-                anyhow::bail!("Imported source is read-only; create a separate authored route");
-            }
-            UiEvent::RenameRoute { id, .. } if self.controller.source_for_route(*id).is_some() => {
-                anyhow::bail!("Imported source is read-only; create a separate authored route");
-            }
-            UiEvent::ToggleRendering => {
-                ensure!(
-                    self.gpu_capable,
-                    "S-421 route display unavailable for current PC/palette"
-                );
-            }
-            UiEvent::RenameRoute { name, .. } | UiEvent::RenameWaypoint { name, .. } => {
-                ensure!(
-                    !name.trim().is_empty()
-                        && name.len() <= 4096
-                        && !name.chars().any(char::is_control),
-                    "Invalid route/waypoint name"
-                );
-            }
             _ => {}
         }
-        let command = serde_json::to_string(&event)?;
-        self.controller
-            .handle_ui_event(RStr::from(command.as_str()));
-        if let UiEvent::DeleteRoute { id } = event {
-            self.sources.remove(&id);
+        if self.route.apply_event(event)? && self.route.controller().routes().is_empty() {
+            self.release_drawing();
         }
-        if matches!(event, UiEvent::Clear) {
-            self.sources.clear();
-        }
-        if self.controller.routes().is_empty() {
-            self.editing_resources = None;
-            self.editing_resource_error = None;
-            self.prepared_overlay = None;
-            self.overlay_prepare_error = None;
-        }
-        self.refresh();
         Ok(())
-    }
-    fn refresh(&mut self) {
-        self.world_samples = None;
-        self.overlay_revision = self
-            .overlay_revision
-            .checked_add(1)
-            .expect("Native route geometry revision exhausted");
-        self.refresh_ui();
-    }
-    fn refresh_ui(&mut self) {
-        let bytes = self.controller.get_ui_data();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(bytes.as_slice()).expect("Route UI is typed serializable data");
-        value["title"] = "S-421 Routes".into();
-        value["rendering_enabled"] =
-            (self.gpu_capable && self.controller.rendering_enabled()).into();
-        value["display_available"] = self.gpu_capable.into();
-        value["leg_geometry_editable"] = self
-            .controller
-            .active_route()
-            .is_some_and(|route| self.controller.source_for_route(route.id).is_none())
-            .into();
-        let imported = self
-            .controller
-            .active_route()
-            .is_some_and(|route| self.controller.source_for_route(route.id).is_some());
-        let editable = self.controller.active_route().is_some() && !imported;
-        value["content_editable"] = editable.into();
-        value["turn_radius_editable"] = editable.into();
-        if let Some(routes) = value["routes"].as_array_mut() {
-            for row in routes {
-                let editable = row["id"]
-                    .as_u64()
-                    .and_then(|id| u32::try_from(id).ok())
-                    .is_some_and(|id| self.controller.source_for_route(id).is_none());
-                row["editable"] = editable.into();
-            }
-        }
-        value["notice"] = if let Some(error) = &self.gpu_error {
-            format!("Route display unavailable: {error}. Imported routes are unverified.").into()
-        } else {
-            "Host route illustration; imported routes are unverified. Local routes are authored drafts."
-                .into()
-        };
-        if let Some(actions) = value["actions"].as_array_mut() {
-            for action in actions {
-                if action["id"] == "new" {
-                    // New attempts own-PC capture; failure is reported, never replaced by ENC resources.
-                    action["enabled"] = (!self.controller.editing()).into();
-                }
-                if action["id"] == "finish" {
-                    action["enabled"] = self
-                        .controller
-                        .active_route()
-                        .is_some_and(|route| self.controller.editing() && route.len() >= 2)
-                        .into();
-                }
-                if action["id"] == "copy" {
-                    action["enabled"] = (imported && !self.controller.editing()).into();
-                }
-                if action["id"] == "export" {
-                    action["label"] = if imported {
-                        "Save original"
-                    } else {
-                        "Export route"
-                    }
-                    .into();
-                    if imported {
-                        action["enabled"] = true.into();
-                    }
-                }
-            }
-        }
-        self.ui_json = serde_json::to_string(&value).expect("Route UI serialization");
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("Native route UI revision exhausted");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrite_s421::s421::MAX_XML_BYTES;
+    use ferrite_s421::s421::{PublishedExport, MAX_XML_BYTES};
     use ferrite_s421::{
         route::{Route, Waypoint},
         s421::export_published,
@@ -822,7 +438,7 @@ mod tests {
         let original = dir.path().join("original.gml");
         host.export_path(&original).unwrap();
         assert_eq!(std::fs::read_to_string(&original).unwrap(), xml);
-        let ui: serde_json::Value = serde_json::from_str(&host.ui_json).unwrap();
+        let ui: serde_json::Value = serde_json::from_str(host.ui_json()).unwrap();
         let copy = ui["actions"]
             .as_array()
             .unwrap()
@@ -832,9 +448,9 @@ mod tests {
         assert_eq!(copy["enabled"], true);
         host.handle_event(r#"{"type":"CopyAsAuthored"}"#, false)
             .unwrap();
-        let active = host.controller.active_route().unwrap().id;
+        let active = host.route.controller().active_route().unwrap().id;
         assert_ne!(active, imported);
-        assert!(host.controller.source_for_route(active).is_none());
+        assert!(host.route.controller().source_for_route(active).is_none());
         // The copy is editable and keeps the declared loxodromes.
         let event =
             serde_json::json!({"type":"SetTurnRadius","id":2,"radius_nm":"0.25"}).to_string();
@@ -845,7 +461,8 @@ mod tests {
         assert!(saved.contains("<gml:LineStringSegment interpolation=\"linear\">"));
         let reloaded = host.import_path(&edited, false).unwrap();
         let route = host
-            .controller
+            .route
+            .controller()
             .routes()
             .iter()
             .find(|r| r.id == reloaded)
@@ -855,7 +472,7 @@ mod tests {
             .iter()
             .all(|w| w.incoming_geometry == Some(LegGeometry::Loxodrome)));
         // The imported original is unchanged.
-        let source = host.controller.source_for_route(imported).unwrap();
+        let source = host.route.controller().source_for_route(imported).unwrap();
         assert_eq!(&*source.original_xml, xml.as_str());
     }
     #[test]
@@ -868,7 +485,7 @@ mod tests {
         let out = dir.path().join("saved.gml");
         host.export_path(&out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), original);
-        let ui: serde_json::Value = serde_json::from_str(&host.ui_json).unwrap();
+        let ui: serde_json::Value = serde_json::from_str(host.ui_json()).unwrap();
         assert_eq!(ui["content_editable"], false);
         assert_eq!(ui["turn_radius_editable"], false);
         assert_eq!(ui["waypoints"][0]["turn_radius_nm"], 0.5);
@@ -881,31 +498,36 @@ mod tests {
                 .unwrap()["label"],
             "Save original"
         );
-        let before = host.ui_json.clone();
+        let before = host.ui_json().to_string();
         assert!(host
             .handle_event(
                 r#"{"type":"SetTurnRadius","id":1,"radius_nm":"0.25"}"#,
                 false
             )
             .is_err());
-        assert_eq!(host.ui_json, before);
-        host.controller.begin_native_local_route().unwrap();
+        assert_eq!(host.ui_json(), before);
+        host.route
+            .controller_mut()
+            .begin_native_local_route()
+            .unwrap();
         let id = host
-            .controller
+            .route
+            .controller_mut()
             .append_native_local_waypoint(25., 59.)
             .unwrap();
         let event =
             serde_json::json!({"type":"SetTurnRadius","id":id,"radius_nm":"0.25"}).to_string();
         host.handle_event(&event, false).unwrap();
-        let local_before = serde_json::to_vec(host.controller.active_route().unwrap()).unwrap();
-        let ui: serde_json::Value = serde_json::from_str(&host.ui_json).unwrap();
+        let local_before =
+            serde_json::to_vec(host.route.controller().active_route().unwrap()).unwrap();
+        let ui: serde_json::Value = serde_json::from_str(host.ui_json()).unwrap();
         assert_eq!(ui["content_editable"], true);
         assert_eq!(ui["waypoints"][0]["turn_radius_nm"], 0.25);
         let event =
             serde_json::json!({"type":"SetTurnRadius","id":id,"radius_nm":"0.251"}).to_string();
         assert!(host.handle_event(&event, false).is_err());
         assert_eq!(
-            serde_json::to_vec(host.controller.active_route().unwrap()).unwrap(),
+            serde_json::to_vec(host.route.controller().active_route().unwrap()).unwrap(),
             local_before
         );
     }
@@ -951,7 +573,7 @@ mod tests {
         let path = fixture(dir.path());
         host.import_path(&path, false).unwrap();
         let first = host.prepare_overlay(&scaler, "Day").unwrap().unwrap();
-        let source_cache = host.world_samples.as_ref().unwrap().clone();
+        let source_cache = host.route.world_samples().unwrap().clone();
         let repeated = host.prepare_overlay(&scaler, "Day").unwrap().unwrap();
         assert!(Arc::ptr_eq(&first, &repeated));
         assert_eq!((host.overlay_preparations, host.overlay_cache_hits), (1, 1));
@@ -962,7 +584,7 @@ mod tests {
         assert!(moved.matches_camera(&scaler));
         assert!(Arc::ptr_eq(
             &source_cache,
-            host.world_samples.as_ref().unwrap()
+            host.route.world_samples().unwrap()
         ));
         assert!(host.prepare_overlay(&scaler, "Night").is_err());
         assert!(Arc::ptr_eq(host.prepared_overlay.as_ref().unwrap(), &moved));
@@ -970,18 +592,18 @@ mod tests {
             &moved,
             &host.prepare_overlay(&scaler, "Day").unwrap().unwrap()
         ));
-        let old_revision = host.overlay_revision;
+        let old_revision = host.route.overlay_revision();
         assert!(host
             .handle_event(r#"{"type":"RenameRoute","id":1,"name":"Renamed"}"#, false)
             .is_err());
-        assert_eq!(host.overlay_revision, old_revision);
+        assert_eq!(host.route.overlay_revision(), old_revision);
         let revised = host.prepare_overlay(&scaler, "Day").unwrap().unwrap();
         assert!(Arc::ptr_eq(
             &source_cache,
-            host.world_samples.as_ref().unwrap()
+            host.route.world_samples().unwrap()
         ));
         assert!(Arc::ptr_eq(&moved, &revised));
-        assert_eq!(revised.route_revision(), host.overlay_revision);
+        assert_eq!(revised.route_revision(), host.route.overlay_revision());
         // Reopening the same captured input is idempotent after a rejected edit;
         // it must not discard the retained route or append a copy.
         host.import_path(&path, false).unwrap();
@@ -1013,26 +635,26 @@ mod tests {
             scaler.pixels_per_mm().to_bits()
         );
         let before_status = host.prepare_overlay(&scaler, "Day").unwrap().unwrap();
-        let geometry_revision = host.overlay_revision;
+        let geometry_revision = host.route.overlay_revision();
         let ui_revision = host.revision();
         host.set_gpu_capability(true, None);
         assert!(host.revision() > ui_revision);
-        assert_eq!(host.overlay_revision, geometry_revision);
+        assert_eq!(host.route.overlay_revision(), geometry_revision);
         assert!(Arc::ptr_eq(
             &before_status,
             &host.prepare_overlay(&scaler, "Day").unwrap().unwrap()
         ));
         host.handle_event(r#"{"type":"ToggleRendering"}"#, false)
             .unwrap();
-        assert!(!host.controller.rendering_enabled());
+        assert!(!host.route.controller().rendering_enabled());
         assert!(host.prepare_overlay(&scaler, "Day").unwrap().is_none());
         host.handle_event(r#"{"type":"ToggleRendering"}"#, false)
             .unwrap();
-        assert!(host.controller.rendering_enabled());
+        assert!(host.route.controller().rendering_enabled());
         assert!(host.prepare_overlay(&scaler, "Day").unwrap().is_some());
         host.clear();
         assert!(host.prepared_overlay.is_none());
-        assert!(host.world_samples.is_none());
+        assert!(host.route.world_samples().is_none());
         assert!(host.prepare_overlay(&scaler, "Day").unwrap().is_none());
         assert!(host.overlay_prepare_error.is_none());
     }
@@ -1064,9 +686,9 @@ mod tests {
         assert_eq!(host.revision(), revision);
         std::fs::write(&path, vec![b' '; MAX_XML_BYTES + 1]).unwrap();
         assert!(host.import_path(&path, false).is_err());
-        assert_eq!(host.controller.routes().len(), 1);
+        assert_eq!(host.route.controller().routes().len(), 1);
         assert_eq!(
-            host.controller.source_for_route(id).unwrap().routes[0]
+            host.route.controller().source_for_route(id).unwrap().routes[0]
                 .route
                 .waypoints
                 .len(),
@@ -1102,19 +724,19 @@ mod tests {
         assert_eq!(host.revision(), revision);
         host.handle_event(r#"{"type":"DeleteRoute","id":1}"#, false)
             .unwrap();
-        assert!(host.controller.routes().is_empty());
-        assert!(host.sources.is_empty());
+        assert!(host.route.controller().routes().is_empty());
+        assert!(host.route.sources().is_empty());
         assert!(host.editing_resources.is_none());
         assert!(host.editing_resource_error.is_none());
         host.clear();
         assert!(!host.panel_visible());
-        assert!(!host.controller.editing());
+        assert!(!host.route.controller().editing());
     }
     #[test]
     fn captured_open_keeps_original_bytes_after_file_mutation_and_policy_denies_first() {
         let dir = tempfile::tempdir().unwrap();
         let path = fixture(dir.path());
-        let input = crate::s421_dataset_input::capture_if_route(&path)
+        let input = ferrite_s421::layer::input::capture_if_route(&path)
             .unwrap()
             .unwrap();
         std::fs::write(&path, "<mutated/>").unwrap();
@@ -1124,7 +746,8 @@ mod tests {
         assert_eq!(host.revision(), before);
         let id = host.import_captured(&input, false).unwrap();
         assert_eq!(
-            host.controller
+            host.route
+                .controller()
                 .source_for_route(id)
                 .unwrap()
                 .original_xml
@@ -1132,7 +755,7 @@ mod tests {
             input.xml().as_bytes()
         );
         assert_eq!(host.import_captured(&input, false).unwrap(), id);
-        assert_eq!(host.controller.routes().len(), 1);
+        assert_eq!(host.route.controller().routes().len(), 1);
         assert_eq!(
             host.dataset_rows()[0].id,
             ferrite_ui::DatasetLayerId::S421 { route_id: id }
@@ -1148,24 +771,26 @@ mod tests {
         let first = host.import_path(&path, false).unwrap();
         let second = host.import_path(&copy, false).unwrap();
         let other = host
-            .controller
+            .route
+            .controller()
             .source_for_route(second)
             .unwrap()
             .original_xml
             .clone();
         host.unload_route(first).unwrap();
         assert!(host.unload_route(first).is_err());
-        assert_eq!(host.controller.routes().len(), 1);
-        assert_eq!(host.controller.routes()[0].id, second);
+        assert_eq!(host.route.controller().routes().len(), 1);
+        assert_eq!(host.route.controller().routes()[0].id, second);
         assert_eq!(
-            host.controller
+            host.route
+                .controller()
                 .source_for_route(second)
                 .unwrap()
                 .original_xml,
             other
         );
-        assert_eq!(host.sources.get(&second), Some(&copy));
-        assert!(!host.gpu_capable);
+        assert_eq!(host.route.sources().get(&second), Some(&copy));
+        assert!(!host.route.display_available());
     }
 
     fn own_editing_fixture(catalogues: &Path) {
@@ -1210,15 +835,20 @@ mod tests {
         let imported = host.import_path(&fixture(dir.path()), false).unwrap();
         let before = host.audit_data();
         let source = host
-            .controller
+            .route
+            .controller()
             .source_for_route(imported)
             .unwrap()
             .original_xml
             .clone();
         let mut next = host.fork_local_edit("Day").unwrap();
-        let local = next.controller.begin_native_local_route().unwrap();
+        let local = next
+            .route
+            .controller_mut()
+            .begin_native_local_route()
+            .unwrap();
         assert_ne!(imported, local);
-        next.refresh();
+        next.route.refresh();
         let scaler = Scaler::new(GeoBounds::new(-3., 49., 0., 52.), Viewport::new(800., 600.));
         let empty = next.prepare_overlay(&scaler, "Day").unwrap().unwrap();
         assert!(empty
@@ -1228,12 +858,17 @@ mod tests {
             .unwrap()
             .waypoints
             .is_empty());
-        assert!(next.controller.finish_native_local_route().is_err());
-        assert!(next.controller.editing());
-        next.controller
+        assert!(next
+            .route
+            .controller_mut()
+            .finish_native_local_route()
+            .is_err());
+        assert!(next.route.controller().editing());
+        next.route
+            .controller_mut()
             .append_native_local_waypoint(-2.5, 50.)
             .unwrap();
-        next.refresh();
+        next.route.refresh();
         let one = next.prepare_overlay(&scaler, "Day").unwrap().unwrap();
         assert_eq!(
             one.paths()
@@ -1244,11 +879,16 @@ mod tests {
                 .len(),
             1
         );
-        assert!(next.controller.finish_native_local_route().is_err());
-        next.controller
+        assert!(next
+            .route
+            .controller_mut()
+            .finish_native_local_route()
+            .is_err());
+        next.route
+            .controller_mut()
             .append_native_local_waypoint(-2.4, 50.1)
             .unwrap();
-        next.refresh();
+        next.route.refresh();
         let two = next.prepare_overlay(&scaler, "Day").unwrap().unwrap();
         assert_eq!(
             two.paths()
@@ -1259,17 +899,22 @@ mod tests {
                 .len(),
             2
         );
-        next.controller.finish_native_local_route().unwrap();
-        assert!(!next.controller.editing());
+        next.route
+            .controller_mut()
+            .finish_native_local_route()
+            .unwrap();
+        assert!(!next.route.controller().editing());
         assert!(next
-            .controller
+            .route
+            .controller()
             .active_route()
             .unwrap()
             .waypoints
             .iter()
             .all(|p| p.turn_radius.is_none()));
         assert!(next
-            .controller
+            .route
+            .controller()
             .export_active_published(PublishedExport {
                 route_id: "LOCAL.ROUTE",
                 edition: 1,
@@ -1278,7 +923,8 @@ mod tests {
             .is_err());
         assert_eq!(
             source.as_bytes(),
-            next.controller
+            next.route
+                .controller()
                 .source_for_route(imported)
                 .unwrap()
                 .original_xml
@@ -1296,44 +942,63 @@ mod tests {
         assert_eq!(host.audit_data(), before);
         own_editing_fixture(&catalogues);
         let mut next = host.fork_local_edit("Day").unwrap();
-        next.controller.begin_native_local_route().unwrap();
-        let snapshot = serde_json::to_vec(next.controller.routes()).unwrap();
+        next.route
+            .controller_mut()
+            .begin_native_local_route()
+            .unwrap();
+        let snapshot = serde_json::to_vec(next.route.controller().routes()).unwrap();
         for (lon, lat) in [(f64::NAN, 50.), (181., 50.), (0., 91.)] {
             assert!(next
-                .controller
+                .route
+                .controller_mut()
                 .append_native_local_waypoint(lon, lat)
                 .is_err());
             assert_eq!(
-                serde_json::to_vec(next.controller.routes()).unwrap(),
+                serde_json::to_vec(next.route.controller().routes()).unwrap(),
                 snapshot
             );
         }
-        assert!(next.controller.begin_native_local_route().is_err());
-        assert!(next.controller.finish_native_local_route().is_err());
+        assert!(next
+            .route
+            .controller_mut()
+            .begin_native_local_route()
+            .is_err());
+        assert!(next
+            .route
+            .controller_mut()
+            .finish_native_local_route()
+            .is_err());
         assert_eq!(
-            next.controller
+            next.route
+                .controller_mut()
                 .append_native_local_waypoint(179., 50.)
                 .unwrap(),
             1
         );
-        let snapshot = serde_json::to_vec(next.controller.routes()).unwrap();
+        let snapshot = serde_json::to_vec(next.route.controller().routes()).unwrap();
         assert!(next
-            .controller
+            .route
+            .controller_mut()
             .append_native_local_waypoint(-179., 50.)
             .is_err());
         assert_eq!(
-            serde_json::to_vec(next.controller.routes()).unwrap(),
+            serde_json::to_vec(next.route.controller().routes()).unwrap(),
             snapshot
         );
         assert_eq!(
-            next.controller
+            next.route
+                .controller_mut()
                 .append_native_local_waypoint(178., 50.)
                 .unwrap(),
             2
         );
-        next.controller.finish_native_local_route().unwrap();
+        next.route
+            .controller_mut()
+            .finish_native_local_route()
+            .unwrap();
         assert!(next
-            .controller
+            .route
+            .controller_mut()
             .append_native_local_waypoint(177., 50.)
             .is_err());
         assert!(host.fork_local_edit("UnknownPalette").is_err());

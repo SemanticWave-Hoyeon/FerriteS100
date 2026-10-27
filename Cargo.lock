@@ -1566,6 +1566,7 @@ dependencies = [
  "epaint",
  "ferrite-kernel",
  "ferrite-portrayal-catalog",
+ "ferrite-product-api",
  "ferrite-render",
  "ferrite-s102",
  "image",
@@ -1723,6 +1724,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "ferrite-kernel",
  "ferrite-portrayal-catalog",
  "ferrite-render",
 ]
@@ -1923,12 +1925,17 @@ name = "ferrite-s421"
 version = "2.0.0"
 dependencies = [
  "abi_stable",
+ "anyhow",
  "ferrite-kernel",
  "ferrite-plugin-api",
+ "ferrite-product-api",
  "quick-xml 0.37.5",
  "roxmltree",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]
@@ -1980,6 +1987,7 @@ dependencies = [
  "egui-winit",
  "ferrite-gpu",
  "ferrite-portrayal-catalog",
+ "ferrite-product-api",
  "ferrite-render",
  "ferrite-s124",
  "ferrite-s129",

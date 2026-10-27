@@ -135,7 +135,7 @@ lua54 = ["ferrite-lua/lua54", "ferrite-s101/lua54", "ferrite-s102/lua54", "ferri
 lua55 = ["ferrite-lua/lua55", "ferrite-s101/lua55", "ferrite-s102/lua55", "ferrite-gpu/lua55", "ferrite-ui/lua55", "ferrite-engine/lua55"]
 
 [dependencies]
-ferrite-engine = { workspace = true, features = ["parallel", "s102-hdf5", "crypto-openssl", "s124", "s129"] }
+ferrite-engine = { workspace = true, features = ["parallel", "s102-hdf5", "crypto-openssl", "s124", "s129", "s421"] }
 quick-xml.workspace = true
 roxmltree = "=0.20.0"
 chrono.workspace = true
@@ -188,6 +188,8 @@ tempfile = "3"
 [dev-dependencies]
 # Test-only engine helpers the application tests use.
 ferrite-engine = { workspace = true, features = ["test-support"] }
+# Test-only access to captured S-421 route text.
+ferrite-s421 = { path = "crates/ferrite-s421", features = ["test-support"] }
 # Test-only actual ECDSA fixture; already used by ferrite-security.
 openssl = { version = "0.10", features = ["vendored"] }
 base64 = "=0.22.1"

@@ -17,20 +17,23 @@
 //!   the viewer's S-124 warning list).
 //! * [`ProductLayer`]: a store of opened datasets of one or more products
 //!   that share an encoding and a portrayal pipeline (the S-100 Part 10b GML
-//!   overlay layer serves S-124 and S-129; S-101 cells, S-102 grids and
-//!   S-421 routes follow in later steps). It opens datasets from bytes
+//!   overlay layer serves S-124 and S-129, `ferrite_s102::layer` S-102
+//!   grids, `ferrite_s421::layer` S-421 routes; S-101 cells follow in a
+//!   later step). It opens datasets from bytes
 //!   ([`DatasetInput`]), portrays them into drawing instructions and
 //!   renderer extensions ([`SceneContribution`]), reports coverage and
 //!   describes and highlights picked features ([`FeaturePick`]).
 //!
 //! Platform services the product modules need themselves (the clock and
 //! per-user records) are defined in [`platform`]; the engine's `Platform`
-//! implements them.
+//! implements them. [`route_overlay`] is the renderer extension a route
+//! product (S-421) portrays into and renderers draw.
 use std::any::Any;
 use std::path::Path;
 use std::sync::Arc;
 
 pub mod platform;
+pub mod route_overlay;
 
 pub use ferrite_render::host_settings::CatalogueStatus;
 pub use ferrite_render::{DrawingInstruction, GeoBounds, WorldPoint};
@@ -185,7 +188,7 @@ pub struct PortrayalRequest<'a> {
 
 /// Renderer-specific output expressed as data the renderer understands.
 /// The kind names the renderer path; the payload type belongs to it (raster
-/// tiles of S-102, the S-421 route overlay in a later step).
+/// tiles of S-102, the S-421 route overlay of [`route_overlay`]).
 #[derive(Clone)]
 pub struct RendererExtension {
     pub kind: &'static str,

@@ -1,4 +1,5 @@
 //! Declared public-PC resources for a HOST editing illustration, not XSLT portrayal.
+use ferrite_product_api::route_overlay::{EditingStyle, EditingStyleReader};
 use std::collections::BTreeSet;
 
 #[derive(Debug)]
@@ -235,6 +236,23 @@ mod tests {
         .is_err());
     }
 }
+
+/// The declared editing contract as the renderer's resource loader takes it.
+fn editing_style(pc: &str, waypoint_svg: &str) -> Result<EditingStyle, String> {
+    let contract = EditingStyleContract::from_declared_pc(pc, waypoint_svg)?;
+    Ok(EditingStyle {
+        product: contract.product().to_owned(),
+        version: contract.version().to_owned(),
+        svg_color_tokens: contract.svg_color_tokens().map(str::to_owned).collect(),
+    })
+}
+
+/// The declared S-421 editing PC contract and palette reader, for the
+/// renderer's route overlay resources (moved from `ferrite_ui::native_route`).
+pub const EDITING_STYLE: EditingStyleReader = EditingStyleReader {
+    contract: editing_style,
+    palette: read_editing_palette,
+};
 
 /// Exact requested palette from declared COLOR01 bytes, never directory enumeration.
 pub fn read_editing_palette(

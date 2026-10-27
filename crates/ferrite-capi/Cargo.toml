@@ -10,7 +10,7 @@ name = "ferrite"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s124", "s129"]
+default = ["lua54", "parallel", "s102-hdf5", "crypto-openssl", "s124", "s129", "s421"]
 lua54 = ["ferrite-cli/lua54"]
 lua55 = ["ferrite-cli/lua55"]
 parallel = ["ferrite-cli/parallel"]
@@ -20,6 +20,7 @@ crypto-openssl = ["ferrite-cli/crypto-openssl"]
 crypto-rust = ["ferrite-cli/crypto-rust"]
 s124 = ["ferrite-cli/s124"]
 s129 = ["ferrite-cli/s129"]
+s421 = ["ferrite-cli/s421"]
 
 [dependencies]
 anyhow.workspace = true

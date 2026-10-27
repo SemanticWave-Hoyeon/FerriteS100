@@ -5,8 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Common interface of the S-100 product modules: product identity and detection, dataset layers (open, portray, coverage, describe), panel data models and platform services shared with the engine"
 
+[features]
+# Test-only hooks (route overlay leg solver call counter) used by renderer tests.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+# WGS84 geodesic and rhumb solvers of the route overlay leg samples.
+ferrite-kernel.workspace = true
 ferrite-portrayal-catalog.workspace = true
 ferrite-render.workspace = true

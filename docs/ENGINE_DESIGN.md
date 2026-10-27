@@ -279,7 +279,7 @@ python3 tools/pixel_regression.py --skip-build    # 이전 빌드 재사용
 
 - S-101: `ferrite-s101`(셀 읽기·Lua 변환) 외에 엔진의 `s101_*` 모듈(업데이트 계획, 생명주기, 교환 세트 검사), `EngineState`의 셀·카탈로그 필드, `chart_engine.rs`의 열기·준비 분기.
 - S-102: `ferrite-s102`, 엔진 `s102_*`(장면, 수심 정책, 입력 포착, 저널 허용, 시험 워커)와 `EngineState`의 `s102_*` 필드, `ferrite-gpu` 래스터 경로, `src/main.rs` 분기(약 230곳).
-- S-421: `ferrite-s421`, 엔진 `s421_dataset_input`, `ferrite-gpu`의 `native_route_*`, `ferrite-ui` 경로 패널, `src/native_s421.rs`.
+- S-421: `ferrite-s421`, 엔진 `s421_dataset_input`, `ferrite-gpu`의 `native_route_*`, `ferrite-ui` 경로 패널, `src/native_s421.rs`(3단계에서 `ferrite-s421`로 모음).
 - S-124/S-129: 두 제품이 `ferrite-s100-gml` 한 크레이트에 섞여 있고, 생명주기·사용자 상태·포트레이얼 옵션은 엔진 `gml_overlay.rs`와 `src/gml_overlay.rs`에 `Product::S124`/`S129` 분기로 들어 있었다.
 
 제품 하나를 추가하거나 빼려면 여러 크레이트를 함께 고쳐야 하고 제품 단위로 빌드할 수 없다.
@@ -309,6 +309,7 @@ ferrite-ui            등록된 제품의 패널 데이터 모델을 그린다
 | `RendererExtension` | 렌더러가 아는 종류 이름과 페이로드. S-102 래스터 타일, S-421 경로 오버레이를 그리기 명령 밖의 데이터로 넘기는 자리 |
 | 패널 데이터 모델 | 제품 크레이트가 행·옵션 타입을 정의하고(`ferrite_s124::panel`, `ferrite_s129::panel`), UI 크레이트는 그 타입만 그린다. API 크레이트는 egui에 의존하지 않는다 |
 | `platform::{Clock, UserRecord, DataSource, CacheStore}` | 제품이 직접 쓰는 플랫폼 서비스(시각, 사용자별 기록, 데이터 원천, 캐시 저장소). `ferrite_engine::platform`이 다시 내보내고 구현한다 |
+| `route_overlay` | 경로 오버레이 렌더러 확장(종류 `"S-421/route-overlay"`, 페이로드 `NativeRouteWorldSamples`): 경로별 웨이포인트(`NativeRoutePath`), 선언된 구간(`NativeRouteLegDeclaration`), 그 WGS84 표본, 편집 PC 판독기 계약(`EditingStyleReader`). 제품(생산)과 렌더러(소비)가 함께 쓴다 |
 
 GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한다.
 
@@ -328,7 +329,7 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 
 ### 기능 플래그
 
-`ferrite-engine`의 `s124`, `s129`(기본 켜짐)가 제품 크레이트를 등록한다(`ferrite_engine::products`, 엔진에서 제품을 이름으로 부르는 유일한 곳). 끄면 그 제품의 데이터셋은 탐색·판별·열기 대상이 아니고 카탈로그도 적재하지 않는다. `ferrite-cli`·`ferrite-capi`·`ferrite-wasm`은 같은 이름의 기능을 기본으로 켜서 넘기고, 뷰어는 엔진 의존에 두 기능을 명시한다. `tools/build_wasm.py --no-s102`도 두 기능을 유지한다.
+`ferrite-engine`의 `s124`, `s129`, `s421`(기본 켜짐)이 제품 크레이트를 등록한다(`ferrite_engine::products`, 엔진에서 제품을 이름으로 부르는 유일한 곳). 끄면 그 제품의 데이터셋은 탐색·판별·열기 대상이 아니고 카탈로그도 적재하지 않는다(`s421`을 끄면 경로를 탐색·캡처하지 않고 `ChartEngine::routes`가 없다). `ferrite-cli`·`ferrite-capi`·`ferrite-wasm`은 같은 이름의 기능을 기본으로 켜서 넘기고, 뷰어는 엔진 의존에 세 기능을 명시한다. `tools/build_wasm.py --no-s102`도 세 기능을 유지한다.
 
 ### 단계
 
@@ -338,7 +339,7 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 |---|---|
 | 1 | **완료.** `ferrite-product-api` 정의. S-124·S-129를 `ferrite-s124`·`ferrite-s129`로 분리하고 엔진 오버레이 경로가 등록된 어댑터를 거치게 함(아래). |
 | 2 | **완료.** S-102: 엔진 `s102_*` 모듈과 `EngineState`의 `s102_*` 필드를 `ferrite-s102`(제품 계층 `layer`)로 옮기고 래스터 타일을 `RendererExtension`으로 넘김. `main.rs`의 S-102 분기 일부를 계층 호출로 바꿈(아래). |
-| 3 | S-421: `s421_dataset_input`, `src/native_s421.rs`의 제품 로직, `ferrite-gpu` `native_route_*`의 데이터 모델을 `ferrite-s421`로 모으고 경로 오버레이를 확장으로 넘긴다. 경로 패널은 제품 패널 모델을 그린다. |
+| 3 | **완료.** S-421: `s421_dataset_input`, `src/native_s421.rs`의 제품 로직을 `ferrite-s421`로 모으고, `ferrite-gpu` `native_route_*`의 데이터 모델을 경로 오버레이 확장(`ferrite_product_api::route_overlay`)으로 옮겨 경로 오버레이를 확장으로 넘긴다(아래). |
 | 4 | S-101: 엔진 `s101_*`(업데이트 계획, 생명주기, 교환 세트 검사, 카탈로그 선택)와 셀 포트레이얼의 제품 고유 부분을 `ferrite-s101` 제품 계층으로 옮긴다. |
 | 5 | 엔진·UI 정리: `ChartEngine`이 `Vec<Box<dyn ProductLayer>>`로 계층을 합성하고, UI는 등록된 패널을 그리며, UI·애플리케이션·CLI·C ABI·웹에 제품별 기능 플래그를 둔다. `ferrite_s100_gml::Product` 열거형을 `ProductId` 등록으로 바꾼다. |
 
@@ -364,6 +365,19 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 - 테스트 이동: 엔진 단위 테스트 `s102_{depth_policy,input_capture,journal_admission,original_inputs,trial_worker}::tests::*`, `s102_scene::opened::tests::*`는 `ferrite-s102`의 `layer::{...}::tests::*`, `layer::scene::tests::*`로 옮겼다(이름 그대로). 메모리 데이터 원천을 쓰던 시험은 계층의 시험용 원천(`layer::test_support`)을 쓴다. 엔진 통합 시험 `in_memory_s102`는 확장을 읽는다.
 - 동작: S-102 열기·검증 문제·알림 순서, 포트레이얼 출력, 저널·시험 파일 처리, 수심 정책, 캐시 항목(키·형식), 서명 처리는 그대로다.
 
+### 3단계 결과
+
+- 옮긴 파일(`git mv`): `ferrite-engine/src/s421_dataset_input.rs` → `ferrite-s421/src/layer/input.rs`, `ferrite-gpu/src/native_route_leg.rs` → `ferrite-product-api/src/route_overlay/leg.rs`, `ferrite-s421/src/lib.rs` → `ferrite-s421/src/controller.rs`(경로 컨트롤러와 abi_stable 플러그인 구현; `lib.rs`는 모듈 목록과 `RouteSettings`만 남김). `ferrite-gpu/src/native_route_overlay.rs`의 경로 데이터 모델(`NativeRouteWaypoint`, `NativeRoutePath`, `NativeRouteWorldSamples`, 경로 검사, 예산 상수)과 편집 스타일 계약 타입(`EditingStyle`, `EditingPalette`, `EditingStyleReader`)은 `ferrite_product_api::route_overlay`로 옮겼다. `src/native_s421.rs`의 제품 로직은 `ferrite_s421::editor`로 옮겼다.
+- 의존 방향: `ferrite-gpu → ferrite-product-api`(경로 오버레이 확장), `ferrite-s421 → ferrite-product-api`. `ferrite-gpu`는 `ferrite-s421`에 의존하지 않는다. 확장의 데이터 모델과 WGS84 구간 표본(`sample_leg`, `NativeRouteWorldSamples::prepare`)이 API 크레이트에 있는 것은 렌더러의 화면 투영(`PreparedNativeRouteOverlay`)이 표본의 불변식(표본 정책 `MAX_STEP_M`·정점 한도, 원래 경로·선언과의 정확 일치 `matches`)을 함께 검사하기 때문이다. 표본은 S-421 파싱과 무관한 선언 구간의 수치 모델이다. API 크레이트에 `ferrite-kernel`(측지) 의존이 생겼다.
+- `ferrite_s421::layer`(모든 대상): `input`(경로 캡처·탐색, `DataSource`를 거침. 경로 기반 `discover_routes`는 없애고 엔진이 `discover_routes_in(&NativeDataSource, ..)`을 부름. 바이트 입력용 `capture_bytes` 추가), `S421`(`ProductAdapter`: `.gml`/`.xml`, `CATALOG.XML` 제외, 앞부분에 `S421`/`S-421`이 있으면 데이터셋 — 엔진이 쓰던 판별 그대로. `SceneRole::Route`, 패널 `S-421/routes`), `S421Layer`(`ProductLayer`: 캡처한 원본 바이트 보관, 같은 SHA-256은 한 번, 필요할 때 판독. `portray` → 그리기 명령 없는 `SceneContribution`과 경로 오버레이 확장(표시 중인 경로, 선언 구간, 리비전별 캐시), `coverage` → 웨이포인트 범위, `describe`/`highlight` → `RouteKey`(웨이포인트 양수, 구간 음수 키)의 웨이포인트·구간 보고와 구간 표본), `overlay`(경로를 확장 입력으로 바꾸는 함수, 편집기와 공용).
+- `ferrite_s421::editor`(네이티브 전용, `RouteEditor`): 컨트롤러, 가져온 경로의 원본 위치, UI·기하 리비전, 경로 패널 데이터(`refresh_ui`), 가져오기(`import_path`/`import_captured`, 새 경로를 받을 때 호스트 훅), 내보내기(`export_xml`/`export_path`), 명령(`parse_event`/`apply_event`), 데이터셋 행(`RouteRow`), 카탈로그 상태, 진단(`audit_data`의 제품 부분), 경로 오버레이(`route_overlay` → `RouteOverlay::extension`, 성공한 게시 뒤 `commit_route_overlay`). `PROVIDER_ID`도 여기로 옮겼다(`ferrite_gpu::NATIVE_S421_PROVIDER`는 쓰는 곳이 없어 없앰).
+- 플러그인 계층: `ferrite-s421`의 `abi_stable`·`ferrite-plugin-api`·`tempfile` 의존과 `controller`·`editor` 모듈은 wasm32가 아닌 대상에서만 빌드한다. 그래서 엔진은 `ferrite-s421`에 대상 조건 없이 의존하고(`s421` 기능), 웹 빌드의 `Profile`·`MAX_XML_BYTES` 사본을 없앴다(같은 이름의 시험은 값을 고정하는 시험으로 남김).
+- `ferrite-gpu`: 화면 투영(`PreparedNativeRouteOverlay`)과 그리기 자원(`NativeRouteOverlayResources`, 편집 PC 판독기는 주입), GPU 게시(`native_route_gpu`)만 남았다. 확장 소비 `PreparedNativeRouteOverlay::from_extension(resources, &RendererExtension, scaler, ppmm)`은 페이로드의 경로·선언·리비전으로 `prepare_with_world_samples`를 부른다. 판독기 `EDITING_STYLE`은 `ferrite_s421::editing_style_contract`로 옮겼고 `ferrite_ui::native_route`는 자원 적재 래퍼와 다시 내보내기(`S421_EDITING_STYLE`)만 가진다.
+- 엔진: `products::s421`(입력·어댑터·계층 다시 내보내기). `dataset_open_plan`의 탐색·단일 파일 캡처와 `ChartEngine`의 열기 작업(어댑터 `sniff`로 판별 후 캡처), 경로 저장(`S421Layer`, 중복 SHA-256은 "Already open")이 계층을 거친다. `ChartEngine::routes()`는 `Vec<&CapturedRouteInput>`을 돌려주고 `route_layer()`가 계층을 준다. 엔진의 장면(`PreparedScene`)에는 경로 확장을 넣지 않는다(이전처럼 "not portrayed by ChartEngine"; CLI·웹 렌더러는 경로 그리기 자원이 없다).
+- 뷰어(`src/native_s421.rs`): 편집기 + 그리기 자원 적재(가져오기 훅에서 Day), 투영된 오버레이 캐시와 GPU 동기화, 편집 거래(포크→컨트롤러 변경→투영→GPU 게시), 파일 대화상자, 데이터셋 트리 행·카탈로그 줄 변환. 앱의 열기 계획 타입은 `ferrite_s421::layer::input`이다.
+- 테스트 이동: `ferrite-engine` `s421_dataset_input::tests::*` → `ferrite-s421` `layer::input::tests::*`(발견 시험은 시험용 로컬 `DataSource`), `ferrite-gpu` `native_route_leg::tests::*` → `ferrite-product-api` `route_overlay::leg::tests::*`, `native_route_overlay::tests::*`(5개) → `route_overlay::tests::*`, `ferrite-s421` `native_import_transaction_tests::*` → `controller::native_import_transaction_tests::*`. 새 시험: `layer::tests::{adapter_sniffs_route_heads_by_name_and_namespace, layer_opens_bytes_once_and_reports_coverage_and_picks}`, `ferrite-ui` `route_overlay_extension_projects_like_its_world_samples`. 앱의 `native_s421::tests::*`는 이름 그대로 앱 쪽 연결 코드와 편집기를 함께 시험한다.
+- 동작: 경로 가져오기·내보내기(원본 바이트 저장 포함), 편집 거래와 실패 시 보존, 오버레이 캐시(적중·준비 횟수, 세계 표본 재사용), GPU 게시, 패널 JSON, 진단 JSON, 알림 문구는 그대로다.
+
 ### 2~5단계 참고
 
 - `ferrite_s100_gml::Product` 열거형(판독기 제품 판별, `namespaced_symbol`, 교환 세트의 제품 판별)과 판독기의 S-129 검사 식별자(`S-158-129/15`)가 아직 공통 기반에 있다. 5단계에서 `ProductId` 등록으로 바꾼다.
@@ -371,7 +385,11 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 - `platform::UserStore::navwarn_state`는 S-124 이름이다. 제품별 기록(`product_state(product, user)`)으로 일반화하되 저장 키(`navwarn/<user>`, `FerriteS100/navwarn/<user>.json`)는 유지한다.
 - `ferrite-ui::overlay_ui::State`는 S-124·S-129 필드를 고정으로 가진다. 5단계 패널 등록에서 제품별 패널 상태로 나누고 UI 기능 플래그를 둔다.
 - `ChartEngine`의 열기 작업(작업 스레드)은 정적 등록(`products::gml_rules`)으로 판별한다. 다른 제품도 정적 규칙과 상태 모듈을 나누면 같은 방식으로 작업 스레드에서 판별할 수 있다.
-- S-421 계층은 `RendererExtension`의 페이로드 타입을 렌더러 쪽(`ferrite-gpu`)과 함께 정해야 한다. 페이로드는 `Arc<dyn Any + Send + Sync>`라 제품 크레이트가 GPU에 의존하지 않는다. S-102는 GPU로 옮길 때 꺼내야 해서 페이로드 안에 `Mutex`를 둔다(`BathymetryScene::take_tiles`).
+- 렌더러 확장 페이로드는 `Arc<dyn Any + Send + Sync>`라 제품 크레이트가 GPU에 의존하지 않는다. S-102는 GPU로 옮길 때 꺼내야 해서 페이로드 안에 `Mutex`를 둔다(`BathymetryScene::take_tiles`). S-421은 불변 표본(`NativeRouteWorldSamples`)을 공유하고 페이로드 타입은 API 크레이트(`route_overlay`)에 있다(3단계).
+- S-421의 두 저장소: 엔진 쪽 `S421Layer`(캡처한 경로, 읽기 전용)와 뷰어의 `RouteEditor`(컨트롤러가 가진 가져온 경로와 작성 경로). 5단계에서 엔진이 계층을 합성할 때 편집기의 가져온 경로를 계층으로 옮기거나 편집기가 계층을 감싸면 하나로 줄일 수 있다. `S421Layer`의 경로 ID는 현재 리비전의 표시 순서(1부터)라 데이터셋을 닫으면 바뀐다.
+- `ChartEngine`의 장면에는 경로 확장이 없다. CLI·웹 렌더러가 경로를 그리려면 `NativeRouteOverlayResources`(편집 PC, 팔레트)를 플랫폼 소스에서 적재하고 `SceneEmitter`가 `from_extension` → `PreparedNativeRouteGpuPublication`을 거쳐야 한다(현재 `sync_native_route_gpu`는 뷰어 렌더러 전용 경로).
+- 경로 패널(`ferrite-ui::egui_integration`)은 여전히 플러그인 UI JSON(`ferrite_s421::ui::UiData` + 편집기 필드)을 그린다. `S421::panels()`가 패널(`S-421/routes`)을 알리지만 형식이 있는 패널 모델로 바꾸는 일은 5단계 패널 등록과 함께 한다.
+- `ferrite-s421`의 플러그인 계층(`RoutePlugin`, `Plugin` 구현)과 외부 `plugins/route-plugin`은 그대로 컨트롤러를 공유한다. 뷰어는 정적으로 연결한 같은 컨트롤러를 쓴다.
 - `ProductLayer::portray`는 실패를 돌려줄 수 없고(`Option`) 요청에 규칙 출처·상호운용 합성이 없다. S-102는 트레이트 구현에서 계층 옵션·캐시와 표시 설정(`PortrayalRequest::settings`, 2단계에서 추가)만 쓰고 실패는 기록 후 None으로 처리한다. 엔진은 오류를 전파해야 하므로 `S102Layer::prepare`를 직접 부른다. 5단계에서 `portray`를 `Result`로 바꾸고 요청에 호스트 서비스(규칙 출처, 캐시, 상호운용 선택)를 넣으면 엔진도 트레이트만 쓸 수 있다.
 - `ProductLayer::open`(바이트 입력)은 서명 스냅숏을 보관하지 않는다. 엔진의 열기 작업은 서명 정책·데이터 원천 포착이 필요해 `open_inputs`/`install`을 쓴다. 단계 5에서 `DatasetInput`에 인증 스냅숏을 싣는 방안을 검토한다.
 - S-102 ID(`ProductLayer::remove`의 `u32`)는 계층이 파일 경로마다 매긴다. 뷰어의 데이터셋 트리는 아직 경로(`DatasetLayerId::S102(path)`)로 부른다.

@@ -1,23 +1,11 @@
-//! Discovery/capture only: no authentication or portrayal authority is produced here.
-//! Routes are read through a [`DataSource`]: the path-based functions read
-//! local files exactly as before; the `_in` variants any source (paths stay
-//! the identity of the captured route).
-use crate::platform::{DataSource, EntryKind, NativeDataSource};
-#[cfg(not(target_arch = "wasm32"))]
-use ferrite_s421::s421::{Profile, MAX_XML_BYTES};
-#[cfg(target_arch = "wasm32")]
-pub use wasm_profile::{Profile, MAX_XML_BYTES};
-/// The web build has no `ferrite-s421` (its plugin layer needs dynamic
-/// loading); these mirror `ferrite_s421::s421::{Profile, MAX_XML_BYTES}`.
-#[cfg(any(target_arch = "wasm32", test))]
-mod wasm_profile {
-    pub const MAX_XML_BYTES: usize = 8 * 1024 * 1024;
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Profile {
-        Published1,
-        Candidate2,
-    }
-}
+//! S-421 route input capture and discovery (moved from the engine's
+//! `s421_dataset_input`). Discovery/capture only: no authentication or
+//! portrayal authority is produced here.
+//! Routes are read through a [`DataSource`]: [`capture_if_route`] reads a
+//! local file, the `_in` variants any source (paths stay the identity of the
+//! captured route).
+use crate::s421::{Profile, MAX_XML_BYTES};
+use ferrite_product_api::platform::{DataSource, EntryKind};
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
@@ -61,6 +49,11 @@ impl CapturedRouteInput {
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn xml(&self) -> &str {
+        &self.xml
+    }
+    /// The captured text, whatever the signature policy (product-internal
+    /// reading for coverage, reports and portrayal).
+    pub(crate) fn source_xml(&self) -> &str {
         &self.xml
     }
     pub fn sha256(&self) -> &[u8; 32] {
@@ -130,6 +123,24 @@ pub fn capture_if_route_in(
         .read_limited(path, MAX_XML_BYTES as u64)
         .map_err(|e| RouteInputError::Io(e.to_string()))?;
     classify_owned(path.to_path_buf(), bytes)
+}
+/// Whether `path` has the extension and is not an AppleDouble (`._`)
+/// companion (the engine's `dataset_discovery::is_dataset_file`).
+pub fn is_dataset_file(path: &Path, extension: &str) -> bool {
+    !path
+        .file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"._"))
+        && path
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+/// Classify bytes already read (an in-memory dataset input): an S-421 route
+/// captured under `path`, None for other XML.
+pub fn capture_bytes(
+    path: PathBuf,
+    bytes: Vec<u8>,
+) -> Result<Option<CapturedRouteInput>, RouteInputError> {
+    classify_owned(path, bytes)
 }
 fn classify_owned(
     path: PathBuf,
@@ -213,13 +224,8 @@ fn classify_owned(
     }))
 }
 /// Extra product discovery; existing numeric/HDF scanner remains byte-identical.
-/// Non-S421 XML catalogues are not reclassified as routes.
-pub fn discover_routes(
-    root: &Path,
-) -> Result<(Vec<CapturedRouteInput>, Vec<String>), RouteInputError> {
-    discover_routes_in(&NativeDataSource, root)
-}
-/// [`discover_routes`] over any data source.
+/// Non-S421 XML catalogues are not reclassified as routes. Local folders are
+/// read through a data source with local paths (the engine's native source).
 pub fn discover_routes_in(
     data: &dyn DataSource,
     root: &Path,
@@ -238,8 +244,7 @@ pub fn discover_routes_in(
         }
         let entry = entry.map_err(|e| RouteInputError::Io(e.to_string()))?;
         if entry.kind == EntryKind::File
-            && (crate::dataset_discovery::is_dataset_file(&entry.path, "gml")
-                || crate::dataset_discovery::is_dataset_file(&entry.path, "xml"))
+            && (is_dataset_file(&entry.path, "gml") || is_dataset_file(&entry.path, "xml"))
         {
             if entry
                 .path
@@ -284,15 +289,91 @@ pub fn discover_routes_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_product_api::platform::SourceEntry;
+    use std::io;
+
+    /// Local files, as the engine's native data source reads them.
+    struct LocalFiles;
+    fn kind_of(meta: std::fs::Metadata) -> EntryKind {
+        if meta.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else if meta.is_dir() {
+            EntryKind::Dir
+        } else if meta.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Other
+        }
+    }
+    impl DataSource for LocalFiles {
+        fn kind(&self, path: &Path) -> io::Result<EntryKind> {
+            std::fs::symlink_metadata(path).map(kind_of)
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            path.is_file()
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            path.is_dir()
+        }
+        fn len(&self, path: &Path) -> io::Result<u64> {
+            std::fs::metadata(path).map(|m| m.len())
+        }
+        fn modified(&self, path: &Path) -> Option<std::time::SystemTime> {
+            std::fs::metadata(path).and_then(|m| m.modified()).ok()
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<SourceEntry>> {
+            std::fs::read_dir(path)?
+                .map(|entry| {
+                    let entry = entry?;
+                    Ok(SourceEntry {
+                        path: entry.path(),
+                        kind: kind_of(std::fs::symlink_metadata(entry.path())?),
+                    })
+                })
+                .collect()
+        }
+        fn walk<'a>(
+            &'a self,
+            root: &Path,
+        ) -> Box<dyn Iterator<Item = io::Result<SourceEntry>> + 'a> {
+            Box::new(
+                walkdir::WalkDir::new(root)
+                    .follow_links(false)
+                    .into_iter()
+                    .map(|entry| {
+                        let entry = entry.map_err(io::Error::other)?;
+                        Ok(SourceEntry {
+                            kind: kind_of(std::fs::symlink_metadata(entry.path())?),
+                            path: entry.into_path(),
+                        })
+                    }),
+            )
+        }
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+        fn read_limited(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take(limit + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            path.canonicalize()
+        }
+        fn local_paths(&self) -> bool {
+            true
+        }
+    }
+    /// The web build used to mirror `Profile` and `MAX_XML_BYTES` (the crate
+    /// did not build for wasm32); it now uses these items directly. The test
+    /// keeps the values the mirror pinned.
     #[test]
     fn wasm_profile_mirror_matches_ferrite_s421() {
-        assert_eq!(wasm_profile::MAX_XML_BYTES, MAX_XML_BYTES);
-        for (native, mirror) in [
-            (Profile::Published1, wasm_profile::Profile::Published1),
-            (Profile::Candidate2, wasm_profile::Profile::Candidate2),
-        ] {
-            assert_eq!(format!("{native:?}"), format!("{mirror:?}"));
-        }
+        assert_eq!(MAX_XML_BYTES, 8 * 1024 * 1024);
+        assert_eq!(format!("{:?}", Profile::Published1), "Published1");
+        assert_eq!(format!("{:?}", Profile::Candidate2), "Candidate2");
     }
     #[test]
     fn namespace_alias_and_dialects_preserve_original_bytes() {
@@ -356,7 +437,7 @@ mod tests {
         std::fs::write(tmp.path().join("._ignored.gml"), raw).unwrap();
         std::fs::write(tmp.path().join("fc.xml"), "<FeatureCatalogue/>").unwrap();
         std::fs::write(tmp.path().join("bad.gml"), "<Dataset").unwrap();
-        let (inputs, notices) = discover_routes(tmp.path()).unwrap();
+        let (inputs, notices) = discover_routes_in(&LocalFiles, tmp.path()).unwrap();
         assert_eq!(inputs.len(), 2);
         assert!(inputs[0].path().ends_with("a.xml"));
         assert!(inputs[1].path().ends_with("nested/b.gml"));

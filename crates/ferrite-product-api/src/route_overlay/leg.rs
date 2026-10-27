@@ -1,4 +1,5 @@
 //! Bounded WGS84 leg sampling for host illustration, not full S421 XSLT portrayal.
+//! (Moved from `ferrite_gpu::native_route_leg`.)
 use ferrite_kernel::geodesy::{direct, inverse, GeographicPosition};
 use ferrite_kernel::rhumb::RhumbSegment;
 /// Numerical receiver policy: at most 1000m geodesic distance / rhumb parameter

@@ -39,7 +39,11 @@ use crate::gml_overlay::{self, GmlOverlays, Provenance, SymbolRegistrar};
 use crate::pick::{find_features_at, FeatureReport, GeometryPicker, PickCandidate, PickSurface};
 use crate::platform::{parallel_map, EntryKind, Platform};
 use crate::portrayal::{AreaTriangulator, PortrayalChangeRequest, PortrayalSource};
-use crate::s421_dataset_input::CapturedRouteInput;
+#[cfg(feature = "s421")]
+use crate::products::s421::{CapturedRouteInput, S421Layer, S421};
+/// Without the S-421 product no route is captured.
+#[cfg(not(feature = "s421"))]
+type CapturedRouteInput = std::convert::Infallible;
 use crate::scene::{prepare_flat_coverage, PreparedScene};
 use crate::state::{EngineState, ViewportPixels};
 use crate::{dataset_signature_policy, s101_update_plan, CellHydrationSource, ChartLoadResult};
@@ -396,7 +400,9 @@ pub struct ChartEngine {
     triangulate: AreaTriangulator,
     display: DisplayOptions,
     provenance: Vec<String>,
-    routes: Vec<CapturedRouteInput>,
+    /// S-421 routes (product layer; captured, not portrayed by the engine).
+    #[cfg(feature = "s421")]
+    routes: S421Layer,
     /// S-102 host options (depth adjustments, raster tile edge).
     s102: crate::s102_host::S102Options,
 }
@@ -446,7 +452,8 @@ impl ChartEngine {
                 ..DisplayOptions::default()
             },
             provenance: Vec::new(),
-            routes: Vec::new(),
+            #[cfg(feature = "s421")]
+            routes: S421Layer::new(),
             s102: Default::default(),
         })
     }
@@ -491,10 +498,18 @@ impl ChartEngine {
     pub fn catalogue_errors(&self) -> &[String] {
         &self.overlays.catalogue_errors
     }
-    /// S-421 routes captured by the opened inputs (not portrayed by the
-    /// engine; under [`SignaturePolicy::Required`] none are admitted).
-    pub fn routes(&self) -> &[CapturedRouteInput] {
-        &self.routes
+    /// S-421 routes captured by the opened inputs, in opening order (not
+    /// portrayed by the engine; under [`SignaturePolicy::Required`] none are
+    /// admitted).
+    #[cfg(feature = "s421")]
+    pub fn routes(&self) -> Vec<&CapturedRouteInput> {
+        self.routes.inputs().collect()
+    }
+    /// The S-421 product layer holding the routes (coverage, feature
+    /// reports, the route overlay renderer extension).
+    #[cfg(feature = "s421")]
+    pub fn route_layer(&mut self) -> &mut S421Layer {
+        &mut self.routes
     }
     /// The S-101 cancellation history of the platform user store (empty when
     /// the host keeps none).
@@ -752,18 +767,22 @@ impl ChartEngine {
             bathymetry: Vec::new(),
         };
         self.apply_cancellations(opened.removals, &opened.cells, &mut report)?;
+        #[cfg(feature = "s421")]
         for route in opened.routes {
-            if self.routes.iter().any(|r| r.sha256() == route.sha256()) {
-                report
+            let path = route.path().to_path_buf();
+            match self.routes.insert(route) {
+                ferrite_product_api::Opened::AlreadyOpen => report
                     .notices
-                    .push(format!("Already open: {}", route.path().display()));
-                continue;
+                    .push(format!("Already open: {}", path.display())),
+                ferrite_product_api::Opened::New(_) => report.notices.push(format!(
+                    "S-421 route captured (not portrayed by ChartEngine): {}",
+                    path.display()
+                )),
             }
-            report.notices.push(format!(
-                "S-421 route captured (not portrayed by ChartEngine): {}",
-                route.path().display()
-            ));
-            self.routes.push(route);
+        }
+        #[cfg(not(feature = "s421"))]
+        for route in opened.routes {
+            match route {}
         }
         let mut added = 0usize;
         let mut loaded: HashSet<[u8; 32]> = (0..self.state.cells.len())
@@ -1410,8 +1429,8 @@ impl OpenTask {
                 charts.push(path);
             } else if gml_overlay::sniff_product_in(data, &path).is_some() {
                 overlays.push(path);
-            } else if let Some(route) = self.capture_route(&path, &mut notices) {
-                routes.push(route);
+            } else if self.capture_route(&path, &mut notices, &mut routes) {
+                // Captured into `routes`.
             } else if crate::s102_host::is_hdf5_input(&path) {
                 s102_inputs.push(path);
             } else if explicit {
@@ -1586,41 +1605,56 @@ impl OpenTask {
         Ok(())
     }
 
-    /// An S-421 route among the inputs (XML/GML whose head names S-421),
-    /// captured once; capture failures and routes refused by the signature
-    /// policy are notices.
-    fn capture_route(&self, path: &Path, notices: &mut Vec<String>) -> Option<CapturedRouteInput> {
+    /// An S-421 route among the inputs (the S-421 adapter recognises the
+    /// name and head), captured once into `routes` (true); capture failures
+    /// and routes refused by the signature policy are notices.
+    #[cfg(feature = "s421")]
+    fn capture_route(
+        &self,
+        path: &Path,
+        notices: &mut Vec<String>,
+        routes: &mut Vec<CapturedRouteInput>,
+    ) -> bool {
+        use ferrite_product_api::ProductAdapter;
         let data = self.platform.data.as_ref();
-        let xml = crate::dataset_discovery::is_dataset_file(path, "gml")
-            || crate::dataset_discovery::is_dataset_file(path, "xml");
-        if !xml
-            || path
-                .file_name()
-                .is_some_and(|n| n.eq_ignore_ascii_case("CATALOG.XML"))
-        {
-            return None;
+        if !S421::is_route_name(path) {
+            return false;
         }
-        let head = data.read_limited(path, 64 * 1024 - 1).ok()?;
-        let head = String::from_utf8_lossy(&head);
-        if !head.contains("S421") && !head.contains("S-421") {
-            return None;
+        let Ok(head) = data.read_limited(path, 64 * 1024 - 1) else {
+            return false;
+        };
+        if S421.sniff(path, &head).is_none() {
+            return false;
         }
-        match crate::s421_dataset_input::capture_if_route_in(data, path) {
+        match crate::products::s421::capture_if_route_in(data, path) {
             Ok(Some(route)) => {
                 match route.allowed_xml(self.signatures == SignaturePolicy::Required) {
-                    Ok(_) => Some(route),
+                    Ok(_) => {
+                        routes.push(route);
+                        true
+                    }
                     Err(error) => {
                         notices.push(format!("Not opened: {}: {error}", path.display()));
-                        None
+                        false
                     }
                 }
             }
-            Ok(None) => None,
+            Ok(None) => false,
             Err(error) => {
                 notices.push(format!("Not opened: {}: {error}", path.display()));
-                None
+                false
             }
         }
+    }
+    /// Without the S-421 product no input is a route.
+    #[cfg(not(feature = "s421"))]
+    fn capture_route(
+        &self,
+        _path: &Path,
+        _notices: &mut Vec<String>,
+        _routes: &mut Vec<CapturedRouteInput>,
+    ) -> bool {
+        false
     }
 
     /// The viewer's authorized planner and loader, over any data source:

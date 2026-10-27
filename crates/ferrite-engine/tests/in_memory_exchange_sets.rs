@@ -31,6 +31,7 @@ use std::sync::Arc;
 const VERIFIED_AT: i64 = 1_774_483_200;
 const SHOM_MAY: &str = "TestData/SHOM-S101/Data/diffusionS101_May_June/S-101_May2026";
 const ED1ER2: &str = "S100_ENC_ROOT_AcrossTheCHannel_101FR0057130_ed1er2_2026-03-25T07_54_05";
+#[cfg(feature = "s421")]
 const S421_ROUTE: &str =
     "Standards/S-421/1.0-published-support/S-421_Ver1.0/TestData/RTE-TEST-GMIN.s421.gml";
 
@@ -443,6 +444,7 @@ fn signed_cancellation_from_memory_removes_the_cell_and_persists_history() {
 }
 
 #[test]
+#[cfg(feature = "s421")]
 fn s421_route_is_captured_from_memory() {
     let root = repository();
     if !root.join(S421_ROUTE).is_file() {
@@ -454,7 +456,7 @@ fn s421_route_is_captured_from_memory() {
     memory.insert(mem("/routes/RTE-TEST-GMIN.s421.gml"), bytes.clone());
 
     let (routes, notices) =
-        ferrite_engine::s421_dataset_input::discover_routes_in(&memory, &mem("/routes")).unwrap();
+        ferrite_engine::products::s421::discover_routes_in(&memory, &mem("/routes")).unwrap();
     assert!(notices.is_empty(), "{notices:?}");
     assert_eq!(routes.len(), 1);
     assert_eq!(
