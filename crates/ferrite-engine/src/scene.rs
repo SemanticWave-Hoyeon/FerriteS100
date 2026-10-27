@@ -21,8 +21,14 @@ pub struct PreparedScene {
     pub catalogue_registry: DatasetCatalogueRegistry,
     /// Vector instructions changed by interoperability composition.
     pub ic_changed: usize,
-    /// S-102 bathymetry rasters (empty without S-102).
-    pub bathymetry: crate::s102_scene::BathymetryScene,
+    /// Identity of this preparation (unique per scene). A host that moves
+    /// extension data to the GPU (S-102 tiles taken out of their extension)
+    /// compares it to know that a later frame of the same, re-projected
+    /// scene still shows them.
+    pub id: Arc<()>,
+    /// Product output for renderer paths beyond drawing instructions: the
+    /// S-102 raster tiles (`ferrite_s102::layer::BATHYMETRY_EXTENSION`).
+    pub extensions: Vec<ferrite_product_api::RendererExtension>,
 }
 
 impl PreparedScene {

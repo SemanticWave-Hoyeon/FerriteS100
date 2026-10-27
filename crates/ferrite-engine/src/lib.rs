@@ -4,9 +4,8 @@
 //! Stage 1 holds the pure domain modules moved out of the application:
 //! dataset discovery and open planning, signature policy, the S-101 update
 //! chain and lifecycle metadata, exchange-set checks, cell publication,
-//! catalogue selection, decoded/instruction caches, the S-102 input and
-//! journal policies, S-421 route input and the non-UI S-124/S-129 overlay
-//! parts. Stage 2 adds the chart state ([`EngineState`]) and the S-101
+//! catalogue selection, decoded/instruction caches, S-421 route input and
+//! the non-UI S-124/S-129 overlay parts. Stage 2 adds the chart state ([`EngineState`]) and the S-101
 //! portrayal pipeline ([`portrayal`], [`portrayal_cache`], [`catalogue`],
 //! [`chart_cells`]) and the S-124/S-129 overlay registry; renderer-specific
 //! pieces (area triangulation, overlay symbol sources) are supplied by the
@@ -30,7 +29,11 @@
 //! `ferrite-product-api`. The GML products S-124 (`ferrite-s124`) and S-129
 //! (`ferrite-s129`) are registered in [`products`] behind the features `s124`
 //! and `s129` (on by default); the overlay layer ([`gml_overlay`]) is
-//! product-agnostic.
+//! product-agnostic. S-102 is the product layer `ferrite_s102::layer`
+//! (input policies, opened files, raster portrayal), held as
+//! [`EngineState::s102`] with `s102-pure` and called through [`s102_host`];
+//! its raster tiles reach renderers as a renderer extension of the
+//! prepared scene.
 
 pub mod catalogue;
 pub mod cell_source_identity;
@@ -57,14 +60,7 @@ pub mod s101_xc_capture_pool;
 pub mod s101_xc_consistency;
 pub mod s101_xc_coverage;
 pub mod s101_xc_region;
-pub mod s102_depth_policy;
-pub mod s102_input_capture;
-#[cfg(feature = "s102-pure")]
-pub mod s102_journal_admission;
-pub mod s102_original_inputs;
-pub mod s102_scene;
-#[cfg(feature = "s102-pure")]
-pub mod s102_trial_worker;
+pub mod s102_host;
 pub mod s421_dataset_input;
 pub mod scene;
 pub mod secure_instruction_cache;

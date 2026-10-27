@@ -8,4 +8,5 @@ description = "Common interface of the S-100 product modules: product identity a
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+ferrite-portrayal-catalog.workspace = true
 ferrite-render.workspace = true

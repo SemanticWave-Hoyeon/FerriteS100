@@ -270,7 +270,7 @@ impl WebEngineCore {
         // S-102: with Lua, the rule's instruction string goes through the
         // cache store, so a page with the stored entry skips Lua for S-102
         // (without Lua the entry is required anyway).
-        engine.set_s102_options(ferrite_engine::s102_scene::S102Options {
+        engine.set_s102_options(ferrite_engine::s102_host::S102Options {
             reuse_rule_instructions: LUA_AVAILABLE,
             ..Default::default()
         });
@@ -668,7 +668,7 @@ impl WebEngineCore {
             "resident_cells": self.engine.state().resident_cells.as_ref()
                 .map(|r| r.iter().filter(|r| **r).count()),
             "cells": self.engine.state().cells.len(),
-            "bathymetry_files": self.engine.state().bathymetry_bounds.len(),
+            "bathymetry_files": self.engine.state().bathymetry_extents().len(),
             // Cache entries read by this preparation (per-cell portrayal
             // caches and precomputed payloads): hits skip Lua.
             "cache_reads": self.cache.take_reads(),

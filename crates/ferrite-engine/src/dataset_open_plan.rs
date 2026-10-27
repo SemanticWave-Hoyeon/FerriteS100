@@ -35,7 +35,8 @@ impl Plan {
     /// Run the isolated S-102 2.1 trial inspector for each discovered trial.
     pub fn inspect_trials(&mut self) {
         for path in std::mem::take(&mut self.trials) {
-            let result = crate::s102_trial_worker::inspect(&path).map_err(|e| format!("{e:#}"));
+            let result =
+                ferrite_s102::layer::trial_worker::inspect(&path).map_err(|e| format!("{e:#}"));
             self.trial_inspections.push((path, result));
         }
     }

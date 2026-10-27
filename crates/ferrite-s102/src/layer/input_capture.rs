@@ -21,8 +21,7 @@ impl CapturedInput {
         required: bool,
         remaining: &mut u64,
     ) -> Result<Self> {
-        let authenticated =
-            crate::dataset_signature_policy::dataset_snapshot(report, source, required)?;
+        let authenticated = report.snapshot_for(&source.canonicalize()?, required)?;
         let unchecked = if authenticated.is_none() {
             Some(Arc::new(UnauthenticatedSnapshot::copy_bounded(
                 source, *remaining,
@@ -50,14 +49,13 @@ impl CapturedInput {
     /// in-memory snapshot when one is required/present, otherwise the bytes
     /// read once from the source. The same aggregate budget applies.
     pub fn capture_in(
-        data: &dyn crate::platform::DataSource,
+        data: &dyn ferrite_product_api::platform::DataSource,
         report: &AuthorizedDatasets,
         source: &Path,
         required: bool,
         remaining: &mut u64,
     ) -> Result<Self> {
-        let authenticated =
-            crate::dataset_signature_policy::dataset_snapshot_in(data, report, source, required)?;
+        let authenticated = report.snapshot_for(&data.canonicalize(source)?, required)?;
         let bytes: Arc<[u8]> = match &authenticated {
             Some(snapshot) => match snapshot.bytes() {
                 Some(bytes) => bytes.into(),
@@ -79,6 +77,25 @@ impl CapturedInput {
         *remaining -= length;
         Ok(Self {
             authenticated,
+            unchecked: None,
+            sha256: Sha256::digest(&bytes).into(),
+            memory: Some(bytes),
+            length,
+        })
+    }
+
+    /// Capture bytes handed over by the host (no file, no authenticated
+    /// snapshot) under the same aggregate budget.
+    pub fn from_bytes(bytes: &[u8], remaining: &mut u64) -> Result<Self> {
+        let length = bytes.len() as u64;
+        ensure!(
+            length <= *remaining,
+            "S102 aggregate input snapshot budget exceeded"
+        );
+        *remaining -= length;
+        let bytes: Arc<[u8]> = bytes.into();
+        Ok(Self {
+            authenticated: None,
             unchecked: None,
             sha256: Sha256::digest(&bytes).into(),
             memory: Some(bytes),
@@ -175,9 +192,7 @@ mod tests {
         let folder = Temp::new();
         let source = folder.path().join("coverage.h5");
         std::fs::write(&source, b"original").unwrap();
-        let report =
-            crate::dataset_signature_policy::unchecked_datasets(std::slice::from_ref(&source))
-                .unwrap();
+        let report = super::super::test_support::unchecked(std::slice::from_ref(&source));
         let mut budget = 8;
         let captured = CapturedInput::capture(&report, &source, false, &mut budget).unwrap();
         assert_eq!(budget, 0);
@@ -190,12 +205,10 @@ mod tests {
     }
     #[test]
     fn data_source_capture_holds_bytes_under_the_same_budget() {
-        use crate::platform::MemoryDataSource;
-        let source = &crate::platform::memory_path("/mem/coverage.h5");
-        let data = MemoryDataSource::new().with(source, b"12345".to_vec());
-        let report =
-            crate::dataset_signature_policy::unchecked_datasets_in(&data, &[source.into()])
-                .unwrap();
+        use super::super::test_support::MemorySource;
+        let source = std::path::Path::new("/mem/coverage.h5");
+        let data = MemorySource::new(source, b"12345".to_vec());
+        let report = ferrite_security::AuthorizedDatasets::unchecked([source.to_path_buf()]);
         let mut budget = 8;
         let captured =
             CapturedInput::capture_in(&data, &report, source, false, &mut budget).unwrap();
@@ -213,9 +226,7 @@ mod tests {
         let folder = Temp::new();
         let source = folder.path().join("coverage.h5");
         std::fs::write(&source, b"12345").unwrap();
-        let report =
-            crate::dataset_signature_policy::unchecked_datasets(std::slice::from_ref(&source))
-                .unwrap();
+        let report = super::super::test_support::unchecked(std::slice::from_ref(&source));
         let mut budget = 8;
         let _first = CapturedInput::capture(&report, &source, false, &mut budget).unwrap();
         assert_eq!(budget, 3);

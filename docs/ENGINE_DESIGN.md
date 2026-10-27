@@ -308,7 +308,7 @@ ferrite-ui            등록된 제품의 패널 데이터 모델을 그린다
 | `ProductLayer` | 같은 인코딩·포트레이얼 경로를 쓰는 제품들의 데이터셋 저장소. `open(DatasetInput)`(이름, 바이트(검증 시 인증 스냅숏), `Provenance`), `remove`, `set_visible`, `portray(PortrayalRequest)` → `SceneContribution`(리비전, `DrawingInstruction`, `RendererExtension`), `coverage`, `describe(key)` → `FeaturePick`, `highlight(key)` |
 | `RendererExtension` | 렌더러가 아는 종류 이름과 페이로드. S-102 래스터 타일, S-421 경로 오버레이를 그리기 명령 밖의 데이터로 넘기는 자리 |
 | 패널 데이터 모델 | 제품 크레이트가 행·옵션 타입을 정의하고(`ferrite_s124::panel`, `ferrite_s129::panel`), UI 크레이트는 그 타입만 그린다. API 크레이트는 egui에 의존하지 않는다 |
-| `platform::{Clock, UserRecord}` | 제품이 직접 쓰는 플랫폼 서비스. `ferrite_engine::platform`이 다시 내보내고 구현한다 |
+| `platform::{Clock, UserRecord, DataSource, CacheStore}` | 제품이 직접 쓰는 플랫폼 서비스(시각, 사용자별 기록, 데이터 원천, 캐시 저장소). `ferrite_engine::platform`이 다시 내보내고 구현한다 |
 
 GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한다.
 
@@ -337,7 +337,7 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 | 단계 | 내용 |
 |---|---|
 | 1 | **완료.** `ferrite-product-api` 정의. S-124·S-129를 `ferrite-s124`·`ferrite-s129`로 분리하고 엔진 오버레이 경로가 등록된 어댑터를 거치게 함(아래). |
-| 2 | S-102: 엔진 `s102_*` 모듈과 `EngineState`의 `s102_*` 필드를 `ferrite-s102`(제품 계층)로 옮기고 래스터 타일을 `RendererExtension`으로 넘긴다. `main.rs`의 S-102 분기를 계층 호출로 바꾼다. |
+| 2 | **완료.** S-102: 엔진 `s102_*` 모듈과 `EngineState`의 `s102_*` 필드를 `ferrite-s102`(제품 계층 `layer`)로 옮기고 래스터 타일을 `RendererExtension`으로 넘김. `main.rs`의 S-102 분기 일부를 계층 호출로 바꿈(아래). |
 | 3 | S-421: `s421_dataset_input`, `src/native_s421.rs`의 제품 로직, `ferrite-gpu` `native_route_*`의 데이터 모델을 `ferrite-s421`로 모으고 경로 오버레이를 확장으로 넘긴다. 경로 패널은 제품 패널 모델을 그린다. |
 | 4 | S-101: 엔진 `s101_*`(업데이트 계획, 생명주기, 교환 세트 검사, 카탈로그 선택)와 셀 포트레이얼의 제품 고유 부분을 `ferrite-s101` 제품 계층으로 옮긴다. |
 | 5 | 엔진·UI 정리: `ChartEngine`이 `Vec<Box<dyn ProductLayer>>`로 계층을 합성하고, UI는 등록된 패널을 그리며, UI·애플리케이션·CLI·C ABI·웹에 제품별 기능 플래그를 둔다. `ferrite_s100_gml::Product` 열거형을 `ProductId` 등록으로 바꾼다. |
@@ -353,6 +353,17 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 - 앱·UI: `src/gml_overlay.rs`는 등록된 모듈로 행을 만들고 요청을 넘긴다. `ferrite-ui::overlay_ui`는 제품 크레이트의 패널 타입을 다시 내보내 그린다.
 - 동작: 검증 문제, 포트레이얼 출력, UI, NAVWARN 상태 파일 형식·위치는 그대로다. 로그 한 줄("Correct known PC errata: on (...)")의 나열 순서가 등록 순서(S-124, S-129)로 바뀌었다.
 
+### 2단계 결과
+
+- 옮긴 파일(`git mv`): `ferrite-engine/src/s102_{depth_policy,input_capture,journal_admission,original_inputs,trial_worker,scene}.rs` → `ferrite-s102/src/layer/{depth_policy,input_capture,journal_admission,original_inputs,trial_worker,scene}.rs`. 엔진 `interoperability::compose_raster`(S-102 래스터 전용)도 `ferrite_s102::layer::compose_raster`로 옮겼다.
+- `ferrite_s102::layer`: `S102Layer`가 `EngineState`의 S-102 필드를 모두 가진다(`fc`/`pc`와 상태, `trials`, `bathymetry`, `bathymetry_bounds`, `provenance`, `depth_policies`, `depth_inputs`, `original_inputs`, `journal_gate`). 파일 단위 조작(`insert_coverages`, `add_trial`/`remove_trial`, `take_file`/`restore_file`/`forget_file`, `clear_coverages`), 카탈로그 상태(`set_fc`/`fc_failed`/`set_pc`/`pc_failed`/`pc_status_of`), 저널 재검사(`recheck_journal_admission`), 수심 조회(`inspect`, 뷰어의 수심 피킹 문구 그대로), 열기(`open_inputs` → `install` → `Installed`), 보고(`summaries`), 포트레이얼(`prepare(S102Portrayal)` → `BathymetryScene`)을 제공한다. `S102`가 `ProductAdapter`(HDF5 서명·확장자 판별, `SceneRole::Grid`), `S102Layer`가 `ProductLayer`를 구현한다.
+- 제품 크레이트의 의존: `ferrite-product-api`(엔진 비의존). 엔진 서비스는 API로 옮기거나 인자로 받는다. `DataSource`·`EntryKind`·`SourceEntry`·`CacheStore`·`CacheEntry`는 `ferrite_product_api::platform`으로 옮기고 엔진이 다시 내보낸다(경로 그대로). 서명 스냅숏 조회와 서명 끔 보고서는 `ferrite_security::AuthorizedDatasets::{snapshot_for, unchecked}`로 옮기고 엔진 `dataset_signature_policy`는 이를 부른다(오류 문구 동일). 규칙 출처(Lua/사전 계산), 내보내기, 캐시 저장소, 상호운용 선택은 `S102Portrayal`로 받는다.
+- 엔진: `EngineState::s102: S102Layer`(`s102-pure`), `EngineState::bathymetry_extents()`(기능과 무관한 범위 조회). `s102_host`(구 `s102_scene`의 엔진 쪽)가 계층 결과를 `OpenReport`·`ValidationIssue`로 옮기고, `s102-pure`가 꺼진 빌드에서는 같은 이름의 평범한 자료형(`S102Options`, `BathymetrySummary`, `OpenedS102`)과 "not built" 알림을 준다. `ChartEngine::set_s102_options`는 계층의 `options`에도 반영한다.
+- 렌더러 확장: `PreparedScene::bathymetry`를 `PreparedScene::{id, extensions}`로 바꿨다. S-102 타일은 종류 `ferrite_s102::layer::BATHYMETRY_EXTENSION`("S-102/bathymetry-tiles"), 페이로드 `BathymetryScene`(타일은 `Mutex`, `take_tiles`로 GPU에 넘김)이다. 장면 식별자는 `BathymetryScene::id` 대신 `PreparedScene::id`가 맡는다. `ferrite-cli`의 `SceneEmitter`는 확장을 찾아 내려받고(`s102-pure`에서 `ferrite-s102` 의존), 같은 장면의 재투영 프레임·다른 렌더러 거부 규칙은 그대로다.
+- 뷰어(`src/main.rs`): 필드 접근은 `self.engine.s102.*`로, 엔진 모듈 경로는 `ferrite_s102::layer::*`로 바꿨다. 카탈로그 초기화, 시험 파일 추가·제거, 저널 재검사, 파일 게시·제거(되돌리기 포함)·전체 해제, 데이터셋 트리의 파일 목록, 수심 조회, 보기 그룹·수심 설정 변환은 계층 호출이다. GPU 단계와 얽힌 래스터 게시·재구성(`load_bathymetry_transaction`, 장면 재구성, 감사 도구)은 앱에 남겼다.
+- 테스트 이동: 엔진 단위 테스트 `s102_{depth_policy,input_capture,journal_admission,original_inputs,trial_worker}::tests::*`, `s102_scene::opened::tests::*`는 `ferrite-s102`의 `layer::{...}::tests::*`, `layer::scene::tests::*`로 옮겼다(이름 그대로). 메모리 데이터 원천을 쓰던 시험은 계층의 시험용 원천(`layer::test_support`)을 쓴다. 엔진 통합 시험 `in_memory_s102`는 확장을 읽는다.
+- 동작: S-102 열기·검증 문제·알림 순서, 포트레이얼 출력, 저널·시험 파일 처리, 수심 정책, 캐시 항목(키·형식), 서명 처리는 그대로다.
+
 ### 2~5단계 참고
 
 - `ferrite_s100_gml::Product` 열거형(판독기 제품 판별, `namespaced_symbol`, 교환 세트의 제품 판별)과 판독기의 S-129 검사 식별자(`S-158-129/15`)가 아직 공통 기반에 있다. 5단계에서 `ProductId` 등록으로 바꾼다.
@@ -360,4 +371,10 @@ GML 제품은 `ferrite_s100_gml::product`의 두 트레이트를 더 구현한�
 - `platform::UserStore::navwarn_state`는 S-124 이름이다. 제품별 기록(`product_state(product, user)`)으로 일반화하되 저장 키(`navwarn/<user>`, `FerriteS100/navwarn/<user>.json`)는 유지한다.
 - `ferrite-ui::overlay_ui::State`는 S-124·S-129 필드를 고정으로 가진다. 5단계 패널 등록에서 제품별 패널 상태로 나누고 UI 기능 플래그를 둔다.
 - `ChartEngine`의 열기 작업(작업 스레드)은 정적 등록(`products::gml_rules`)으로 판별한다. 다른 제품도 정적 규칙과 상태 모듈을 나누면 같은 방식으로 작업 스레드에서 판별할 수 있다.
-- S-102·S-421 계층은 `RendererExtension`의 페이로드 타입을 렌더러 쪽(`ferrite-gpu`)과 함께 정해야 한다. 페이로드는 `Arc<dyn Any + Send + Sync>`라 제품 크레이트가 GPU에 의존하지 않는다.
+- S-421 계층은 `RendererExtension`의 페이로드 타입을 렌더러 쪽(`ferrite-gpu`)과 함께 정해야 한다. 페이로드는 `Arc<dyn Any + Send + Sync>`라 제품 크레이트가 GPU에 의존하지 않는다. S-102는 GPU로 옮길 때 꺼내야 해서 페이로드 안에 `Mutex`를 둔다(`BathymetryScene::take_tiles`).
+- `ProductLayer::portray`는 실패를 돌려줄 수 없고(`Option`) 요청에 규칙 출처·상호운용 합성이 없다. S-102는 트레이트 구현에서 계층 옵션·캐시와 표시 설정(`PortrayalRequest::settings`, 2단계에서 추가)만 쓰고 실패는 기록 후 None으로 처리한다. 엔진은 오류를 전파해야 하므로 `S102Layer::prepare`를 직접 부른다. 5단계에서 `portray`를 `Result`로 바꾸고 요청에 호스트 서비스(규칙 출처, 캐시, 상호운용 선택)를 넣으면 엔진도 트레이트만 쓸 수 있다.
+- `ProductLayer::open`(바이트 입력)은 서명 스냅숏을 보관하지 않는다. 엔진의 열기 작업은 서명 정책·데이터 원천 포착이 필요해 `open_inputs`/`install`을 쓴다. 단계 5에서 `DatasetInput`에 인증 스냅숏을 싣는 방안을 검토한다.
+- S-102 ID(`ProductLayer::remove`의 `u32`)는 계층이 파일 경로마다 매긴다. 뷰어의 데이터셋 트리는 아직 경로(`DatasetLayerId::S102(path)`)로 부른다.
+- 뷰어의 래스터 경로(`load_bathymetry_transaction`, 장면 재구성의 `stage_s102_raster_batch`, `audit_bathymetry`)는 같은 모자이크·타일 계산을 앱에서 반복한다. GPU 단계 콜백 안에서 타일을 만드는 구조라 `S102Layer::prepare`로 바로 바꾸지 못했다. 타일을 하나씩 내주는 반복자(`prepare`의 내부)를 계층이 공개하면 합칠 수 있다.
+- 엔진은 S-102 입력을 확장자(`s102_host::is_hdf5_input`)로 고른다. `S102::sniff`(HDF5 서명)로 바꾸려면 열기 작업이 앞부분을 읽어야 한다(5단계 정적 판별과 함께).
+- `s102-pure`가 꺼진 엔진은 `s102_host`의 같은 모양 자료형(`S102Options`, `BathymetrySummary`)을 따로 정의한다. 5단계에서 제품 보고를 공통 모델로 옮기면 없앨 수 있다.

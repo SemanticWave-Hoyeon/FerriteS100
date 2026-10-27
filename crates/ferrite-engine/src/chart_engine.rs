@@ -268,7 +268,7 @@ pub struct OpenReport {
     /// by this job (removals of loaded datasets and announcements).
     pub cancellations: Vec<CancellationRecord>,
     /// S-102 files newly opened by this job.
-    pub bathymetry: Vec<crate::s102_scene::BathymetrySummary>,
+    pub bathymetry: Vec<crate::s102_host::BathymetrySummary>,
 }
 
 /// Datasets loaded by an [`OpenJob`], not yet installed.
@@ -281,7 +281,7 @@ pub struct OpenedDatasets {
     notices: Vec<String>,
     catalogues: ([u8; 32], [u8; 32]),
     /// Decoded S-102 inputs.
-    s102: crate::s102_scene::OpenedS102,
+    s102: crate::s102_host::OpenedS102,
 }
 
 impl OpenedDatasets {
@@ -398,7 +398,7 @@ pub struct ChartEngine {
     provenance: Vec<String>,
     routes: Vec<CapturedRouteInput>,
     /// S-102 host options (depth adjustments, raster tile edge).
-    s102: crate::s102_scene::S102Options,
+    s102: crate::s102_host::S102Options,
 }
 
 impl ChartEngine {
@@ -434,7 +434,7 @@ impl ChartEngine {
         );
         // S-102 catalogues are optional, like the overlay catalogues.
         let data = Arc::clone(&state.platform.data);
-        crate::s102_scene::load_catalogues(&mut state, data.as_ref(), &config.catalogues);
+        crate::s102_host::load_catalogues(&mut state, data.as_ref(), &config.catalogues);
         Ok(Self {
             state,
             overlays,
@@ -451,16 +451,20 @@ impl ChartEngine {
         })
     }
 
-    /// Opened S-102 files ([`crate::s102_scene::SUPPORT`] says what is served).
-    pub fn bathymetry(&self) -> Vec<crate::s102_scene::BathymetrySummary> {
-        crate::s102_scene::summaries(&self.state)
+    /// Opened S-102 files ([`crate::s102_host::SUPPORT`] says what is served).
+    pub fn bathymetry(&self) -> Vec<crate::s102_host::BathymetrySummary> {
+        crate::s102_host::summaries(&self.state)
     }
-    pub fn s102_options(&self) -> &crate::s102_scene::S102Options {
+    pub fn s102_options(&self) -> &crate::s102_host::S102Options {
         &self.s102
     }
     /// Depth adjustments and raster tile edge for S-102 opened and prepared
     /// from now on.
-    pub fn set_s102_options(&mut self, options: crate::s102_scene::S102Options) {
+    pub fn set_s102_options(&mut self, options: crate::s102_host::S102Options) {
+        #[cfg(feature = "s102-pure")]
+        {
+            self.state.s102.options = options.clone();
+        }
         self.s102 = options;
     }
 
@@ -863,19 +867,17 @@ impl ChartEngine {
                 }),
             }
         }
-        crate::s102_scene::install(&mut self.state, opened.s102, &mut report);
+        crate::s102_host::install(&mut self.state, opened.s102, &mut report);
         self.state.bounds = self.data_bounds();
         Ok(report)
     }
 
     fn data_bounds(&self) -> GeoBounds {
-        if !self.state.cells.is_empty() || !self.state.bathymetry_bounds.is_empty() {
+        let bathymetry = self.state.bathymetry_extents();
+        if !self.state.cells.is_empty() || !bathymetry.is_empty() {
             // The viewer's all-data view: the data extent (S-101 cells and
             // S-102 rasters) with a margin.
-            let mut bounds = chart_data_bounds(
-                &self.state.cells,
-                self.state.bathymetry_bounds.values().copied(),
-            );
+            let mut bounds = chart_data_bounds(&self.state.cells, bathymetry);
             bounds.expand_by_percent(0.1);
             return bounds;
         }
@@ -1101,6 +1103,7 @@ impl ChartEngine {
         let request = PortrayalRequest {
             profile: &self.display.profile,
             viewing_time: gml_overlay::viewing_time(&self.state.render_context.settings),
+            settings: Some(&settings),
         };
         if let Some(overlay) = self.overlays.portray(&request) {
             context.append_converted(overlay.instructions.to_vec());
@@ -1113,13 +1116,12 @@ impl ChartEngine {
             [width, height],
             scale_factor,
         )?;
-        // S-102: the viewer's raster portrayal of the loaded bathymetry.
-        let bathymetry = crate::s102_scene::prepare_scene(
-            &self.state,
-            &self.display.profile,
-            &settings,
-            &self.s102,
-        )?;
+        // S-102: the viewer's raster portrayal of the loaded bathymetry,
+        // handed to the renderer as an extension.
+        let extensions =
+            crate::s102_host::prepare(&self.state, &self.display.profile, &settings, &self.s102)?
+                .into_iter()
+                .collect();
         self.state.catalogue_registry = registry.clone();
         self.state.coverage_inventory = Some(Arc::clone(&coverage));
         self.state.ic_assigned_vectors = ic_changed;
@@ -1128,7 +1130,8 @@ impl ChartEngine {
             coverage,
             catalogue_registry: registry,
             ic_changed,
-            bathymetry,
+            id: Arc::new(()),
+            extensions,
         }))
     }
 
@@ -1176,9 +1179,9 @@ impl ChartEngine {
     /// Cache-store entry of the S-102 portrayal rule's instructions the
     /// next [`Self::prepare`] reads for the loaded bathymetry with the
     /// current display (precomputed portrayal, or Lua with
-    /// [`crate::s102_scene::S102Options::reuse_rule_instructions`]).
+    /// [`crate::s102_host::S102Options::reuse_rule_instructions`]).
     pub fn s102_cache_entry(&self) -> Option<PathBuf> {
-        crate::s102_scene::s102_instruction_entry(&self.state, &self.display.settings)
+        crate::s102_host::instruction_entry(&self.state, &self.display.settings)
     }
 
     /// Move `scene` to `view` without portraying again, as the viewer's
@@ -1340,7 +1343,7 @@ struct OpenTask {
     loaded: s101_update_plan::LoadedDatasets,
     /// Inputs of the loaded chains (predecessors of selected updates).
     loaded_inputs: Vec<PathBuf>,
-    s102_options: crate::s102_scene::S102Options,
+    s102_options: crate::s102_host::S102Options,
 }
 
 /// One S-101 chain read into memory.
@@ -1409,7 +1412,7 @@ impl OpenTask {
                 overlays.push(path);
             } else if let Some(route) = self.capture_route(&path, &mut notices) {
                 routes.push(route);
-            } else if crate::s102_scene::is_hdf5_input(&path) {
+            } else if crate::s102_host::is_hdf5_input(&path) {
                 s102_inputs.push(path);
             } else if explicit {
                 notices.push(format!("Not a supported dataset: {}", path.display()));
@@ -1450,7 +1453,7 @@ impl OpenTask {
                 }),
             }
         }
-        let s102 = crate::s102_scene::open_inputs(
+        let s102 = crate::s102_host::open_inputs(
             s102_inputs,
             data,
             &|paths| self.authorize(paths),

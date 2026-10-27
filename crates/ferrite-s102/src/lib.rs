@@ -2881,3 +2881,4 @@ pub mod discovery;
 
 /// Bounded historical receipt codec; not cancellation/removal permission.
 pub mod cancellation_journal;
+pub mod layer;

@@ -179,11 +179,13 @@ pub struct PortrayalRequest<'a> {
     pub profile: &'a str,
     /// Viewing time selected by the user; None follows the platform clock.
     pub viewing_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Display settings (contours, display mode); None: the defaults.
+    pub settings: Option<&'a ferrite_render::host_settings::SettingsState>,
 }
 
 /// Renderer-specific output expressed as data the renderer understands.
 /// The kind names the renderer path; the payload type belongs to it (raster
-/// tiles of S-102, the S-421 route overlay in later steps).
+/// tiles of S-102, the S-421 route overlay in a later step).
 #[derive(Clone)]
 pub struct RendererExtension {
     pub kind: &'static str,

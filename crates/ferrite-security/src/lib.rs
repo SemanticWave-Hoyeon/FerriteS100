@@ -905,6 +905,48 @@ pub struct AuthorizedDatasets {
     pub metadata_warnings: Vec<String>,
 }
 impl AuthorizedDatasets {
+    /// The authenticated snapshot authorized under `canonical` (the key
+    /// authorization used), None when the dataset was admitted without one;
+    /// an error when the path is not in this report or a required snapshot
+    /// is missing.
+    pub fn snapshot_for(
+        &self,
+        canonical: &Path,
+        require_signature: bool,
+    ) -> Result<Option<std::sync::Arc<AuthenticatedSnapshot>>> {
+        let snapshot = self
+            .snapshots
+            .get(canonical)
+            .context("Dataset path changed after authorization; reopen the dataset")?
+            .clone();
+        ensure!(
+            !require_signature || snapshot.is_some(),
+            "Required authenticated dataset snapshot is missing; reopen the dataset"
+        );
+        Ok(snapshot)
+    }
+
+    /// A report admitting `canonical` paths with signature verification
+    /// switched off: no authenticated snapshot (which does not assert that
+    /// the datasets are unsigned).
+    pub fn unchecked(canonical: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut report = AuthorizedDatasets {
+            dataset_discovery: Default::default(),
+            snapshots: Default::default(),
+            signed_count: 0,
+            unsigned_count: 0,
+            metadata_warnings: Vec::new(),
+        };
+        for canonical in canonical {
+            report.dataset_discovery.insert(
+                canonical.clone(),
+                DatasetDiscoveryAuthorization::SignatureVerificationDisabled,
+            );
+            report.snapshots.insert(canonical, None);
+        }
+        report
+    }
+
     /// Bind the public maps back to one retained authenticated resource before
     /// a product planner consumes metadata. `canonical` is the original key
     /// captured during authorization; no live source/catalogue is reread.

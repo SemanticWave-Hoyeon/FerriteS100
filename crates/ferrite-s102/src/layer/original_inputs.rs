@@ -164,12 +164,10 @@ mod tests {
         let path = folder.path().join("legacy21.h5");
         std::fs::write(&path, b"original legacy product bytes").unwrap();
         let path = path.canonicalize().unwrap();
-        let report =
-            crate::dataset_signature_policy::unchecked_datasets(std::slice::from_ref(&path))
-                .unwrap();
+        let report = super::super::test_support::unchecked(std::slice::from_ref(&path));
         let mut budget = 1024;
         let captured =
-            crate::s102_input_capture::CapturedInput::capture(&report, &path, false, &mut budget)
+            super::super::input_capture::CapturedInput::capture(&report, &path, false, &mut budget)
                 .unwrap();
         assert!(capture(&report, &path, captured.authenticated.as_ref())
             .unwrap()

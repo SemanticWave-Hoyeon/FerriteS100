@@ -1496,8 +1496,10 @@ dependencies = [
  "ferrite-gpu",
  "ferrite-kernel",
  "ferrite-portrayal-catalog",
+ "ferrite-product-api",
  "ferrite-render",
  "ferrite-s101",
+ "ferrite-s102",
  "image",
  "pollster",
  "serde_json",
@@ -1721,6 +1723,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "ferrite-portrayal-catalog",
  "ferrite-render",
 ]
 
@@ -1860,21 +1863,27 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "ferrite-feature-catalog",
  "ferrite-interoperability",
  "ferrite-kernel",
  "ferrite-lua",
  "ferrite-portrayal-catalog",
+ "ferrite-product-api",
  "ferrite-render",
  "ferrite-security",
  "flate2",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "libc",
  "ndarray",
  "openssl",
  "roxmltree",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
+ "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

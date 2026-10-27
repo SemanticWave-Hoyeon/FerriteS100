@@ -7,8 +7,8 @@ use ferrite_engine::platform::{
     DataSource, MemoryCacheStore, MemoryDataSource, NativeDataSource, Platform,
 };
 #[cfg(feature = "lua-native")]
-use ferrite_engine::s102_scene::BathymetryTile;
-use std::path::{Path, PathBuf};
+use ferrite_s102::layer::BathymetryTile;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const SHOM: &str = "TestData/SHOM-S102/Data/S-102/S100_ENC_ROOT_SAINTMALO_5m_2026-05-26/S100_ROOT/S-102/DATASET_FILES";
@@ -54,9 +54,9 @@ fn new_engine(memory: MemoryDataSource, cache: Arc<MemoryCacheStore>) -> ChartEn
 #[cfg(feature = "lua-native")]
 fn tiles(scene: Arc<ferrite_engine::scene::PreparedScene>) -> Vec<([f64; 4], u32, u32, Vec<u8>)> {
     let scene = Arc::try_unwrap(scene).ok().unwrap();
-    scene
-        .bathymetry
-        .tiles
+    ferrite_s102::layer::bathymetry(&scene.extensions)
+        .expect("S-102 extension")
+        .take_tiles()
         .into_iter()
         .map(|tile| {
             let layer = match tile {
@@ -95,9 +95,9 @@ fn opens_and_prepares_s102_entirely_from_memory() {
     let cache = Arc::new(MemoryCacheStore::default());
     let mut engine = new_engine(memory, cache.clone());
     assert!(
-        engine.state().s102_pc.is_some(),
+        engine.state().s102.pc.is_some(),
         "{:?}",
-        engine.state().s102_pc_status
+        engine.state().s102.pc_status
     );
     let job = engine.open(DatasetSource::Folder(mem("/mem/data")));
     let opened = job.wait().unwrap();
@@ -153,12 +153,9 @@ fn opens_and_prepares_s102_entirely_from_memory() {
 fn prepare_with_lua_then_precomputed(mut engine: ChartEngine, cache: Arc<MemoryCacheStore>) {
     engine.set_precomputed_export(true);
     let scene = engine.prepare(&View::fit(800, 600)).unwrap();
-    assert!(scene
-        .bathymetry
-        .viewing_groups
-        .as_ref()
-        .is_some_and(|g| !g.is_empty()));
-    assert!(!scene.bathymetry.is_empty());
+    let bathymetry = ferrite_s102::layer::bathymetry(&scene.extensions).unwrap();
+    assert!(!bathymetry.viewing_groups.is_empty());
+    assert!(!bathymetry.is_empty());
     let lua = tiles(scene);
     let opaque = lua
         .iter()
@@ -208,7 +205,7 @@ fn bytes_source_without_s102_catalogue_is_refused_with_an_issue() {
     let mut memory = MemoryDataSource::new();
     catalogues(&mut memory, &["FC/S-101", "PC/S-101"]);
     let mut engine = new_engine(memory, Arc::new(MemoryCacheStore::default()));
-    assert!(engine.state().s102_pc.is_none());
+    assert!(engine.state().s102.pc.is_none());
     let report = engine
         .open_blocking(DatasetSource::Bytes(vec![(
             mem("/host/102FR00SMALOG000001.H5"),
@@ -234,11 +231,10 @@ fn bytes_source_without_s102_catalogue_is_refused_with_an_issue() {
         report.issues.iter().any(|i| i.check == "S-102 load"),
         "{report:#?}"
     );
-    assert!(engine
-        .prepare(&View::fit(64, 64))
-        .unwrap()
-        .bathymetry
-        .is_empty());
+    assert!(ferrite_s102::layer::bathymetry(
+        &engine.prepare(&View::fit(64, 64)).unwrap().extensions
+    )
+    .is_none());
 }
 
 /// The facade's tiles equal the viewer's own pipeline on the same file:
@@ -246,8 +242,8 @@ fn bytes_source_without_s102_catalogue_is_refused_with_an_issue() {
 #[cfg(all(feature = "s102-hdf5", feature = "lua-native"))]
 #[test]
 fn facade_tiles_match_the_viewer_pipeline() {
-    use ferrite_engine::s102_depth_policy::DepthPolicy;
     use ferrite_kernel::NumericCoverageSource;
+    use ferrite_s102::layer::depth_policy::DepthPolicy;
     use ferrite_s102::{BathymetryCoverage, BathymetryPortrayal};
     if !present() {
         eprintln!("TestData not present; skipped");
@@ -276,7 +272,7 @@ fn facade_tiles_match_the_viewer_pipeline() {
     let portrayal = BathymetryPortrayal::from_bound_catalogue(
         pc,
         "Day",
-        ferrite_engine::s102_scene::depth_settings(&settings),
+        ferrite_s102::layer::depth_settings(&settings),
     )
     .unwrap();
     let coverages =

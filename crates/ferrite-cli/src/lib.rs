@@ -10,7 +10,7 @@ use ferrite_engine::chart_engine::{
 };
 use ferrite_engine::pick::FeatureReport;
 use ferrite_engine::platform::Platform;
-use ferrite_engine::s102_scene::BathymetrySummary;
+use ferrite_engine::s102_host::BathymetrySummary;
 use ferrite_engine::scene::PreparedScene;
 use ferrite_gpu::headless::{HeadlessSurface, HeadlessUi};
 use ferrite_gpu::{PhysicalSize, SurfaceHost, SymbolCache, UiLayer, WgpuRenderer};
@@ -167,8 +167,8 @@ pub fn palettes(engine: &ChartEngine) -> Vec<String> {
 pub struct SceneEmitter {
     /// Symbols of one catalogue and palette (rasterized per palette).
     symbols: Option<(([u8; 32], String), SymbolCache)>,
-    /// The bathymetry scene whose tiles the renderer holds
-    /// ([`ferrite_engine::s102_scene::BathymetryScene::id`]).
+    /// The scene whose S-102 tiles the renderer holds
+    /// ([`PreparedScene::id`]).
     rasters: Option<Arc<()>>,
     /// The scene emitted last and what its emission set up once.
     emitted: Option<EmittedScene>,
@@ -184,7 +184,7 @@ pub struct SceneEmitter {
 /// renderer palette and settings, symbol rasterization, area triangulation,
 /// viewing groups and per-catalogue cell resources.
 struct EmittedScene {
-    /// [`ferrite_engine::s102_scene::BathymetryScene::id`], unique per
+    /// [`PreparedScene::id`], unique per
     /// preparation (kept alive, so the identity is not reused).
     scene: Arc<()>,
     /// Catalogue digest and colour profile.
@@ -271,9 +271,7 @@ impl SceneEmitter {
             .with_context(|| format!("Portrayal catalogue has no colour profile {profile}"))?;
         let view_only = !self.always_full
             && self.emitted.as_ref().is_some_and(|e| {
-                Arc::ptr_eq(&e.scene, &scene.bathymetry.id)
-                    && e.key == key
-                    && e.settings == display.settings
+                Arc::ptr_eq(&e.scene, &scene.id) && e.key == key && e.settings == display.settings
             });
         let mut timings = EmitTimings {
             view_only,
@@ -355,7 +353,7 @@ impl SceneEmitter {
             renderer.prefill_area_triangulations(&scene.context);
             timings.prefill_ms = ms(prefill);
             self.emitted = Some(EmittedScene {
-                scene: Arc::clone(&scene.bathymetry.id),
+                scene: Arc::clone(&scene.id),
                 key,
                 settings: display.settings.clone(),
                 visible,
@@ -371,7 +369,8 @@ impl SceneEmitter {
             &mut self.rasters,
             renderer,
             engine,
-            &mut scene.bathymetry,
+            &scene.id,
+            &scene.extensions,
             &context.scaler,
         );
         timings.bathymetry_ms = ms(bathymetry);
@@ -406,18 +405,19 @@ impl SceneEmitter {
 }
 
 impl SceneEmitter {
-    /// Publish the S-102 tiles of a scene as the viewer's raster scene
-    /// publication (staged, prepared for the scene's camera with the display
-    /// mode's viewing groups, committed). The tiles move to the GPU (CPU
-    /// pixels are released, as in the viewer), so a scene with bathymetry is
-    /// drawn by one renderer: later frames of the same scene (re-projected
-    /// views) re-project the held rasters, and another renderer refuses it.
-    /// A scene without bathymetry clears them.
+    /// Publish the S-102 tiles of a scene (its renderer extension) as the
+    /// viewer's raster scene publication (staged, prepared for the scene's
+    /// camera with the display mode's viewing groups, committed). The tiles
+    /// move to the GPU (CPU pixels are released, as in the viewer), so a
+    /// scene with bathymetry is drawn by one renderer: later frames of the
+    /// same scene (re-projected views) re-project the held rasters, and
+    /// another renderer refuses it. A scene without bathymetry clears them.
     fn emit_bathymetry<U: UiLayer>(
         rasters: &mut Option<Arc<()>>,
         renderer: &mut WgpuRenderer<U>,
         engine: &ChartEngine,
-        bathymetry: &mut ferrite_engine::s102_scene::BathymetryScene,
+        scene: &Arc<()>,
+        extensions: &[ferrite_product_api::RendererExtension],
         scaler: &ferrite_render::Scaler,
     ) -> Result<()> {
         // S-98 Level 2: an active combination suppressing S-102 clips the
@@ -429,7 +429,7 @@ impl SceneEmitter {
                 if !state.cells.is_empty() {
                     displayed.push("S-101");
                 }
-                if !state.bathymetry_bounds.is_empty() {
+                if !state.bathymetry_extents().is_empty() {
                     displayed.push("S-102");
                 }
                 ic.catalogue
@@ -439,11 +439,9 @@ impl SceneEmitter {
                     .is_some_and(|c| c.suppressed.iter().any(|l| l.product == "S-102"))
             });
         renderer.set_raster_layer_suppression(suppress);
-        if bathymetry.tiles.is_empty() {
-            if rasters
-                .as_ref()
-                .is_some_and(|id| Arc::ptr_eq(id, &bathymetry.id))
-            {
+        let bathymetry = extensions.iter().find(|e| e.kind == S102_TILES);
+        if !Self::has_tiles(bathymetry) {
+            if rasters.as_ref().is_some_and(|id| Arc::ptr_eq(id, scene)) {
                 renderer.update_raster_view(scaler);
                 return Ok(());
             }
@@ -453,25 +451,46 @@ impl SceneEmitter {
             // Bathymetry whose tiles another renderer took: not silently
             // drawn without it.
             ensure!(
-                bathymetry.viewing_groups.is_none(),
+                bathymetry.is_none(),
                 "The S-102 tiles of this scene went to another renderer; prepare the scene again"
             );
             return Ok(());
         }
         *rasters = None;
-        Self::publish_bathymetry(renderer, bathymetry, scaler)?;
-        *rasters = Some(Arc::clone(&bathymetry.id));
+        Self::publish_bathymetry(renderer, bathymetry.expect("tiles above"), scaler)?;
+        *rasters = Some(Arc::clone(scene));
         Ok(())
+    }
+
+    #[cfg(feature = "s102-pure")]
+    fn has_tiles(extension: Option<&ferrite_product_api::RendererExtension>) -> bool {
+        extension
+            .and_then(|e| {
+                e.payload
+                    .downcast_ref::<ferrite_s102::layer::BathymetryScene>()
+            })
+            .is_some_and(|b| !b.is_empty())
+    }
+
+    #[cfg(not(feature = "s102-pure"))]
+    fn has_tiles(extension: Option<&ferrite_product_api::RendererExtension>) -> bool {
+        // Without s102-pure the engine builds no S-102 tiles; one reaching
+        // here is refused below.
+        extension.is_some()
     }
 
     #[cfg(feature = "s102-pure")]
     fn publish_bathymetry<U: UiLayer>(
         renderer: &mut WgpuRenderer<U>,
-        bathymetry: &mut ferrite_engine::s102_scene::BathymetryScene,
+        extension: &ferrite_product_api::RendererExtension,
         scaler: &ferrite_render::Scaler,
     ) -> Result<()> {
-        use ferrite_engine::s102_scene::BathymetryTile;
-        let tiles = std::mem::take(&mut bathymetry.tiles);
+        use ferrite_s102::layer::{BathymetryScene, BathymetryTile};
+        let bathymetry = extension
+            .payload
+            .downcast_ref::<BathymetryScene>()
+            .context("Unexpected S-102 extension payload")?;
+        let tiles = bathymetry.take_tiles();
         let batch = renderer.stage_s102_raster_batch(scaler, |upload| {
             for tile in tiles {
                 upload(match tile {
@@ -488,7 +507,7 @@ impl SceneEmitter {
         let raster = renderer.prepare_raster_material_publication(batch, true, None)?;
         let scene = renderer.prepare_raster_scene_publication_with_groups(
             raster,
-            Some(bathymetry.viewing_groups.clone().unwrap_or_default()),
+            Some(bathymetry.viewing_groups.clone()),
         )?;
         renderer.validate_raster_scene_publication(&scene)?;
         renderer.commit_raster_scene_publication(scene);
@@ -498,17 +517,21 @@ impl SceneEmitter {
     #[cfg(not(feature = "s102-pure"))]
     fn publish_bathymetry<U: UiLayer>(
         _: &mut WgpuRenderer<U>,
-        bathymetry: &mut ferrite_engine::s102_scene::BathymetryScene,
+        _: &ferrite_product_api::RendererExtension,
         _: &ferrite_render::Scaler,
     ) -> Result<()> {
-        // Without s102-pure the engine builds only composed tiles, and only
-        // with S-102 support; nothing reaches here.
-        anyhow::bail!(
-            "S-102 tiles ({}) need ferrite-cli's s102-pure feature",
-            bathymetry.tiles.len()
-        )
+        // Without s102-pure the engine builds no S-102 tiles; nothing
+        // reaches here.
+        anyhow::bail!("S-102 tiles need ferrite-cli's s102-pure feature")
     }
 }
+
+/// [`ferrite_product_api::RendererExtension::kind`] of the S-102 raster
+/// tiles (`ferrite_s102::layer::BATHYMETRY_EXTENSION`).
+#[cfg(feature = "s102-pure")]
+const S102_TILES: &str = ferrite_s102::layer::BATHYMETRY_EXTENSION;
+#[cfg(not(feature = "s102-pure"))]
+const S102_TILES: &str = "S-102/bathymetry-tiles";
 
 /// Renders prepared [`ChartEngine`] scenes into RGBA images with
 /// ferrite-gpu on an offscreen target (no window, no GUI toolkit): the same

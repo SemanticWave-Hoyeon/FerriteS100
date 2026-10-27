@@ -1,10 +1,8 @@
 //! Application choice to open datasets without authenticating their signatures.
 //! Content identities and parsing remain independent of this setting.
 use crate::platform::DataSource;
-use anyhow::{ensure, Context, Result};
-use ferrite_security::{
-    AuthenticatedSnapshot, AuthorizedDatasets, DatasetDiscoveryAuthorization, ExchangeSource,
-};
+use anyhow::Result;
+use ferrite_security::{AuthenticatedSnapshot, AuthorizedDatasets, ExchangeSource};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -70,16 +68,7 @@ fn dataset_snapshot_key(
     canonical: PathBuf,
     require_signature: bool,
 ) -> Result<Option<Arc<AuthenticatedSnapshot>>> {
-    let snapshot = report
-        .snapshots
-        .get(&canonical)
-        .context("Dataset path changed after authorization; reopen the dataset")?
-        .clone();
-    ensure!(
-        !require_signature || snapshot.is_some(),
-        "Required authenticated dataset snapshot is missing; reopen the dataset"
-    );
-    Ok(snapshot)
+    report.snapshot_for(&canonical, require_signature)
 }
 
 pub fn unchecked_datasets(paths: &[PathBuf]) -> Result<AuthorizedDatasets> {
@@ -91,30 +80,21 @@ pub fn unchecked_datasets_in(
     data: &dyn DataSource,
     paths: &[PathBuf],
 ) -> Result<AuthorizedDatasets> {
-    let mut report = AuthorizedDatasets {
-        dataset_discovery: Default::default(),
-        snapshots: Default::default(),
-        signed_count: 0,
-        unsigned_count: 0,
-        metadata_warnings: Vec::new(),
-    };
-    for path in paths {
-        // Match the canonical keys used by authenticated dataset loading.
-        // None means no authenticated snapshot; it does not assert unsignedness.
-        let canonical = data.canonicalize(path)?;
-        report.dataset_discovery.insert(
-            canonical.clone(),
-            DatasetDiscoveryAuthorization::SignatureVerificationDisabled,
-        );
-        report.snapshots.insert(canonical, None);
-    }
-    Ok(report)
+    // Match the canonical keys used by authenticated dataset loading.
+    // None means no authenticated snapshot; it does not assert unsignedness.
+    let canonical = paths
+        .iter()
+        .map(|path| data.canonicalize(path))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(AuthorizedDatasets::unchecked(canonical))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrite_security::{authorize_datasets, TrustAnchors, UnsignedPolicy};
+    use ferrite_security::{
+        authorize_datasets, DatasetDiscoveryAuthorization, TrustAnchors, UnsignedPolicy,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     struct Temp(PathBuf);
     impl Temp {

@@ -28,6 +28,7 @@ serde.workspace = true
 sha2.workspace = true
 ferrite-render.workspace = true
 ferrite-kernel.workspace = true
+ferrite-feature-catalog.workspace = true
 ferrite-lua.workspace = true
 ferrite-portrayal-catalog.workspace = true
 
@@ -36,13 +37,23 @@ ferrite-interoperability.workspace = true
 ferrite-security.workspace = true
 chrono.workspace = true
 roxmltree = "=0.20.0"
+# Product layer (`layer`): the engine-facing S-102 dataset store.
+ferrite-product-api = { path = "../ferrite-product-api" }
+serde_json.workspace = true
+tempfile = "3"
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # Fixture writing in the reader parity tests (the version hdf5-metno uses).
 ndarray = "=0.17.2"
 base64 = "=0.22.1"
 openssl = { version = "0.10", features = ["vendored"] }
-tempfile = "3"
 
 [[example]]
 name = "resolved_color_lookup_bench"

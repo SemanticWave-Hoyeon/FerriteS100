@@ -2,10 +2,10 @@
 //! with a time and output budget; only the validated `TrialInspection` wire
 //! (metadata, no samples) returns. Trial grids never become depth coverage:
 //! a missing vertical datum is reported, never inferred.
-use anyhow::{ensure, Context, Result};
-use ferrite_s102::trial_inspection::{
+use crate::trial_inspection::{
     TrialInspection, TrialInspectionRequest, TrialSourceIdentity, MAX_WIRE_BYTES,
 };
+use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
@@ -88,7 +88,7 @@ pub fn run_child() -> Result<()> {
         },
         window: None,
     };
-    let grid = ferrite_s102::legacy_trial::LegacyTrialGrid::open(Path::new(&source))?;
+    let grid = crate::legacy_trial::LegacyTrialGrid::open(Path::new(&source))?;
     let inspection = TrialInspection::from_grid(&grid, request)?;
     let file = OpenOptions::new()
         .write(true)
@@ -180,12 +180,12 @@ pub fn inspect_bytes(bytes: std::sync::Arc<[u8]>) -> Result<TrialInspection> {
         },
         window: None,
     };
-    let grid = ferrite_s102::legacy_trial::LegacyTrialGrid::open_bytes(bytes)?;
+    let grid = crate::legacy_trial::LegacyTrialGrid::open_bytes(bytes)?;
     TrialInspection::from_grid(&grid, request)
 }
 /// One-line description for the data tree.
 pub fn summary(inspection: &TrialInspection) -> String {
-    use ferrite_s102::legacy_trial::TrialVerticalDatum;
+    use crate::legacy_trial::TrialVerticalDatum;
     let m = inspection.metadata();
     let datum = match m.vertical_datum {
         TrialVerticalDatum::Missing => "vertical datum missing".to_owned(),

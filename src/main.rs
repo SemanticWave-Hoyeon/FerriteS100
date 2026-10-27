@@ -105,12 +105,15 @@ use ferrite_engine::portrayal::{validated_lua_context, PortrayalChangeRequest};
 use ferrite_engine::scene::PreparedScene;
 use ferrite_engine::{
     chart_publication, dataset_discovery, dataset_open_plan, dataset_signature_policy,
-    interoperability, primary_viewing_layers, s101_catalogue_selection, s101_update_plan,
-    s102_depth_policy, s102_input_capture, s102_journal_admission, s102_original_inputs,
-    s102_trial_worker, s421_dataset_input,
+    primary_viewing_layers, s101_catalogue_selection, s101_update_plan, s421_dataset_input,
 };
 use ferrite_engine::{
     CellHydration, CellHydrationSource, CellScene, ChangeCellScene, ChartLoadResult, EngineState,
+};
+use ferrite_s102::layer::{
+    depth_policy as s102_depth_policy, input_capture as s102_input_capture,
+    journal_admission as s102_journal_admission, original_inputs as s102_original_inputs,
+    trial_worker as s102_trial_worker,
 };
 
 use std::fs;
@@ -222,9 +225,7 @@ use ferrite_lua::{PortrayalEngine, TypeCatalogue};
 use ferrite_portrayal_catalog::{BoundPortrayalCatalogue, PortrayalCatalogue};
 use ferrite_render::{DrawingInstruction, GeoBounds, RenderContext, Viewport, WorldPoint};
 use ferrite_s101::{convert_lua_results_for_cell, lookup_pc_color};
-use ferrite_s102::{
-    BathymetryCoverage, BathymetryPortrayal, ConservativeCoverage, DatumCoverage, DepthSettings,
-};
+use ferrite_s102::{BathymetryCoverage, BathymetryPortrayal, ConservativeCoverage, DatumCoverage};
 use ferrite_security::{
     authorize_datasets, AuthenticatedSnapshot, AuthorizedDatasets, TrustAnchors,
     UnauthenticatedSnapshot, UnsignedPolicy,
@@ -1401,8 +1402,7 @@ impl ChartApp {
                         },
                         path.display()
                     ));
-                    self.engine.s102_trials.retain(|(p, _)| *p != path);
-                    self.engine.s102_trials.push((path, inspection));
+                    self.engine.s102.add_trial(path, inspection);
                 }
                 Err(error) => notices.push(format!(
                     "S-102 2.1 trial could not be inspected {}: {error}",
@@ -1420,7 +1420,7 @@ impl ChartApp {
             if !self.engine.cells.is_empty() {
                 displayed.push("S-101");
             }
-            if !self.engine.bathymetry.is_empty() {
+            if !self.engine.s102.bathymetry.is_empty() {
                 displayed.push("S-102");
             }
             ic.catalogue
@@ -1681,18 +1681,6 @@ impl ChartApp {
         result
     }
 
-    fn bathymetry_viewing_groups(
-        pc: &PortrayalCatalogue,
-        mode: DisplayMode,
-    ) -> Result<std::collections::HashSet<u32>> {
-        use ferrite_s102::BathymetryDisplayPreset;
-        let preset = match mode {
-            DisplayMode::Base => BathymetryDisplayPreset::Base,
-            DisplayMode::Standard => BathymetryDisplayPreset::Standard,
-            DisplayMode::All => BathymetryDisplayPreset::Other,
-        };
-        ferrite_s102::bathymetry_viewing_groups_for_preset(pc, preset)
-    }
     /// Load installed product resources before any datasets are opened. Errors
     /// remain visible; a failed parse is never presented as a loaded catalogue.
     fn initialize_product_catalogues(&mut self) {
@@ -1705,24 +1693,14 @@ impl ChartApp {
             );
             Ok(fc)
         }) {
-            Ok(fc) => {
-                self.engine.s102_fc_status = CatalogueStatus {
-                    loaded: true,
-                    product_id: fc.product_id.clone(),
-                    version: fc.version.clone(),
-                    path: fc.source_path.display().to_string(),
-                    item_count: fc.feature_types.len(),
-                    validation_message: Some("Parsed installed S-102 Feature Catalogue".into()),
-                };
-                self.engine.s102_fc = Some(Arc::new(fc));
-            }
+            Ok(fc) => self
+                .engine
+                .s102
+                .set_fc(fc, "Parsed installed S-102 Feature Catalogue"),
             Err(error) => {
-                self.engine.s102_fc_status = CatalogueStatus {
-                    product_id: "S-102".into(),
-                    path: fc_path.display().to_string(),
-                    validation_message: Some(format!("Load failed: {error:#}")),
-                    ..Default::default()
-                };
+                self.engine
+                    .s102
+                    .fc_failed(&fc_path, format!("Load failed: {error:#}"));
                 warn!("S-102 FC initialization failed: {error:#}");
             }
         }
@@ -1735,24 +1713,14 @@ impl ChartApp {
             }
             Ok(pc)
         }) {
-            Ok(pc) => {
-                self.engine.s102_pc_status = CatalogueStatus {
-                    loaded: true,
-                    product_id: pc.product_id.clone(),
-                    version: pc.version.clone(),
-                    path: pc.root_path.display().to_string(),
-                    item_count: pc.symbols.symbols.len(),
-                    validation_message: Some("Parsed installed S-102 Portrayal Catalogue".into()),
-                };
-                self.engine.s102_pc = Some(Arc::new(pc));
-            }
+            Ok(pc) => self
+                .engine
+                .s102
+                .set_pc(pc, "Parsed installed S-102 Portrayal Catalogue"),
             Err(error) => {
-                self.engine.s102_pc_status = CatalogueStatus {
-                    product_id: "S-102".into(),
-                    path: self.s102_pc_path.display().to_string(),
-                    validation_message: Some(format!("Load failed: {error}")),
-                    ..Default::default()
-                };
+                self.engine
+                    .s102
+                    .pc_failed(&self.s102_pc_path, format!("Load failed: {error}"));
                 warn!("S-102 PC initialization failed: {error}");
             }
         }
@@ -1767,7 +1735,8 @@ impl ChartApp {
     )> {
         let pc = self
             .engine
-            .s102_pc
+            .s102
+            .pc
             .as_ref()
             .context("S-102 PC unavailable; see Catalogue status")?
             .clone();
@@ -1776,28 +1745,19 @@ impl ChartApp {
             .as_ref()
             .context("Renderer not initialized")?
             .settings();
-        let groups = Self::bathymetry_viewing_groups(&pc, s.display_mode)?;
+        let groups = ferrite_s102::layer::viewing_groups(&pc, s.display_mode)?;
         BathymetryPortrayal::from_bound_catalogue(
             Arc::clone(&pc),
             &self.engine.current_profile_name,
-            DepthSettings {
-                safety_contour: s.safety_contour,
-                shallow_contour: s.shallow_contour,
-                deep_contour: s.deep_contour,
-                four_shades: !s.two_shades,
-            },
+            ferrite_s102::layer::depth_settings(s),
         )
         .map(|portrayal| {
             (
                 portrayal,
-                CatalogueStatus {
-                    loaded: true,
-                    product_id: pc.product_id.clone(),
-                    version: pc.version.clone(),
-                    path: pc.root_path.display().to_string(),
-                    item_count: pc.symbols.symbols.len(),
-                    validation_message: Some("Active S-102 portrayal catalogue".into()),
-                },
+                ferrite_s102::layer::S102Layer::pc_status_of(
+                    &pc,
+                    "Active S-102 portrayal catalogue",
+                ),
                 groups,
             )
         })
@@ -1821,27 +1781,7 @@ impl ChartApp {
         // Chart bounds read every cell's geometry.
         self.engine.hydrate_all_cells()?;
         self.ensure_navigation_scene()?;
-        if let Some(gate) = &mut self.engine.s102_journal_gate {
-            let mut seen = std::collections::BTreeSet::new();
-            for (path, _, snapshot) in &self.engine.bathymetry {
-                let record = self.engine.s102_original_inputs.get(path);
-                if !record
-                    .zip(snapshot.as_ref())
-                    .is_some_and(|(r, s)| Arc::ptr_eq(&r.snapshot, s))
-                {
-                    gate.block_for_recovery();
-                    anyhow::bail!("Enforced S102 history requires every active instance's authenticated parser owner");
-                }
-                if seen.insert(path) {
-                    if let Err(error) = gate.check_input(record, snapshot.as_ref(), path) {
-                        // Existing scene authority failed, unlike a refused new import.
-                        // Rolling back a load checkpoint must not resume that scene.
-                        gate.block_for_recovery();
-                        return Err(error);
-                    }
-                }
-            }
-        }
+        self.engine.s102.recheck_journal_admission()?;
         if paths.is_empty() {
             return Ok(());
         }
@@ -1857,6 +1797,7 @@ impl ChartApp {
                 .with_context(|| format!("Cannot open {}", path.display()))?;
             if !self
                 .engine
+                .s102
                 .bathymetry
                 .iter()
                 .any(|(loaded, _, _)| loaded == &path)
@@ -1877,6 +1818,7 @@ impl ChartApp {
             let mut original_paths = std::collections::BTreeSet::new();
             for path in self
                 .engine
+                .s102
                 .bathymetry
                 .iter()
                 .map(|entry| &entry.0)
@@ -1915,7 +1857,7 @@ impl ChartApp {
                 &path,
                 capture.authenticated.as_ref(),
             )?;
-            if let Some(gate) = &mut self.engine.s102_journal_gate {
+            if let Some(gate) = &mut self.engine.s102.journal_gate {
                 gate.check_input(
                     original_input.as_ref(),
                     capture.authenticated.as_ref(),
@@ -1969,7 +1911,7 @@ impl ChartApp {
             });
         }
         let next_original_inputs = s102_original_inputs::stage(
-            &self.engine.s102_original_inputs,
+            &self.engine.s102.original_inputs,
             pending
                 .iter()
                 .map(|input| (input.path.as_path(), input.original_input.as_ref())),
@@ -2034,7 +1976,7 @@ impl ChartApp {
                             )?)
                         } else {
                             ferrite_gpu::S102RasterMaterial::LegacyIc(
-                                interoperability::compose_raster(
+                                ferrite_s102::layer::compose_raster(
                                     portrayal.raster_window(
                                         numeric,
                                         window,
@@ -2073,6 +2015,7 @@ impl ChartApp {
         let mut next_bounds = chart_data_bounds(
             &self.engine.cells,
             self.engine
+                .s102
                 .bathymetry_bounds
                 .values()
                 .copied()
@@ -2155,7 +2098,7 @@ impl ChartApp {
         }
         for input in &pending {
             input.capture.verify()?;
-            if let Some(gate) = &mut self.engine.s102_journal_gate {
+            if let Some(gate) = &mut self.engine.s102.journal_gate {
                 gate.check_input(
                     input.original_input.as_ref(),
                     input.snapshot.as_ref(),
@@ -2192,24 +2135,16 @@ impl ChartApp {
                 }
             }
 
-            let path = input.path;
-            self.engine
-                .bathymetry_bounds
-                .insert(path.clone(), input.bounds.expect("validated bounds"));
-            if let Some(unsigned) = input.unsigned_input {
-                self.engine.depth_inputs.insert(path.clone(), unsigned);
-            }
-            self.engine
-                .depth_policies
-                .insert(path.clone(), input.policy);
-            self.engine.bathymetry.extend(
-                input
-                    .coverages
-                    .into_iter()
-                    .map(|c| (path.clone(), c, input.snapshot.clone())),
+            self.engine.s102.insert_coverages(
+                input.path,
+                input.bounds.expect("validated bounds"),
+                input.policy,
+                input.unsigned_input,
+                input.coverages,
+                input.snapshot,
             );
         }
-        self.engine.s102_original_inputs = next_original_inputs;
+        self.engine.s102.original_inputs = next_original_inputs;
         self.engine.bounds = next_bounds;
         self.pan_offset = next_pan;
         self.zoom_level = next_zoom;
@@ -2217,9 +2152,9 @@ impl ChartApp {
         self.chart_loaded = true;
         self.publish_instructions(prepared);
         if let Some(renderer) = &mut self.renderer {
-            renderer.ui.ui_state.bathymetry_count = self.engine.bathymetry.len();
+            renderer.ui.ui_state.bathymetry_count = self.engine.s102.bathymetry.len();
             renderer.ui.ui_state.chart_count =
-                self.engine.cells.len() + self.engine.bathymetry.len();
+                self.engine.cells.len() + self.engine.s102.bathymetry.len();
             renderer.update_selection(&self.engine.render_context.scaler);
         }
         if self.auto_screenshot.is_some() {
@@ -2228,8 +2163,11 @@ impl ChartApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
-        self.engine.s102_pc_status = pc_status;
-        info!("S-102 loaded: {} coverages", self.engine.bathymetry.len());
+        self.engine.s102.pc_status = pc_status;
+        info!(
+            "S-102 loaded: {} coverages",
+            self.engine.s102.bathymetry.len()
+        );
         self.recompose_for_level2();
         Ok(())
     }
@@ -2566,31 +2504,28 @@ impl ChartApp {
         )?;
         let raster_staging = if matches!(raster_preparation, RasterPreparation::Rebuild) {
             // An ordinary S101-only installation must not depend on an S102 PC.
-            let (portrayal, raster_groups) = if self.engine.bathymetry.is_empty() {
+            let (portrayal, raster_groups) = if self.engine.s102.bathymetry.is_empty() {
                 (None, Some(std::collections::HashSet::new()))
             } else {
                 let pc = self
                     .engine
-                    .s102_pc
+                    .s102
+                    .pc
                     .as_ref()
                     .context("S-102 PC unavailable; see Catalogue status")?
                     .clone();
-                let groups = Self::bathymetry_viewing_groups(&pc, request.settings.display_mode)?;
+                let groups =
+                    ferrite_s102::layer::viewing_groups(&pc, request.settings.display_mode)?;
                 (
                     Some(BathymetryPortrayal::from_bound_catalogue(
                         Arc::clone(&pc),
                         &request.profile,
-                        DepthSettings {
-                            safety_contour: request.settings.safety_contour,
-                            shallow_contour: request.settings.shallow_contour,
-                            deep_contour: request.settings.deep_contour,
-                            four_shades: !request.settings.two_shades,
-                        },
+                        ferrite_s102::layer::depth_settings(&request.settings),
                     )?),
                     Some(groups),
                 )
             };
-            if !self.engine.bathymetry.is_empty() {
+            if !self.engine.s102.bathymetry.is_empty() {
                 self.s102_raster_rebuild_count = self.s102_raster_rebuild_count.saturating_add(1);
             }
             let edge = self.bathymetry_tile_edge()?;
@@ -2599,10 +2534,11 @@ impl ChartApp {
                 .as_mut()
                 .context("Renderer not initialized")?
                 .stage_s102_raster_batch(&next.scaler, |upload| {
-                    for group in self.engine.bathymetry.chunk_by(|a, b| a.0 == b.0) {
+                    for group in self.engine.s102.bathymetry.chunk_by(|a, b| a.0 == b.0) {
                         let (path, first, _) = &group[0];
                         let policy = self
                             .engine
+                            .s102
                             .depth_policies
                             .get(path)
                             .context("Missing loaded depth policy")?;
@@ -2660,7 +2596,7 @@ impl ChartApp {
                                 )
                             } else {
                                 ferrite_gpu::S102RasterMaterial::LegacyIc(
-                                    interoperability::compose_raster(
+                                    ferrite_s102::layer::compose_raster(
                                         portrayal
                                             .as_ref()
                                             .context("Missing staged S102 portrayal")?
@@ -2775,7 +2711,8 @@ impl ChartApp {
                     coverage,
                     catalogue_registry,
                     ic_changed,
-                    bathymetry: Default::default(),
+                    id: Default::default(),
+                    extensions: Vec::new(),
                 },
                 cell_resources,
                 raster_scene: scene,
@@ -2961,7 +2898,7 @@ impl ChartApp {
     }
 
     fn recolor_bathymetry(&mut self) -> Result<()> {
-        if self.engine.bathymetry.is_empty() {
+        if self.engine.s102.bathymetry.is_empty() {
             return Ok(());
         }
         let request = PortrayalChangeRequest {
@@ -2973,158 +2910,11 @@ impl ChartApp {
     }
 
     fn inspect_bathymetry(&self, lon: f64, lat: f64) -> Result<Option<String>> {
-        let mut missing = None;
         let wrapping = self
             .renderer
             .as_ref()
             .is_some_and(|r| r.longitude_wrapping_enabled());
-        for group in self.engine.bathymetry.chunk_by(|a, b| a.0 == b.0).rev() {
-            let path = &group[0].0;
-            let policy = self
-                .engine
-                .depth_policies
-                .get(path)
-                .context("Missing loaded depth policy")?;
-            let mosaic = ConservativeCoverage::new(
-                group
-                    .iter()
-                    .map(|(_, c, _)| DatumCoverage {
-                        coverage: c,
-                        reference: DepthReference(c.vertical_datum as u64),
-                    })
-                    .collect(),
-                DepthReference(policy.target as u64),
-                policy,
-            )?;
-            for shift in &([0., -360., 360.])[..if wrapping { 3 } else { 1 }] {
-                let Some(selected) = mosaic.query_nearest(lon - shift, lat)? else {
-                    if mosaic.covers_position(lon - shift, lat)? {
-                        missing = Some(format!("S-102 depth: No data\n{}", path.display()));
-                    }
-                    continue;
-                };
-                let sample = selected.candidate;
-                let c = &group[sample.source.instance].1;
-                let uncertainty = sample
-                    .uncertainty
-                    .map(|v| format!("{v:.2} m"))
-                    .unwrap_or_else(|| "No data".into());
-                let coordinate_uncertainty = |value: f32| {
-                    if value == -1. {
-                        "Unknown".to_owned()
-                    } else {
-                        format!("{value:.2} m")
-                    }
-                };
-                let mut info = format!(
-                    "S-102 depth: {:.2} m\nCell depth uncertainty: {uncertainty}\nContainer horizontal coordinate uncertainty: {}\nContainer vertical coordinate uncertainty: {}\nVertical CRS: {} / datum code: {}\n{}",
-                    selected.adjusted_depth,
-                    coordinate_uncertainty(c.horizontal_position_uncertainty),
-                    coordinate_uncertainty(c.vertical_position_uncertainty),
-                    if c.vertical_cs_reinterpreted_as_depth {
-                        format!("{} (declared; read as depth-down, compatibility mode)", c.vertical_crs)
-                    } else {
-                        c.vertical_crs.to_string()
-                    },
-                    c.vertical_datum,
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                );
-                info.push_str(&format!(
-                    "\nProduct issue date: {}\nProduct issue time: {}\nEncoded axes: {} / {}",
-                    c.issue.date,
-                    c.issue.time.as_deref().unwrap_or("Not provided"),
-                    c.axes.names[0],
-                    c.axes.names[1]
-                ));
-                info.push_str(&format!(
-                    "\nDeclared S-102 features: {}",
-                    c.feature_metadata.declared_features.join(", ")
-                ));
-                for diagnostic in &c.feature_metadata.diagnostics {
-                    info.push_str(&format!("\nFeature metadata diagnostic: {diagnostic:?}"));
-                }
-                for definition in c
-                    .feature_metadata
-                    .bathymetry
-                    .iter()
-                    .chain(c.feature_metadata.quality.iter())
-                {
-                    info.push_str(&format!(
-                        "\nDefinition {}: unit '{}', {}, fill {}, {} [{}, {}]",
-                        definition.code,
-                        definition.unit,
-                        definition.datatype,
-                        definition.fill_value,
-                        definition.closure,
-                        definition.lower,
-                        definition.upper
-                    ));
-                }
-                if !c.axes.matches_generic_array_major_order()
-                    || c.quality
-                        .as_ref()
-                        .is_some_and(|q| !q.axes.matches_generic_array_major_order())
-                {
-                    info.push_str("\nAxis metadata diagnostic: declared axis order differs from generic S-100 array major order. Original S-102 east-then-north samples are retained; no automatic transpose.");
-                }
-                info.push_str(&format!(
-                    "\nRoot geographic extent assessment: grid {:?}, domain {:?}",
-                    c.root_enclosure.full_grid, c.root_enclosure.declared_domain
-                ));
-                info.push_str(&format!("\nTarget datum code: {}\nRaw source depth: {:.8} m\nPositive-down correction: {:+.8} m\nCorrection source: {}\nHost-supplied correction; not dataset-authenticated transformation evidence.\nSource instance: {}",
-                    policy.target,sample.raw_depth.unwrap(),selected.adjustment.correction_metres,policy.source(selected.adjustment.provenance),c.instance_name));
-                info.push_str(&format!("\nQuery longitude / latitude: {lon:.8} / {lat:.8}\nSample longitude / latitude: {:.8} / {:.8}\nGrid column / row (zero-based): {} / {}\nNearest grid node; no spatial interpolation. Shared boundaries use the least adjusted depth.",sample.x,sample.y,sample.source.column,sample.source.row));
-                if *shift != 0. {
-                    info.push_str(&format!("\nDisplay longitude copy: {shift:+.0}°; sample coordinates are from the source."));
-                }
-                let metadata_issues = group
-                    .iter()
-                    .filter_map(|(_, source, _)| {
-                        let issues = source.observed_range_violations();
-                        issues.iter().any(|v| *v).then(|| {
-                            format!(
-                                "{} ({})",
-                                source.instance_name,
-                                if issues[0] && issues[1] {
-                                    "depth and uncertainty"
-                                } else if issues[0] {
-                                    "depth"
-                                } else {
-                                    "uncertainty"
-                                }
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if !metadata_issues.is_empty() {
-                    info.push_str(&format!("\nDataset metadata warning: {} values outside declared extrema. Original samples retained.",metadata_issues.join(", ")));
-                }
-                let domain_issues = group
-                    .iter()
-                    .filter(|(_, source, _)| source.observed_depth_centroids_outside_domain())
-                    .map(|(_, source, _)| source.instance_name.as_str())
-                    .collect::<Vec<_>>();
-                if !domain_issues.is_empty() {
-                    info.push_str(&format!("\nValidity diagnostic: {} populated depth sample positions outside their own domain. Raw samples retained; this is not an entire-cell intersection test.",domain_issues.join(", ")));
-                }
-                let quality = match &c.quality {
-                    Some(q) => {
-                        let mut description=match q.sample_nearest(lon-shift,lat)? {
-                            Some(record)=>record.description(),None=>"Quality: no record at this location (fill ID 0 or outside its own validity domain)".into(),
-                        };
-                        if q.observed_id_centroids_outside_domain() {
-                            description.push_str("\nQuality validity diagnostic: nonzero original ID sample positions outside its own domain; IDs retained.");
-                        }
-                        description
-                    }
-                    None => "Quality coverage: not supplied".into(),
-                };
-                info.push('\n');
-                info.push_str(&quality);
-                return Ok(Some(info));
-            }
-        }
-        Ok(missing)
+        self.engine.s102.inspect(lon, lat, wrapping)
     }
 
     /// Exercise the same coverage query used by mouse picking, without OS input.
@@ -3290,10 +3080,11 @@ impl ChartApp {
     fn audit_bathymetry(&mut self, output: &Path) -> Result<()> {
         self.ensure_navigation_scene()?;
         let mut probes = Vec::new();
-        for group in self.engine.bathymetry.chunk_by(|a, b| a.0 == b.0) {
+        for group in self.engine.s102.bathymetry.chunk_by(|a, b| a.0 == b.0) {
             let path = &group[0].0;
             let policy = self
                 .engine
+                .s102
                 .depth_policies
                 .get(path)
                 .context("Missing loaded depth policy")?;
@@ -3486,25 +3277,26 @@ impl ChartApp {
                 ),
             });
         }
-        let mut raster_files = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for (path, _, _) in &self.engine.bathymetry {
-            if seen.insert(path.clone()) {
-                raster_files.push(DatasetLayerEntry {
-                    id: DatasetLayerId::S102(path.clone()),
-                    name: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    source: path.display().to_string(),
-                    detail: "S-102 bathymetry".into(),
-                });
-            }
-        }
+        let raster_files: Vec<_> = self
+            .engine
+            .s102
+            .files()
+            .into_iter()
+            .map(|path| DatasetLayerEntry {
+                id: DatasetLayerId::S102(path.to_path_buf()),
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                source: path.display().to_string(),
+                detail: "S-102 bathymetry".into(),
+            })
+            .collect();
         let trial_files: Vec<_> = self
             .engine
-            .s102_trials
+            .s102
+            .trials
             .iter()
             .map(|(path, inspection)| DatasetLayerEntry {
                 id: DatasetLayerId::S102Trial(path.clone()),
@@ -3539,8 +3331,8 @@ impl ChartApp {
                 },
                 DatasetCatalogueLayer {
                     product: "S-102".into(),
-                    fc: self.engine.s102_fc_status.clone(),
-                    pc: self.engine.s102_pc_status.clone(),
+                    fc: self.engine.s102.fc_status.clone(),
+                    pc: self.engine.s102.pc_status.clone(),
                 },
             ];
             renderer.ui.ui_state.dataset_layers = vec![
@@ -3562,7 +3354,7 @@ impl ChartApp {
                     product: "S-102".into(),
                     fc: format!(
                         "FC {} · {}",
-                        self.engine.s102_fc_status.version, self.engine.s102_fc_status.path
+                        self.engine.s102.fc_status.version, self.engine.s102.fc_status.path
                     ),
                     pc: format!("PC · {}", self.s102_pc_path.display()),
                     files: raster_files,
@@ -3717,63 +3509,45 @@ impl ChartApp {
                     !self.publication_test_fail_before_commit,
                     "Injected publication failure before commit"
                 );
-                let before = self.engine.s102_trials.len();
-                self.engine.s102_trials.retain(|(p, _)| *p != path);
                 anyhow::ensure!(
-                    self.engine.s102_trials.len() < before,
+                    self.engine.s102.remove_trial(&path),
                     "Dataset is no longer loaded"
                 );
             }
             ferrite_ui::DatasetLayerId::S102(path) => {
                 anyhow::ensure!(
                     self.engine
+                        .s102
                         .bathymetry
                         .iter()
                         .any(|(loaded, _, _)| *loaded == path),
                     "Dataset is no longer loaded"
                 );
-                let mut removed = Vec::new();
-                let retained = std::mem::take(&mut self.engine.bathymetry)
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, value)| {
-                        if value.0 == path {
-                            removed.push((index, value));
-                            None
-                        } else {
-                            Some(value)
-                        }
-                    })
-                    .collect();
-                self.engine.bathymetry = retained;
+                let removed = self.engine.s102.take_file(&path);
                 let staged = self
                     .prepare_portrayal_change(request)
                     .and_then(|prepared| self.commit_portrayal_change(prepared));
                 if let Err(error) = staged {
-                    for (index, value) in removed {
-                        self.engine.bathymetry.insert(index, value);
-                    }
+                    self.engine.s102.restore_file(removed);
                     return Err(error);
                 }
                 // Close removed HDF handles before releasing their private files,
                 // including on Windows where open-file deletion is restricted.
                 drop(removed);
-                self.engine.bathymetry_bounds.remove(&path);
-                self.engine.depth_policies.remove(&path);
-                self.engine.depth_inputs.remove(&path);
-                self.engine.s102_original_inputs.remove(&path);
+                self.engine.s102.forget_file(&path);
             }
         }
         // Manual unloading is in-memory only: never create cancellation history.
         self.select_feature(None);
         self.pending_hit_test = None;
-        self.chart_loaded = !self.engine.cells.is_empty() || !self.engine.bathymetry.is_empty();
+        self.chart_loaded =
+            !self.engine.cells.is_empty() || !self.engine.s102.bathymetry.is_empty();
         if let Some(renderer) = &mut self.renderer {
             renderer.ui.ui_state.selection_candidates.clear();
             renderer.ui.ui_state.selection_requested = None;
             renderer.ui.ui_state.chart_count =
-                self.engine.cells.len() + self.engine.bathymetry.len();
-            renderer.ui.ui_state.bathymetry_count = self.engine.bathymetry.len();
+                self.engine.cells.len() + self.engine.s102.bathymetry.len();
+            renderer.ui.ui_state.bathymetry_count = self.engine.s102.bathymetry.len();
             renderer.ui.ui_state.security_status = "Retained datasets keep their original verification results; dataset manually unloaded".into();
             renderer.ui.ui_state.feature_count = self
                 .engine
@@ -3928,9 +3702,11 @@ impl ChartApp {
         // Each raster is transactional. A damaged/unsupported delivery cannot
         // prevent the remaining independent files from being attempted.
         if let Some(path) = session.rasters.pop_front() {
-            let previous = self.engine.bathymetry.len();
+            let previous = self.engine.s102.bathymetry.len();
             match self.load_bathymetry(std::slice::from_ref(&path)) {
-                Ok(()) if self.engine.bathymetry.len() > previous => session.raster_loaded += 1,
+                Ok(()) if self.engine.s102.bathymetry.len() > previous => {
+                    session.raster_loaded += 1
+                }
                 Ok(()) => session.raster_existing += 1,
                 Err(error) => {
                     session.raster_failed += 1;
@@ -3983,11 +3759,11 @@ impl ChartApp {
                         "rasters_loaded": session.raster_loaded,
                         "rasters_existing": session.raster_existing,
                         "rasters_failed": session.raster_failed,
-                        "coverages": self.engine.bathymetry.len(),
+                        "coverages": self.engine.s102.bathymetry.len(),
                         "chart_count": self.engine.cells.len(),
                         "notices": session.notices,
                         "summary": summary,
-                        "paths": self.engine.bathymetry.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
+                        "paths": self.engine.s102.bathymetry.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
                         "hidden": self.window.as_ref().and_then(|w| w.is_visible()) == Some(false),
                         "focused": self.window.as_ref().is_some_and(|w| w.has_focus()),
                         "ordinary_folder_queue": true,
@@ -4769,10 +4545,10 @@ impl ChartApp {
             return;
         }
         let previous_bounds = self.engine.bounds;
-        if !self.engine.cells.is_empty() || !self.engine.bathymetry.is_empty() {
+        if !self.engine.cells.is_empty() || !self.engine.s102.bathymetry.is_empty() {
             self.engine.bounds = chart_data_bounds(
                 &self.engine.cells,
-                self.engine.bathymetry_bounds.values().copied(),
+                self.engine.s102.bathymetry_bounds.values().copied(),
             );
             self.engine.bounds.expand_by_percent(0.1);
         }
@@ -4899,7 +4675,8 @@ impl ChartApp {
         }
         drop(transaction.commit());
         self.engine.loaded_discovery = next_metadata;
-        self.chart_loaded = !self.engine.cells.is_empty() || !self.engine.bathymetry.is_empty();
+        self.chart_loaded =
+            !self.engine.cells.is_empty() || !self.engine.s102.bathymetry.is_empty();
 
         if let Some(renderer) = &mut self.renderer {
             renderer.ui.ui_state.selected_feature = None;
@@ -4938,7 +4715,7 @@ impl ChartApp {
                     .sum();
                 renderer.ui.ui_state.feature_count = total_count;
                 renderer.ui.ui_state.chart_count =
-                    self.engine.cells.len() + self.engine.bathymetry.len();
+                    self.engine.cells.len() + self.engine.s102.bathymetry.len();
 
                 // The reference comes from producer DataCoverage attributes.
                 // A legacy dataset without optimumDisplayScale has no current
@@ -5181,12 +4958,8 @@ impl ChartApp {
         self.engine.loaded_source_identities.clear();
         self.engine.loaded_chain_paths.clear();
         self.engine.loaded_discovery.clear();
-        self.engine.bathymetry.clear();
+        self.engine.s102.clear_coverages();
         self.pending_portrayal_change = None;
-        self.engine.bathymetry_bounds.clear();
-        self.engine.depth_policies.clear();
-        self.engine.depth_inputs.clear();
-        self.engine.s102_original_inputs.clear();
         self.engine.bounds = GeoBounds::new(-180.0, -90.0, 180.0, 90.0);
         self.chart_loaded = false;
         self.zoom_level = 1.0;
@@ -5336,7 +5109,8 @@ impl ChartApp {
                 coverage: coverage_inventory,
                 catalogue_registry,
                 ic_changed,
-                bathymetry: Default::default(),
+                id: Default::default(),
+                extensions: Vec::new(),
             },
             cell_resources: None,
             raster_scene: None,
@@ -6029,7 +5803,7 @@ impl ChartApp {
             anyhow::ensure!(
                 !self.chart_loaded
                     && self.engine.cells.is_empty()
-                    && self.engine.bathymetry.is_empty(),
+                    && self.engine.s102.bathymetry.is_empty(),
                 "Last dataset retained"
             );
             self.capture_catalogue_audit(&output.join("unloaded-all"))?;
@@ -6041,7 +5815,7 @@ impl ChartApp {
         fs::write(
             output.join("result.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"tree_count":tree_count,"opening_notice":opening_notice,"failed_unload":format!("{failure:#}"),"failure_binding_exact":true,"tree_before":old_tree,"remaining_cells":self.engine.cells.len(),"remaining_raster_instances":self.engine.bathymetry.len(),"history_written":false,"visible":self.window.as_ref().unwrap().is_visible(),"focused":self.window.as_ref().unwrap().has_focus()}),
+                &serde_json::json!({"tree_count":tree_count,"opening_notice":opening_notice,"failed_unload":format!("{failure:#}"),"failure_binding_exact":true,"tree_before":old_tree,"remaining_cells":self.engine.cells.len(),"remaining_raster_instances":self.engine.s102.bathymetry.len(),"history_written":false,"visible":self.window.as_ref().unwrap().is_visible(),"focused":self.window.as_ref().unwrap().has_focus()}),
             )?,
         )?;
         Ok(())
@@ -6461,7 +6235,7 @@ impl ChartApp {
         anyhow::ensure!(
             self.chart_loaded
                 && !self.engine.cells.is_empty()
-                && self.engine.bathymetry.is_empty()
+                && self.engine.s102.bathymetry.is_empty()
                 && self.dataset_open_discovery.is_none()
                 && self.dataset_open_session.is_none(),
             "Settled vector-only load required"
@@ -6911,7 +6685,7 @@ impl ChartApp {
         anyhow::ensure!(
             self.chart_loaded
                 && !self.engine.cells.is_empty()
-                && !self.engine.bathymetry.is_empty()
+                && !self.engine.s102.bathymetry.is_empty()
                 && self.dataset_open_discovery.is_none()
                 && self.dataset_open_session.is_none(),
             "Settled genuine S101 and S102 required"
@@ -6922,7 +6696,7 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.engine.cells.len() <= 128
-                && self.engine.bathymetry.len() <= 32
+                && self.engine.s102.bathymetry.len() <= 32
                 && self.engine.render_context.raw_instructions().len() <= 500_000
                 && bincode::serialized_size(self.engine.render_context.raw_instructions())?
                     <= 64 * 1024 * 1024,
@@ -6951,17 +6725,13 @@ impl ChartApp {
         let profile = self.engine.current_profile_name.clone();
         let s102_pc = self
             .engine
-            .s102_pc
+            .s102
+            .pc
             .as_ref()
             .context("Retained S102 PC missing")?
             .clone();
         let policy = renderer.settings();
-        let depth = DepthSettings {
-            safety_contour: policy.safety_contour,
-            shallow_contour: policy.shallow_contour,
-            deep_contour: policy.deep_contour,
-            four_shades: !policy.two_shades,
-        };
+        let depth = ferrite_s102::layer::depth_settings(policy);
         let symbols = bincode::serialize(&renderer.displayed_symbols_with_sources())?;
         anyhow::ensure!(
             symbols.len() <= 32 * 1024 * 1024,
@@ -7211,7 +6981,7 @@ impl ChartApp {
             "Joint activation changed original model/registry/camera/symbol source metadata"
         );
         let report = serde_json::json!({"passed":true,"scope":"same-original/current-camera genuine S101 and regular S102 Renderer joint activation; no full App/journal/continuous authorization or FPS claim",
-            "hidden":true,"focused":false,"charts":self.engine.cells.len(),"bathymetry_instances":self.engine.bathymetry.len(),
+            "hidden":true,"focused":false,"charts":self.engine.cells.len(),"bathymetry_instances":self.engine.s102.bathymetry.len(),
             "original_ir_count":self.engine.render_context.instruction_count(),"text_draw_count":text_draw_count,
             "original_ir_sha256":format!("{:x}",Sha256::digest(bincode::serialize(self.engine.render_context.raw_instructions())?)),
             "rgba_sha256":format!("{:x}",Sha256::digest(&reference.2)),"rgba_bytes":reference.2.len(),"extent":[reference.0,reference.1],
@@ -7245,7 +7015,9 @@ impl ChartApp {
             "Private readback forbidden in measured callbacks"
         );
         anyhow::ensure!(
-            self.chart_loaded && self.engine.cells.len() == 1 && self.engine.bathymetry.is_empty(),
+            self.chart_loaded
+                && self.engine.cells.len() == 1
+                && self.engine.s102.bathymetry.is_empty(),
             "Single original chain and vector-only scene required"
         );
         anyhow::ensure!(
@@ -7688,7 +7460,7 @@ impl ChartApp {
         anyhow::ensure!(
             self.chart_loaded
                 && !self.engine.cells.is_empty()
-                && self.engine.bathymetry.is_empty()
+                && self.engine.s102.bathymetry.is_empty()
                 && self.engine.cells.len() <= 128
                 && self.engine.render_context.raw_instructions().len() <= 500_000
                 && bincode::serialized_size(self.engine.render_context.raw_instructions())?
@@ -8039,7 +7811,9 @@ impl ChartApp {
             "Private readback is forbidden in measured callbacks"
         );
         anyhow::ensure!(
-            self.chart_loaded && !self.engine.cells.is_empty() && self.engine.bathymetry.is_empty(),
+            self.chart_loaded
+                && !self.engine.cells.is_empty()
+                && self.engine.s102.bathymetry.is_empty(),
             "Loaded vector-only scene required"
         );
         anyhow::ensure!(
@@ -8280,7 +8054,7 @@ impl ChartApp {
             "Visible audit forbidden"
         );
         anyhow::ensure!(
-            self.engine.cells.len() == 1 && self.engine.bathymetry.is_empty(),
+            self.engine.cells.len() == 1 && self.engine.s102.bathymetry.is_empty(),
             "One S101 chain required"
         );
         anyhow::ensure!(
@@ -8373,7 +8147,7 @@ impl ChartApp {
             "Visible/focused cancellation audit forbidden"
         );
         anyhow::ensure!(
-            self.engine.cells.len() == 1 && self.engine.bathymetry.is_empty(),
+            self.engine.cells.len() == 1 && self.engine.s102.bathymetry.is_empty(),
             "Audit requires one vector cell and no raster"
         );
         let selected = PathBuf::from(
@@ -8800,15 +8574,23 @@ impl ChartApp {
         let renderer = self.renderer.as_ref().context("Renderer required")?;
         let mut policies = self
             .engine
+            .s102
             .depth_policies
             .iter()
             .map(|(path, policy)| (path.clone(), policy.target))
             .collect::<Vec<_>>();
         policies.sort();
-        let mut inputs = self.engine.depth_inputs.keys().cloned().collect::<Vec<_>>();
+        let mut inputs = self
+            .engine
+            .s102
+            .depth_inputs
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         inputs.sort();
         let mut bounds = self
             .engine
+            .s102
             .bathymetry_bounds
             .iter()
             .map(|(path, b)| {
@@ -8824,7 +8606,7 @@ impl ChartApp {
             })
             .collect::<Vec<_>>();
         bounds.sort();
-        let sources=self.engine.bathymetry.iter().map(|(path,c,snapshot)|serde_json::json!({"path":path,"instance":c.instance_name,"geometry":format!("{:?}",c.numeric_geometry()),"datum":c.vertical_datum,"snapshot":snapshot.as_ref().map(|s|s.path())})).collect::<Vec<_>>();
+        let sources=self.engine.s102.bathymetry.iter().map(|(path,c,snapshot)|serde_json::json!({"path":path,"instance":c.instance_name,"geometry":format!("{:?}",c.numeric_geometry()),"datum":c.vertical_datum,"snapshot":snapshot.as_ref().map(|s|s.path())})).collect::<Vec<_>>();
         Ok(
             serde_json::json!({"vectors":self.publication_model()?,"sources":sources,"policies":policies,"private_inputs":inputs,"bounds":bounds,"pan_bits":[self.pan_offset.0.to_bits(),self.pan_offset.1.to_bits()],"zoom_bits":self.zoom_level.to_bits(),"zoom_target_bits":self.zoom_target.to_bits(),"raster_composition":renderer.raster_composition_metadata().map(|(p,o,g,v)|(format!("{p:?}"),o,g.to_vec(),v)).collect::<Vec<_>>(),"ui_bathymetry_count":renderer.ui.ui_state.bathymetry_count,"ui_chart_count":renderer.ui.ui_state.chart_count}),
         )
@@ -8884,10 +8666,13 @@ impl ChartApp {
                 && !window.has_focus(),
             "Hidden audit required"
         );
-        anyhow::ensure!(!self.engine.bathymetry.is_empty(), "S102 raster required");
+        anyhow::ensure!(
+            !self.engine.s102.bathymetry.is_empty(),
+            "S102 raster required"
+        );
         fs::create_dir_all(output)?;
         let pc = PortrayalCatalogue::load(&self.s102_pc_path)?;
-        let groups = Self::bathymetry_viewing_groups(&pc, self.applied_settings.display_mode)?;
+        let groups = ferrite_s102::layer::viewing_groups(&pc, self.applied_settings.display_mode)?;
         let composition = |r: &WgpuRenderer| {
             r.raster_composition_metadata()
                 .map(|(plane, priority, g, v)| (format!("{plane:?}"), priority, g.to_vec(), v))
@@ -8979,7 +8764,7 @@ impl ChartApp {
             "Hidden audit required"
         );
         anyhow::ensure!(
-            self.engine.bathymetry.is_empty() && self.engine.s102_original_inputs.is_empty(),
+            self.engine.s102.bathymetry.is_empty() && self.engine.s102.original_inputs.is_empty(),
             "Original retention audit needs no initial rasters"
         );
         let paths: Vec<PathBuf> =
@@ -8995,7 +8780,7 @@ impl ChartApp {
         fs::create_dir_all(output)?;
         if std::env::var("FERRITE_S102_POPULATED_HISTORY_AUDIT").as_deref() == Ok("1") {
             anyhow::ensure!(
-                self.engine.s102_journal_gate.is_some(),
+                self.engine.s102.journal_gate.is_some(),
                 "Populated history audit requires explicit history"
             );
             let before = self.bathymetry_publication_model()?;
@@ -9029,26 +8814,28 @@ impl ChartApp {
             );
             anyhow::ensure!(
                 self.bathymetry_publication_model()? == before
-                    && self.engine.bathymetry.is_empty()
-                    && self.engine.s102_original_inputs.is_empty(),
+                    && self.engine.s102.bathymetry.is_empty()
+                    && self.engine.s102.original_inputs.is_empty(),
                 "Rejected original changed existing publication"
             );
             self.ensure_navigation_scene()?;
             self.load_bathymetry(&paths[1..])?;
             anyhow::ensure!(
-                self.engine.s102_original_inputs.len() == paths.len() - 1,
+                self.engine.s102.original_inputs.len() == paths.len() - 1,
                 "Tombstone refusal blocked unrelated authenticated originals"
             );
             let admitted = self
                 .engine
-                .s102_journal_gate
+                .s102
+                .journal_gate
                 .as_ref()
                 .unwrap()
                 .successful_checks();
             self.clear_charts();
             self.ensure_s102_journal_ready()?;
             anyhow::ensure!(
-                self.engine.bathymetry.is_empty() && self.engine.s102_original_inputs.is_empty(),
+                self.engine.s102.bathymetry.is_empty()
+                    && self.engine.s102.original_inputs.is_empty(),
                 "Clear retained unrelated original owners"
             );
             let again = self
@@ -9080,7 +8867,7 @@ impl ChartApp {
             .verify_dataset_signatures = true;
         self.load_bathymetry(&paths[..1])?;
         let original = self.bathymetry_publication_model()?;
-        let old = self.engine.s102_original_inputs.clone();
+        let old = self.engine.s102.original_inputs.clone();
         anyhow::ensure!(old.len() == 1, "Original proof not retained");
         std::env::set_var("FERRITE_ROOT_S102_FAIL_SCENE", "1");
         let failed = self.load_bathymetry(&paths[1..]);
@@ -9094,10 +8881,11 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.bathymetry_publication_model()? == original
-                && self.engine.s102_original_inputs.len() == old.len()
+                && self.engine.s102.original_inputs.len() == old.len()
                 && old.iter().all(|(p, v)| self
                     .engine
-                    .s102_original_inputs
+                    .s102
+                    .original_inputs
                     .get(p)
                     .is_some_and(|n| Arc::ptr_eq(n, v))),
             "Failed staging changed retained originals/model"
@@ -9105,11 +8893,11 @@ impl ChartApp {
         drop(old);
         self.load_bathymetry(&paths[1..])?;
         anyhow::ensure!(
-            self.engine.s102_original_inputs.len() == paths.len(),
+            self.engine.s102.original_inputs.len() == paths.len(),
             "Missing retained originals"
         );
         let mut evidence = Vec::new();
-        for (path, record) in &self.engine.s102_original_inputs {
+        for (path, record) in &self.engine.s102.original_inputs {
             let bytes = fs::read(record.snapshot.path())?;
             anyhow::ensure!(
                 record.snapshot.source == *path
@@ -9128,6 +8916,7 @@ impl ChartApp {
             );
             anyhow::ensure!(
                 self.engine
+                    .s102
                     .bathymetry
                     .iter()
                     .filter(|(p, _, _)| p == path)
@@ -9139,7 +8928,7 @@ impl ChartApp {
                 "resource_signatures":record.original.signatures().len(),"reader_arc_exact":true}));
         }
         let fresh = self.authenticate_paths(&paths[..1])?;
-        let old_snapshot = &self.engine.s102_original_inputs[&paths[0]].snapshot;
+        let old_snapshot = &self.engine.s102.original_inputs[&paths[0]].snapshot;
         anyhow::ensure!(
             s102_original_inputs::capture(&fresh, &paths[0], Some(old_snapshot)).is_err(),
             "Foreign parser snapshot accepted"
@@ -9150,7 +8939,7 @@ impl ChartApp {
                 &Default::default(),
                 [(
                     foreign_path,
-                    Some(&self.engine.s102_original_inputs[&paths[0]])
+                    Some(&self.engine.s102.original_inputs[&paths[0]])
                 )],
                 &fresh
             )
@@ -9159,10 +8948,10 @@ impl ChartApp {
         );
         anyhow::ensure!(
             s102_original_inputs::stage(
-                &self.engine.s102_original_inputs,
+                &self.engine.s102.original_inputs,
                 [(
                     paths[0].as_path(),
-                    Some(&self.engine.s102_original_inputs[&paths[0]])
+                    Some(&self.engine.s102.original_inputs[&paths[0]])
                 )],
                 &fresh
             )
@@ -9170,8 +8959,8 @@ impl ChartApp {
             "Duplicate original publication accepted"
         );
         drop(fresh);
-        if let Some(gate) = &mut self.engine.s102_journal_gate {
-            let record = self.engine.s102_original_inputs[&paths[0]].clone();
+        if let Some(gate) = &mut self.engine.s102.journal_gate {
+            let record = self.engine.s102.original_inputs[&paths[0]].clone();
             let foreign = Arc::new(record.original.capture_resource()?);
             anyhow::ensure!(
                 gate.check_input(Some(&record), Some(&foreign), &paths[0])
@@ -9190,28 +8979,29 @@ impl ChartApp {
             .unwrap()
             .save_screenshot(output.join("loaded.png"))?;
         let middle = paths[paths.len() / 2].clone();
-        let private = self.engine.s102_original_inputs[&middle]
+        let private = self.engine.s102.original_inputs[&middle]
             .snapshot
             .path()
             .to_path_buf();
-        let weak = Arc::downgrade(&self.engine.s102_original_inputs[&middle].snapshot);
+        let weak = Arc::downgrade(&self.engine.s102.original_inputs[&middle].snapshot);
         self.unload_dataset(ferrite_ui::DatasetLayerId::S102(middle.clone()))?;
         anyhow::ensure!(
-            !self.engine.s102_original_inputs.contains_key(&middle)
+            !self.engine.s102.original_inputs.contains_key(&middle)
                 && weak.upgrade().is_none()
                 && !private.exists(),
             "Manual unload retained original reader/file"
         );
         let remaining = self
             .engine
-            .s102_original_inputs
+            .s102
+            .original_inputs
             .values()
             .map(|v| (Arc::downgrade(&v.snapshot), v.snapshot.path().to_path_buf()))
             .collect::<Vec<_>>();
         self.clear_charts();
         anyhow::ensure!(
-            self.engine.s102_original_inputs.is_empty()
-                && self.engine.bathymetry.is_empty()
+            self.engine.s102.original_inputs.is_empty()
+                && self.engine.s102.bathymetry.is_empty()
                 && remaining
                     .iter()
                     .all(|(w, p)| w.upgrade().is_none() && !p.exists()),
@@ -9224,8 +9014,8 @@ impl ChartApp {
             "late_failure_preserves_registry_and_model":true,"foreign_snapshot_rejected":true,
             "foreign_path_rejected":true,"duplicate_publication_rejected":true,
             "middle_unload_releases_reader_and_private_file":true,"clear_releases_remaining":true,
-            "journal_admission_checks":self.engine.s102_journal_gate.as_ref().map(|g| g.successful_checks()),
-            "journal_preserved_after_unload_clear":self.engine.s102_journal_gate.is_some(),
+            "journal_admission_checks":self.engine.s102.journal_gate.as_ref().map(|g| g.successful_checks()),
+            "journal_preserved_after_unload_clear":self.engine.s102.journal_gate.is_some(),
             "scope":"Current signed original loading and manual lifecycle only; no cancellation permission/replay or cross-platform proof"}))?,
         )?;
         Ok(())
@@ -9248,7 +9038,7 @@ impl ChartApp {
             !output.exists()
                 && self.loading_state.is_none()
                 && !self.engine.cells.is_empty()
-                && self.engine.bathymetry.is_empty(),
+                && self.engine.s102.bathymetry.is_empty(),
             "Fresh output and settled vector-only scene required"
         );
         let renderer = self.renderer.as_ref().context("Renderer required")?;
@@ -9473,7 +9263,7 @@ impl ChartApp {
         );
         self.ensure_navigation_scene()?;
         anyhow::ensure!(
-            self.loading_state.is_none() && self.engine.bathymetry.is_empty(),
+            self.loading_state.is_none() && self.engine.s102.bathymetry.is_empty(),
             "Completed vector-only load required"
         );
         anyhow::ensure!(
@@ -9565,11 +9355,13 @@ impl ChartApp {
         );
         anyhow::ensure!(
             self.engine
+                .s102
                 .bathymetry
                 .iter()
                 .any(|(p, _, _)| p == &paths[0])
                 && self
                     .engine
+                    .s102
                     .bathymetry
                     .iter()
                     .any(|(p, _, _)| p == &paths[1]),
@@ -9612,7 +9404,7 @@ impl ChartApp {
             "Visible/focused audit forbidden"
         );
         anyhow::ensure!(
-            self.loading_state.is_none() && self.engine.bathymetry.is_empty(),
+            self.loading_state.is_none() && self.engine.s102.bathymetry.is_empty(),
             "Audit requires completed original vector load and no existing bathymetry"
         );
         let paths: Vec<PathBuf> =
@@ -9687,13 +9479,13 @@ impl ChartApp {
             .save_screenshot(output.join("after-late.png"))?;
         self.load_bathymetry(&paths)?;
         anyhow::ensure!(
-            self.engine.bathymetry_bounds.len() == paths.len()
-                && self.engine.depth_policies.len() == paths.len(),
+            self.engine.s102.bathymetry_bounds.len() == paths.len()
+                && self.engine.s102.depth_policies.len() == paths.len(),
             "Successful publication did not publish all file metadata"
         );
         anyhow::ensure!(
             self.renderer.as_ref().unwrap().ui.ui_state.bathymetry_count
-                == self.engine.bathymetry.len(),
+                == self.engine.s102.bathymetry.len(),
             "UI count out of sync"
         );
 
@@ -11983,7 +11775,7 @@ impl ChartApp {
         flat_event_coalescing::flush_runtime(self)
     }
     fn ensure_s102_journal_ready(&mut self) -> Result<()> {
-        if let Some(gate) = &mut self.engine.s102_journal_gate {
+        if let Some(gate) = &mut self.engine.s102.journal_gate {
             if let Err(error) = gate.require_ready() {
                 gate.block_for_recovery();
                 return Err(error);
@@ -12347,7 +12139,7 @@ impl ChartApp {
             "Editor audit requires no imported routes"
         );
         anyhow::ensure!(
-            self.engine.s102_fc_status.loaded && self.engine.s102_pc_status.loaded,
+            self.engine.s102.fc_status.loaded && self.engine.s102.pc_status.loaded,
             "Default S-102 catalogues not initialized"
         );
         anyhow::ensure!(!output.exists(), "Editor audit output already exists");
@@ -12543,7 +12335,7 @@ impl ChartApp {
                 "app_geometry_choice":true,"invalid_geometry_choice_preserved_host_and_pixels":true,"geometry_choice_rows":geometry_choice_rows,
                 "wrong_camera_gpu_refused":format!("{:?}",refusal.err()),"failed_gpu_whole_rgba_unchanged":true,
                 "stopped_editor_click_ignored":true,"chart_model_unchanged":true,"camera_unchanged":true,
-                "s102_fc":self.engine.s102_fc_status.version,"s102_pc":self.engine.s102_pc_status.version,
+                "s102_fc":self.engine.s102.fc_status.version,"s102_pc":self.engine.s102.pc_status.version,
                 "native":self.native_s421.audit_data(),"full_s421_conformance":false
             }))?,
         )?;
@@ -15452,7 +15244,7 @@ fn run_app() -> Result<()> {
     app.initialize_product_catalogues();
     app.engine.catalogue_inventory = config.catalogue_inventory;
     app.s102_adjustments_path = config.s102_adjustments_path;
-    app.engine.s102_journal_gate = s102_journal_gate;
+    app.engine.s102.journal_gate = s102_journal_gate;
     app.initial_interoperability_enabled = config.initial_interoperability_enabled;
     app.ic_transition_audit = config.ic_transition_audit;
     app.wake_proxy = Some(event_loop.create_proxy());
@@ -16244,30 +16036,30 @@ mod installed_product_catalogue_tests {
         );
         app.s102_pc_path = base.join("Catalogues/PC/S-102");
         app.initialize_product_catalogues();
-        assert!(app.engine.cells.is_empty() && app.engine.bathymetry.is_empty());
+        assert!(app.engine.cells.is_empty() && app.engine.s102.bathymetry.is_empty());
         assert!(
-            app.engine.s102_fc_status.loaded,
+            app.engine.s102.fc_status.loaded,
             "{:?}",
-            app.engine.s102_fc_status.validation_message
+            app.engine.s102.fc_status.validation_message
         );
         assert!(
-            app.engine.s102_pc_status.loaded,
+            app.engine.s102.pc_status.loaded,
             "{:?}",
-            app.engine.s102_pc_status.validation_message
+            app.engine.s102.pc_status.validation_message
         );
-        assert_eq!(app.engine.s102_fc_status.product_id, "S-102");
-        assert_eq!(app.engine.s102_pc_status.product_id, "S-102");
-        let held = app.engine.s102_pc.as_ref().unwrap();
+        assert_eq!(app.engine.s102.fc_status.product_id, "S-102");
+        assert_eq!(app.engine.s102.pc_status.product_id, "S-102");
+        let held = app.engine.s102.pc.as_ref().unwrap();
         let portrayal = BathymetryPortrayal::from_bound_catalogue(
             held.clone(),
             "Day",
-            DepthSettings::default(),
+            ferrite_s102::DepthSettings::default(),
         )
         .unwrap();
         assert!(Arc::ptr_eq(
             held,
             portrayal.bound_evaluation().unwrap().catalogue()
         ));
-        assert_eq!(app.engine.s102_fc.as_ref().unwrap().version, "3.0.0");
+        assert_eq!(app.engine.s102.fc.as_ref().unwrap().version, "3.0.0");
     }
 }

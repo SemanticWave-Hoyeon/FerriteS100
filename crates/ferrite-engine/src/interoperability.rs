@@ -1,8 +1,8 @@
 //! App orchestration for authenticated Part 16 plane rules; readers stay in product crates.
 use anyhow::{ensure, Result};
-use ferrite_interoperability::{Assignment, AuthenticatedCatalogue, Selection};
+use ferrite_interoperability::{AuthenticatedCatalogue, Selection};
 use ferrite_kernel::{GridGeometry, GridWindow, NumericCoverageSource};
-use ferrite_render::{DisplayPlane, RasterDrawOrder, RasterLayer, RenderContext};
+use ferrite_render::RenderContext;
 
 /// Level 2 context for one composition: the mariner's predefined combination
 /// and where the replacing products have data coverage.
@@ -226,29 +226,6 @@ pub fn compose_vectors_for_cells(
     plan.apply(&mut instructions)?;
     context.set_instructions_from_cache(instructions);
     Ok(changed)
-}
-pub fn compose_raster(
-    mut layer: RasterLayer,
-    assignment: Option<&Assignment>,
-) -> Result<RasterLayer> {
-    if let Some(a) = assignment {
-        ensure!(
-            a.plane.stage == ferrite_kernel::CompositionStage::Chart && a.priority >= 0,
-            "Invalid raster IC assignment"
-        );
-        // A coverage raster has no symbol or line style to substitute.
-        ensure!(
-            a.substitution.is_none(),
-            "substituteSymbolization cannot apply to a raster coverage"
-        );
-        layer.draw_order = RasterDrawOrder {
-            stage: a.plane.stage,
-            display_plane: DisplayPlane::Interoperability(a.plane.order),
-            priority: a.priority,
-        };
-        layer.viewing_groups = vec![a.viewing_group];
-    }
-    Ok(layer)
 }
 #[cfg(test)]
 mod tests {

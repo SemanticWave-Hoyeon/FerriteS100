@@ -1,8 +1,8 @@
 //! Import/restart replay gate only. Never creates removal permission or deletes user files.
 //! Root must connect explicit trusted existing-path configuration and every render consumer.
-use crate::s102_original_inputs::OwnedOriginalInput;
+use super::original_inputs::OwnedOriginalInput;
+use crate::cancellation_journal::store::Store;
 use anyhow::{ensure, Context, Result};
-use ferrite_s102::cancellation_journal::store::Store;
 use ferrite_security::AuthenticatedSnapshot;
 use sha2::{Digest, Sha384};
 use std::{

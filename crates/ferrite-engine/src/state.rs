@@ -10,12 +10,9 @@ use crate::portrayal::{
     CellCaches, CellPortrayalSelection, PortrayalChangeRequest, PortrayalRun, PortrayalSource,
     PrecomputedCells,
 };
-#[cfg(feature = "s102-pure")]
-use crate::s102_journal_admission;
 use crate::{
     cell_source_identity, decoded_chart_cache, interoperability, primary_viewing_layers,
-    s101_catalogue_selection, s101_lifecycle_metadata, s101_update_plan,
-    s102_depth_policy::DepthPolicy, s102_original_inputs, CellHydrationSource,
+    s101_catalogue_selection, s101_lifecycle_metadata, s101_update_plan, CellHydrationSource,
 };
 use anyhow::{Context, Result};
 use ferrite_feature_catalog::BoundFeatureCatalogue;
@@ -26,11 +23,6 @@ use ferrite_render::DrawingInstruction;
 use ferrite_render::{GeoBounds, RenderContext};
 use ferrite_s100_core::S101Cell;
 use ferrite_s101::coverage_projection::GeographicCoverageInventory;
-#[cfg(feature = "s102-pure")]
-use ferrite_s102::BathymetryCoverage;
-#[cfg(feature = "s102-pure")]
-use ferrite_security::AuthenticatedSnapshot;
-use ferrite_security::UnauthenticatedSnapshot;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -95,10 +87,6 @@ pub struct EngineState {
     pub fc_status: CatalogueStatus,
     /// Portrayal Catalogue status (for UI display)
     pub pc_status: CatalogueStatus,
-    pub s102_pc_status: CatalogueStatus,
-    pub s102_fc_status: CatalogueStatus,
-    pub s102_fc: Option<Arc<BoundFeatureCatalogue>>,
-    pub s102_pc: Option<Arc<BoundPortrayalCatalogue>>,
     /// All loaded S101 cells
     pub cells: Vec<S101Cell>,
     pub loaded_source_identities: cell_source_identity::LoadedSourceIdentities,
@@ -122,23 +110,11 @@ pub struct EngineState {
     pub ic: Option<Arc<ferrite_interoperability::AuthenticatedCatalogue>>,
     pub ic_combination: Option<String>,
     pub ic_assigned_vectors: usize,
-    /// S-102 2.1 trial files opened for inspection only (never depth).
+    /// The S-102 product layer: catalogues, opened files (coverages,
+    /// extents, depth policies, input snapshots, original authentication,
+    /// journal admission) and inspected trial files.
     #[cfg(feature = "s102-pure")]
-    pub s102_trials: Vec<(PathBuf, ferrite_s102::trial_inspection::TrialInspection)>,
-    #[cfg(feature = "s102-pure")]
-    pub bathymetry: Vec<(
-        PathBuf,
-        BathymetryCoverage,
-        Option<Arc<AuthenticatedSnapshot>>,
-    )>,
-    pub bathymetry_bounds: HashMap<PathBuf, GeoBounds>,
-    /// Signature provenance of each S-102 file opened by `ChartEngine`.
-    pub s102_provenance: HashMap<PathBuf, String>,
-    pub depth_policies: HashMap<PathBuf, DepthPolicy>,
-    pub depth_inputs: HashMap<PathBuf, Arc<UnauthenticatedSnapshot>>,
-    pub s102_original_inputs: s102_original_inputs::Registry,
-    #[cfg(feature = "s102-pure")]
-    pub s102_journal_gate: Option<s102_journal_admission::Gate>,
+    pub s102: ferrite_s102::layer::S102Layer,
     pub require_signatures: bool,
     pub operational_mode: bool,
     pub verified_count: usize,
@@ -184,10 +160,6 @@ impl EngineState {
             catalogue_registry: Default::default(),
             fc_status,
             pc_status,
-            s102_pc_status: CatalogueStatus::default(),
-            s102_fc_status: CatalogueStatus::default(),
-            s102_fc: None,
-            s102_pc: None,
             cells: Vec::new(),
             loaded_source_identities: Default::default(),
             loaded_chain_paths: Vec::new(),
@@ -206,16 +178,7 @@ impl EngineState {
             ic_combination: None,
             ic_assigned_vectors: 0,
             #[cfg(feature = "s102-pure")]
-            s102_trials: Vec::new(),
-            #[cfg(feature = "s102-pure")]
-            bathymetry: Vec::new(),
-            bathymetry_bounds: Default::default(),
-            s102_provenance: Default::default(),
-            depth_policies: HashMap::new(),
-            depth_inputs: HashMap::new(),
-            s102_original_inputs: Default::default(),
-            #[cfg(feature = "s102-pure")]
-            s102_journal_gate: None,
+            s102: ferrite_s102::layer::S102Layer::new(Some(Arc::clone(&platform.cache))),
             require_signatures: false,
             operational_mode: false,
             verified_count: 0,
@@ -766,6 +729,7 @@ impl EngineState {
         }
         #[cfg(feature = "s102-pure")]
         let bathymetry: Vec<&dyn ferrite_kernel::NumericCoverageSource> = self
+            .s102
             .bathymetry
             .iter()
             .map(|(_, c, _)| c as &dyn ferrite_kernel::NumericCoverageSource)
@@ -776,6 +740,13 @@ impl EngineState {
             displayed.push("S-102");
         }
         interoperability::Level2::new(ic, self.ic_combination.as_deref(), &displayed, bathymetry)
+    }
+    /// Portrayed extents of the loaded S-102 files (empty without S-102).
+    pub fn bathymetry_extents(&self) -> Vec<GeoBounds> {
+        #[cfg(feature = "s102-pure")]
+        return self.s102.bathymetry_bounds.values().copied().collect();
+        #[cfg(not(feature = "s102-pure"))]
+        Vec::new()
     }
     /// Selection for S-102 rasters being composed now: S-102 is on display.
     pub fn ic_s102_selection(
